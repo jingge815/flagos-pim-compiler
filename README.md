@@ -26,6 +26,23 @@
 
 固定 shape 全链路打通，模型选定 GPT-2（`openai-community/gpt2`），在 NumpyBackend 上跑通 prefill + 完整 decode 自回归解码，与单卡 PyTorch 逐元素对齐。
 
+## 环境
+
+```bash
+source /media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+python -m pytest tests/ -x -q
+```
+
+torch 2.9.1 / transformers 4.57.6 / python 3.10.20。每个新 shell 都要先 source。
+
+## 文档
+
+- `docs/spec.md` — 完整技术方案
+- `docs/spec-index.md` — 方案分节行号索引（按需定位，避免整篇读）
+- `docs/<module>.md` — 各模块接口与设计决策
+
 ## 开发约定
 
 `contracts/` 是全仓地基，字段名须在开发初期钉死，之后各组在自己目录内并行推进，仅通过 `node.meta` 标注解耦。
+
+开发规范（代码量控制、可读性、测试、文档要求）见 [`CLAUDE.md`](./CLAUDE.md)，人和 agent 共用同一份。
