@@ -35,6 +35,30 @@ python -m pytest tests/ -x -q
 
 torch 2.9.1 / transformers 4.57.6 / python 3.10.20。每个新 shell 都要先 source。
 
+### 站点相关路径
+
+`genesim_bridge` 需要知道 flagTree 安装与 GeneSim 仓库的位置。默认值是当前
+开发机路径，换机器时**不要改代码**，用环境变量或配置文件覆盖：
+
+```bash
+# 方式 1：环境变量
+export FLAGTREE_PREFIX=/path/to/flagOS-installed/flagTree
+export GENESIM_ROOT=/path/to/genesim
+
+# 方式 2：仓库根建 paths.local.json（已被 .gitignore 忽略）
+echo '{"flagtree_prefix": "...", "genesim_root": "..."}' > paths.local.json
+```
+
+优先级：环境变量 > `paths.local.json` > `genesim_bridge/paths.py` 里的默认值。
+查看当前生效路径：
+
+```bash
+python -c "from genesim_bridge.paths import describe; print(describe())"
+```
+
+GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 另有一个 `PIM_COMPILER_ROOT`
+环境变量，指向本仓库根目录。
+
 ## 文档
 
 - `docs/spec.md` — 完整技术方案
