@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .flagtree_driver import run_and_capture
+from .ir_cost import analyze_ir
 from .op_classify import (
     UNCOVERED_OP_TYPES,
     ShapePoint,
@@ -33,9 +34,9 @@ from .op_classify import (
     flash_attention_probe,
     gemm_features,
 )
-from .ttir_cost import analyze_ttir
+from .paths import pim_options
 
-SIDECAR_VERSION = "1.0"
+SIDECAR_VERSION = "1.1"
 
 
 @dataclass
@@ -48,10 +49,23 @@ class Measurement:
     element_bytes: int
     kernel_ids: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    # 以下仅 ir_level="pimir" 时有值
+    mram_traffic_bytes: Optional[float] = None
+    pim_kernels: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def _measure(op_dict: dict, point: ShapePoint, dims: Dict[str, int]) -> Measurement:
-    """在一个 shape 点上编译该算子并抽成本。"""
+def _measure(
+    op_dict: dict,
+    point: ShapePoint,
+    dims: Dict[str, int],
+    ir_level: str,
+) -> Measurement:
+    """在一个 shape 点上编译该算子并抽成本。
+
+    ir_level="pimir" 时 driver 额外把捕获到的 TTIR 就地降成 pim mlir，成本从
+    pim mlir 上抽。flops 两层必然相等（PIM pass 不改 tt.dot / arith / scf.for），
+    差别是 pimir 多出 mram_traffic_bytes 与 WRAM 用量。
+    """
     op_type = op_dict["op_type"]
     recipes = build_recipes(dims)
 
@@ -61,7 +75,8 @@ def _measure(op_dict: dict, point: ShapePoint, dims: Dict[str, int]) -> Measurem
     else:
         recipe = recipes[op_type](point)
 
-    captured = run_and_capture(recipe.build)
+    pimir = ir_level == "pimir"
+    captured = run_and_capture(recipe.build, emit_pimir=pimir)
     if not captured:
         raise RuntimeError(
             f"op_type={op_type} 在 {point.label} 未捕获到任何 kernel；"
@@ -69,17 +84,23 @@ def _measure(op_dict: dict, point: ShapePoint, dims: Dict[str, int]) -> Measurem
         )
 
     total_flops = 0.0
+    total_mram = 0.0
     dtype = "f16"
     element_bytes = 2
     kernel_ids: List[str] = []
     notes: List[str] = []
+    pim_kernels: List[Dict[str, Any]] = []
     for cap in captured:
-        cost = analyze_ttir(cap.ttir, cap.name, cap.grid, cap.arg_values)
+        text = cap.pimir if pimir else cap.ttir
+        cost = analyze_ir(text, cap.name, cap.grid, cap.arg_values, ir_level=ir_level)
         total_flops += cost.flops
         dtype = cost.dtype
         element_bytes = cost.element_bytes
         kernel_ids.append(f"{cost.kernel_name}@grid{cost.grid}")
         notes.extend(f"{cost.kernel_name}: {n}" for n in cost.notes)
+        if pimir:
+            total_mram += cost.mram_traffic_bytes
+            pim_kernels.append(_pim_kernel_dict(cost))
 
     return Measurement(
         point=point,
@@ -89,7 +110,34 @@ def _measure(op_dict: dict, point: ShapePoint, dims: Dict[str, int]) -> Measurem
         element_bytes=element_bytes,
         kernel_ids=kernel_ids,
         notes=notes,
+        mram_traffic_bytes=total_mram if pimir else None,
+        pim_kernels=pim_kernels,
     )
+
+
+def _pim_kernel_dict(cost) -> Dict[str, Any]:
+    """pim mlir 特有的 kernel 级元数据，落 sidecar。
+
+    这些量 GeneSim 的 Operator schema 放不下，且按方案三.(3) 也不该进
+    `data_bytes`；但它们是「换成 pim mlir 之后新拿到的信息」的全部内容，
+    是这一步的实际产出，故完整记录。
+    """
+    return {
+        "kernel": cost.kernel_name,
+        "grid": list(cost.grid),
+        "mram_traffic_bytes": cost.mram_traffic_bytes,
+        "wram_bytes_used": cost.wram_bytes_used,
+        "wram_bytes_budget": cost.wram_bytes_budget,
+        "wram_buffers": [
+            {"shape": b.shape, "dtype": b.dtype, "bytes": b.bytes}
+            for b in cost.wram_buffers
+        ],
+        "dma_ops": cost.dma_ops,
+        # 指针分析证明了 stride 的 DMA 数。未证明不等于不连续，只是当前没证明
+        # （doc 9.5），比值低说明 PIM 后端能利用的 DMA 信息有限
+        "dma_ops_with_proven_layout": cost.dma_ops_with_layout,
+        "loop_trip_counts": cost.loop_trip_counts,
+    }
 
 
 def _resolve_dim(dim: Any, point: ShapePoint) -> int:
@@ -204,12 +252,20 @@ def export_costs_to_genesim(
     sidecar_path: Path,
     seq_len: int,
     cross_validate: bool = True,
+    ir_level: str = "pimir",
 ) -> Dict[str, Any]:
     """主入口：读 GeneSim .ir，回填编译器测得的成本，落盘 .ir + sidecar。
 
     不改算子个数、类型、连接与设备归属——只换成本数值，以及把 GeneSim
     schema 放不下的元数据落 sidecar。
+
+    ir_level="ttir"  -- 方案三.(4) 第 1 步，成本从 FlagTree 原生 TTIR 抽。
+    ir_level="pimir" -- 第 2 步（默认），成本从 pim mlir 抽，额外产出
+                       mram_traffic_bytes 与 WRAM 用量。回填进 .ir 的
+                       flops/data_bytes 口径与第 1 步完全相同（方案三.(3)：
+                       tile 级重复搬运不进 data_bytes）。
     """
+    assert ir_level in ("ttir", "pimir"), f"未知 ir_level: {ir_level}"
     ir = json.loads(Path(ir_path).read_text())
 
     dims = {
@@ -225,7 +281,7 @@ def export_costs_to_genesim(
     cache: Dict[tuple, Tuple[Measurement, Measurement]] = {}
     sidecar: Dict[str, Any] = {
         "version": SIDECAR_VERSION,
-        "ir_level": "ttir",
+        "ir_level": ir_level,
         "source_ir": str(ir_path),
         "shape_points": {
             "prefill": {"Tq": prefill_point.tq, "Tp": prefill_point.tp},
@@ -234,6 +290,9 @@ def export_costs_to_genesim(
         "coverage": {"bridged": [], "template": []},
         "operators": {},
     }
+    if ir_level == "pimir":
+        # 生效的 PIM pass 参数：换硬件配置后要能溯源到这份 sidecar 是哪组参数编的
+        sidecar["pim_options"] = pim_options()
 
     for op in ir["operators"]:
         op_type = op["op_type"]
@@ -248,8 +307,8 @@ def export_costs_to_genesim(
                tuple(tuple(s) for s in op["output_shapes"]))
         if key not in cache:
             cache[key] = (
-                _measure(op, prefill_point, dims),
-                _measure(op, decode_point, dims),
+                _measure(op, prefill_point, dims, ir_level),
+                _measure(op, decode_point, dims, ir_level),
             )
         prefill, decode = cache[key]
 
@@ -283,14 +342,26 @@ def export_costs_to_genesim(
                 "flops_coeffs": template_flops,
                 "data_bytes_coeffs": template_bytes,
             },
-            # 第 2 步接 pim mlir 才有值，见方案三.(3)
-            "mram_traffic_bytes": None,
-            # 第 2 步做局部→全局换算才需要，见方案三.(6)
+            # tile 级 MRAM↔WRAM 真实搬运字节，只供后续精化访存时延模型参考，
+            # 不进 data_bytes（方案三.(3)）。ir_level="ttir" 时为 None。
+            "mram_traffic_bytes": (
+                None if ir_level == "ttir"
+                else {
+                    "prefill": prefill.mram_traffic_bytes,
+                    "decode": decode.mram_traffic_bytes,
+                }
+            ),
+            # 局部→全局换算（方案三.(6)）当前无对象：实测 PIM pass 不重切 tile，
+            # num-dpus 只记进 module 属性、dpusPerDevice 恒为全 1（FlagTree
+            # doc 15.9），kernel 编的就是单 DPU 全局 shape。跨 DPU sharding
+            # 落地后此处才需要按 placement 乘回去。
             "shard_participants": None,
         }
 
     if cross_validate:
-        sidecar["cross_validation"] = _cross_validate(dims, prefill_point, decode_point)
+        sidecar["cross_validation"] = _cross_validate(
+            dims, prefill_point, decode_point, ir_level
+        )
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))
@@ -309,7 +380,7 @@ def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint) -> str:
 
 
 def _measurement_dict(m: Measurement) -> Dict[str, Any]:
-    return {
+    entry = {
         "Tq": m.point.tq,
         "Tp": m.point.tp,
         "flops": m.flops,
@@ -318,12 +389,23 @@ def _measurement_dict(m: Measurement) -> Dict[str, Any]:
         "kernel_ids": m.kernel_ids,
         "notes": m.notes,
     }
+    if m.mram_traffic_bytes is not None:
+        entry["mram_traffic_bytes"] = m.mram_traffic_bytes
+        # mram / net 的放大倍数：WRAM 装不下整个算子，同一份 MRAM 数据要按 tile
+        # 反复搬入，这个比值就是「tile 级重复搬运」的量化结果——第 2 步接 pim mlir
+        # 拿到的核心新信息
+        entry["mram_amplification"] = (
+            m.mram_traffic_bytes / m.data_bytes if m.data_bytes else None
+        )
+        entry["pim_kernels"] = m.pim_kernels
+    return entry
 
 
 def _cross_validate(
     dims: Dict[str, int],
     prefill_point: ShapePoint,
     decode_point: ShapePoint,
+    ir_level: str,
 ) -> Dict[str, Any]:
     """跑一次融合 flash attention，记录其成本作交叉验证基准。
 
@@ -334,23 +416,35 @@ def _cross_validate(
         "note": "FlagGems 实跑 attention 为融合 flash 路径；"
                 "此处记录融合 kernel 的单层全 head 成本，供与代表实现求和对照",
     }
+    pimir = ir_level == "pimir"
     for name, point in (("prefill", prefill_point), ("decode", decode_point)):
         try:
-            captured = run_and_capture(flash_attention_probe(dims, point))
+            captured = run_and_capture(
+                flash_attention_probe(dims, point), emit_pimir=pimir
+            )
         except Exception as exc:                     # noqa: BLE001
             result[name] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
         entries = []
         total = 0.0
+        total_mram = 0.0
         for cap in captured:
-            cost = analyze_ttir(cap.ttir, cap.name, cap.grid, cap.arg_values)
+            text = cap.pimir if pimir else cap.ttir
+            cost = analyze_ir(text, cap.name, cap.grid, cap.arg_values, ir_level=ir_level)
             total += cost.flops
-            entries.append({
+            entry = {
                 "kernel": cost.kernel_name,
                 "grid": list(cost.grid),
                 "flops": cost.flops,
                 "loop_trip_counts": cost.loop_trip_counts,
                 "notes": cost.notes,
-            })
+            }
+            if pimir:
+                total_mram += cost.mram_traffic_bytes
+                entry["mram_traffic_bytes"] = cost.mram_traffic_bytes
+                entry["wram_bytes_used"] = cost.wram_bytes_used
+            entries.append(entry)
         result[name] = {"total_flops": total, "kernels": entries}
+        if pimir:
+            result[name]["total_mram_traffic_bytes"] = total_mram
     return result

@@ -16,7 +16,7 @@
 | `memory/` | KV 布局与 runtime、三区静态内存规划 | 问题 7、8 |
 | `runtime/` | 编排器：ExecutionPlan 生成 + 解码循环执行 | 问题 6 |
 | `backend/` | HAL 抽象：`hal_numpy` 假后端 / `hal_vendor` 真硬件 | 运行时底座 |
-| `genesim_bridge/` | GeneSim 成本桥接（从 IR 抽 flops/data_bytes，性能评估旁支） | 问题 4 |
+| `genesim_bridge/` | GeneSim 成本桥接（从 TTIR / pim mlir 抽 flops/data_bytes，性能评估旁支） | 问题 4 |
 | `tests/` | 逐节点对拍器 + 各模块单测 | 集成验证 |
 | `examples/` | 端到端示例（如 GPT-2 全链路跑通） | — |
 | `scripts/` | 开发与构建脚本 | — |
@@ -37,20 +37,26 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20。每个新 shell 都要先 s
 
 ### 站点相关路径
 
-`genesim_bridge` 需要知道 flagTree 安装与 GeneSim 仓库的位置。默认值是当前
-开发机路径，换机器时**不要改代码**，用环境变量或配置文件覆盖：
+`genesim_bridge` 需要知道两份 flagTree 安装与 GeneSim 仓库的位置——成本从
+pim mlir 抽时要用带 PIM 支持的那份（普通 flagTree 安装的 `libtriton.so` 里
+没有 PIM pass）。默认值是当前开发机路径，换机器时**不要改代码**，用环境变量
+或配置文件覆盖：
 
 ```bash
 # 方式 1：环境变量
 export FLAGTREE_PREFIX=/path/to/flagOS-installed/flagTree
+export FLAGTREE_PIM_PREFIX=/path/to/flagOS-installed/flagTree-pim
 export GENESIM_ROOT=/path/to/genesim
 
 # 方式 2：仓库根建 paths.local.json（已被 .gitignore 忽略）
-echo '{"flagtree_prefix": "...", "genesim_root": "..."}' > paths.local.json
+echo '{"flagtree_prefix": "...", "flagtree_pim_prefix": "...", "genesim_root": "..."}' > paths.local.json
 ```
 
+PIM pass 的硬件参数（`FLAGTREE_PIM_TARGET` / `_NUM_DPUS` / `_NUM_TASKLETS` /
+`_WRAM_BYTES`）走同一套优先级，键名去掉 `FLAGTREE_` 前缀改小写即为配置文件键。
+
 优先级：环境变量 > `paths.local.json` > `genesim_bridge/paths.py` 里的默认值。
-查看当前生效路径：
+查看当前生效路径与参数：
 
 ```bash
 python -c "from genesim_bridge.paths import describe; print(describe())"

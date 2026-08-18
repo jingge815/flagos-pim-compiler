@@ -27,7 +27,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 | `memory/`         | `kv_layout.py` KV 布局 + runtime、`mem_planner.py` 三区 offset 规划                  | 7、8 |
 | `runtime/`        | `exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                 | 6    |
 | `backend/`        | `hal_numpy.py` 假后端（N 块独立 numpy buffer 模拟 N 个 DPU）/ `hal_vendor.py` 真硬件 | 底座 |
-| `genesim_bridge/` | `cost_extractor.py` 从 IR 抽 flops/data_bytes（评估旁支）                            | 4    |
+| `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                       | 4    |
 | `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                               | 验证 |
 
 `contracts/` 是地基：改任何字段先 grep 调用方，改完同步全链路。各组只通过 `node.meta` 解耦，不私自约定字段。
