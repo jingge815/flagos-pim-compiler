@@ -20,7 +20,7 @@
 
 ## 阶段范围
 
-**第 1 阶段（当前）**：固定 shape 全链路打通，GPT-2（`openai-community/gpt2`，初期可配小：n_layer=4, n_head=8, n_embd=512, max_seq=128），NumpyBackend 上跑通 prefill + 完整 decode，与单卡 PyTorch 逐元素对齐。
+**第 1 阶段（当前）**：固定 shape 全链路打通，Llama‑2‑7B(HuggingFace获取静态模型)，NumpyBackend 上跑通 prefill + 完整 decode，与单卡 PyTorch 逐元素对齐。
 
 序列变长、代价模型、自动切分、激活区紧凑复用、算子融合、异步 dispatch 属第 2/3 阶段，**当前不实现、不预留抽象**。
 

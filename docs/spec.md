@@ -538,7 +538,7 @@ class RedistributeEdge:
 4. **规约类型**：`Partial.reduce_type ∈ {sum, mean}`；softmax 型 partial 靠"按 head 切、规约维不被切"回避，不在第 1 阶段出现。
 5. **切分对齐**：DPU 数取 2 的整数次幂，整除 head 数（GQA 按 KV head 数），且切点对齐 head 边界。由此保证 reshape、cat、split 均落在本地执行的合法情形。
 
-上述不变量把复杂的切分场景排除在配置层之外，使第 1 阶段的规则表只需处理本地执行与标准 redistribute 两类情形。契约外的一般情形（二维切分、非连续分片、子集规约、通用 reshape、softmax 规约维被切）统一留 `[阶段2]`。第 1 阶段的固定模型为 **GPT-2**（HuggingFace `openai-community/gpt2`，标准 MHA decoder-only、绝对位置编码），其全部权重切分均落在本契约范围内；16 头可被 2/4/8 整除，切点对齐 head 边界即可覆盖 4/8 DPU 张量并行。规则表本身按标准 GQA / MHA decoder-only 通用编写（GQA 是一般情形、MHA 为其特例），因此后续宽化到 GQA 模型（如 Llama、Qwen 类）无需改动切分契约。
+上述不变量把复杂的切分场景排除在配置层之外，使第 1 阶段的规则表只需处理本地执行与标准 redistribute 两类情形。契约外的一般情形（二维切分、非连续分片、子集规约、通用 reshape、softmax 规约维被切）统一留 `[阶段2]`。第 1 阶段的固定模型为 Llama‑2‑7B(HuggingFace获取静态模型)；规则表本身按标准 GQA / MHA decoder-only 通用编写（GQA 是一般情形、MHA 为其特例），因此后续宽化到 GQA 模型（如 Llama、Qwen 类）无需改动切分契约。
 
 #### 四. 工作量与推进建议
 
@@ -2158,7 +2158,7 @@ for k in DPU:
 
 ### 6.1 三阶段总览
 
-1. **第 1 阶段（本期）——能跑对**：固定 shape 全链路打通，和单卡 PyTorch 数值对齐。`max_seq` 为常量、满算加 mask、切分手工指定、模型选定 **GPT-2**（HuggingFace `openai-community/gpt2`，研发初期可配置，例如：n_layer=4, n_head=8, n_embd=512, max_seq=128，编排器可串行。GeneSim 接入同属本期，分两步：第 1 步接 FlagTree 原生 TTIR 先走通 `HF→…→GeneSim` 全链路（访存侧近似）、不依赖问题 5，可最先起步；第 2 步随问题 5 产出的 pim mlir 接入、补齐访存侧精度。
+1. **第 1 阶段（本期）——能跑对**：固定 shape 全链路打通，和单卡 PyTorch 数值对齐。`max_seq` 为常量、满算加 mask、切分手工指定、模型选定 **GPT-2**（Llama‑2‑7B(HuggingFace获取静态模型)，编排器可串行。GeneSim 接入同属本期，分两步：第 1 步接 FlagTree 原生 TTIR 先走通 `HF→…→GeneSim` 全链路（访存侧近似）、不依赖问题 5，可最先起步；第 2 步随问题 5 产出的 pim mlir 接入、补齐访存侧精度。
 2. **第 2 阶段——跑得全**：在第1阶段的基础上，添加序列变长（符号维加上界）、代价模型、自动切分、激活区紧凑复用、图拆分宽化、异步 dispatch。
 3. **第 3 阶段——跑得快**：性能优化，包括：算子融合、把单算子逐次下发合并为批量下发以摊薄主机-设备通信开销，对齐第七节第 5 条与第八节的通信开销风险。
 
@@ -2339,7 +2339,7 @@ flagOS-installers: https://github.com/jingge815/flagOS-installers
 
 ## 八、风险点
 
-1. 算子覆盖面广，需要实现对全部算子的支持，上百个，涉及算子修改、FlagTree 支持以及上层图编译优化的数据布局转换。缓解：先走通整体流程，第 1 阶段用窄白名单只放 A 类（GEMM/GEMV/逐元素），B/C 类留 host 当胶水，几乎无需手改 kernel；再按 host 是否成为瓶颈逐个宽化（`[阶段2]`）。**第 1 阶段选定 GPT-2 （HuggingFace `openai-community/gpt2`，标准 MHA decoder-only、绝对位置编码，权重切分落在问题 2 第 1 阶段切分契约范围内）；选它而非 GQA 模型是为把第 1 阶段难度压到最低——MHA 免去 `q_heads_by_kv` 映射、绝对位置编码免去 RoPE 留 host、且 HF 开放下载无 gating；16 头可被 2/4/8 整除，能验 4/8 DPU 张量并行。避开 MoE（专家路由是真动态控制流，导出会 graph break）。功能验证只要求编译器输出与单卡 PyTorch 逐元素对齐，与权重是否预训练无关，故日常迭代可用缩小层数的随机权重配置加速，验收时再加载完整 24 层权重跑一遍，二者架构一致、代码不变。**
+1. 算子覆盖面广，需要实现对全部算子的支持，上百个，涉及算子修改、FlagTree 支持以及上层图编译优化的数据布局转换。缓解：先走通整体流程，第 1 阶段用窄白名单只放 A 类（GEMM/GEMV/逐元素），B/C 类留 host 当胶水，几乎无需手改 kernel；再按 host 是否成为瓶颈逐个宽化（`[阶段2]`）。**第 1 阶段选定 Llama‑2‑7B(HuggingFace获取静态模型)`，标准 MHA decoder-only、绝对位置编码，权重切分落在问题 2 第 1 阶段切分契约范围内）；选它而非 GQA 模型是为把第 1 阶段难度压到最低——MHA 免去 `q_heads_by_kv` 映射、绝对位置编码免去 RoPE 留 host、且 HF 开放下载无 gating；16 头可被 2/4/8 整除，能验 4/8 DPU 张量并行。避开 MoE（专家路由是真动态控制流，导出会 graph break）。功能验证只要求编译器输出与单卡 PyTorch 逐元素对齐，与权重是否预训练无关，故日常迭代可用缩小层数的随机权重配置加速，验收时再加载完整 24 层权重跑一遍，二者架构一致、代码不变。**
 2. **全链路修改、收口点单一**，本方案涉及编译期图分析、算子编译、运行时编排全链路的协同修改，任一环节数据流标错都会导致最终结果错。缓解：以逐节点对拍器（问题 6）为核心调试基础设施，按 placement 合并分片后与单卡 PyTorch 逐元素比，第一处不匹配即定位到具体 node；全链路先在 NumpyBackend 零硬件验对，再上真硬件。
 3. **GeneSim 接入的成本换算精度**，问题 4 从 IR 抽成本回填 GeneSim，难点有三：① IR 到 GeneSim 字段的成本换算规则，尤其访存字节的准确统计；② 一个 GeneSim `Operator` 与 FlagTree kernel 的一对多 / 多对一关联；③ 第 1 步 TTIR 目标无关、访存侧拿不准，须显式标注为近似、不与第 2 步 pim mlir 混淆。缓解：先用 TTIR 走通链路（访存侧近似），再随问题 5 的 pim mlir 补齐访存精度；A 类算子先行、与问题 5 白名单口径一致，避免"某算子没编 kernel 却要抽成本"的矛盾。此项为性能评估旁支，不影响功能正确性。
 
