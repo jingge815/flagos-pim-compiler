@@ -67,29 +67,32 @@ cd /media/disk/fengjingge/src/genesim
 source /media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh
 export PATH="$HOME/.local/bin:$PATH"   # run.sh 需要 uv
 
-python scripts/generate_builtin_gpt2_ir.py --output models/gpt2_builtin.ir
-./run.sh --trace --synthetic --num_requests 10 --output traces/gpt2_builtin.trace
+./run.sh --parse-model \
+  --model_name /media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/meta-llama-Llama-2-7b-hf \
+  --output models/llama2_7b.ir
+./run.sh --trace --synthetic --num_requests 10 --output traces/llama2_7b.trace
 
 python scripts/refine_ir_with_flagtree.py \
-  --ir models/gpt2_builtin.ir \
-  --out-ir models/gpt2_builtin_flagtree.ir \
-  --sidecar models/gpt2_builtin_flagtree_extensions.json --seq-len 128
+  --ir models/llama2_7b.ir \
+  --out-ir models/llama2_7b_flagtree.ir \
+  --sidecar models/llama2_7b_flagtree_extensions.json --seq-len 128 \
+  --ir-level ttir
 
 python scripts/refine_ir_with_flagtree.py --ir-level pimir \
-  --ir models/gpt2_builtin.ir --out-ir models/gpt2_builtin_pimir.ir \
-  --sidecar models/gpt2_builtin_pimir_extensions.json --seq-len 128
+  --ir models/llama2_7b.ir --out-ir models/llama2_7b_pimir.ir \
+  --sidecar models/llama2_7b_pimir_extensions.json --seq-len 128
 
-./run.sh --config conf/sim_gpt2_flagtree.yaml
+./run.sh --config conf/sim_llama2_7b_pimir.yaml
 ```
 
 生成物：
 
 | 文件 | 说明 |
 | --- | --- |
-| `models/gpt2_builtin_flagtree.ir` | TTIR 路精化结果 |
-| `models/gpt2_builtin_flagtree_extensions.json` | TTIR 路侧车 |
-| `models/gpt2_builtin_pimir.ir` | PIM 路精化结果 |
-| `models/gpt2_builtin_pimir_extensions.json` | PIM 路侧车 |
+| `models/llama2_7b_flagtree.ir` | TTIR 路精化结果 |
+| `models/llama2_7b_flagtree_extensions.json` | TTIR 路侧车 |
+| `models/llama2_7b_pimir.ir` | PIM 路精化结果 |
+| `models/llama2_7b_pimir_extensions.json` | PIM 路侧车 |
 
 ## 当前问题
 

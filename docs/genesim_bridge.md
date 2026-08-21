@@ -16,9 +16,9 @@ from genesim_bridge import (
 prepare_triton_env(pim=True)         # 必须在 import triton / flag_gems 之前
 assert_pim_passes_available()        # pimir 路专用，缺 PIM pass 直接抛
 sidecar = export_costs_to_genesim(
-    ir_path=Path("models/gpt2_builtin.ir"),          # GeneSim 图骨架（输入）
-    out_ir_path=Path("models/gpt2_builtin_pimir.ir"),
-    sidecar_path=Path("models/gpt2_builtin_pimir_extensions.json"),
+    ir_path=Path("models/llama2_7b.ir"),          # GeneSim 图骨架（输入）
+    out_ir_path=Path("models/llama2_7b_pimir.ir"),
+    sidecar_path=Path("models/llama2_7b_pimir_extensions.json"),
     seq_len=128,                     # prefill 代表点的 Tq
     cross_validate=True,
     ir_level="pimir",                # 或 "ttir"（第 1 步，回归对照）
@@ -56,8 +56,7 @@ padding 开销达 159 倍。无约束两点解会给出负斜率，在 Tq=512 �
 两点原始测量值完整落 sidecar，不丢信息。
 
 **3. 走原始 JSON 改写，不用 `ModelIR.load()/save()`。**
-`ModelIR.to_dict()` 不含 gpt2 IR 携带的 `max_seq` / `vocab_size`，往返一趟
-会静默丢字段。
+`ModelIR.to_dict()` 不含部分 GeneSim IR 携带的扩展字段，往返一趟会静默丢字段。
 
 **4. 包 `LibEntry.run` 而非 `JITFunction.run`。**
 FlagGems 命中自身 kernel_cache 后直接 `kernel[grid](...)` 发射，不再经过
@@ -87,7 +86,7 @@ GeneSim 的 GEMM `input_shapes` 只有激活（`[["Tq",512]]`），权重不在 
 ## 算子覆盖（a+c 路线，与方案原文的差异）
 
 方案二.算子边界假设原文设定「GEMV 走 FlagGems 分离实现、1:1 对齐」。
-**实测不成立**：gpt2 推理的 994 个 IR dump 里，带 `tt.dot` 的 kernel 只有
+**实测不成立**：推理 IR dump 里，带 `tt.dot` 的 kernel 主要只有
 `linear_kernel` / `addmm_kernel` / `flash_fwd_kernel`，没有独立的
 score/softmax/context kernel——FlagGems 的 attention 走融合 flash 路线，
 一个 kernel 内做完 score→softmax→context 且所有 head 一起做。而 GeneSim
@@ -114,8 +113,8 @@ sidecar 已按 note 标注该 kernel flops 被低估——不静默当 0。
 `convert-triton-to-pim` 只给张量类型加 `#pim.tasklet_tiled` 布局，
 `pim-explicit-dma` 只把 `tt.load`/`tt.store` 换成
 `wram_alloc` + `dma_load/store` + `barrier` + `wram_load/store`；
-`tt.dot`、`arith.*`、`scf.for` 原样保留。实测 gpt2 的 112 个算子 × 2 个代表点
-全部相等，GeneSim 仿真出的总时延两条路也完全一致（2.024890 s）。
+`tt.dot`、`arith.*`、`scf.for` 原样保留。LLaMA2 默认链路应保持同一算子两层
+flops 相等；GeneSim 仿真的时延差异来自 PIM 侧新增搬运信息，而不是计算 flops。
 
 pim mlir 真正新增的是 `mram_traffic_bytes`——MRAM↔WRAM 的显式搬运字节数。
 按方案三.(3) 它**只落 sidecar、不进 `data_bytes`**（塞进去会把跨 VPU 传输量

@@ -246,7 +246,7 @@ for pid, part in enumerate(parts):          # 把分组结果写回每个节点
 # 未被分到任何 part 的节点即 host 节点（问题 6 编排器的“胶水”）
 ```
 
-还有一个问题，为适配存算一体 DPU 推理的张量并行约束，GPT2 融合 QKV 权重的原生连续布局，会导致多头 QKV 被拆分至不同 DPU，引发 KV Cache 跨设备传输、带宽爆炸的核心问题。最优工程方案是通过编译 Pass 做图层面优化，拆解融合 QKV 算子为三个独立 Q/K/V 线性算子，分别按注意力头做列并行切分，让单 DPU 持有完整头部的 QKV 权重，实现 KV Cache 本地驻留、无跨设备通信。同时支持性能优化分支，可通过编译阶段一次性权重重排，将权重布局改为单头 QKV 连续排布后再分片，兼顾分布式合规性与算子融合性能，仅需改动编译与权重加载逻辑，运行时无开销、改动成本最低。
+还有一个问题，为适配存算一体 DPU 推理的张量并行约束，带融合 QKV 权重的 decoder-only 模型原生连续布局，会导致多头 QKV 被拆分至不同 DPU，引发 KV Cache 跨设备传输、带宽爆炸的核心问题。最优工程方案是通过编译 Pass 做图层面优化，拆解融合 QKV 算子为三个独立 Q/K/V 线性算子，分别按注意力头做列并行切分，让单 DPU 持有完整头部的 QKV 权重，实现 KV Cache 本地驻留、无跨设备通信。HF LLaMA2-7B 已是独立 Q/K/V 投影，本阶段主要验证该约束在 LLaMA2 图上的切分与 KV 本地性；融合 QKV 拆解作为兼容 GPT-2 等 legacy/debug 模型的规则保留。同时支持性能优化分支，可通过编译阶段一次性权重重排，将权重布局改为单头 QKV 连续排布后再分片，兼顾分布式合规性与算子融合性能，仅需改动编译与权重加载逻辑，运行时无开销、改动成本最低。
 
 四. 工作量与推进建议
 
@@ -1725,7 +1725,7 @@ kv_bytes = 2 × |L_k| × max_seq × |H_k| × head_dim × dtype_bytes
          （2 = K 和 V 两份）
 ```
 
-这个大小是本节的产物；把它连同权重区、激活区一起排进那块 ≤8GB 的地址空间、算出偏移，是问题 8 通用内存规划器的职责。**GQA 模型（如 Llama 3）按 KV head 数计算**，而非 Q head 数（一个 KV head 对应多个 Q head）；第 1 阶段固定模型 GPT-2是 MHA，本公式对它自然成立，GQA 一般情形的处理能力仍保留、待后续宽化到 GQA 模型时启用。
+这个大小是本节的产物；把它连同权重区、激活区一起排进那块 ≤8GB 的地址空间、算出偏移，是问题 8 通用内存规划器的职责。**GQA 模型（如 Llama 3）按 KV head 数计算**，而非 Q head 数（一个 KV head 对应多个 Q head）；第 1 阶段默认模型 LLaMA2-7B 是 MHA（Q head 数等于 KV head 数），本公式对它自然成立，GQA 一般情形的处理能力仍保留、待后续宽化到 GQA 模型时启用。
 
 **③ 怎么用——本地按 tile 分块读取 + mask，KV 不跨 DPU**
 
@@ -1892,7 +1892,7 @@ KV cache 管理器逻辑简单，其所需要的内存排布、跨 DPU 搬运、
 
 - KV 读取按 key token 分块（`read_tile`），**单 tile 的 WRAM 占用受 WRAM 容量约束**（如 `max_seq=256/head_dim=64/fp32` 单 head 整块已 64KB，远超 WRAM，不能满读），tile 尺寸由问题 5 的 `ttir→upmem` 桥按 WRAM 容量定；第 1 阶段 `max_seq` 取小值（如 128 或 256）配合小模型控制 KV 区总量，但读取路径不依赖"整块恰好装得下 WRAM"这一前提；
 - 先在 NumpyBackend（N 块独立 numpy 缓冲区模拟 N 个 DPU）上验证 `update` / `read_tile` / mask 的数值对齐，再上真实硬件；接入 FlagTree 后 `update` / `read_tile` 下沉进 kernel，Python 侧退回只管"偏移 + tile 划分 + mask"；
-- **GQA 模型（如 Llama 3）的 KV 区按 KV head 数计算**，而非 Q head 数（一个 KV head 对应多个 Q head）；且 `KVRegionSpec` 必须带 `q_heads_by_kv` 映射，注意力按 Q head 遍历、每个 KV head 服务其对应的多个 Q head——只按 KV head 遍历会丢失 Q head 输出、使 attention 输出 head 数塌成 KV head 数，是最易算错的一处；第 1 阶段固定模型 GPT-2为 MHA，，该映射退化为恒等、不会触发上述塌缩，但代码仍按 GQA 通用写法实现，宽化到 GQA 模型时零改动；
+- **GQA 模型（如 Llama 3）的 KV 区按 KV head 数计算**，而非 Q head 数（一个 KV head 对应多个 Q head）；且 `KVRegionSpec` 必须带 `q_heads_by_kv` 映射，注意力按 Q head 遍历、每个 KV head 服务其对应的多个 Q head——只按 KV head 遍历会丢失 Q head 输出、使 attention 输出 head 数塌成 KV head 数，是最易算错的一处；第 1 阶段默认模型 LLaMA2-7B 为 MHA，该映射退化为恒等、不会触发上述塌缩，但代码仍按 GQA 通用写法实现，宽化到 GQA 模型时零改动；
 - **序列位置单一真值源**：位置只由编排器 `DecodeState.valid_len` 持有并传入，`PIMStaticKVCache` 不自持指针、无 `advance`；避免"三处真值源"不同步导致 mask 位置与写入位置错位；
 - softmax 第 1 阶段在 host（B 类算子留 host），是宽白名单里优先级最高的收回项（规约天然本地、在热路径上）；
 - prefill（计算密集）与 decode（访存密集）的最优切分可能不同，或需一次中途重分布，作为后续优化项，第 1 阶段两图共用同一套固定切分。
@@ -2158,7 +2158,7 @@ for k in DPU:
 
 ### 6.1 三阶段总览
 
-1. **第 1 阶段（本期）——能跑对**：固定 shape 全链路打通，和单卡 PyTorch 数值对齐。`max_seq` 为常量、满算加 mask、切分手工指定、模型选定 **GPT-2**（Llama‑2‑7B(HuggingFace获取静态模型)，编排器可串行。GeneSim 接入同属本期，分两步：第 1 步接 FlagTree 原生 TTIR 先走通 `HF→…→GeneSim` 全链路（访存侧近似）、不依赖问题 5，可最先起步；第 2 步随问题 5 产出的 pim mlir 接入、补齐访存侧精度。
+1. **第 1 阶段（本期）——能跑对**：固定 shape 全链路打通，和单卡 PyTorch 数值对齐。`max_seq` 为常量、满算加 mask、切分手工指定、默认模型选定 **LLaMA2-7B**（`meta-llama/Llama-2-7b-hf`，本地路径 `/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/meta-llama-Llama-2-7b-hf`），编排器可串行。GeneSim 接入同属本期，分两步：第 1 步接 FlagTree 原生 TTIR 先走通 `HF→…→GeneSim` 全链路（访存侧近似）、不依赖问题 5，可最先起步；第 2 步随问题 5 产出的 pim mlir 接入、补齐访存侧精度。
 2. **第 2 阶段——跑得全**：在第1阶段的基础上，添加序列变长（符号维加上界）、代价模型、自动切分、激活区紧凑复用、图拆分宽化、异步 dispatch。
 3. **第 3 阶段——跑得快**：性能优化，包括：算子融合、把单算子逐次下发合并为批量下发以摊薄主机-设备通信开销，对齐第七节第 5 条与第八节的通信开销风险。
 
@@ -2214,7 +2214,7 @@ for k in DPU:
         ▼
 第 1 步：编译期图分析链跑通（A 组，纯 CPU，零硬件）
   问题1 图拆分打标 → 问题2 placement/redistribute 标注 → 问题8 三区 offset 规划
-  ✅ 验证 P1：GPT-2 torch.export 不 graph break；每个 aten 节点带 device/part_id；
+  ✅ 验证 P1：LLaMA2 架构 torch.export 不 graph break；每个 aten 节点带 device/part_id；
             核对分组符合"相邻+都落DPU→同组，遇host断开"
   ✅ 验证 P2：中间张量 placement 与附录 A 手推一致；redistribute 边落在预期位置
              （如两层 Linear 之间的 Partial→Replicate）；KV 节点带 pinned、不被插 redistribute
@@ -2268,7 +2268,7 @@ for k in DPU:
 | 第 3 周（迭代完善）      | 编译期图层核心能力补齐 + 通信库基础能力开发 + 内存规划     | 1. 完成问题 2 切分传播核心逻辑：权重初始切分配置、DTensor 布局适配、PIMTensorSpec 四元组标注、redistribute 边识别；<br />2. 实现 KV 张量 pinned 常驻标注，规避 KV 跨 step 重分发；<br />3. 开发通信库基础原语，实现 redistribute 边识别与编译期通信计划表生成；<br />4. 完善图分析链路，打通问题 1→问题 2 的数据流转。  <br /> 5. 进行问题 8 内存规划开发：权重 / KV / 激活三区静态布局、贪心复用、容量校验、pending_readers 依赖生成；<br /> | 1. 切分传播完整代码、算子布局规则表；<br />2. 带完整 placement/redistribute 标注的计算图；<br />3. KV 局部性约束逻辑代码。<br /> 4. 内存规划完整代码、各 DPU 内存规划表 DPU_k.plan <br /> | 1. 中间张量布局推导与附录 A 手推结果逻辑相符；<br />2. KV 张量无冗余 redistribute 边，常驻属性生效；<br />3. 可精准识别 all-reduce/all-gather 等重分布场景；<br />4. 全图标注完整、无缺失、无逻辑冲突。                       | 问题 2、问题 3、问题 7、问题 8 |
 | 第 4 周（pim适配模拟器） | 算子编译器下沉 + GeneSim （核心里程碑）                    | 1. 完成问题 5 算子编译器核心开发，自研 pim mlir 桥接、近存访存下降、DPU 同步原语补齐；<br />2. 完成 GeneSim 接入第二步：实现自研的 pim mlir接入；<br />3. 完成 A 类主力算子（GEMM/GEMV/ 逐元素）I/O 适配与算子接入；<br />4. 对齐编译期算子契约，实现图层与算子编译器双向接口打通。                                                                                                                                                            | 1. 顶层 Pytorch module 模型到 pim mlir 编译桥完整代码；<br />2. 各级 mlir 成本提取模块，GeneSim 适配相关代码；<br />3. 适配存算一体的 A 类算子 kernel 编译能力。                          | 1. 单 DPU 算子可正常编译；<br> 2. GeneSim 可正常解析 pim mlir 产物。                                                                                                                                                          | 问题 4、问题 5                 |
 | 第 5 周（全链路串联）    | KV 缓存运行时 + 编排器核心逻辑开发                         | 1. 开发问题 6 编排器核心：ExecutionPlan 生成、命令 DAG 调度、DMA 时序控制、host 胶水算子适配；<br />2. 实现问题 7 KV 缓存运行时逻辑：KV 分区布局、逐 step 追加、掩码适配、本地驻留管理；<br />3. 打通编译期蓝图→运行时执行的全数据链路。<br />4. 完成问题 8 内存规划开发：权重 / KV / 激活三区静态布局、贪心复用、容量校验、pending_readers 依赖生成；<br />                                                                                  | 1. 内存规划完整代码、各 DPU 内存规划表 DPU_k.plan；<br />2. KV 缓存全量运行时逻辑；<br />3. 编排器调度核心、执行计划生成模块；<br />4. 全链路静态蓝图产物（标注图、通信表、内存表）。     | 1. 三区内存无重叠、无溢出，8GB 容量校验通过；<br />2. KV 缓存跨 step 稳定驻留，解码掩码生效；<br />3. 编排器可自动调度多 DPU 执行；                                                                                           | 问题 6、问题 7、问题 8         |
-| 第 6 周（阶段收口）      | 全链路闭环调试 + 数值对拍 + 阶段验收收尾                   | 1. 打通 prefill + 完整 decode 自回归解码全流程；<br />2. 搭建逐节点对拍器，完成与原生 PyTorch 单卡数值对齐；<br />3. 修复全链路时序、依赖、数据搬运 bug，统一链路口径；<br />4. 整理所有代码产物、文档、测试报告，完成第 1 阶段全量收口；<br />5. 固化 NumpyBackend 功能验证体系。                                                                                                                                                             | 1. 可完整运行的存算一体大模型推理全链路；<br />2. 第 1 阶段全套代码产物、技术文档、接口契约文档；<br />3. 稳定的 GeneSim 仿真评估链路。                                                   | 1. GPT-2 模型可正常自回归解码，模拟代价估计正常；<br />2. 编译、调度、通信、内存、KV 缓存全模块稳定运行；<br />3. 满足第 1 阶段所有研发目标。                                                                                 | 全模块汇总验收                 |
+| 第 6 周（阶段收口）      | 全链路闭环调试 + 数值对拍 + 阶段验收收尾                   | 1. 打通 prefill + 完整 decode 自回归解码全流程；<br />2. 搭建逐节点对拍器，完成与原生 PyTorch 单卡数值对齐；<br />3. 修复全链路时序、依赖、数据搬运 bug，统一链路口径；<br />4. 整理所有代码产物、文档、测试报告，完成第 1 阶段全量收口；<br />5. 固化 NumpyBackend 功能验证体系。                                                                                                                                                             | 1. 可完整运行的存算一体大模型推理全链路；<br />2. 第 1 阶段全套代码产物、技术文档、接口契约文档；<br />3. 稳定的 GeneSim 仿真评估链路。                                                   | 1. LLaMA2-7B 模型可正常自回归解码，模拟代价估计正常；<br />2. 编译、调度、通信、内存、KV 缓存全模块稳定运行；<br />3. 满足第 1 阶段所有研发目标。                                                                                 | 全模块汇总验收                 |
 
 ### 6.5 分工
 
@@ -2309,7 +2309,7 @@ flagos-pim-compiler/
 ├── backend/            # 编排器: hal_numpy 假后端 / hal_vendor 真硬件
 ├── genesim_bridge/     # 模拟器:   问题4    成本桥接（sidecar，产 .ir）
 ├── tests/              # : 逐节点对拍器 + 各组单测
-├── examples/           # 端到端示例（GPT-2 全链路跑通）
+├── examples/           # 端到端示例（默认 LLaMA2 全链路，GPT-2 legacy/debug）
 ├── scripts/            # 开发与构建脚本
 └── docs/               # 设计文档与接口契约
 ```
@@ -2339,7 +2339,7 @@ flagOS-installers: https://github.com/jingge815/flagOS-installers
 
 ## 八、风险点
 
-1. 算子覆盖面广，需要实现对全部算子的支持，上百个，涉及算子修改、FlagTree 支持以及上层图编译优化的数据布局转换。缓解：先走通整体流程，第 1 阶段用窄白名单只放 A 类（GEMM/GEMV/逐元素），B/C 类留 host 当胶水，几乎无需手改 kernel；再按 host 是否成为瓶颈逐个宽化（`[阶段2]`）。**第 1 阶段选定 Llama‑2‑7B(HuggingFace获取静态模型)`，标准 MHA decoder-only、绝对位置编码，权重切分落在问题 2 第 1 阶段切分契约范围内）；选它而非 GQA 模型是为把第 1 阶段难度压到最低——MHA 免去 `q_heads_by_kv` 映射、绝对位置编码免去 RoPE 留 host、且 HF 开放下载无 gating；16 头可被 2/4/8 整除，能验 4/8 DPU 张量并行。避开 MoE（专家路由是真动态控制流，导出会 graph break）。功能验证只要求编译器输出与单卡 PyTorch 逐元素对齐，与权重是否预训练无关，故日常迭代可用缩小层数的随机权重配置加速，验收时再加载完整 24 层权重跑一遍，二者架构一致、代码不变。**
+1. 算子覆盖面广，需要实现对全部算子的支持，上百个，涉及算子修改、FlagTree 支持以及上层图编译优化的数据布局转换。缓解：先走通整体流程，第 1 阶段用窄白名单只放 A 类（GEMM/GEMV/逐元素），B/C 类留 host 当胶水，几乎无需手改 kernel；再按 host 是否成为瓶颈逐个宽化（`[阶段2]`）。**第 1 阶段默认目标为 LLaMA2-7B（`meta-llama/Llama-2-7b-hf`，HuggingFace gated 官方权重），标准 decoder-only 架构，权重切分落在问题 2 第 1 阶段切分契约范围内。功能验证只要求编译器输出与单卡 PyTorch 逐元素对齐，日常迭代可用缩小层数的随机 LLaMA 配置加速，验收时再加载完整 7B 权重跑一遍，二者架构一致、代码不变。**
 2. **全链路修改、收口点单一**，本方案涉及编译期图分析、算子编译、运行时编排全链路的协同修改，任一环节数据流标错都会导致最终结果错。缓解：以逐节点对拍器（问题 6）为核心调试基础设施，按 placement 合并分片后与单卡 PyTorch 逐元素比，第一处不匹配即定位到具体 node；全链路先在 NumpyBackend 零硬件验对，再上真硬件。
 3. **GeneSim 接入的成本换算精度**，问题 4 从 IR 抽成本回填 GeneSim，难点有三：① IR 到 GeneSim 字段的成本换算规则，尤其访存字节的准确统计；② 一个 GeneSim `Operator` 与 FlagTree kernel 的一对多 / 多对一关联；③ 第 1 步 TTIR 目标无关、访存侧拿不准，须显式标注为近似、不与第 2 步 pim mlir 混淆。缓解：先用 TTIR 走通链路（访存侧近似），再随问题 5 的 pim mlir 补齐访存精度；A 类算子先行、与问题 5 白名单口径一致，避免"某算子没编 kernel 却要抽成本"的矛盾。此项为性能评估旁支，不影响功能正确性。
 

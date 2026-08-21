@@ -155,7 +155,7 @@ def test_pimir_flops_identical_to_ttir():
 
     这不是巧合而是 pass 语义：convert-triton-to-pim 只给张量类型加布局，
     pim-explicit-dma 只改 tt.load/store，`tt.dot` 与 `scf.for` 原样保留。
-    实测 gpt2 的 112 个算子 × 2 个代表点全部相等。
+    实测 LLaMA2 默认链路的算子代表点应保持逐位相等。
 
     早期正则把 tensor 类型锚定成 `tensor<...>` 结尾，在 pim mlir 的
     `tensor<32x32xf16, #pim.tasklet_tiled<...>>` 上 tt.dot 命中 0 次，会把
@@ -304,7 +304,7 @@ def test_fit_rejects_negative_slope_from_padding():
     assert f["Tq(Tp+Tq)"] == pytest.approx(128.0, rel=0.02)
 
 
-@pytest.mark.parametrize("refined_name", ["gpt2_builtin_flagtree.ir", "gpt2_builtin_pimir.ir"])
+@pytest.mark.parametrize("refined_name", ["llama2_7b_flagtree.ir", "llama2_7b_pimir.ir"])
 def test_refined_ir_preserves_structure(refined_name):
     """精化只改成本，不动图结构；且保留 ModelIR.to_dict() 不含的字段。
 
@@ -312,7 +312,7 @@ def test_refined_ir_preserves_structure(refined_name):
     成本数值来源。
     """
     ir_dir = genesim_models_dir()
-    base_path, ref_path = ir_dir / "gpt2_builtin.ir", ir_dir / refined_name
+    base_path, ref_path = ir_dir / "llama2_7b.ir", ir_dir / refined_name
     if not (base_path.is_file() and ref_path.is_file()):
         pytest.skip("需要先跑 scripts/refine_ir_with_flagtree.py 生成产物")
 
@@ -346,12 +346,12 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
     """整模型两条路的 flops 必须逐个算子相等，且 pimir 独有字段都有值。
 
     这是「换 pim mlir」这一步的实际收益边界：flops 不变（PIM pass 不动计算），
-    新增的是 mram_traffic_bytes。实测 gpt2 的 112 个算子全部相等，
-    放大倍数 1.0~8.5x。
+    新增的是 mram_traffic_bytes。LLaMA2 默认链路应保持同一算子两层 flops 相等，
+    并把搬运放大倍数写入 sidecar。
     """
     ir_dir = genesim_models_dir()
-    ttir_path = ir_dir / "gpt2_builtin_flagtree_extensions.json"
-    pimir_path = ir_dir / "gpt2_builtin_pimir_extensions.json"
+    ttir_path = ir_dir / "llama2_7b_flagtree_extensions.json"
+    pimir_path = ir_dir / "llama2_7b_pimir_extensions.json"
     if not (ttir_path.is_file() and pimir_path.is_file()):
         pytest.skip("需要先跑 scripts/refine_ir_with_flagtree.py 生成两条路的产物")
 

@@ -18,13 +18,13 @@
 | `backend/` | HAL 抽象：`hal_numpy` 假后端 / `hal_vendor` 真硬件 | 运行时底座 |
 | `genesim_bridge/` | GeneSim 成本桥接（从 TTIR / pim mlir 抽 flops/data_bytes，性能评估旁支） | 问题 4 |
 | `tests/` | 逐节点对拍器 + 各模块单测 | 集成验证 |
-| `examples/` | 端到端示例（如 GPT-2 全链路跑通） | — |
+| `examples/` | 端到端示例（默认 LLaMA2 全链路，GPT-2 仅作 legacy/debug） | — |
 | `scripts/` | 开发与构建脚本 | — |
 | `docs/` | 设计文档与接口契约 | — |
 
 ## 第 1 阶段目标
 
-固定 shape 全链路打通，模型选定 GPT-2（`openai-community/gpt2`），在 NumpyBackend 上跑通 prefill + 完整 decode 自回归解码，与单卡 PyTorch 逐元素对齐。
+固定 shape 全链路打通，默认模型选定 `meta-llama/Llama-2-7b-hf`，例如，设置本地路径为 `/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/meta-llama-Llama-2-7b-hf`。编译器日常单测使用缩小的随机 LLaMA 配置避免下载权重，端到端验证加载官方 HuggingFace LLaMA2-7B 权重，在 NumpyBackend 上跑通 prefill + decode 路径并与单卡 PyTorch 逐元素对齐。GPT-2 只保留为显式 legacy/debug smoke。
 
 ## 环境
 

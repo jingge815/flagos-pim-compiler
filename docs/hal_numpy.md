@@ -24,10 +24,10 @@ The backend is the validation base for the runtime portions of problem 3
 compile-time graph analysis and problem 4 cost analysis are outside this
 module.
 
-The smoke use case is a GPT-2-shaped payload: produce model logits with the
-configured small GPT-2 shape, copy the NumPy result into a DPU MRAM buffer,
-then copy it back and compare elementwise. The same runtime contract is
-intended to be used when switching to `VendorBackend`.
+The smoke use case is a LLaMA2-shaped activation payload: copy a
+`[batch, seq, hidden]` NumPy tensor matching the 4096-wide LLaMA2 hidden state
+into a DPU MRAM buffer, then copy it back and compare elementwise. The same
+runtime contract is intended to be used when switching to `VendorBackend`.
 
 `VendorBackend` is exported from `backend` as a construction-time stub. Its
 construction raises `NotImplementedError` until the vendor SDK is wired.

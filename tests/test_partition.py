@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 from torch.fx import Graph, GraphModule, Node
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import LlamaConfig, LlamaForCausalLM
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -125,8 +125,8 @@ def test_partition_replaces_stale_metadata_without_touching_other_metadata() -> 
     assert nodes["add"].meta["sentinel"] == "preserve-me-too"
 
 
-class _FixedMaskGPT2(torch.nn.Module):
-    def __init__(self, model: GPT2LMHeadModel) -> None:
+class _FixedMaskLlama(torch.nn.Module):
+    def __init__(self, model: LlamaForCausalLM) -> None:
         super().__init__()
         self.model = model
 
@@ -139,20 +139,21 @@ class _FixedMaskGPT2(torch.nn.Module):
         ).logits
 
 
-def _export_random_gpt2() -> GraphModule:
-    sequence_length = 128
+def _export_random_llama() -> GraphModule:
+    sequence_length = 16
     torch.manual_seed(0)
-    model = GPT2LMHeadModel(
-        GPT2Config(
-            vocab_size=50257,
-            n_positions=sequence_length,
-            n_ctx=sequence_length,
-            n_embd=512,
-            n_layer=4,
-            n_head=8,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            pad_token_id=50256,
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32000,
+            hidden_size=64,
+            intermediate_size=176,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=sequence_length,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
         )
     ).eval()
     input_ids = torch.arange(sequence_length, dtype=torch.long).unsqueeze(0)
@@ -160,14 +161,14 @@ def _export_random_gpt2() -> GraphModule:
     causal_mask = torch.zeros((1, 1, sequence_length, sequence_length), dtype=torch.float32)
     causal_mask.masked_fill_(blocked, torch.finfo(causal_mask.dtype).min)
     return torch.export.export(
-        _FixedMaskGPT2(model),
+        _FixedMaskLlama(model),
         (input_ids, causal_mask),
         strict=True,
     ).module()
 
 
-def test_partition_covers_the_strictly_exported_random_gpt2_graph() -> None:
-    gm = _export_random_gpt2()
+def test_partition_covers_the_strictly_exported_random_llama_graph() -> None:
+    gm = _export_random_llama()
 
     partitions = partition_graph(gm)
     nodes = list(gm.graph.nodes)

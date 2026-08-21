@@ -15,7 +15,7 @@
    故每个点的原始测量值完整落 sidecar，不丢信息。
 
 改 .ir 走原始 JSON 而不是 ModelIR.load()/save()：`ModelIR.to_dict()` 不含
-gpt2 IR 携带的 `max_seq` / `vocab_size`，往返一趟会静默丢字段。
+部分 GeneSim IR 携带的扩展字段，往返一趟会静默丢字段。
 """
 
 from __future__ import annotations
@@ -277,7 +277,7 @@ def export_costs_to_genesim(
     prefill_point = ShapePoint(tq=seq_len, tp=0)
     decode_point = ShapePoint(tq=1, tp=seq_len)
 
-    # 同一 (op_type, shape) 只测一次：gpt2 里 116 个算子只有 7 种不同 shape
+    # 同一 (op_type, shape) 只测一次：整模型里大量算子共享相同 op_type/shape。
     cache: Dict[tuple, Tuple[Measurement, Measurement]] = {}
     sidecar: Dict[str, Any] = {
         "version": SIDECAR_VERSION,

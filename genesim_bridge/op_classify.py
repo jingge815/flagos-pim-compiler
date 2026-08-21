@@ -2,12 +2,11 @@
 
 方案依据：spec.md 问题 4 二.算子边界假设，按实测修正后的 a+c 口径。
 
-实测事实（gpt2 推理的 994 个 IR dump）：FlagGems 的 attention 走融合
-flash 路线，整条推理里带 `tt.dot` 的 kernel 只有 linear/addmm/flash_fwd，
-没有独立的 score / softmax / context kernel。而 GeneSim 图骨架把 attention
-拆成 GEMV_SCORE + SOFTMAX + GEMV_CONTEXT（每层每 head 各一个，占 116 个
-算子里的 96 个，且全在 PIM 侧）。方案原文假设的「GEMV 走 FlagGems 分离
-实现、1:1 对齐」不成立。
+实测事实：FlagGems 的 attention 走融合 flash 路线，整条推理里带 `tt.dot`
+的 kernel 主要是 linear/addmm/flash_fwd，没有独立的 score / softmax /
+context kernel。而 GeneSim 图骨架把 attention 拆成 GEMV_SCORE + SOFTMAX +
+GEMV_CONTEXT（每层每 head 各一个，且全在 PIM 侧）。方案原文假设的「GEMV
+走 FlagGems 分离实现、1:1 对齐」不成立。
 
 因此采用 a+c：
   - GEMM（16 个）    -> FlagGems linear，边界天然 1:1，抽真实成本

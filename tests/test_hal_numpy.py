@@ -3,7 +3,6 @@ import threading
 import numpy as np
 import pytest
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel
 
 from backend import VendorBackend
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
@@ -241,13 +240,16 @@ def test_read_local_returns_a_copy_and_push_xfer_fans_out() -> None:
     assert np.array_equal(backend.read_local(1, 16, payload.shape, payload.dtype), payload)
 
 
-def test_gpt2_smoke_payload_stays_model_agnostic() -> None:
-    torch.manual_seed(0)
-    model = GPT2LMHeadModel(
-        GPT2Config(n_layer=4, n_head=8, n_embd=512, n_positions=128, n_ctx=128)
-    ).eval()
-    input_ids = torch.arange(128, dtype=torch.long).unsqueeze(0)
-    logits = model(input_ids=input_ids, use_cache=False, return_dict=True).logits.detach().cpu().numpy()
-    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=logits.nbytes * 2))
-    backend.copy_to_dpu(0, 0, logits)
-    assert np.array_equal(backend.copy_from_dpu(0, 0, logits.shape, logits.dtype), logits)
+def test_llama2_smoke_payload_stays_model_agnostic() -> None:
+    hidden_size = 4096
+    sequence_length = 128
+    activation = np.arange(sequence_length * hidden_size, dtype=np.float16).reshape(
+        1,
+        sequence_length,
+        hidden_size,
+    )
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=activation.nbytes * 2))
+
+    backend.copy_to_dpu(0, 0, activation)
+
+    assert np.array_equal(backend.copy_from_dpu(0, 0, activation.shape, activation.dtype), activation)
