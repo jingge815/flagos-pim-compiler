@@ -12,7 +12,10 @@ allow_device_to_device=False)` configures it. The public API is:
 
 Each DPU owns an isolated NumPy MRAM buffer. An operation addressing one DPU
 cannot read or modify another DPU's buffer; offsets and byte ranges are checked
-against that DPU's configured capacity.
+against that DPU's configured capacity. Since problem 3, the MRAM storage and
+the DMA primitives are delegated to `backend/dpu_sdk.py` (the NumPy mirror of
+the vendor SDK); this module only adds the async `Command`/`Event` semantics on
+top, so the comm library and the backend share one fake-hardware state.
 
 The copy helpers and `push_xfer` are synchronous. `submit` returns an `Event`
 for a kernel launch, DMA command, or host operation; `wait` blocks for it and

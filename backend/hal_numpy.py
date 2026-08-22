@@ -5,6 +5,7 @@ from typing import Callable, Literal
 
 import numpy as np
 
+from backend.dpu_sdk import DpuSet, dpu_alloc, dpu_copy_from, dpu_copy_to
 from contracts.exec_plan import Command
 
 
@@ -43,14 +44,14 @@ class MRAMAllocator:
             )
 
 
-class DPUDevice:
-    def __init__(self, dpu_id: int, capacity: int) -> None:
-        self.dpu_id = dpu_id
-        self.mram = np.zeros(capacity, dtype=np.uint8)
-        self.alloc = MRAMAllocator(capacity)
-
-
 class NumpyBackend:
+    """问题 6 的异步 HAL：submit/wait/query + 每 DPU 一条有序流。
+
+    存储与 DMA 底座架在 backend/dpu_sdk（厂商 SDK 的 numpy 镜像）之上：本类只提供
+    Command/Event 异步语义，MRAM 字节数组由 dpu_sdk 的机器持有，通信库与编排器共享
+    同一份伪硬件状态。
+    """
+
     def __init__(self, config: NumpyBackendConfig) -> None:
         if config.allow_device_to_device:
             raise ValueError("device-to-device copies are not supported in Phase 1")
@@ -60,10 +61,13 @@ class NumpyBackend:
         self._stream_locks = {dpu_id: Lock() for dpu_id in range(config.num_dpus)}
         self._stream_tail: dict[int, Future[object]] = {}
         self._events_by_id: dict[int, Event] = {}
-        self._devices = {
-            dpu_id: DPUDevice(dpu_id, config.mram_bytes_per_dpu)
-            for dpu_id in range(config.num_dpus)
-        }
+        self._dpu_set: DpuSet = dpu_alloc(config.num_dpus, mram_bytes=config.mram_bytes_per_dpu)
+        self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
+
+    @property
+    def dpu_set(self) -> DpuSet:
+        """底层 SDK 集合：通信库（comm/lowering.py）经此与 HAL 共享同一伪硬件。"""
+        return self._dpu_set
 
     def register_plan(self, plan: object) -> None:
         self._plan = plan
@@ -72,19 +76,18 @@ class NumpyBackend:
         self._kernels.register(name, fn)
 
     def copy_to_dpu(self, dpu_id: int, offset: int, data: np.ndarray) -> None:
-        blob = np.ascontiguousarray(data).view(np.uint8)
-        dev = self._devices[dpu_id]
-        dev.alloc.check(offset, blob.nbytes)
-        dev.mram[offset : offset + blob.nbytes] = blob.reshape(-1)
+        blob = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
+        self._alloc.check(offset, blob.nbytes)
+        dpu_copy_to(self._dpu_set.dpu(dpu_id), offset, blob, blob.nbytes)
 
     def copy_from_dpu(
         self, dpu_id: int, offset: int, shape: tuple[int, ...], dtype: np.dtype
     ) -> np.ndarray:
         size = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        dev = self._devices[dpu_id]
-        dev.alloc.check(offset, size)
-        blob = dev.mram[offset : offset + size].copy()
-        return blob.view(dtype).reshape(shape).copy()
+        self._alloc.check(offset, size)
+        data = np.empty(shape, dtype=dtype)
+        dpu_copy_from(self._dpu_set.dpu(dpu_id), offset, data, size)
+        return data
 
     def write_local(self, dpu_id: int, offset: int, data: np.ndarray) -> None:
         self.copy_to_dpu(dpu_id, offset, data)

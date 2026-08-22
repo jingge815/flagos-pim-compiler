@@ -398,6 +398,8 @@ def _diff_edge(
         dst_loc=_loc_of_spec(dst_spec),
         nbytes=val.numel() * val.element_size(),
         reduce_type=actual.reduce_type,
+        shape=tuple(val.shape),
+        dtype=str(val.dtype).removeprefix("torch."),
     )
 
 

@@ -92,3 +92,5 @@ class RedistributeEdge:
     dst_loc: dict                   # 同上
     nbytes: int                     # 逻辑张量总字节数；逐 segment 字节由问题 3 按 shard_map 展开
     reduce_type: str | None = None  # 仅 all_reduce 使用，取自 Partial 的规约类型
+    shape: tuple[int, ...] = ()     # 全局逻辑张量形状，问题 3 通信计划表按它做摊平坐标换算
+    dtype: str = ""                 # torch dtype 名（如 "float16"），问题 3 映射为 np.dtype
