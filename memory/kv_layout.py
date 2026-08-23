@@ -15,6 +15,7 @@ k_proj 切分结果推出每台 DPU 驻留的 (layer, kv_head)——KV 按 head 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Literal
 
 import numpy as np
@@ -23,6 +24,16 @@ from contracts.exec_plan import Access
 from contracts.pim_tensor_spec import PIMTensorSpec
 
 _NP_DTYPE = {2: np.dtype(np.float16), 4: np.dtype(np.float32)}
+
+
+def _check_position(name: str, value: int, upper: int, *, inclusive: bool) -> None:
+    """序列位置必须是整数，避免小数改变 mask 中可见 token 的集合。"""
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name}={value!r} 必须是整数")
+    in_range = 0 <= value <= upper if inclusive else 0 <= value < upper
+    if not in_range:
+        bound = f"[0,{upper}]" if inclusive else f"[0,{upper})"
+        raise ValueError(f"{name}={value} 越界 {bound}")
 
 
 def align_up(n: int, align: int) -> int:
@@ -142,6 +153,13 @@ def kv_specs_from_placement(
             dtype_bytes=dtype_bytes,
             kv_base=kv_base,
         )
+    assigned_heads = [head for spec in specs.values() for head in spec.kv_heads]
+    expected_heads = set(range(num_kv_heads))
+    if len(assigned_heads) != len(set(assigned_heads)) or set(assigned_heads) != expected_heads:
+        raise ValueError(
+            "k_proj 分片必须恰好覆盖每个 KV head 一次，got "
+            f"{sorted(assigned_heads)}，expected {sorted(expected_heads)}"
+        )
     return specs
 
 
@@ -192,15 +210,18 @@ class PIMStaticKVCache:
         出: 无（原地写各 DPU 本地 MRAM；空间编译期已定长预留，这里不涉及分配）。
         """
         for dpu_id, spec in self.specs.items():
-            assert 0 <= pos < spec.max_seq, f"pos={pos} 越界 [0,{spec.max_seq})"  # 写前校验
+            if not 0 <= pos < spec.max_seq:
+                raise ValueError(f"pos={pos} 越界 [0,{spec.max_seq})")
             row = spec.head_dim * spec.dtype_bytes
             for head in spec.kv_heads:
                 for which, by_dpu in (("k", k_by_dpu), ("v", v_by_dpu)):
                     vec = np.asarray(by_dpu[dpu_id][head])
-                    if vec.size != spec.head_dim or vec.dtype.itemsize != spec.dtype_bytes:
+                    expected_dtype = _NP_DTYPE[spec.dtype_bytes]
+                    if vec.shape != (spec.head_dim,) or vec.dtype != expected_dtype:
                         raise ValueError(
                             f"dpu{dpu_id} layer{layer} head{head} {which}: 期望 "
-                            f"[{spec.head_dim}]x{spec.dtype_bytes}B，got shape={vec.shape} dtype={vec.dtype}")
+                            f"shape=({spec.head_dim},) dtype={expected_dtype}，got "
+                            f"shape={vec.shape} dtype={vec.dtype}")
                     off = spec.kv_off[(layer, head, which)] + pos * row
                     self.backend.write_local(dpu_id, off, vec)  # 本地写，零跨 DPU
 
@@ -236,6 +257,7 @@ def prefill_mask(prompt_len: int, max_seq: int) -> np.ndarray:
     可见当且仅当 不看未来（因果 j <= i）且 是真实 token（j < prompt_len，非预留位）；
     可见处为 0、其余为 -inf，softmax 在 host 做，mask 随 scores 一起送 host（方案问题 7 三）。
     """
+    _check_position("prompt_len", prompt_len, max_seq, inclusive=True)
     i = np.arange(max_seq)[:, None]   # query 位置
     j = np.arange(max_seq)[None, :]   # key 位置
     visible = (j <= i) & (j < prompt_len)
@@ -248,6 +270,7 @@ def decode_mask(valid_len: int, max_seq: int) -> np.ndarray:
     [0, valid_len] 为 0（含本步刚写入的位置）、其余预留位为 -inf；只有一个 query
     位置时因果自动满足。valid_len = DecodeState.valid_len（唯一真值源）。
     """
+    _check_position("valid_len", valid_len, max_seq, inclusive=False)
     j = np.arange(max_seq)
     return np.where(j <= valid_len, 0.0, -np.inf).astype(np.float32)
 

@@ -183,6 +183,21 @@ def test_kv_specs_from_placement_gqa() -> None:
                                 head_dim=128, max_seq=16, dtype_bytes=2, kv_base=0)
 
 
+def test_kv_specs_from_placement_rejects_incomplete_or_overlapping_heads() -> None:
+    """问题 2 的 k_proj shard_map 必须恰好覆盖每个 KV head 一次。"""
+    incomplete = _k_proj_spec(2, 4, 2, 8)
+    incomplete.shard_map[1] = TensorShardDetail(1, 0, 2, 6, (4, 8))
+    with pytest.raises(ValueError, match="覆盖"):
+        kv_specs_from_placement(incomplete, num_layers=2, num_kv_heads=4, num_q_heads=4,
+                                head_dim=2, max_seq=16, dtype_bytes=2, kv_base=0)
+
+    overlapping = _k_proj_spec(2, 4, 2, 8)
+    overlapping.shard_map[1] = TensorShardDetail(1, 0, 2, 8, (6, 8))
+    with pytest.raises(ValueError, match="覆盖"):
+        kv_specs_from_placement(overlapping, num_layers=2, num_kv_heads=4, num_q_heads=4,
+                                head_dim=2, max_seq=16, dtype_bytes=2, kv_base=0)
+
+
 def test_kv_access_matches_layout() -> None:
     """问题 6 填 Command.reads/writes 的区间必须与 update/read_tile 实际访问一致。"""
     spec = _specs()[0]
@@ -247,11 +262,15 @@ def test_update_and_read_tile_contract_violations() -> None:
     cache = PIMStaticKVCache(_backend(), _specs(), wram_budget_bytes=WRAM_BUDGET)
     vec = np.zeros(HEAD_DIM, dtype=np.float32)
     full = {d: {h: vec for h in s.kv_heads} for d, s in cache.specs.items()}
-    with pytest.raises(AssertionError):  # pos 越界（写进预留区外）
+    with pytest.raises(ValueError, match="pos=.*越界"):  # pos 越界（写进预留区外）
         cache.update(0, MAX_SEQ, full, full)
     with pytest.raises(ValueError):  # dtype 与规格不符
         bad = {d: {h: vec.astype(np.float64) for h in s.kv_heads} for d, s in cache.specs.items()}
         cache.update(0, 0, bad, bad)
+    with pytest.raises(ValueError, match="dtype"):  # 字节数相同但语义不同的 dtype 也不能写入
+        wrong_dtype = {d: {h: np.zeros(HEAD_DIM, dtype=np.uint32) for h in s.kv_heads}
+                       for d, s in cache.specs.items()}
+        cache.update(0, 0, wrong_dtype, wrong_dtype)
     with pytest.raises(ValueError):  # tile 越界
         cache.read_tile(0, 0, 0, 0, MAX_SEQ + 1)
     with pytest.raises(KeyError):  # head 不在本 DPU
@@ -276,6 +295,14 @@ def test_masks() -> None:
     assert np.array_equal(decode_mask(2, 5),
                           np.array([0, 0, 0, -np.inf, -np.inf], dtype=np.float32))
     assert prefill_mask(3, 5).dtype == np.float32
+    with pytest.raises(ValueError, match="prompt_len"):
+        prefill_mask(6, 5)
+    with pytest.raises(ValueError, match="prompt_len"):
+        prefill_mask(1.5, 5)
+    with pytest.raises(ValueError, match="valid_len"):
+        decode_mask(5, 5)
+    with pytest.raises(ValueError, match="valid_len"):
+        decode_mask(1.5, 5)
 
 
 # ---------- 端到端数值：逐 tile 读 KV 的注意力 vs 单卡 PyTorch ----------

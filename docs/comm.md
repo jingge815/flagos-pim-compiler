@@ -37,6 +37,9 @@ an empty placeholder entry (zero DMA).
 - `src_addr`/`dst_addr` bake `mram_offset + local_offset * itemsize` into each
   segment, so the table is self-contained for the orchestrator; problem 8 only
   changes `mram_offset` values, not the rules.
+- A DPU-local `Shard(i) -> Shard(j)` edge is emitted as `all_to_all`; plan
+  construction verifies that both endpoint locations exactly match their
+  `PIMTensorSpec.shard_map`, so stale node metadata cannot target a wrong DPU.
 - Collect segments (`dst_dpu=None`) vs writeback segments (`src_dpu=None`); no
   writeback rows when `dst_loc` is host. An all-gather from a Replicate source
   collects a single copy. `all_to_all` rows are pairwise run intersections and
@@ -62,6 +65,11 @@ registered but not executable), the rank layer is not mirrored, and all calls
 are synchronous. `NumpyBackend` (problem 6 HAL) stores its MRAM in the same
 machine, so the comm library and the future orchestrator share one fake
 hardware state. There is no DPU→DPU primitive anywhere (host-star topology).
+All `dpu_prepare_xfer` buffers must be `numpy.ndarray` and C-contiguous;
+DPU-to-host output buffers must additionally be writable. The mirror rejects
+views or Python containers that NumPy would otherwise silently copy to a
+temporary buffer. `dpu_push_xfer` also accepts only the two `dpu_xfer_t`
+directions from the vendor API and rejects unknown values.
 
 Verification: `tests/test_dpu_sdk.py`, `tests/test_comm_plan.py`,
 `tests/test_comm_lowering.py`, `tests/test_comm_llama2_7b.py` (real Llama-2-7B:

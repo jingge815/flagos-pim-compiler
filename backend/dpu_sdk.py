@@ -109,6 +109,24 @@ def _as_bytes(src: object, length: int) -> np.ndarray:
     return blob
 
 
+def _writable_c_bytes(buffer: np.ndarray) -> np.ndarray:
+    """返回供 DPU→host 写入的原缓冲区字节视图，拒绝会生成临时副本的数组。"""
+    if not isinstance(buffer, np.ndarray):
+        raise DpuError("DPU→host 的 host buffer 必须是 numpy.ndarray")
+    if not buffer.flags.c_contiguous or not buffer.flags.writeable:
+        raise DpuError("DPU→host 的 host buffer 必须可写且 C-contiguous")
+    return buffer.view(np.uint8).reshape(-1)
+
+
+def _c_bytes(buffer: np.ndarray) -> np.ndarray:
+    """返回原 C-contiguous 缓冲区的字节视图，不为 host→DPU 读取要求可写。"""
+    if not isinstance(buffer, np.ndarray):
+        raise DpuError("host buffer 必须是 numpy.ndarray")
+    if not buffer.flags.c_contiguous:
+        raise DpuError("host buffer 必须 C-contiguous")
+    return buffer.view(np.uint8).reshape(-1)
+
+
 # ---------------------------------------------------------------------------
 # 设备管理（dpu.h：归属编排器层，镜像一并给出供问题 6 使用）
 # ---------------------------------------------------------------------------
@@ -151,7 +169,7 @@ def dpu_copy_from(dpu_set: DpuSet, offset: int, dst: np.ndarray, length: int) ->
     _check_live(dpu_set)
     _, dpu = dpu_set._member()
     _check_range(dpu, offset, length)
-    view = np.ascontiguousarray(dst).view(np.uint8).reshape(-1)
+    view = _writable_c_bytes(dst)
     if view.size < length:
         raise DpuError(f"host 缓冲区字节数 {view.size} 小于 length={length}")
     view[:length] = dpu.mram[offset : offset + length]
@@ -161,7 +179,8 @@ def dpu_prepare_xfer(dpu_set: DpuSet, buffer: np.ndarray) -> None:
     """为单台 DPU 登记下一次 push_xfer 使用的 host buffer（DPU_FOREACH 内逐台调用）。"""
     _check_live(dpu_set)
     dpu_id, _ = dpu_set._member()
-    dpu_set._machine.xfer_buffers[dpu_id] = np.ascontiguousarray(buffer)
+    _c_bytes(buffer)
+    dpu_set._machine.xfer_buffers[dpu_id] = buffer
 
 
 def dpu_push_xfer(dpu_set: DpuSet, xfer: DpuXfer, offset: int, length: int, flags: int = 0) -> None:
@@ -171,13 +190,15 @@ def dpu_push_xfer(dpu_set: DpuSet, xfer: DpuXfer, offset: int, length: int, flag
     瓶颈）；成员间 offset/length 必须一致是 C 版原语本身的约束。
     """
     _check_live(dpu_set)
+    if xfer not in (DPU_XFER_TO_DPU, DPU_XFER_FROM_DPU):
+        raise DpuError(f"未知 xfer 方向: {xfer!r}")
     for dpu_id in dpu_set._ids:
         dpu = dpu_set._machine.dpus[dpu_id]
         _check_range(dpu, offset, length)
         buffer = dpu_set._machine.xfer_buffers.get(dpu_id)
         if buffer is None:
             raise DpuError(f"DPU{dpu_id} 未 dpu_prepare_xfer")
-        view = buffer.view(np.uint8).reshape(-1)
+        view = _writable_c_bytes(buffer) if xfer == DPU_XFER_FROM_DPU else _c_bytes(buffer)
         if view.size < length:
             raise DpuError(f"DPU{dpu_id} 登记的 buffer 字节数 {view.size} 小于 length={length}")
         if xfer == DPU_XFER_TO_DPU:

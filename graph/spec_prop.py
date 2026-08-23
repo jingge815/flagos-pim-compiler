@@ -346,8 +346,8 @@ def _edge_type(node: Node, actual: PIMTensorSpec, req: _Req) -> str:
     Partial→Replicate=all_reduce；Shard→Replicate=all_gather；Replicate→Shard
     跨位置=scatter、同位置=local_slice（本地切片，零通信，方案二.(8) 逐元素行）；
     同 placement 纯跨位置：host→dpu 记 scatter（目标全量即 broadcast 退化）、
-    dpu→host 记 all_gather（源为全量副本，问题 3 只收一份）。契约外（Shard(i)→
-    Shard(j) 的 all_to_all、Partial→Shard 等）抛错。
+    dpu→host 记 all_gather（源为全量副本，问题 3 只收一份）。不同切分维的
+    DPU Shard(i)→Shard(j) 记 all_to_all；其余契约外组合（如 Partial→Shard）抛错。
     """
     a, r = actual.placement, req.placement
     if not (
@@ -355,10 +355,13 @@ def _edge_type(node: Node, actual: PIMTensorSpec, req: _Req) -> str:
         or (a.kind == "Partial" and r.kind == "Replicate")
         or (a.kind == "Shard" and r.kind == "Replicate")
         or (a.kind == "Replicate" and r.kind == "Shard")
+        or (a.kind == r.kind == "Shard" and a.dim != r.dim and actual.device == req.device == DEVICE_DPU)
     ):
         raise ValueError(f"{node.name} 不支持的布局转换: {a}@{actual.device} → {r}@{req.device}")
     if a == r:  # 布局相同、仅跨 host↔dpu 位置
         return "scatter" if actual.device == DEVICE_HOST else "all_gather"
+    if a.kind == r.kind == "Shard":
+        return "all_to_all"
     if a.kind == "Partial" and r.kind == "Replicate":
         return "all_reduce"
     if a.kind == "Shard" and r.kind == "Replicate":

@@ -25,9 +25,11 @@ from contracts.graph_meta import (
     REDISTRIBUTE_META_KEY,
     SPEC_META_KEY,
 )
-from contracts.pim_tensor_spec import Placement, TensorShardDetail
+from contracts.pim_tensor_spec import PIMTensorSpec, Placement, TensorShardDetail
 from graph.partition import partition_graph
 from graph.spec_prop import (
+    _Req,
+    _edge_type,
     ShardConfig,
     format_spec_report,
     llama_shard_config,
@@ -37,6 +39,25 @@ from tests.test_partition import _export_random_llama
 
 REPLICATE = Placement("Replicate")
 PARTIAL_SUM = Placement("Partial", reduce_type="sum")
+
+
+def test_shard_dimension_change_between_dpus_is_all_to_all() -> None:
+    """问题 3 已支持的 Shard(i) → Shard(j) 必须能由问题 2 产生。"""
+    graph = Graph()
+    producer = graph.placeholder("producer")
+    actual = PIMTensorSpec(
+        DEVICE_DPU,
+        Placement("Shard", 0),
+        "transient",
+        None,
+        {
+            0: TensorShardDetail(0, 0, 0, 2, (2, 4)),
+            1: TensorShardDetail(1, 0, 2, 4, (2, 4)),
+        },
+        None,
+    )
+
+    assert _edge_type(producer, actual, _Req(DEVICE_DPU, Placement("Shard", 1))) == "all_to_all"
 
 
 # ---------------------------------------------------------------------------

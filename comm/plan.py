@@ -254,6 +254,15 @@ def _check_coverage(segs: list[CommSegment], expect_full: bool, expected: int, l
         raise ValueError(f"{label} 段覆盖 [0, {cursor}) != [0, {expected})")
 
 
+def _check_endpoint_location(name: str, location: dict, spec: PIMTensorSpec) -> None:
+    """校验问题 2 写入的 loc 与同一边的 tensor spec 指向同一组设备。"""
+    expected = {"device": "host"} if spec.device == "host" else {
+        "device": "dpu", "dpus": sorted(spec.shard_map)
+    }
+    if location != expected:
+        raise ValueError(f"edge endpoint {name}={location} 与 spec={expected} 不一致")
+
+
 def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
     try:
         dtype = np.dtype(edge.dtype)
@@ -262,6 +271,8 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
     numel = prod(edge.shape)
     if numel * dtype.itemsize != edge.nbytes:
         raise ValueError(f"edge {edge.edge_id} 的 shape/dtype 与 nbytes={edge.nbytes} 不符")
+    _check_endpoint_location("src_loc", edge.src_loc, edge.src_spec)
+    _check_endpoint_location("dst_loc", edge.dst_loc, edge.dst_spec)
     wait_for = tuple(edge.src_loc["dpus"]) if edge.src_loc["device"] == "dpu" else ()
     entry = CommPlanEntry(
         edge_id=edge.edge_id,

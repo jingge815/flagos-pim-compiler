@@ -110,6 +110,51 @@ def test_push_xfer_without_prepare_or_with_short_buffer_raises() -> None:
         dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, 0, 8)
 
 
+def test_copy_from_and_prepare_xfer_reject_non_contiguous_host_buffers() -> None:
+    """DPU→host 写入必须直达调用方缓冲，不能被 numpy 临时副本吞掉。"""
+    dpu_set = dpu_alloc(1, mram_bytes=64)
+    dpu_copy_to(dpu_set.dpu(0), 0, np.array([10, 20], dtype=np.int32), 8)
+    destination = np.zeros((2, 2), dtype=np.int32)[:, 0]
+
+    with pytest.raises(DpuError, match="C-contiguous"):
+        dpu_copy_from(dpu_set.dpu(0), 0, destination, 8)
+    with pytest.raises(DpuError, match="C-contiguous"):
+        dpu_prepare_xfer(dpu_set.dpu(0), destination)
+
+
+def test_prepare_xfer_allows_read_only_input_but_not_read_only_output() -> None:
+    """prepare 只登记指针；可写约束仅属于 DPU→host 的实际写入方向。"""
+    dpu_set = dpu_alloc(1, mram_bytes=64)
+    payload = np.array([10, 20], dtype=np.int32)
+    payload.setflags(write=False)
+
+    dpu_prepare_xfer(dpu_set.dpu(0), payload)
+    dpu_push_xfer(dpu_set.dpu(0), DPU_XFER_TO_DPU, 0, payload.nbytes)
+    with pytest.raises(DpuError, match="可写"):
+        dpu_push_xfer(dpu_set.dpu(0), DPU_XFER_FROM_DPU, 0, payload.nbytes)
+
+
+def test_dpu_to_host_rejects_non_array_buffers_that_would_be_copied() -> None:
+    """Python 容器不是 DMA 缓冲；np.asarray 产生的临时数组不能作为接收端。"""
+    dpu_set = dpu_alloc(1, mram_bytes=64)
+    dpu_copy_to(dpu_set.dpu(0), 0, np.array([10, 20], dtype=np.int32), 8)
+
+    with pytest.raises(DpuError, match="numpy.ndarray"):
+        dpu_copy_from(dpu_set.dpu(0), 0, [0, 0], 8)
+    with pytest.raises(DpuError, match="numpy.ndarray"):
+        dpu_prepare_xfer(dpu_set.dpu(0), [0, 0])
+
+
+def test_push_xfer_rejects_unknown_direction() -> None:
+    """dpu_xfer_t 是封闭枚举，未知方向不能被误当成 DPU→host。"""
+    dpu_set = dpu_alloc(1, mram_bytes=64)
+    payload = np.array([10, 20], dtype=np.int32)
+    dpu_prepare_xfer(dpu_set.dpu(0), payload)
+
+    with pytest.raises(DpuError, match="未知 xfer"):
+        dpu_push_xfer(dpu_set.dpu(0), "unknown", 0, payload.nbytes)  # type: ignore[arg-type]
+
+
 def test_broadcast_to_writes_one_buffer_to_every_dpu() -> None:
     dpu_set = dpu_alloc(2, mram_bytes=128)
     payload = np.arange(8, dtype=np.float16)

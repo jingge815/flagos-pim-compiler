@@ -322,6 +322,19 @@ def test_coverage_check_catches_gaps_and_dtype_mismatch() -> None:
         build_comm_plan([edge])
 
 
+def test_plan_rejects_endpoint_locations_inconsistent_with_specs() -> None:
+    """计划表只能使用问题 2 产物的真实 DPU 端点，不能信任漂移的 loc 元数据。"""
+    shape = (8,)
+    src = _dpu_spec(Placement("Shard", 0), shape, (0, 1))
+    edge = _edge(14, "all_gather", src, _host_spec(), shape)
+    edge = RedistributeEdge(
+        **{**edge.__dict__, "src_loc": {"device": "dpu", "dpus": [1, 2]}}
+    )
+
+    with pytest.raises(ValueError, match="src_loc"):
+        build_comm_plan([edge])
+
+
 def test_format_comm_plan_printable() -> None:
     shape = (8,)
     src = _dpu_spec(PARTIAL_SUM, shape, (0, 1))
