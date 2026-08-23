@@ -19,16 +19,16 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 ## 目录职责
 
 
-| 目录              | 内容                                                                                 | 问题 |
-| ----------------- | ------------------------------------------------------------------------------------ | ---- |
-| `contracts/`      | `PIMTensorSpec` / `ExecutionPlan` / `node.meta` 字段约定——全仓唯一真源             | 共用 |
-| `graph/`          | `partition.py` 图拆分打标、`spec_prop.py` 切分传播 + redistribute 标注               | 1、2 |
-| `comm/`           | `plan.py` 编译期通信计划表、`lowering.py` 运行时 redistribute→DMA                   | 3    |
-| `memory/`         | `kv_layout.py` KV 布局 + runtime、`mem_planner.py` 三区 offset 规划                  | 7、8 |
-| `runtime/`        | `exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                 | 6    |
+| 目录              | 内容                                                                                                                            | 问题 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| `contracts/`      | `PIMTensorSpec` / `ExecutionPlan` / `node.meta` 字段约定——全仓唯一真源                                                        | 共用 |
+| `graph/`          | `partition.py` 图拆分打标、`spec_prop.py` 切分传播 + redistribute 标注                                                          | 1、2 |
+| `comm/`           | `plan.py` 编译期通信计划表、`lowering.py` 运行时 redistribute→DMA                                                              | 3    |
+| `memory/`         | `kv_layout.py` KV 布局 + runtime、`mem_planner.py` 三区 offset 规划                                                             | 7、8 |
+| `runtime/`        | `exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                                                            | 6    |
 | `backend/`        | `dpu_sdk.py` 厂商 SDK（pre-g-driver-api）的 numpy 镜像 / `hal_numpy.py` 异步 HAL（存储架在 dpu_sdk 上）/ `hal_vendor.py` 真硬件 | 底座 |
-| `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                       | 4    |
-| `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                               | 验证 |
+| `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                                                                 | 4    |
+| `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                                                                          | 验证 |
 
 `contracts/` 是地基：改任何字段先 grep 调用方，改完同步全链路。各组只通过 `node.meta` 解耦，不私自约定字段。
 
@@ -51,7 +51,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 
 - 数据结构用 `@dataclass` + 类型标注，不用裸 dict 传结构化数据。
 - 命名跟方案术语一致：`part_id`、`dpu_id`、`placement`、`mram_offset`、`valid_len`——不另起别名。
-- 注释写「为什么这么做」和方案依据（如 `# 附录 A：Linear2 权重按行切 → 输出为 Partial`），实现原理简述，字数不要太多。
+- 注释写「为什么这么做」和方案依据（如 `# 附录 A：Linear2 权重按行切 → 输出为 Partial`），实现原理简述，字数不要太多，不要中英文混合，除非英文专有名词，通俗易懂。
 - 关键中间产物（标注图、通信计划表、`DPU_k.plan`、`ExecutionPlan`）要能 `print` 出可读文本，方便定位问题。
 - 函数保持短、单一职责；避免深嵌套和长参数表。
 - **关键结构体**（`contracts/` 里定义的、跨模块传递的 `@dataclass`）：字段名字已经自解释就不用注释；含义不直观的字段（如单位、取值范围、何时为 `None`）补一行说明。
