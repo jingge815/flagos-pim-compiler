@@ -121,10 +121,10 @@ def test_submit_dma_and_host_paths_return_results_and_propagate_errors() -> None
     out = backend.submit(Command(2, "dma_out", 0, {"offset": 0, "shape": payload.shape, "dtype": payload.dtype}))
     assert np.array_equal(backend.wait(out), payload)
 
-    host = backend.submit(Command(3, "host_op", None, {"fn": lambda cmd: cmd.id + 10}))
+    host = backend.submit(Command(3, "host_op", None, {"fn": lambda hal, cmd: cmd.id + 10}))
     assert backend.wait(host) == 13
 
-    def fail_host(cmd) -> None:
+    def fail_host(hal, cmd) -> None:
         raise RuntimeError(f"host failure in cmd {cmd.id}")
 
     failed_host = backend.submit(Command(4, "host_op", None, {"fn": fail_host}))

@@ -64,6 +64,20 @@ class NumpyBackend:
         self._dpu_set: DpuSet = dpu_alloc(config.num_dpus, mram_bytes=config.mram_bytes_per_dpu)
         self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
 
+    def reset_events(self) -> None:
+        """清空命令 id -> Event 的查找表（问题 6 `execute_plan` 每次调用前必调）。
+
+        命令 id 只在单次 `build_execution_plan` 产出的一份 `ExecutionPlan`
+        内唯一，两图各自从 0 编号；decode 循环对同一份 decode_plan 重复调
+        `execute_plan` 多次（每步一次），id 会重复出现。`_events_by_id` 是
+        这唯一会跨调用累积、导致 `submit` 误判"重复 id"的状态——不清空
+        `_stream_tail`（每 DPU 的异步 future 链要跨步真实串行，代表"这台
+        DPU 上一步的最后一条命令必须先跑完"，这是 KV cache 跨步累积写入
+        MRAM 的正确性所需要的，问题 6 三.(1) 的"编排器持有横跨两张图的状态"
+        正是靠它落地）。
+        """
+        self._events_by_id = {}
+
     @property
     def dpu_set(self) -> DpuSet:
         """底层 SDK 集合：通信库（comm/lowering.py）经此与 HAL 共享同一伪硬件。"""
@@ -179,7 +193,7 @@ class NumpyBackend:
             dep.result()
         operation = cmd.payload.get("fn")
         if callable(operation):
-            return operation(cmd)
+            return operation(self, cmd)
         return None
 
     def wait(self, event: Event, timeout: float | None = None) -> object:
@@ -187,3 +201,31 @@ class NumpyBackend:
 
     def query(self, event: Event) -> bool:
         return event.future.done()
+
+    def bind_inputs(self, values: dict[str, object], *, pos: int | None = None) -> None:
+        """问题 6 编排器的输入绑定入口（方案三.(3) `execute_plan` 的 `hal.bind_inputs`）。
+
+        `values`：本次调用的图 placeholder 节点名 -> 具体值（如
+        `{"input_ids": tensor, "causal_mask": tensor}`），供
+        `runtime/exec_plan_gen.py` 的 `_resolve_value` 在运行时读取。
+        `pos`：写 KV 的位置（= 编排器 `DecodeState.valid_len`），KV/SDPA
+        handler 用；不是图输入，图本身不含"位置"这个 placeholder。每次
+        `execute_plan` 前必须重新绑定，本方法不做跨调用累积。
+        """
+        self._bound_values = values
+        self._bound_pos = pos
+
+    def bound_value(self, name: str) -> object:
+        """取本次绑定的某个 placeholder 值（`exec_plan_gen._resolve_value` 用）。"""
+        return self._bound_values[name]
+
+    @property
+    def bound_pos(self) -> int | None:
+        """取本次 `bind_inputs` 绑定的 `pos`（KV/SDPA handler 读写位置用）。"""
+        return self._bound_pos
+
+    def result_of(self, cmd_id: int) -> object:
+        """取某条已提交命令的返回值（问题 6 host handler 读上游数值用，见
+        `runtime/exec_plan_gen.py` 模块 docstring 的"编译期只捕获命令 id、
+        运行时按 id 查具体值"设计）。"""
+        return self._events_by_id[cmd_id].future.result()

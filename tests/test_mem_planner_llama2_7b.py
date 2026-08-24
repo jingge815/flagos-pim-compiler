@@ -207,3 +207,32 @@ def test_format_mem_plan_printable(plans, hw_budget) -> None:
     text = format_mem_plan(plans, hw_budget)
     assert "dpu0" in text and "margin=" in text
     print("\n" + "\n".join(text.splitlines()[:4]))
+
+
+def test_redistribute_landing_offsets_reach_comm_plan_dst_addr(llama2_two_graphs, plans) -> None:
+    """问题 8 缺口修复的真实 7B 回归：build_comm_plan 的写回段 dst_addr 正确反映
+    plan_dpu 回填的 edge.dst_spec.mram_offset，不再是构造默认值 0。
+
+    修复前 mram_offset 恒为 0：dst_addr = 0 + 局部偏移 × itemsize，低地址段
+    看起来"非零"只是局部偏移的贡献，容易误判成"本来就是对的"。这里直接比对
+    dst_addr 与 (mram_offset + 局部偏移 × itemsize) 手算值，而非只看非零。
+    """
+    from comm.plan import build_comm_plan
+
+    _, _, prefill_gm, _ = llama2_two_graphs
+    edges = [e for n in prefill_gm.graph.nodes for e in n.meta.get("redistribute", [])]
+    assert edges
+    entries = build_comm_plan(edges)
+    by_edge_id = {e.edge_id: e for e in edges}
+
+    checked_nonzero = 0
+    for entry in entries:
+        edge = by_edge_id[entry.edge_id]
+        itemsize = np.dtype(edge.dtype).itemsize
+        for seg in entry.writeback_segments:
+            detail = edge.dst_spec.shard_map[seg.dst_dpu]
+            expected = detail.mram_offset + seg.dst_local_offset * itemsize
+            assert seg.dst_addr == expected
+            if detail.mram_offset != 0:
+                checked_nonzero += 1
+    assert checked_nonzero > 0

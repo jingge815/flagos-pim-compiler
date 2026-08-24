@@ -25,6 +25,7 @@ from memory.kv_layout import KVRegionSpec
 from memory.mem_planner import (
     HwBudget,
     TransientTensor,
+    _build_step_index,
     _pack_weights,
     bytes_of,
     format_mem_plan,
@@ -111,19 +112,40 @@ def test_pack_weights_rejects_cross_graph_shape_mismatch() -> None:
 def test_transient_tensors_local_and_redistribute_readers() -> None:
     gm, nodes = _built_appendix_a()
     all_nodes = list(gm.graph.nodes)
+    node_step, edge_step = _build_step_index(all_nodes)
     tensors = {t.name: t for t in transient_tensors(all_nodes, dpu_id=0)}
 
     y1, y2, norm = nodes["y1"], nodes["y2"], nodes["norm"]
-    assert set(tensors) == {y1.name, y2.name}  # x/w1/w2 非 transient，norm 是 host 节点
+    # x/w1/w2 非 transient，norm 是 host 节点；多出一个 redist_dst:e0——x（host）
+    # scatter 到 y1 的输入落在本 DPU 的落地缓冲（问题 8 缺口修复新增的一类张量）。
+    (scatter_edge,) = y1.meta[REDISTRIBUTE_META_KEY]
+    assert set(tensors) == {y1.name, y2.name, f"redist_dst:e{scatter_edge.edge_id}"}
 
-    # y1 本地读者是 y2（列切输出天然对齐行切输入，零通信）
+    # y1 本地读者是 y2（列切输出天然对齐行切输入，零通信）；读取时刻用细粒度
+    # 步骤号（问题 8 缺口修复：不能再用粗粒度节点位置，见 _build_step_index）。
     assert tensors[y1.name].readers == [y2.name]
-    assert tensors[y1.name].last_read_at == all_nodes.index(y2)
+    assert tensors[y1.name].last_read_at == node_step[y2]
 
-    # y2 是 Partial，被 host norm 消费须 all_reduce，读者记为 redist:eN
+    # y2 是 Partial，被 host norm 消费须 all_reduce，读者记为 redist:eN，
+    # 读取时刻是该边自己搬运命令的步骤号，不是 norm 节点自己的步骤号。
     (edge,) = norm.meta[REDISTRIBUTE_META_KEY]
     assert tensors[y2.name].readers == [f"redist:e{edge.edge_id}"]
-    assert tensors[y2.name].last_read_at == all_nodes.index(norm)
+    assert tensors[y2.name].last_read_at == edge_step[edge.edge_id]
+
+
+def test_redistribute_landing_tensor_offset_backfilled_after_plan_dpu() -> None:
+    """问题 8 缺口修复：edge.dst_spec 的 mram_offset 在 plan_dpu 后落在激活区内，不再是默认值 0。"""
+    (gm1, nodes1), (gm2, nodes2) = _two_appendix_a_graphs()
+    kv_specs = _kv_specs()
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    plan = plan_dpu(0, list(gm1.graph.nodes), list(gm2.graph.nodes), kv_specs, hw)
+
+    (scatter_edge,) = nodes1["y1"].meta[REDISTRIBUTE_META_KEY]
+    detail = scatter_edge.dst_spec.shard_map[0]
+    assert detail.mram_offset != 0
+    assert plan.act_base <= detail.mram_offset < plan.total
+    # 与 greedy_reuse 记的落地缓冲 offset 完全一致，不是另算的
+    assert plan.act_prefill[f"redist_dst:e{scatter_edge.edge_id}"] == detail.mram_offset
 
 
 def test_transient_tensors_no_readers_defaults_last_read_to_produced() -> None:
@@ -228,6 +250,25 @@ def test_plan_dpu_weight_offsets_shared_across_both_graphs() -> None:
         off = plan.weight[name]
         assert nodes1[key].meta["spec"].shard_map[0].mram_offset == off
         assert nodes2[key].meta["spec"].shard_map[0].mram_offset == off
+
+
+def test_plan_dpu_backfills_activation_node_own_spec_offset() -> None:
+    """问题 8 缺口修复：DPU 节点自己的 spec.shard_map[dpu].mram_offset 也要回填
+    （此前只回填权重与 redistribute 落地缓冲，节点自身激活输出漏了，
+    exec_plan_gen 若照 spec 取地址会全部读到默认值 0）。
+    """
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    plans, _, (nodes1, nodes2) = _plan_both_dpus(hw)
+    plan = plans[0]
+    for key in ("y1", "y2"):
+        off = plan.act_prefill[nodes1[key].name]
+        assert nodes1[key].meta["spec"].shard_map[0].mram_offset == off
+        assert off != 0
+        # decode 图（nodes2）的同名节点走同一份 act_prefill 表？不——act_decode 是
+        # 它自己那张图独立装箱的表，键是 nodes2 的节点名（这里两图结构相同，节点名
+        # 也相同，但 offset 来自 act_decode，不能拿 act_prefill 的值比）。
+        off2 = plan.act_decode[nodes2[key].name]
+        assert nodes2[key].meta["spec"].shard_map[0].mram_offset == off2
 
 
 def test_plan_dpu_raises_when_over_budget() -> None:
