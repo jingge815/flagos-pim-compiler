@@ -39,6 +39,7 @@ from __future__ import annotations
 import ctypes
 import glob
 import os
+import threading
 
 import numpy as np
 import torch
@@ -108,6 +109,112 @@ def linear_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, y)
 
 
+# (op, arg_shapes 元组化) -> ctypes 函数对象，进程内缓存，避免重复
+# compile_op()/dlopen（compile_op 自己在磁盘按同一个 key 缓存 .so，这里只是不
+# 想每次 launch 都重新构造 ctypes 函数签名）。
+_COMPILED_KERNEL_CACHE: dict[tuple, object] = {}
+
+# `NumpyBackend` 每台 DPU 一个线程并发 launch（问题 6 验证 3b 要求的真实并行）。
+# 8 台 DPU 第一次同时遇到同一个新 shape 时，若不加锁，会有多个线程同时判定
+# _COMPILED_KERNEL_CACHE 里没有、都去调 compile_op——多个 gcc 进程并发写同一个
+# .so 路径，非原子写导致文件损坏，ctypes 加载报 `undefined symbol`（实测：
+# 8 卡真实 decode 跑到第一次遇到新 shape 时稳定复现）。这把锁只序列化"缓存未
+# 命中时的编译"这一段，命中之后（绝大多数调用）直接读字典不用等锁。
+_COMPILE_LOCK = threading.Lock()
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _compiled_linear_supports(arg_shapes, dtype: str = "float32") -> bool:
+    """`opcompiler_bridge/kernel_src.py` 的 kernel 用 `tl.arange` 直接生成整块
+    索引（M/N 方向不切分，K 方向按 BLOCK_K 分块），要求 M/K/N 都是 2 的幂
+    （`tl.arange` 的范围必须是 2 的幂），且 K>=16（`tl.dot` 的硬约束）。
+
+    `arg_shapes[0]`（x）真实图上带 batch 维（如 `(1, 6, 4096)`），先展平成
+    `(M, K)` 再判断——见 `contracts/op_contract.py` 的 `flatten_leading_dims`。
+    这是从真实端到端测试插桩抓出来的：最早一版误以为 x 恒为二维，实测直接在
+    这里 `ValueError: too many values to unpack` 崩掉，`linear` 的每一次调用
+    都会经过这里，不修就是 100% 崩，不是极端情况。
+
+    真实 llama2-7b 里 hidden_size=4096（q/k/v/o_proj 的展平后 M/K/N，decode
+    时 M=1 也是 2 的幂）满足这两条，但 intermediate_size=11008（MLP 的
+    gate/up/down_proj）和 vocab_size=32000（lm_head）都不是 2 的幂——这两类
+    算子第一期垂直切片不覆盖，`compiled_linear_kernel` 遇到时退回
+    `linear_kernel`（纯 NumPy），不是缺陷，是本期明确的范围边界（见
+    docs/opcompiler_bridge-20260825.md）。
+
+    注意 prefill 的 M 是 prompt 长度（本仓测试里是 6），一般不是 2 的幂，所以
+    prefill 的 linear 基本都走 fallback；decode 的 M=1 是 2 的幂，才是编译产物
+    真正跑到的地方。
+    """
+    from contracts.op_contract import flatten_leading_dims
+
+    if dtype not in ("float16", "float32"):
+        return False
+    m, k = flatten_leading_dims(arg_shapes[0])
+    n = arg_shapes[1][0]
+    return k >= 16 and _is_pow2(m) and _is_pow2(k) and _is_pow2(n)
+
+
+def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
+    """`aten.linear(x, w)` 的算子编译器产物版本——contracts/op_contract.py
+    定义的第一期垂直切片：把 `linear_kernel` 换成 opcompiler_bridge 编译出的
+    `.so`（TTIR -> pim mlir -> EmitC -> C -> gcc），在真实 MRAM 内存上原地
+    计算，而不是拷贝出来用 NumPy 算。
+
+    shape 超出 `_compiled_linear_supports` 覆盖范围（见其 docstring）时静默
+    退回 `linear_kernel`——上层（图编译器/exec_plan_gen）不需要关心某个
+    `linear` 节点最终是算子编译器产物执行还是 NumPy 执行，数值结果一致。
+
+    K>=16 且 M/K/N 都是 2 的幂时：数值上与 `linear_kernel` 一致（两者都固定
+    用 float32 计算，MRAM 存储按 `dtype` 走，见 `contracts/op_contract.py`
+    顶部关于 dtype 字段的说明）。
+
+    不需要预先切 triton 环境——这台机器上的 triton 现在只有一份，默认自带
+    PIM pass 支持（`opcompiler_bridge/driver.py` 模块 docstring 有说明为什么
+    不能再维护两份：真实端到端场景下 transformers/torch 会在任何人切环境
+    之前就 import 到普通版，这是实测到的真实故障，不是理论风险）。
+    """
+    arg_shapes = tuple(tuple(s) for s in cmd.payload["arg_shapes"])
+    dtype = str(cmd.payload["dtype"])
+    if not _compiled_linear_supports(arg_shapes, dtype):
+        linear_kernel(hal, dpu_id, cmd)
+        return
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+
+    # dtype 进 key：同 shape 的 f16/f32 产物元素宽度不同，混用会静默算错。
+    key = ("linear", arg_shapes, dtype)
+    fn = _COMPILED_KERNEL_CACHE.get(key)
+    if fn is None:
+        # 缓存未命中才需要排队：多台 DPU 线程第一次同时遇到同一个新 shape 时，
+        # 不加锁会有多个 gcc 进程并发写同一个 .so 路径导致文件损坏（见
+        # _COMPILE_LOCK 的注释）。拿到锁后要重新查一次缓存——等锁的这段时间
+        # 里，先拿到锁的那个线程可能已经编译完并把结果放进去了。
+        with _COMPILE_LOCK:
+            fn = _COMPILED_KERNEL_CACHE.get(key)
+            if fn is None:
+                result = compile_op(
+                    OpCompileRequest(
+                        op="linear", arg_shapes=list(arg_shapes), dtype=dtype
+                    )
+                )
+                fn = load_kernel(result)
+                _COMPILED_KERNEL_CACHE[key] = fn
+
+    x_access, w_access = cmd.reads
+    (out_access,) = cmd.writes
+    base = hal.raw_mram_ptr(dpu_id)
+    fn(
+        ctypes.c_void_p(base + x_access.offset),
+        ctypes.c_void_p(base + w_access.offset),
+        ctypes.c_void_p(base + out_access.offset),
+    )
+
+
 def add_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.add.Tensor(x, y_or_scalar)`：逐元素加（方案二.(8) 逐元素行）。"""
     args = _read_tensor_args(hal, dpu_id, cmd)
@@ -138,8 +245,17 @@ _KERNELS = {
 }
 
 
-def register_all(hal) -> None:
+def register_all(hal, *, use_compiled_linear: bool = False) -> None:
     """把全部白名单 kernel 注册进一个 `NumpyBackend`（`launch` 命令按
-    `payload["kernel"]` 字符串查表，字符串即 `str(node.target)`）。"""
-    for name, fn in _KERNELS.items():
+    `payload["kernel"]` 字符串查表，字符串即 `str(node.target)`）。
+
+    `use_compiled_linear=True` 时把 `linear` 换成 `compiled_linear_kernel`
+    （算子编译器产物）——默认关闭，因为它第一次调用会触发 GPU 编译
+    （`opcompiler_bridge.driver.compile_op`），跟现有测试/编排器默认的纯
+    numpy 路径要求不同的环境（GPU + `prepare_triton_env(pim=True)`）。
+    """
+    kernels = dict(_KERNELS)
+    if use_compiled_linear:
+        kernels[str(torch.ops.aten.linear.default)] = compiled_linear_kernel
+    for name, fn in kernels.items():
         hal.register_kernel(name, fn)

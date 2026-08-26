@@ -106,6 +106,21 @@ class NumpyBackend:
     def write_local(self, dpu_id: int, offset: int, data: np.ndarray) -> None:
         self.copy_to_dpu(dpu_id, offset, data)
 
+    def raw_mram_ptr(self, dpu_id: int) -> int:
+        """DPU `dpu_id` 的 MRAM 起始地址（`ctypes` 裸指针，`int`）。
+
+        供 `opcompiler_bridge` 编译出的 C kernel 直接原地读写用——`read_local`/
+        `write_local` 永远拷贝，这里给的是内存的地址，跟 `dpu_sdk.py` 里
+        `_Dpu.mram`（每 DPU 一块独立连续 `np.zeros(mram_bytes, dtype=uint8)`）
+        是同一份存储，调用方对着这个地址加 offset 写等价于直接改 MRAM。
+
+        调用方必须保证：(1) 只在本 DPU 的 launch 线程内使用，不跨线程持有；
+        (2) offset+length 落在 `mram_bytes_per_dpu` 之内——本方法不做越界检查，
+        因为它连长度都不知道，检查在编译出的 kernel 自己算下标之前完成。
+        """
+        _, dpu = self._dpu_set.dpu(dpu_id)._member()
+        return dpu.mram.ctypes.data
+
     def read_local(
         self, dpu_id: int, offset: int, shape: tuple[int, ...], dtype: np.dtype
     ) -> np.ndarray:

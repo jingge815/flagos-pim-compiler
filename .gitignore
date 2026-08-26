@@ -3,3 +3,6 @@ __pycache__/
 
 # 站点相关路径覆盖（见 genesim_bridge/paths.py），每台机器各自一份，不入库
 paths.local.json
+
+# opcompiler_bridge 的编译产物缓存（.so/.c/.meta），按机器/shape 各自生成
+.opcompiler_cache/
