@@ -2,7 +2,7 @@
 
 跟 FlagGems `ops/linear.py` 的 `linear_kernel` 比，两处刻意的不同：
 
-**不做 autotune、不做 mask**。`LowerPIMSingleTasklet`（FlagTree 新 pass）要求
+**不做 autotune、不做 mask**。`LowerPIMToEmitC`（FlagTree 新 pass，原名 LowerPIMSingleTasklet）要求
 每次 DMA 的地址模式能被 `pim-explicit-dma` 的指针分析证明（`base_arg` 属性
 存在），FlagGems 版本的 `mask=input_mask` 一旦 M/N/K 不是 BLOCK 整数倍就引入
 掩码分支，这条分析证不出来。本仓契约（`contracts/op_contract.py`）本来就是
@@ -18,7 +18,7 @@ WRAM 装不下整个 K 时必须做的事，`pim.wram_alloc` 的尺寸因此也�
 分块引入的 `scf.for`（累加器是循环携带的 tensor、load 地址依赖归纳变量）由
 新 pass 识别并**折叠回一个完整 K 的平坦归约**——因为 numpy 后端上 MRAM 直接
 可寻址、WRAM 搬运被省略，分块就只剩"地址怎么算"的意义，数学上等价于不分块。
-详见 `LowerPIMSingleTasklet.cpp` 文件头的 "K-tiling" 一节。
+详见 `LowerPIMToEmitC.cpp` 文件头的 "Tiling" 一节。
 
 offset 计算必须先把完整 offset 张量算完再一次性 `ptr + off`（而不是对行/列
 offset 各做一次 `tt.addptr`）：`pim-explicit-dma` 里 `traceBaseArg`

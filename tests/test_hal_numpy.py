@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from backend import VendorBackend
-from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+from backend.hal_numpy import HazardTracker, NumpyBackend, NumpyBackendConfig, TaskletHazardError
 from contracts.exec_plan import Access, Command, ExecutionPlan
 from contracts.pim_tensor_spec import Placement, PIMTensorSpec, TensorShardDetail
 
@@ -83,6 +83,46 @@ def test_submit_wait_query_and_kernel_stub() -> None:
     gate.set()
     backend.wait(event)
     assert backend.query(event)
+
+
+def test_submit_launch_propagates_tasklet_hazard_from_kernel() -> None:
+    """kernel 内部通过 hal.record_access 触发的冲突要能穿过 submit/wait 传出来。
+
+    对应验收标准 (b)：故意让 kernel 漏加 barrier（两个 tasklet 写同一地址
+    之间不调用 hal.barier()），hazard 检测必须能抓到——不是只验证
+    HazardTracker 本身，而是验证它真的接进了 launch 的执行路径。
+    """
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
+
+    def bad_kernel(hal, dpu_id, cmd) -> None:
+        hal.record_access(0, "mram", 0, 8, is_write=True)
+        # 漏掉这里该有的 hal.barrier()
+        hal.record_access(1, "mram", 4, 8, is_write=True)  # 与 tasklet 0 重叠
+
+    backend.register_kernel("bad", bad_kernel)
+    event = backend.submit(
+        Command(id=1, op="launch", dpu_id=0, payload={"kernel": "bad"},
+                reads=[], writes=[Access(("dpu", 0), 0, 16)], waits=[], num_tasklets=2)
+    )
+    with pytest.raises(TaskletHazardError):
+        backend.wait(event)
+
+
+def test_submit_launch_allows_barrier_separated_tasklets() -> None:
+    """同样两个 tasklet 写重叠地址，但中间隔了 hal.barrier()——不该报错。"""
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
+
+    def good_kernel(hal, dpu_id, cmd) -> None:
+        hal.record_access(0, "mram", 0, 8, is_write=True)
+        hal.barrier()
+        hal.record_access(1, "mram", 4, 8, is_write=True)
+
+    backend.register_kernel("good", good_kernel)
+    event = backend.submit(
+        Command(id=1, op="launch", dpu_id=0, payload={"kernel": "good"},
+                reads=[], writes=[Access(("dpu", 0), 0, 16)], waits=[], num_tasklets=2)
+    )
+    backend.wait(event)  # 不应抛异常
 
 
 def test_submit_serializes_commands_on_the_same_dpu() -> None:
@@ -238,6 +278,42 @@ def test_read_local_returns_a_copy_and_push_xfer_fans_out() -> None:
     host_copy[0] = -1
     assert backend.read_local(0, 0, payload.shape, payload.dtype)[0] != -1
     assert np.array_equal(backend.read_local(1, 16, payload.shape, payload.dtype), payload)
+
+
+def test_hazard_tracker_catches_overlapping_write_across_tasklets() -> None:
+    """两个 tasklet 写重叠区间、无 barrier 隔开——漏加 barrier 或切分算错的直接模拟。"""
+    tracker = HazardTracker()
+    tracker.record(0, "mram", offset=0, length=16, is_write=True)
+    with pytest.raises(TaskletHazardError, match="tasklet 0.*tasklet 1"):
+        tracker.record(1, "mram", offset=8, length=16, is_write=True)
+
+
+def test_hazard_tracker_allows_non_overlapping_writes() -> None:
+    tracker = HazardTracker()
+    tracker.record(0, "mram", offset=0, length=16, is_write=True)
+    tracker.record(1, "mram", offset=16, length=16, is_write=True)  # 相邻但不重叠
+
+
+def test_hazard_tracker_allows_concurrent_reads() -> None:
+    """只读重叠不算冲突——两个 tasklet 同时读同一段权重是合法的（如共享 w）。"""
+    tracker = HazardTracker()
+    tracker.record(0, "mram", offset=0, length=16, is_write=False)
+    tracker.record(1, "mram", offset=0, length=16, is_write=False)
+
+
+def test_hazard_tracker_barrier_clears_epoch() -> None:
+    """barrier 之后同一区间可以被另一个 tasklet 写——上一 epoch 的记录不该跨 barrier 生效。"""
+    tracker = HazardTracker()
+    tracker.record(0, "mram", offset=0, length=16, is_write=True)
+    tracker.check_and_advance()  # barrier
+    tracker.record(1, "mram", offset=0, length=16, is_write=True)  # 不应该报错
+
+
+def test_hazard_tracker_same_tasklet_overlap_is_not_a_hazard() -> None:
+    """同一个 tasklet 自己前后两次访问同一地址不是竞争（顺序执行下天然安全）。"""
+    tracker = HazardTracker()
+    tracker.record(0, "mram", offset=0, length=16, is_write=True)
+    tracker.record(0, "mram", offset=0, length=16, is_write=True)
 
 
 def test_llama2_smoke_payload_stays_model_agnostic() -> None:

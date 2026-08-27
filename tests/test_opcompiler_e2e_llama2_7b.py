@@ -164,10 +164,15 @@ def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
     return wrapped, stats
 
 
-def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch) -> None:
+@pytest.mark.parametrize("num_tasklets", [1, 4, 8])
+def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklets) -> None:
     """完整走一遍图编译器 -> 算子编译器 -> numpy 执行，真实 llama2-7b decode，
     编译产物覆盖到的每一次 linear 调用都跟手写 NumPy 逐次比对，且最终生成
     文本与 HF `model.generate()` 一致。
+
+    按 num_tasklets ∈ {1, 4, 8} 跑三遍：1 是退化回归（泛化前的唯一行为），
+    4 是新默认值，8 覆盖 decode 阶段 M=1 时 tasklet 数超过行数的场景
+    （tasklet_linear_kernel/emitDotLoops 里对应的"多出的 tasklet 空转"分支）。
     """
     import runtime.kernels as km
 
@@ -225,10 +230,12 @@ def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch) -> None:
     prefill_compiled = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
         host_handler_of=make_host_handler(sdpa_layer_map(prefill_gm)),
+        num_tasklets=num_tasklets,
     )
     decode_compiled = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
         host_handler_of=make_host_handler(sdpa_layer_map(decode_gm)),
+        num_tasklets=num_tasklets,
     )
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))

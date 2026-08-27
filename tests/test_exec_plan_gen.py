@@ -38,7 +38,7 @@ def _built_appendix_a():
     return gm, nodes, edges
 
 
-def _plan_and_compile(gm, edges):
+def _plan_and_compile(gm, edges, num_tasklets=4):
     """跑一遍问题 8（拿两台 dpu 的 pending_readers 合并）+ 问题 3 + 问题 6。"""
     kv_specs = {
         d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
@@ -52,7 +52,7 @@ def _plan_and_compile(gm, edges):
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
-    compiled = build_execution_plan(nodes, gm, entries_by_id, pending)
+    compiled = build_execution_plan(nodes, gm, entries_by_id, pending, num_tasklets=num_tasklets)
     return compiled, plans
 
 
@@ -230,3 +230,19 @@ def test_execute_plan_matches_torch_reference() -> None:
         [4], None, None, 1e-5,
     ).detach().numpy()
     assert np.allclose(result, ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("num_tasklets", [1, 4])
+def test_build_execution_plan_stamps_num_tasklets_on_every_launch(num_tasklets) -> None:
+    """`build_execution_plan(..., num_tasklets=N)` 要落到每一条 launch 命令上——
+    覆盖默认值 4（主线路径）和显式 1（退化情形回归，泛化后单 tasklet 行为不变）。
+    非 launch 命令（host_op 等）不受影响，仍是 Command 的默认值。
+    """
+    gm, _, edges = _built_appendix_a()
+    for n in gm.graph.nodes:
+        if "layer_norm" in str(n.target):
+            n.target = lambda x, *a, orig=n.target, **k: orig(torch.from_numpy(np.asarray(x)), *a, **k).numpy()
+    compiled, _ = _plan_and_compile(gm, edges, num_tasklets=num_tasklets)
+    launch_cmds = [c for c in compiled.plan.commands if c.op == "launch"]
+    assert launch_cmds, "附录 A 图应该至少有一条 launch 命令（两层 Linear）"
+    assert all(c.num_tasklets == num_tasklets for c in launch_cmds)

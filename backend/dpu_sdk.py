@@ -9,12 +9,18 @@
 - ``dpu_error_t`` 的非零返回 → ``DpuError`` 异常（镜像不做错误码）；
 - ``dpu_load`` 的 program：numpy 镜像下是一个 ``fn(dpu_id, mram)`` 的 Python callable
   （真硬件对应 kernel 二进制路径/字节流，镜像无法执行，装载后 launch 抛 DpuError）；
-- rank 层（``dpu_alloc_ranks`` / ``DPU_RANK_FOREACH``）未镜像：第 1 阶段机型按扁平
-  dpu_id 编号，真硬件层次明确后再补；
+- rank 层：``dpu_alloc_ranks`` / ``dpu_get_nr_ranks`` / ``DpuSet.by_rank``
+  （镜像 ``DPU_RANK_FOREACH``）现在有了——但只是 ``dpu_id -> rank_id`` 的
+  只读分组标签，不影响任何寻址/迭代语义，扁平 dpu_id 仍是图编译器侧唯一的
+  切分粒度（rank 不进 graph/spec_prop.py 的切分决策、不进 comm/ 的通信
+  计划，这是范围边界,不是尚未做完）；
 - 所有拷贝/launch 同步阻塞（C 版同步语义）；异步事件由问题 6 的 HAL（hal_numpy）提供。
 
-容量：C 版 MRAM 容量由硬件定，镜像由 ``dpu_alloc(..., mram_bytes=...)`` 显式给定，
-默认 64MiB（UPMEM MRAM 规格）。
+容量：C 版 MRAM/WRAM 容量由硬件定，镜像由 ``dpu_alloc(..., mram_bytes=...,
+wram_bytes=...)`` 显式给定，默认 MRAM 64MiB、WRAM 64KiB（UPMEM 规格）。WRAM
+是每台 DPU 一块独立的真实字节数组（不是校验用的数字）——DPU 内多 tasklet
+并发建模（backend/hal_numpy.py 的 HazardTracker）依赖它是真实内存，才能让
+"tasklet 读写 WRAM 的哪个区间"这件事有具体地址可以记录、可以检测重叠。
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ DPU_ASYNCHRONOUS: DpuLaunchPolicy = "async"
 DPU_SYNCHRONOUS: DpuLaunchPolicy = "sync"
 
 DEFAULT_MRAM_BYTES = 64 * 2**20  # UPMEM MRAM 64MiB
+DEFAULT_WRAM_BYTES = 64 * 2**10  # UPMEM WRAM 64KiB
 
 # numpy 镜像下的 DPU kernel：fn(dpu_id, mram)，直接读写本 DPU 的 MRAM 字节数组
 DpuKernel = Callable[[int, np.ndarray], None]
@@ -42,22 +49,36 @@ class DpuError(RuntimeError):
 
 
 class _Dpu:
-    """单台 DPU 的硬件状态：独立 MRAM 地址空间 + 已装载程序（设备模型）。"""
+    """单台 DPU 的硬件状态：独立 MRAM/WRAM 地址空间 + 已装载程序（设备模型）。
 
-    __slots__ = ("mram", "program")
+    WRAM 与 MRAM 是两块独立的字节数组——真实硬件上 tasklet 只能直接算
+    WRAM 里的数据，MRAM 要先 DMA 进 WRAM。这里两者都建成真实内存（不是
+    只有 MRAM），供 backend/hal_numpy.py 的多 tasklet hazard 检测使用。
+    """
 
-    def __init__(self, mram_bytes: int) -> None:
+    __slots__ = ("mram", "wram", "program")
+
+    def __init__(self, mram_bytes: int, wram_bytes: int) -> None:
         self.mram = np.zeros(mram_bytes, dtype=np.uint8)
+        self.wram = np.zeros(wram_bytes, dtype=np.uint8)
         self.program: DpuKernel | bytes | None = None
 
 
 class _Machine:
-    """整机：扁平编号的 DPU 阵列 + push_xfer 的 per-DPU host buffer 登记表。"""
+    """整机：扁平编号的 DPU 阵列 + push_xfer 的 per-DPU host buffer 登记表。
 
-    def __init__(self, nr_dpus: int, mram_bytes: int) -> None:
-        self.dpus = [_Dpu(mram_bytes) for _ in range(nr_dpus)]
+    ``rank_of`` 是 dpu_id -> rank_id 的只读分组标签（镜像 pre-g-driver-api
+    的 rank 概念），均匀按 ``dpus_per_rank`` 分组，不影响任何寻址/迭代
+    语义——扁平 dpu_id 仍是全部 DMA/launch 原语的唯一寻址方式。
+    """
+
+    def __init__(self, nr_dpus: int, mram_bytes: int, wram_bytes: int,
+                 dpus_per_rank: int | None = None) -> None:
+        self.dpus = [_Dpu(mram_bytes, wram_bytes) for _ in range(nr_dpus)]
         self.xfer_buffers: dict[int, np.ndarray] = {}
         self.freed = False
+        self.dpus_per_rank = dpus_per_rank or nr_dpus
+        self.rank_of = {i: i // self.dpus_per_rank for i in range(nr_dpus)}
 
 
 class DpuSet:
@@ -69,6 +90,13 @@ class DpuSet:
 
     def __iter__(self) -> Iterator["DpuSet"]:  # DPU_FOREACH
         return (DpuSet(self._machine, (dpu_id,)) for dpu_id in self._ids)
+
+    def by_rank(self) -> Iterator["DpuSet"]:  # DPU_RANK_FOREACH
+        """按 rank 分组迭代：每次产出同一个 rank 内全部成员组成的子集。"""
+        by_rank: dict[int, list[int]] = {}
+        for dpu_id in self._ids:
+            by_rank.setdefault(self._machine.rank_of[dpu_id], []).append(dpu_id)
+        return (DpuSet(self._machine, tuple(ids)) for ids in by_rank.values())
 
     def dpu(self, dpu_id: int) -> "DpuSet":
         return self.subset((dpu_id,))
@@ -132,11 +160,33 @@ def _c_bytes(buffer: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def dpu_alloc(nr_dpus: int, profile: str | None = None, *, mram_bytes: int = DEFAULT_MRAM_BYTES) -> DpuSet:
-    """分配 nr_dpus 台 DPU，返回全机集合。profile 为 C 版占位（镜像忽略）。"""
+def dpu_alloc(
+    nr_dpus: int, profile: str | None = None, *,
+    mram_bytes: int = DEFAULT_MRAM_BYTES, wram_bytes: int = DEFAULT_WRAM_BYTES,
+) -> DpuSet:
+    """分配 nr_dpus 台 DPU，返回全机集合（单一 rank）。profile 为 C 版占位（镜像忽略）。"""
     if nr_dpus <= 0:
         raise DpuError(f"nr_dpus={nr_dpus} 必须为正")
-    return DpuSet(_Machine(nr_dpus, mram_bytes), tuple(range(nr_dpus)))
+    return DpuSet(_Machine(nr_dpus, mram_bytes, wram_bytes), tuple(range(nr_dpus)))
+
+
+def dpu_alloc_ranks(
+    nr_ranks: int, profile: str | None = None, *, dpus_per_rank: int,
+    mram_bytes: int = DEFAULT_MRAM_BYTES, wram_bytes: int = DEFAULT_WRAM_BYTES,
+) -> DpuSet:
+    """镜像 pre-g-driver-api 的 ``dpu_alloc_ranks``：按 rank 批量分配 DPU。
+
+    只是给扁平 dpu_id 打上 rank 分组标签（``_Machine.rank_of``），不改变
+    任何寻址/迭代语义——`dpu_alloc` 分配的单 rank 集合与这里分配的多 rank
+    集合，对 `dpu_copy_to`/`dpu_launch` 等原语完全一样地使用。
+    """
+    if nr_ranks <= 0:
+        raise DpuError(f"nr_ranks={nr_ranks} 必须为正")
+    if dpus_per_rank <= 0:
+        raise DpuError(f"dpus_per_rank={dpus_per_rank} 必须为正")
+    nr_dpus = nr_ranks * dpus_per_rank
+    machine = _Machine(nr_dpus, mram_bytes, wram_bytes, dpus_per_rank)
+    return DpuSet(machine, tuple(range(nr_dpus)))
 
 
 def dpu_free(dpu_set: DpuSet) -> None:
@@ -147,6 +197,11 @@ def dpu_free(dpu_set: DpuSet) -> None:
 def dpu_get_nr_dpus(dpu_set: DpuSet) -> int:
     _check_live(dpu_set)
     return len(dpu_set._ids)
+
+
+def dpu_get_nr_ranks(dpu_set: DpuSet) -> int:
+    _check_live(dpu_set)
+    return len({dpu_set._machine.rank_of[i] for i in dpu_set._ids})
 
 
 # ---------------------------------------------------------------------------

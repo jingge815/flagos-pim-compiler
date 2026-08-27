@@ -17,17 +17,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.dpu_sdk import (
     DEFAULT_MRAM_BYTES,
+    DEFAULT_WRAM_BYTES,
     DPU_ASYNCHRONOUS,
     DPU_SYNCHRONOUS,
     DPU_XFER_FROM_DPU,
     DPU_XFER_TO_DPU,
     DpuError,
     dpu_alloc,
+    dpu_alloc_ranks,
     dpu_broadcast_to,
     dpu_copy_from,
     dpu_copy_to,
     dpu_free,
     dpu_get_nr_dpus,
+    dpu_get_nr_ranks,
     dpu_launch,
     dpu_load,
     dpu_log_read,
@@ -198,3 +201,39 @@ def test_log_read_and_no_direct_dpu_to_dpu_primitive() -> None:
     assert not any(
         name.startswith("dpu_copy_dpu") or "dpu_to_dpu" in name for name in dir(sdk)
     )
+
+
+def test_dpu_alloc_default_wram_matches_upmem() -> None:
+    assert DEFAULT_WRAM_BYTES == 64 * 2**10
+    dpu_set = dpu_alloc(1)
+    assert dpu_set._machine.dpus[0].wram.shape == (DEFAULT_WRAM_BYTES,)
+    assert dpu_set._machine.dpus[0].wram.dtype == np.uint8
+
+
+def test_dpu_alloc_ranks_groups_dpus_and_reports_rank_count() -> None:
+    """镜像 pre-g-driver-api 的 dpu_alloc_ranks/dpu_get_nr_ranks/DPU_RANK_FOREACH。
+
+    只是给扁平 dpu_id 打分组标签，dpu_id 本身仍然从 0 连续编号——rank 不改变
+    任何寻址语义（方案确认的范围边界：rank 只在 SDK 元数据层）。
+    """
+    dpu_set = dpu_alloc_ranks(2, dpus_per_rank=4, mram_bytes=1024, wram_bytes=256)
+    assert dpu_get_nr_dpus(dpu_set) == 8
+    assert dpu_get_nr_ranks(dpu_set) == 2
+    assert dpu_set.dpu_ids == tuple(range(8))
+
+    groups = sorted(subset.dpu_ids for subset in dpu_set.by_rank())
+    assert groups == [(0, 1, 2, 3), (4, 5, 6, 7)]
+
+
+def test_dpu_alloc_single_rank_by_default() -> None:
+    """dpu_alloc（不经 dpu_alloc_ranks）分配的仍是单一 rank，dpu_get_nr_ranks==1。"""
+    dpu_set = dpu_alloc(4, mram_bytes=64)
+    assert dpu_get_nr_ranks(dpu_set) == 1
+    assert [subset.dpu_ids for subset in dpu_set.by_rank()] == [(0, 1, 2, 3)]
+
+
+def test_dpu_alloc_ranks_rejects_non_positive_args() -> None:
+    with pytest.raises(DpuError):
+        dpu_alloc_ranks(0, dpus_per_rank=4)
+    with pytest.raises(DpuError):
+        dpu_alloc_ranks(2, dpus_per_rank=0)

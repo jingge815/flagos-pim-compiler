@@ -2,13 +2,18 @@
 
 完整链路（每一步都已经手工跑通过一次，细节见 `docs/opcompiler_bridge-20260825.md`）：
 
-    triton.compile（FLAGTREE_EMIT_PIM=1，num_dpus=1 num_tasklets=1）
+    triton.compile（FLAGTREE_EMIT_PIM=1，num_dpus=1 num_tasklets=<request.num_tasklets>）
         -> pim_sidecar 产出 `.pimir`（其实是重新对 TTIR 跑
            convert-triton-to-pim + pim-explicit-dma，见下）
-        -> triton-opt -pim-lower-single-tasklet -convert-func-to-emitc
+        -> triton-opt -pim-lower-to-emitc -convert-func-to-emitc
         -> mlir-translate --mlir-to-cpp
         -> gcc -shared -fPIC
         -> .so，签名 `void <symbol>(float*, float*, float*)`
+
+    `pim-lower-to-emitc`（原名 `pim-lower-single-tasklet`，已泛化，不再要求
+    `num-tasklets==1`——见 FlagTree 该 pass 的 Passes.td 说明）按
+    `num_tasklets` 把 M 维静态切成对应块数，每块各自做一次 WRAM staging，
+    `num_tasklets=1` 时退化成原来的单块行为，不是走另一条 pass。
 
 不直接读 `pim_sidecar` 的 dump（同 `genesim_bridge/flagtree_driver.py` 的理由：
 不依赖 `FLAGTREE_EMIT_PIM`/`TRITON_DUMP_DIR`、不依赖编译缓存 miss），而是拿到
@@ -62,7 +67,7 @@ _CACHE_DIR = Path(
 )
 
 # 生成的 C 函数签名固定形如 `void <name>(float* v1, float* v2, ...)`——
-# LowerPIMSingleTasklet 把每个原始 !tt.ptr<f32> 参数改写成一个 !emitc.ptr<f32>，
+# LowerPIMToEmitC 把每个原始 !tt.ptr<f32> 参数改写成一个 !emitc.ptr<f32>，
 # 不带偏移量参数（见 kernel_src.py 顶部注释、docs/opcompiler_bridge-20260825.md）。
 # 这里解析实际产出的签名，而不是硬编码假设，一旦形状不对就直接报错。
 _SIG_RE = re.compile(r"void\s+(\w+)\s*\(([^)]*)\)")
@@ -91,7 +96,7 @@ def _torch_dtypes() -> dict:
 
 
 def _triton_opt() -> Path:
-    """带 `pim-lower-single-tasklet` 的 `triton-opt`。
+    """带 `pim-lower-to-emitc` 的 `triton-opt`。
 
     可用 `OPCOMPILER_TRITON_OPT` 覆盖。默认指向 `flagTree-pim` 安装里的构建
     目录——注意这台机器上还有一份 `FlagTree-back/build-pim` 构建树，改了 pass
@@ -111,7 +116,12 @@ def _mlir_translate() -> Path:
 def _cache_key(request: OpCompileRequest) -> str:
     # dtype 必须进 key：同一 shape 的 f16 / f32 产物读写的元素宽度不同，
     # 互换会静默算错（见 contracts/op_contract.py 里记的那个 bug）。
-    payload = f"{request.op}:{request.arg_shapes}:{request.dtype}".encode()
+    # num_tasklets 也必须进 key：`pim-lower-to-emitc` 按这个数字把 M 维静态
+    # 切成不同块数，同一 shape 不同 num_tasklets 生成的 C 代码结构不同。
+    payload = (
+        f"{request.op}:{request.arg_shapes}:{request.dtype}:"
+        f"{request.num_tasklets}"
+    ).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
@@ -202,12 +212,17 @@ def _wram_budget(request: OpCompileRequest) -> int:
     return budget
 
 
-def _run_triton_opt(ttir: str, wram_bytes: int) -> str:
+def _run_triton_opt(ttir: str, wram_bytes: int, num_tasklets: int) -> str:
     """ttir 文本 -> 跑完 convert-triton-to-pim/pim-explicit-dma/
-    pim-lower-single-tasklet/convert-func-to-emitc 之后的 emitc 文本。
+    pim-lower-to-emitc/convert-func-to-emitc 之后的 emitc 文本。
 
-    `pim-lower-single-tasklet` 要求 num-tasklets=1（见该 pass 的
-    runOnOperation 检查），单 DPU 单 tasklet 是本期契约的前提。
+    `pim-lower-to-emitc`（原名 `pim-lower-single-tasklet`）已经泛化,支持
+    `pim.num-tasklets >= 1`——不再是"选哪个 pass"，只是同一个 pass 的一个
+    参数,`num_tasklets=1` 时退化成原来的单块行为。这个参数只影响
+    `pim-lower-to-emitc` 内部怎么把 M 维切成几块（每块各自一次 WRAM
+    staging），不影响 `pim-explicit-dma` 的 `wram_bytes` 预算检查——那条检查
+    针对的是 Triton 侧未拆分的整个 M 行 tile（Triton kernel 本身没有
+    tasklet 概念，`grid=(1,)`），发生在 `pim-lower-to-emitc` 之前。
 
     `wram_bytes` 由调用方按本次 shape 的实际 tile 大小算出来传进来，而不是取
     `pim_options()` 里的默认值：`pim-explicit-dma` 会对每个 `pim.wram_alloc`
@@ -220,7 +235,7 @@ def _run_triton_opt(ttir: str, wram_bytes: int) -> str:
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
         raise RuntimeError(
-            f"找不到带 pim-lower-single-tasklet 的 triton-opt: {triton_opt}\n"
+            f"找不到带 pim-lower-to-emitc 的 triton-opt: {triton_opt}\n"
             "需要先在 FlagTree 里重新编译（该 pass 是本次新增，若安装未重建会"
             "缺这个 pass）。"
         )
@@ -235,9 +250,9 @@ def _run_triton_opt(ttir: str, wram_bytes: int) -> str:
             str(triton_opt),
             ttir_path,
             f"-convert-triton-to-pim=target={opts['pim_target']} "
-            f"num-tasklets=1 wram-bytes={wram_bytes}",
+            f"num-tasklets={num_tasklets} wram-bytes={wram_bytes}",
             "-pim-explicit-dma",
-            "-pim-lower-single-tasklet",
+            "-pim-lower-to-emitc",
             "-convert-func-to-emitc",
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -268,7 +283,7 @@ def _translate_to_c(emitc_text: str) -> str:
 def _parse_signature(c_source: str) -> tuple[str, list[str]]:
     """从生成的 C 源码里解析出函数名和 ctypes.argtypes 列表。
 
-    不硬编码假设 ABI——按 LowerPIMSingleTasklet 的设计，参数应该全是
+    不硬编码假设 ABI——按 LowerPIMToEmitC 的设计，参数应该全是
     `<elem>*`（没有偏移量参数），但这里仍然去读实际文本，形状不对就直接报错，
     而不是静默假设。
     """
@@ -315,7 +330,7 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
         )
 
     ttir = _make_ttir(request)
-    emitc_text = _run_triton_opt(ttir, _wram_budget(request))
+    emitc_text = _run_triton_opt(ttir, _wram_budget(request), request.num_tasklets)
     c_source = _translate_to_c(emitc_text)
     symbol, argtypes = _parse_signature(c_source)
 
@@ -330,11 +345,11 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
     tmp_tag = f"{os.getpid()}.{threading.get_ident()}"
     c_path = _CACHE_DIR / f"{key}.{tmp_tag}.c"
     so_tmp_path = _CACHE_DIR / f"{key}.{tmp_tag}.so"
-    # stdlib.h: LowerPIMSingleTasklet emits malloc/free to snapshot MRAM
+    # stdlib.h: LowerPIMToEmitC emits malloc/free to snapshot MRAM
     # operands into a private heap buffer before computing (mem_planner can
     # alias an op's output onto a dead input's address, and the compiled
     # kernel runs in a ThreadPoolExecutor worker whose pthread stack is too
-    # small for a multi-MiB local array -- see LowerPIMSingleTasklet.cpp's
+    # small for a multi-MiB local array -- see LowerPIMToEmitC.cpp's
     # snapshotToLocal for both).
     try:
         c_path.write_text("#include <stdint.h>\n#include <stdlib.h>\n" + c_source)

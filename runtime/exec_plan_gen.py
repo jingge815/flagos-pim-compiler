@@ -150,9 +150,11 @@ class _PlanBuilder:
         self._next_id = 0
 
     def append(self, op: str, dpu_id: int | None, payload: dict,
-               reads: list[Access], writes: list[Access], waits: list[int]) -> Command:
+               reads: list[Access], writes: list[Access], waits: list[int],
+               num_tasklets: int = 1) -> Command:
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
-                       reads=reads, writes=writes, waits=sorted(set(waits)))
+                       reads=reads, writes=writes, waits=sorted(set(waits)),
+                       num_tasklets=num_tasklets)
         self._next_id += 1
         self.commands.append(cmd)
         for w in writes:
@@ -284,6 +286,7 @@ def build_execution_plan(
     *,
     kv_access_of: KvAccessFn | None = None,
     host_handler_of: HostHandlerFn | None = None,
+    num_tasklets: int = 4,
 ) -> CompiledPlan:
     """问题 6 编译期主入口：标注图 + 通信计划表 + pending_readers → ExecutionPlan。
 
@@ -291,7 +294,10 @@ def build_execution_plan(
     gm_root —— 该图的 `GraphModule`（取 `get_attr` 常量真实值用）；
     comm_entries —— `{edge_id: CommPlanEntry}`（问题 3 产物按 edge_id 建的
     索引）；pending_readers —— 该图对应的那份（问题 8 `DPUPlan
-    .pending_readers_prefill`/`_decode`）。
+    .pending_readers_prefill`/`_decode`）；num_tasklets —— 每个 DPU launch
+    命令内部按几个 tasklet 顺序模拟切分（默认 4，全图统一一个数字，见
+    `contracts/exec_plan.py::Command.num_tasklets` 的说明；不做 per-op
+    不同 tasklet 数，那需要代价模型才有意义，属于第 2 阶段范畴）。
     出: CompiledPlan（`plan.commands` 按生成顺序即拓扑序排列）。
     """
     builder = _PlanBuilder(gm_root, pending_readers)
@@ -381,6 +387,7 @@ def build_execution_plan(
                      "arg_shapes": arg_shapes, "dtype": str(node.meta["val"].dtype).removeprefix("torch."),
                      "out_shape": out_detail.local_shape},
                     reads, [write] + kv_writes, waits,
+                    num_tasklets=num_tasklets,
                 )
                 # 登记"本节点（作为读者）在这台 DPU 上就是这条命令"，供后续
                 # 命令的 WAR 查询（`pending_readers` 给的是读者节点名）。

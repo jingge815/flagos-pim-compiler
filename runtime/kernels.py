@@ -109,6 +109,49 @@ def linear_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, y)
 
 
+def tasklet_linear_kernel(hal, dpu_id: int, cmd) -> None:
+    """`aten.linear(x, w)` 的多 tasklet 版本：按 M 维（batch*seq 展平后的行数）
+    切分给 `cmd.num_tasklets` 个 tasklet，仿 downmem `GEMV.c` 的
+    `my_rows = num_rows / NR_TASKLETS` 模式。
+
+    每个 tasklet 顺序模拟跑完自己的行区间（`backend/hal_numpy.py` 的
+    `HazardTracker`：不用真 pthread，按固定顺序依次执行，保持数值确定可
+    复现），每次读/写前调 `hal.record_access` 记录地址区间——两个 tasklet
+    若因为切分算错、行区间重叠，`record_access` 会立刻抛
+    `TaskletHazardError`。全部 tasklet 跑完后调一次 `hal.barrier()`，对应
+    真实硬件上"落盘前的一次全 tasklet 同步"。
+
+    `w`（权重）不按 tasklet 切分——全部 tasklet 共享同一份只读权重，只有
+    `x`/输出按 M 行切分，这与 FlagTree 泛化后 `pim-lower-to-emitc` pass 生成
+    的 C 代码的切分方式一一对应（方案 2.2 节）。
+    """
+    x, w = _read_tensor_args(hal, dpu_id, cmd)
+    num_tasklets = cmd.num_tasklets
+    m = x.shape[0]
+    rows_per_tasklet = -(-m // num_tasklets)  # 向上取整
+
+    dtype = np.dtype(cmd.payload["dtype"])
+    out_access = cmd.writes[0]
+    x_access = cmd.reads[0]
+    k = x.shape[1]
+    row_bytes_x = k * dtype.itemsize
+    row_bytes_out = w.shape[0] * dtype.itemsize
+
+    for tid in range(num_tasklets):
+        row_start = tid * rows_per_tasklet
+        row_end = min(row_start + rows_per_tasklet, m)
+        if row_start >= row_end:
+            continue
+        hal.record_access(tid, "mram", x_access.offset + row_start * row_bytes_x,
+                           (row_end - row_start) * row_bytes_x, is_write=False)
+        y_slice = x[row_start:row_end].astype(np.float32) @ w.astype(np.float32).T
+        hal.record_access(tid, "mram", out_access.offset + row_start * row_bytes_out,
+                           (row_end - row_start) * row_bytes_out, is_write=True)
+        hal.write_local(dpu_id, out_access.offset + row_start * row_bytes_out,
+                         np.ascontiguousarray(y_slice, dtype=dtype))
+    hal.barrier()
+
+
 # (op, arg_shapes 元组化) -> ctypes 函数对象，进程内缓存，避免重复
 # compile_op()/dlopen（compile_op 自己在磁盘按同一个 key 缓存 .so，这里只是不
 # 想每次 launch 都重新构造 ctypes 函数签名）。
@@ -186,8 +229,11 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     from contracts.op_contract import OpCompileRequest
     from opcompiler_bridge.driver import compile_op, load_kernel
 
-    # dtype 进 key：同 shape 的 f16/f32 产物元素宽度不同，混用会静默算错。
-    key = ("linear", arg_shapes, dtype)
+    num_tasklets = cmd.num_tasklets
+    # dtype 和 num_tasklets 都进 key：同 shape 的 f16/f32 产物元素宽度不同，
+    # 混用会静默算错；num_tasklets 不同时生成的 C 代码结构不同（外层 tid
+    # 循环的行区间切分依赖这个数字），也不能共享缓存。
+    key = ("linear", arg_shapes, dtype, num_tasklets)
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         # 缓存未命中才需要排队：多台 DPU 线程第一次同时遇到同一个新 shape 时，
@@ -199,7 +245,8 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
             if fn is None:
                 result = compile_op(
                     OpCompileRequest(
-                        op="linear", arg_shapes=list(arg_shapes), dtype=dtype
+                        op="linear", arg_shapes=list(arg_shapes), dtype=dtype,
+                        num_tasklets=num_tasklets,
                     )
                 )
                 fn = load_kernel(result)

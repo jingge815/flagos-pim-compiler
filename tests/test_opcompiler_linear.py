@@ -46,7 +46,7 @@ _ALIGN = 4096
 
 
 def _run(backend: NumpyBackend, kernel_name: str, arg_shapes,
-         reads_data: list[np.ndarray], out_shape, dtype="float32"):
+         reads_data: list[np.ndarray], out_shape, dtype="float32", num_tasklets=4):
     """写入全部张量、构造 launch 命令、submit/wait，返回结果。
 
     张量之间按 `_ALIGN` 向上对齐排布（不是固定步长——真实 shape 下 weight 有
@@ -67,6 +67,7 @@ def _run(backend: NumpyBackend, kernel_name: str, arg_shapes,
                   "arg_kinds": ["tensor", "tensor"], "arg_shapes": arg_shapes,
                   "dtype": dtype, "out_shape": out_shape},
         reads=reads, writes=[Access(("dpu", 0), write_off, write_nbytes)], waits=[],
+        num_tasklets=num_tasklets,
     )
     event = backend.submit(cmd)
     backend.wait(event)
@@ -95,6 +96,28 @@ def test_compiled_linear_matches_handwritten_numpy() -> None:
     )
 
     np.testing.assert_allclose(compiled_result, hand_result, atol=1e-4)
+
+
+@pytest.mark.parametrize("num_tasklets", [1, 2, 4, 8])
+def test_compiled_linear_matches_torch_across_tasklet_counts(num_tasklets) -> None:
+    """算子编译器泛化后的 `pim-lower-to-emitc`（原 pim-lower-single-tasklet）
+    按 num_tasklets 把 M 维静态切分——覆盖 1（退化回归）/2/4（整除）/8（大于
+    M，尾部 tasklet 空转）四档，每档都要跟 torch 参考逐元素对齐，这是方案
+    约束 4"必须显式跑通 num_tasklets>1"在算子编译器这一层的直接验证。
+    """
+    rng = np.random.default_rng(1)
+    M, K, N = 4, 32, 8
+    x = rng.standard_normal((M, K)).astype(np.float32)
+    w = rng.standard_normal((N, K)).astype(np.float32)
+
+    backend = _backend()
+    register_all(backend, use_compiled_linear=True)
+    result = _run(
+        backend, str(torch.ops.aten.linear.default), [(M, K), (N, K)],
+        [x, w], (M, N), num_tasklets=num_tasklets,
+    )
+    ref = torch.nn.functional.linear(torch.from_numpy(x), torch.from_numpy(w)).numpy()
+    np.testing.assert_allclose(result, ref, atol=1e-4)
 
 
 def test_compiled_linear_matches_torch() -> None:

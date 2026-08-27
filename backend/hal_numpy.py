@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from contracts.exec_plan import Command
 class NumpyBackendConfig:
     num_dpus: int
     mram_bytes_per_dpu: int
+    wram_bytes_per_dpu: int = 65536
     allow_device_to_device: bool = False
 
 
@@ -20,6 +22,59 @@ class NumpyBackendConfig:
 class Event:
     kind: Literal["dpu", "dma", "host"]
     future: Future[object]
+
+
+@dataclass(frozen=True)
+class _AccessRecord:
+    """一次 tasklet 对 WRAM/MRAM 某个地址区间的访问，用于同一 epoch 内的重叠检测。"""
+
+    tasklet_id: int
+    loc: Literal["wram", "mram"]
+    offset: int
+    length: int
+    is_write: bool
+
+    def overlaps(self, other: "_AccessRecord") -> bool:
+        return (
+            self.loc == other.loc
+            and self.offset < other.offset + other.length
+            and other.offset < self.offset + self.length
+        )
+
+
+class TaskletHazardError(RuntimeError):
+    """两个 tasklet 在同一 epoch 内访问重叠地址且至少一方写——漏加 barrier 或
+    行区间切分算错，真实硬件上这就是一次数据竞争。"""
+
+
+class HazardTracker:
+    """单次 launch 命令内、一个 epoch（两次 barrier 之间）的访问记录。
+
+    按方案确认的模型：多个 tasklet 按固定顺序（0..num_tasklets-1）依次跑完
+    自己的工作分片，不是真并发（不用 pthread，保持数值确定可复现）。每次
+    WRAM/MRAM 读写在 `record()` 里就地和本 epoch 已有记录比对——顺序模拟下
+    后到的访问和已记录的比较即可发现冲突，不需要等 epoch 结束再批量扫描。
+    命中重叠即抛异常，模拟真实硬件上"少加 barrier 导致数据竞争"的后果。
+    """
+
+    def __init__(self) -> None:
+        self._epoch: list[_AccessRecord] = []
+
+    def record(self, tasklet_id: int, loc: Literal["wram", "mram"],
+               offset: int, length: int, is_write: bool) -> None:
+        rec = _AccessRecord(tasklet_id, loc, offset, length, is_write)
+        for prev in self._epoch:
+            if prev.tasklet_id != rec.tasklet_id and prev.overlaps(rec) and (prev.is_write or rec.is_write):
+                raise TaskletHazardError(
+                    f"tasklet {prev.tasklet_id} 与 tasklet {rec.tasklet_id} 在 "
+                    f"{rec.loc}[{rec.offset},{rec.offset + rec.length}) 无 barrier "
+                    f"重叠访问（至少一方写）——缺少同步或切分区间算错"
+                )
+        self._epoch.append(rec)
+
+    def check_and_advance(self) -> None:
+        """遇到 barrier：验证已经在每次 record 时做完，这里只清空进入下一 epoch。"""
+        self._epoch = []
 
 
 class KernelStubRegistry:
@@ -61,8 +116,15 @@ class NumpyBackend:
         self._stream_locks = {dpu_id: Lock() for dpu_id in range(config.num_dpus)}
         self._stream_tail: dict[int, Future[object]] = {}
         self._events_by_id: dict[int, Event] = {}
-        self._dpu_set: DpuSet = dpu_alloc(config.num_dpus, mram_bytes=config.mram_bytes_per_dpu)
+        self._dpu_set: DpuSet = dpu_alloc(
+            config.num_dpus, mram_bytes=config.mram_bytes_per_dpu,
+            wram_bytes=config.wram_bytes_per_dpu,
+        )
         self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
+        # 每次 launch 命令私有的 HazardTracker——多个 DPU 的 launch 在
+        # ThreadPoolExecutor 的不同 worker 线程上并发跑，不能挂在 self 的
+        # 单一属性上，否则会互相踩；见 submit() 的 "launch" 分支。
+        self._tracker_local = threading.local()
 
     def reset_events(self) -> None:
         """清空命令 id -> Event 的查找表（问题 6 `execute_plan` 每次调用前必调）。
@@ -121,6 +183,26 @@ class NumpyBackend:
         _, dpu = self._dpu_set.dpu(dpu_id)._member()
         return dpu.mram.ctypes.data
 
+    def wram_ptr(self, dpu_id: int) -> int:
+        """DPU `dpu_id` 的 WRAM 起始地址（`ctypes` 裸指针），镜像 `raw_mram_ptr`。
+
+        供 opcompiler_bridge 编译出的多 tasklet C kernel 用——每个 tasklet
+        把自己的行区间 snapshot 进 WRAM 再算，不是像单 tasklet 版本一样
+        直接算 MRAM。
+        """
+        _, dpu = self._dpu_set.dpu(dpu_id)._member()
+        return dpu.wram.ctypes.data
+
+    def record_access(self, tasklet_id: int, loc: Literal["wram", "mram"],
+                       offset: int, length: int, is_write: bool) -> None:
+        """多 tasklet kernel 每次访问 WRAM/MRAM 前调用，交给当前 launch 命令的
+        `HazardTracker`（只在一次 launch 的执行期间有效，见 `submit`）。"""
+        self._tracker_local.tracker.record(tasklet_id, loc, offset, length, is_write)
+
+    def barrier(self) -> None:
+        """多 tasklet kernel 遇到 barrier 时调用，清空当前 epoch 的访问记录。"""
+        self._tracker_local.tracker.check_and_advance()
+
     def read_local(
         self, dpu_id: int, offset: int, shape: tuple[int, ...], dtype: np.dtype
     ) -> np.ndarray:
@@ -136,9 +218,19 @@ class NumpyBackend:
         deps = self._dependency_futures(cmd.waits)
         if cmd.op == "launch":
             kernel = self._kernels.lookup(str(cmd.payload["kernel"]))
+            tracker = HazardTracker()
+
+            def run_with_tracker(dpu_id: int = int(cmd.dpu_id), cmd: Command = cmd,
+                                  tracker: HazardTracker = tracker) -> object:
+                self._tracker_local.tracker = tracker
+                try:
+                    return kernel(self, dpu_id, cmd)
+                finally:
+                    del self._tracker_local.tracker
+
             event = Event(
                 "dpu",
-                self._submit_on_dpu(int(cmd.dpu_id), deps, kernel, self, int(cmd.dpu_id), cmd),
+                self._submit_on_dpu(int(cmd.dpu_id), deps, run_with_tracker),
             )
         elif cmd.op == "dma_in":
             data = np.ascontiguousarray(np.asarray(cmd.payload["data"])).copy()
