@@ -1,6 +1,7 @@
 """图层编译器 → 算子编译器的唯一契约（方案 spec.md:89,1120 的"单算子本地视图"约定）。
 
-字段是四个：`op`、`arg_shapes`、`dtype`、`num_tasklets`。不需要更多——`linear`
+字段是五个：`op`、`arg_shapes`、`hardware`、`dtype`、`num_tasklets`。`hardware`
+是图层编译器和算子编译器共享的 PIM 硬件契约；`linear`
 白名单实现（`graph/spec_prop.py` 拒绝 tensor bias、`runtime/kernels.py` 无 bias
 add）不需要 bias；每个 DPU 收到的已经是切分传播后的本地 shape，算子编译器不需要
 知道全局切分方式；MRAM 内的字节 offset 是运行期值（KV cache 增长会变），本就不该
@@ -31,6 +32,52 @@ from dataclasses import dataclass
 from math import prod
 
 
+@dataclass(frozen=True)
+class PIMHardwareConfig:
+    num_dpus: int
+    num_tasklets: int
+    mram_bytes_per_dpu: int
+    wram_bytes_per_dpu: int
+    dma_align: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "num_dpus",
+            "num_tasklets",
+            "mram_bytes_per_dpu",
+            "wram_bytes_per_dpu",
+            "dma_align",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive int, got {value!r}")
+        if self.num_dpus & (self.num_dpus - 1):
+            raise ValueError(f"num_dpus must be a power of two, got {self.num_dpus}")
+        if self.dma_align & (self.dma_align - 1):
+            raise ValueError(f"dma_align must be a power of two, got {self.dma_align}")
+
+    def to_payload(self) -> dict[str, int]:
+        return {
+            "num_dpus": self.num_dpus,
+            "num_tasklets": self.num_tasklets,
+            "mram_bytes_per_dpu": self.mram_bytes_per_dpu,
+            "wram_bytes_per_dpu": self.wram_bytes_per_dpu,
+            "dma_align": self.dma_align,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "PIMHardwareConfig":
+        if not isinstance(payload, dict):
+            raise ValueError(f"hardware payload must be a dict, got {type(payload).__name__}")
+        return cls(
+            num_dpus=int(payload["num_dpus"]),
+            num_tasklets=int(payload["num_tasklets"]),
+            mram_bytes_per_dpu=int(payload["mram_bytes_per_dpu"]),
+            wram_bytes_per_dpu=int(payload["wram_bytes_per_dpu"]),
+            dma_align=int(payload["dma_align"]),
+        )
+
+
 def flatten_leading_dims(shape: tuple[int, ...]) -> tuple[int, int]:
     """把一个 rank>=2 的 shape 按最后一维为 K、其余维展平成 M，返回 `(M, K)`。
 
@@ -50,6 +97,7 @@ def flatten_leading_dims(shape: tuple[int, ...]) -> tuple[int, int]:
 class OpCompileRequest:
     op: str
     arg_shapes: list[tuple[int, ...]]
+    hardware: PIMHardwareConfig
     # MRAM 里的存储 dtype（NumPy dtype 名，如 "float16"/"float32"），来自
     # `cmd.payload["dtype"]`。见模块 docstring 里为什么这个字段必须存在。
     dtype: str = "float32"

@@ -53,7 +53,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from contracts.op_contract import OpCompileRequest, OpCompileResult, flatten_leading_dims
+from contracts.op_contract import (
+    OpCompileRequest,
+    OpCompileResult,
+    PIMHardwareConfig,
+    flatten_leading_dims,
+)
 from genesim_bridge.paths import flagtree_pim_prefix, pim_options
 
 # 编译产物缓存目录：按 (op, arg_shapes) 的哈希分文件，同一 shape 只编译一次。
@@ -120,7 +125,7 @@ def _cache_key(request: OpCompileRequest) -> str:
     # 切成不同块数，同一 shape 不同 num_tasklets 生成的 C 代码结构不同。
     payload = (
         f"{request.op}:{request.arg_shapes}:{request.dtype}:"
-        f"{request.num_tasklets}"
+        f"{request.num_tasklets}:{request.hardware.to_payload()}"
     ).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -195,24 +200,7 @@ def _make_ttir(request: OpCompileRequest) -> str:
     return compiled.asm["ttir"]
 
 
-def _wram_budget(request: OpCompileRequest) -> int:
-    """本次 shape 下 `pim-explicit-dma` 需要的 WRAM 预算（字节）。
-
-    三个 tile：`x` 是 `M x BLOCK_K`、`w` 是 `BLOCK_N x BLOCK_K`、输出是
-    `M x BLOCK_N`，都是 float32。给一倍余量后向上取到 2 的幂，避免贴着边界。
-    """
-    from .kernel_src import pick_blocks
-
-    m, k = flatten_leading_dims(request.arg_shapes[0])
-    n = request.arg_shapes[1][0]
-    block_n, block_k = pick_blocks(k, n)
-    itemsize = 2 if request.dtype == "float16" else 4
-    needed = (m * block_k + block_n * block_k + m * block_n) * itemsize
-    budget = 1 << max(16, (needed * 2 - 1).bit_length())
-    return budget
-
-
-def _run_triton_opt(ttir: str, wram_bytes: int, num_tasklets: int) -> str:
+def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> str:
     """ttir 文本 -> 跑完 convert-triton-to-pim/pim-explicit-dma/
     pim-lower-to-emitc/convert-func-to-emitc 之后的 emitc 文本。
 
@@ -224,12 +212,8 @@ def _run_triton_opt(ttir: str, wram_bytes: int, num_tasklets: int) -> str:
     针对的是 Triton 侧未拆分的整个 M 行 tile（Triton kernel 本身没有
     tasklet 概念，`grid=(1,)`），发生在 `pim-lower-to-emitc` 之前。
 
-    `wram_bytes` 由调用方按本次 shape 的实际 tile 大小算出来传进来，而不是取
-    `pim_options()` 里的默认值：`pim-explicit-dma` 会对每个 `pim.wram_alloc`
-    检查是否超预算并报错，而 K 分块后 `w` 的 tile 是 `N x BLOCK_K x 4` 字节
-    （llama2-7b 的 N=512、BLOCK_K=64 就是 128KiB，超过默认的 64KiB）。这里
-    的预算只影响 `pim-explicit-dma` 的这条检查——numpy 后端上没有真实 WRAM，
-    见 docs/opcompiler_bridge-20260825.md。
+    硬件预算从 `request.hardware` 直接取，不能再由 shape 反推：
+    `pim-explicit-dma` 的预算检查必须与图层编译器给出的硬件契约一致。
     """
     opts = pim_options()
     triton_opt = _triton_opt()
@@ -250,7 +234,12 @@ def _run_triton_opt(ttir: str, wram_bytes: int, num_tasklets: int) -> str:
             str(triton_opt),
             ttir_path,
             f"-convert-triton-to-pim=target={opts['pim_target']} "
-            f"num-tasklets={num_tasklets} wram-bytes={wram_bytes}",
+            f"num-dpus={hardware.num_dpus} "
+            f"num-tasklets={hardware.num_tasklets} "
+            f"wram-bytes={hardware.wram_bytes_per_dpu} "
+            f"mram-bytes={hardware.mram_bytes_per_dpu} "
+            f"dma-align={hardware.dma_align}",
+            "-pim-tile-to-budget",
             "-pim-explicit-dma",
             "-pim-lower-to-emitc",
             "-convert-func-to-emitc",
@@ -330,7 +319,7 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
         )
 
     ttir = _make_ttir(request)
-    emitc_text = _run_triton_opt(ttir, _wram_budget(request), request.num_tasklets)
+    emitc_text = _run_triton_opt(ttir, request.hardware)
     c_source = _translate_to_c(emitc_text)
     symbol, argtypes = _parse_signature(c_source)
 
@@ -392,7 +381,11 @@ def _selftest() -> None:
     os.environ.setdefault("FLAGTREE_PIM_NUM_DPUS", "1")
     os.environ.setdefault("FLAGTREE_PIM_NUM_TASKLETS", "1")
 
-    request = OpCompileRequest(op="linear", arg_shapes=[(2, 16), (4, 16)])
+    request = OpCompileRequest(
+        op="linear",
+        arg_shapes=[(2, 16), (4, 16)],
+        hardware=PIMHardwareConfig(1, 1, 1 << 20, 64 * 1024, 4096),
+    )
     result = compile_op(request, force=True)
     print(f"compiled: {result}")
 

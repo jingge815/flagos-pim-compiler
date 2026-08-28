@@ -226,14 +226,19 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
         linear_kernel(hal, dpu_id, cmd)
         return
 
-    from contracts.op_contract import OpCompileRequest
+    from contracts.op_contract import OpCompileRequest, PIMHardwareConfig
     from opcompiler_bridge.driver import compile_op, load_kernel
 
-    num_tasklets = cmd.num_tasklets
-    # dtype 和 num_tasklets 都进 key：同 shape 的 f16/f32 产物元素宽度不同，
-    # 混用会静默算错；num_tasklets 不同时生成的 C 代码结构不同（外层 tid
-    # 循环的行区间切分依赖这个数字），也不能共享缓存。
-    key = ("linear", arg_shapes, dtype, num_tasklets)
+    hardware = PIMHardwareConfig.from_payload(cmd.payload["hardware"])
+    if cmd.num_tasklets != hardware.num_tasklets:
+        raise ValueError(
+            f"cmd.num_tasklets ({cmd.num_tasklets}) must match hardware.num_tasklets ({hardware.num_tasklets})"
+        )
+    num_tasklets = hardware.num_tasklets
+    # dtype、num_tasklets 和硬件字典都进 key：同 shape 的 f16/f32 产物元素宽度
+    # 不同，混用会静默算错；num_tasklets 不同时生成的 C 代码结构不同；硬件
+    # 配置不同时，编译产物需要满足的约束不同。
+    key = ("linear", arg_shapes, dtype, tuple(hardware.to_payload().items()))
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         # 缓存未命中才需要排队：多台 DPU 线程第一次同时遇到同一个新 shape 时，
@@ -245,8 +250,8 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
             if fn is None:
                 result = compile_op(
                     OpCompileRequest(
-                        op="linear", arg_shapes=list(arg_shapes), dtype=dtype,
-                        num_tasklets=num_tasklets,
+                        op="linear", arg_shapes=list(arg_shapes), hardware=hardware,
+                        dtype=dtype, num_tasklets=num_tasklets,
                     )
                 )
                 fn = load_kernel(result)

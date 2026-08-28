@@ -313,19 +313,25 @@ for n0 in range(0, N, BLOCK_N):
 | --- | --- | --- | --- |
 | 校验和构造 kernel | `_kernel_launcher` | `OpCompileRequest` | 固定 M/K/N 的 Triton launcher |
 | 生成 TTIR | `_make_ttir` | launcher 和 CUDA tensor | `compiled.asm["ttir"]` |
-| 计算 WRAM 预算 | `_wram_budget` | shape 和 dtype | `wram_bytes` |
-| 跑 FlagTree pass 链 | `_run_triton_opt` | TTIR 文本 | EmitC 方言文本 |
+| 跑 FlagTree pass 链 | `_run_triton_opt` | TTIR 文本、`request.hardware` | EmitC 方言文本 |
 | 翻译为 C | `_translate_to_c` | EmitC 文本 | C 源码 |
 | 解析 ABI | `_parse_signature` | C 源码 | 函数名和参数类型 |
 | 编译共享库 | `compile_op` 内部 | C 源码 | `.so` 和 `.meta` |
 | 加载共享库 | `load_kernel` | `OpCompileResult` | `ctypes` 函数对象 |
 
+WRAM/MRAM/DMA 预算不再由 `driver.py` 按 shape 反推（原来的 `_wram_budget`
+已删除）：`request.hardware`（`contracts/op_contract.py` 的
+`PIMHardwareConfig`，图层编译器显式传入）直接喂给
+`-convert-triton-to-pim` 的 `wram-bytes`/`mram-bytes`/`dma-align` 选项，新增的
+`-pim-tile-to-budget` pass（跑在 `-pim-explicit-dma` 之前）校验当前
+`kernel_src.py` 生成的 N/K tile 是否满足这三个预算，不满足直接编译期报错。
+
 缓存规则：
 
 | 缓存层 | key | 作用 |
 | --- | --- | --- |
-| 磁盘缓存 | `sha256(op,arg_shapes,dtype)` | 避免同 shape 重复跑 Triton、FlagTree、gcc |
-| 进程内缓存 | `(op,arg_shapes,dtype)` | 避免每次 launch 都重新 `dlopen` 和设置签名 |
+| 磁盘缓存 | `sha256(op,arg_shapes,dtype,num_tasklets,hardware)` | 避免同 shape+硬件配置重复跑 Triton、FlagTree、gcc |
+| 进程内缓存 | `(op,arg_shapes,dtype,hardware)` | 避免每次 launch 都重新 `dlopen` 和设置签名 |
 
 并发安全：
 
@@ -355,16 +361,37 @@ FlagTree/lib/Dialect/TritonPIM/Transforms/LowerPIMSingleTasklet.cpp
 
 ```mermaid
 flowchart TD
-    A["TTIR<br/>tt.load, tt.store, tt.dot"] --> B["convert-triton-to-pim"]
+    A["TTIR<br/>tt.load, tt.store, tt.dot"] --> B["convert-triton-to-pim<br/>num-dpus/num-tasklets/wram-bytes/<br/>mram-bytes/dma-align"]
     B --> C["PIM IR<br/>带 pim.dpu_id / pim.tasklet_id 等"]
-    C --> D["pim-explicit-dma"]
+    C --> C1["pim-tile-to-budget<br/>2026-08-27 新增"]
+    C1 --> D["pim-explicit-dma"]
     D --> E["PIM IR<br/>wram_alloc, dma_load, wram_load,<br/>tt.dot, wram_store, dma_store"]
-    E --> F["pim-lower-single-tasklet<br/>本次新增"]
+    E --> F["pim-lower-to-emitc"]
     F --> G["EmitC + func<br/>emitc.for, emitc.load, emitc.assign"]
     G --> H["convert-func-to-emitc"]
     H --> I["纯 EmitC"]
     I --> J["mlir-translate 生成 C"]
 ```
+
+`pim-tile-to-budget` 在 `pim-explicit-dma` 之前跑。先用前端已选的 tile
+（`kernel_src.py::pick_blocks` 选出的 `BLOCK_N`/`BLOCK_K`，M 不分块）校验是否
+满足 `pim.wram-bytes`/`pim.mram-bytes`/`pim.dma-align`：满足就直接写回
+`pim.tile-m/n/k`/`pim.tile-wram-bytes`，不改 IR。不满足时，pass 在 M/N/K 的
+2 的幂格点上做穷举搜索（不是贪心单路径收缩——贪心会在某一维缩到卡住 DMA
+对齐、其余维还没试过更小组合时提前宣告失败,漏掉本来存在的合法 tile),
+找到满足预算的最大（元素数最多）tile 后**整体重建**该 `tt.dot` 的 M/N/K
+分块循环嵌套（新的 `scf.for` + `tt.make_range`/`tt.expand_dims`/
+`tt.broadcast`/`tt.load`/`tt.dot`/`tt.store`，逐条对应 `kernel_src.py` 的
+算子序列，而不是另设一套写法),并删除被替换的旧循环嵌套及其独占的地址计算
+死代码（否则 `pim-explicit-dma` 会把这些死掉的 `tt.load`/`tt.store` 也计入
+WRAM 用量）。搜索和重写在 M/N/K 三个维度上是对称的——当前 `kernel_src.py`
+前端从不生成 M 循环（真实 llama2-7b decode 的 M 恒为 1），但 pass 本身按同一
+套逻辑处理 M，为以后放开 M>1 的 shape 做好准备，见
+`test/Dialect/TritonPIM/tile_to_budget_m_split.mlir`。两种情况（改写/不改写）
+下都找不到合法 tile 时直接编译期报错，`pim-explicit-dma` 发现
+`pim.wram-bytes-used` 超预算也是报错而非 warning。设计文档见
+`docs/superpowers/specs/2026-08-27-pim-budget-tiling-design.md`（该文档写的
+"第一期只做校验"描述的是更早一版实现，已经被这版的真实重写取代）。
 
 ### 6.2 pass 的输入和输出
 

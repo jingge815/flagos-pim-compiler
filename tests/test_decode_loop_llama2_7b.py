@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from comm.plan import build_comm_plan
 from contracts.graph_meta import SPEC_META_KEY
+from contracts.op_contract import PIMHardwareConfig
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import PIMStaticKVCache, kv_specs_from_placement
@@ -123,6 +124,18 @@ def llama2_decode_setup():
         num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    hardware = PIMHardwareConfig(
+        num_dpus=NUM_DPUS,
+        num_tasklets=4,
+        mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536,
+        # dma_align 是 WRAM tile 搬运的对齐要求，跟 hw.align（MRAM 里
+        # 张量摆放对齐，供 memory/mem_planner.py 用）是两个不同量级的概念，
+        # 不能共用同一个值——用 hw.align=1024 会让 kernel_src.py 编出的
+        # tile（几百到几万字节）几乎全部不整除，实测触发
+        # pim-tile-to-budget 的 DMA 对齐报错。
+        dma_align=64,
+    )
     prefill_nodes = list(prefill_gm.graph.nodes)
     decode_nodes = list(decode_gm.graph.nodes)
     plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw) for d in range(NUM_DPUS)}
@@ -148,10 +161,12 @@ def llama2_decode_setup():
 
     prefill_compiled = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
+        hardware=hardware,
         host_handler_of=make_host_handler(sdpa_layer_map(prefill_gm)),
     )
     decode_compiled = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
+        hardware=hardware,
         host_handler_of=make_host_handler(sdpa_layer_map(decode_gm)),
     )
 

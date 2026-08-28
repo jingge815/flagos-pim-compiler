@@ -28,6 +28,7 @@ import runtime.exec_plan_gen as exec_plan_gen_module
 from runtime.exec_plan_gen import build_execution_plan, overlap
 from runtime.kernels import register_all
 from contracts.exec_plan import Access
+from contracts.op_contract import PIMHardwareConfig
 from tests.test_spec_prop import _appendix_a_config, _appendix_a_graph
 
 
@@ -36,6 +37,16 @@ def _built_appendix_a():
     partition_graph(gm)
     edges = propagate_specs(gm, _appendix_a_config())
     return gm, nodes, edges
+
+
+def _hardware(num_tasklets=4):
+    return PIMHardwareConfig(
+        num_dpus=2,
+        num_tasklets=num_tasklets,
+        mram_bytes_per_dpu=1 << 16,
+        wram_bytes_per_dpu=65536,
+        dma_align=64,
+    )
 
 
 def _plan_and_compile(gm, edges, num_tasklets=4):
@@ -52,7 +63,10 @@ def _plan_and_compile(gm, edges, num_tasklets=4):
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
-    compiled = build_execution_plan(nodes, gm, entries_by_id, pending, num_tasklets=num_tasklets)
+    compiled = build_execution_plan(
+        nodes, gm, entries_by_id, pending, hardware=_hardware(num_tasklets),
+        num_tasklets=num_tasklets,
+    )
     return compiled, plans
 
 
@@ -118,7 +132,7 @@ def test_pending_readers_join_reader_cmds_so_war_deps_are_not_dropped() -> None:
     original = exec_plan_gen_module._war_waits
     exec_plan_gen_module._war_waits = counting_war_waits
     try:
-        build_execution_plan(graph_nodes, gm, entries_by_id, pending)
+        build_execution_plan(graph_nodes, gm, entries_by_id, pending, hardware=_hardware())
     finally:
         exec_plan_gen_module._war_waits = original
 
@@ -246,3 +260,111 @@ def test_build_execution_plan_stamps_num_tasklets_on_every_launch(num_tasklets) 
     launch_cmds = [c for c in compiled.plan.commands if c.op == "launch"]
     assert launch_cmds, "附录 A 图应该至少有一条 launch 命令（两层 Linear）"
     assert all(c.num_tasklets == num_tasklets for c in launch_cmds)
+
+
+def test_build_execution_plan_requires_explicit_hardware() -> None:
+    gm, _, edges = _built_appendix_a()
+    kv_specs = {
+        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
+                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+        for d in (0, 1)
+    }
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    graph_nodes = list(gm.graph.nodes)
+    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (0, 1)}
+    pending = {}
+    for plan in plans.values():
+        pending.update(plan.pending_readers_prefill)
+    entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
+
+    with pytest.raises(TypeError, match="hardware"):
+        build_execution_plan(graph_nodes, gm, entries_by_id, pending)
+
+
+def test_build_execution_plan_rejects_per_node_shard_count_mismatch() -> None:
+    gm, _, edges = _built_appendix_a()
+    kv_specs = {
+        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
+                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+        for d in (0, 1)
+    }
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    graph_nodes = list(gm.graph.nodes)
+    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (0, 1)}
+    pending = {}
+    for plan in plans.values():
+        pending.update(plan.pending_readers_prefill)
+    entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
+
+    with pytest.raises(ValueError, match="shard count"):
+        build_execution_plan(
+            graph_nodes, gm, entries_by_id, pending,
+            hardware=PIMHardwareConfig(
+                num_dpus=4,
+                num_tasklets=4,
+                mram_bytes_per_dpu=1 << 16,
+                wram_bytes_per_dpu=65536,
+                dma_align=64,
+            ),
+        )
+
+
+def test_build_execution_plan_stamps_hardware_payload_on_every_launch() -> None:
+    gm, _, edges = _built_appendix_a()
+    hardware = _hardware(num_tasklets=4)
+
+    compiled, _ = _plan_and_compile(gm, edges, num_tasklets=hardware.num_tasklets)
+
+    launch_cmds = [c for c in compiled.plan.commands if c.op == "launch"]
+    assert launch_cmds, "附录 A 图应该至少有一条 launch 命令（两层 Linear）"
+    assert all(c.payload["hardware"] == hardware.to_payload() for c in launch_cmds)
+
+
+def test_build_execution_plan_rejects_tasklet_mismatch() -> None:
+    gm, _, edges = _built_appendix_a()
+    kv_specs = {
+        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
+                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+        for d in (0, 1)
+    }
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    graph_nodes = list(gm.graph.nodes)
+    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (0, 1)}
+    pending = {}
+    for plan in plans.values():
+        pending.update(plan.pending_readers_prefill)
+    entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
+
+    with pytest.raises(ValueError, match="num_tasklets"):
+        build_execution_plan(
+            graph_nodes, gm, entries_by_id, pending, hardware=_hardware(num_tasklets=4),
+            num_tasklets=2,
+        )
+
+
+def test_build_execution_plan_rejects_dpu_count_mismatch() -> None:
+    gm, _, edges = _built_appendix_a()
+    kv_specs = {
+        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
+                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+        for d in (0, 1)
+    }
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    graph_nodes = list(gm.graph.nodes)
+    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (0, 1)}
+    pending = {}
+    for plan in plans.values():
+        pending.update(plan.pending_readers_prefill)
+    entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
+
+    with pytest.raises(ValueError, match="num_dpus"):
+        build_execution_plan(
+            graph_nodes, gm, entries_by_id, pending,
+            hardware=PIMHardwareConfig(
+                num_dpus=4,
+                num_tasklets=4,
+                mram_bytes_per_dpu=1 << 16,
+                wram_bytes_per_dpu=65536,
+                dma_align=64,
+            ),
+        )

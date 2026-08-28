@@ -65,6 +65,7 @@ from comm.lowering import DmaEngine, all_gather, all_reduce, all_to_all, scatter
 from comm.plan import CommPlanEntry
 from contracts.exec_plan import Access, Command, ExecutionPlan
 from contracts.graph_meta import DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, REDISTRIBUTE_META_KEY, SPEC_META_KEY
+from contracts.op_contract import PIMHardwareConfig
 
 _REDISTRIBUTE_OP = {
     "all_reduce": "host_reduce",
@@ -284,6 +285,7 @@ def build_execution_plan(
     comm_entries: dict[int, CommPlanEntry],
     pending_readers: dict[tuple, list[str]],
     *,
+    hardware: PIMHardwareConfig,
     kv_access_of: KvAccessFn | None = None,
     host_handler_of: HostHandlerFn | None = None,
     num_tasklets: int = 4,
@@ -294,16 +296,20 @@ def build_execution_plan(
     gm_root —— 该图的 `GraphModule`（取 `get_attr` 常量真实值用）；
     comm_entries —— `{edge_id: CommPlanEntry}`（问题 3 产物按 edge_id 建的
     索引）；pending_readers —— 该图对应的那份（问题 8 `DPUPlan
-    .pending_readers_prefill`/`_decode`）；num_tasklets —— 每个 DPU launch
-    命令内部按几个 tasklet 顺序模拟切分（默认 4，全图统一一个数字，见
-    `contracts/exec_plan.py::Command.num_tasklets` 的说明；不做 per-op
-    不同 tasklet 数，那需要代价模型才有意义，属于第 2 阶段范畴）。
+    .pending_readers_prefill`/`_decode`）；hardware —— 共享硬件契约，
+    每条 `launch` 命令都会写入 `payload["hardware"]`；num_tasklets —— 每个
+    DPU launch 命令内部按几个 tasklet 顺序模拟切分（默认 4，全图统一一个
+    数字，见 `contracts/exec_plan.py::Command.num_tasklets` 的说明；不做
+    per-op 不同 tasklet 数，那需要代价模型才有意义，属于第 2 阶段范畴）。
     出: CompiledPlan（`plan.commands` 按生成顺序即拓扑序排列）。
     """
+    if hardware.num_tasklets != num_tasklets:
+        raise ValueError(
+            f"hardware.num_tasklets ({hardware.num_tasklets}) must match num_tasklets ({num_tasklets})"
+        )
     builder = _PlanBuilder(gm_root, pending_readers)
     by_name = {n.name: n for n in nodes}
     output_cmd_id = -1
-
     for node in nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
@@ -330,6 +336,11 @@ def build_execution_plan(
 
         if node.meta.get(DEVICE_META_KEY) == DEVICE_DPU:
             spec = node.meta[SPEC_META_KEY]
+            if len(spec.shard_map) != hardware.num_dpus:
+                raise ValueError(
+                    f"hardware.num_dpus ({hardware.num_dpus}) must match "
+                    f"{node.name} shard count ({len(spec.shard_map)})"
+                )
             landing_by_src = {
                 e.src: e for e in node.meta.get(REDISTRIBUTE_META_KEY, [])
                 if e.dst_loc.get("device") == DEVICE_DPU
@@ -385,7 +396,7 @@ def build_execution_plan(
                     "launch", dpu_id,
                     {"kernel": str(node.target), "node": node.name, "arg_kinds": arg_kinds,
                      "arg_shapes": arg_shapes, "dtype": str(node.meta["val"].dtype).removeprefix("torch."),
-                     "out_shape": out_detail.local_shape},
+                     "out_shape": out_detail.local_shape, "hardware": hardware.to_payload()},
                     reads, [write] + kv_writes, waits,
                     num_tasklets=num_tasklets,
                 )
