@@ -8,14 +8,12 @@
 1. 环境变量（推荐，换机器不用改代码）：
 
        export FLAGTREE_PREFIX=/path/to/flagOS-installed/flagTree
-       export FLAGTREE_PIM_PREFIX=/path/to/flagOS-installed/flagTree-pim
        export GENESIM_ROOT=/path/to/genesim
 
 2. 配置文件 `paths.local.json`（放在本仓库根，已被 .gitignore 忽略）：
 
        {
          "flagtree_prefix": "/path/to/flagOS-installed/flagTree",
-         "flagtree_pim_prefix": "/path/to/flagOS-installed/flagTree-pim",
          "genesim_root": "/path/to/genesim"
        }
 
@@ -24,6 +22,17 @@
 换机器时首选方式 1 或 2，不要改 `_DEFAULTS`。
 
 PIM 硬件参数（`pim_*`）走同一套三层优先级，见 `pim_options()`。
+
+统一到单一 `flagTree` 安装（2026-08-29 起）：这台机器一度维护过两份独立
+FlagTree 安装——`flagTree`（普通，供 opcompiler_bridge/PyTorch 环境用）和
+`flagTree-pim`（裸 venv，只为 PIM pass 支持存在）。当时 pytorch 环境自带的
+triton 没有 PIM pass，才需要切到 `flagTree-pim`。这个前提已经不成立：
+`flagTree` 重新编译后已经把带 PIM pass 的 `libtriton.so`/`pim_sidecar.py`/
+nvidia backend 同步进了 pytorch 环境（`0-install-flagtree.sh` 的
+`sync_triton_to_pytorch`），任何时候 `import triton` 都自带 PIM 支持
+（`--pim-tile-to-budget` 等 pass 也在内），不再需要维护第二份独立安装、也不
+再需要运行时切换 `sys.path`。`flagtree_pim_prefix()` 等函数已删除，
+`genesim_bridge/env.py::prepare_triton_env` 不再做实际切换。
 """
 
 from __future__ import annotations
@@ -31,6 +40,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+
+from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
 
 # 本仓库根（flagos-pim-compiler/），由文件位置推出，不需要配置
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,31 +51,30 @@ _CONFIG_FILE = REPO_ROOT / "paths.local.json"
 # 兜底默认值：当前开发机实测路径。优先用环境变量或 paths.local.json 覆盖。
 _DEFAULTS = {
     "flagtree_prefix": "/media/disk/fengjingge/src/flagOS/flagOS-installed/flagTree",
-    "flagtree_pim_prefix": "/media/disk/fengjingge/src/flagOS/flagOS-installed/flagTree-pim",
     "genesim_root": "/media/disk/fengjingge/src/genesim",
 }
 
 # 环境变量名 ← 配置键
 _ENV_VARS = {
     "flagtree_prefix": "FLAGTREE_PREFIX",
-    "flagtree_pim_prefix": "FLAGTREE_PIM_PREFIX",
     "genesim_root": "GENESIM_ROOT",
 }
 
-# triton nvidia backend 的相对位置（cuda.h 与 ptxas 所在）。两份 flagTree 安装
-# 的 python 环境布局不同：非 PIM 那份装在 `python/`，PIM 那份装在 `venv/`。
+# triton nvidia backend 的相对位置（cuda.h 与 ptxas 所在）。
 _NVIDIA_BACKEND_SUBPATH = "python/lib/python3.10/site-packages/triton/backends/nvidia"
-_PIM_SITE_PACKAGES_SUBPATH = "venv/lib/python3.10/site-packages"
 
-# PIM 硬件参数默认值。与 FlagTree 的 convert-triton-to-pim pass 选项、
-# pim_sidecar.py 的 DEFAULT_* 保持一致，改这里等于换 pass 的输入参数。
-# 实测这几个值当前不影响产物（FlagGems 的 tile 由 GPU autotune 定，PIM pass
-# 不重切），但仍要记进 sidecar：换硬件配置时它们是唯一的溯源依据。
+# PIM 硬件参数默认值。数值来源统一为 contracts/op_contract.py::DEFAULT_HARDWARE_CONFIG
+# ——图编译器的权威硬件配置，不再在这里独立写一份字面量。
+# mram_bytes/dma_align 曾经不影响产物（FlagGems 的 tile 由 GPU autotune 定，
+# PIM pass 不重切），但 add_tile_to_budget 接入后（见 flagtree_driver.py）会真正
+# 按这两个值选 tile，因此现在必须给真实值。
 _PIM_DEFAULTS = {
     "pim_target": "pim:v1",
     "pim_num_dpus": 1,
-    "pim_num_tasklets": 16,
-    "pim_wram_bytes": 65536,
+    "pim_num_tasklets": DEFAULT_HARDWARE_CONFIG.num_tasklets,
+    "pim_wram_bytes": DEFAULT_HARDWARE_CONFIG.wram_bytes_per_dpu,
+    "pim_mram_bytes": DEFAULT_HARDWARE_CONFIG.mram_bytes_per_dpu,
+    "pim_dma_align": DEFAULT_HARDWARE_CONFIG.dma_align,
 }
 
 _PIM_ENV_VARS = {
@@ -72,6 +82,8 @@ _PIM_ENV_VARS = {
     "pim_num_dpus": "FLAGTREE_PIM_NUM_DPUS",
     "pim_num_tasklets": "FLAGTREE_PIM_NUM_TASKLETS",
     "pim_wram_bytes": "FLAGTREE_PIM_WRAM_BYTES",
+    "pim_mram_bytes": "FLAGTREE_PIM_MRAM_BYTES",
+    "pim_dma_align": "FLAGTREE_PIM_DMA_ALIGN",
 }
 
 
@@ -99,36 +111,13 @@ def _resolve(key: str) -> Path:
 
 
 def flagtree_prefix() -> Path:
-    """flagTree 安装根目录。"""
+    """flagTree 安装根目录（唯一安装，带 PIM pass 支持）。"""
     return _resolve("flagtree_prefix")
 
 
 def flagtree_nvidia_backend() -> Path:
     """flagTree 里 triton 的 nvidia backend 目录（含 include/cuda.h 与 bin/ptxas）。"""
     return flagtree_prefix() / _NVIDIA_BACKEND_SUBPATH
-
-
-def flagtree_pim_prefix() -> Path:
-    """带 PIM 支持的 flagTree 安装根目录。
-
-    与 `flagtree_prefix()` 是两份独立安装：只有这一份的 `libtriton.so` 里有
-    `convert-triton-to-pim` / `pim-explicit-dma`，pytorch env 里那份没有。
-    """
-    return _resolve("flagtree_pim_prefix")
-
-
-def flagtree_pim_site_packages() -> Path:
-    """PIM 安装的 site-packages（前插 sys.path 即可让 `import triton` 拿到 PIM 版）。"""
-    return flagtree_pim_prefix() / _PIM_SITE_PACKAGES_SUBPATH
-
-
-def flagtree_pim_nvidia_backend() -> Path:
-    """PIM 安装里 triton 的 nvidia backend 目录。
-
-    切到 PIM triton 时 cuda.h / ptxas 必须取**同一份安装**的，混用两份安装的
-    头文件与 triton 二进制会在 driver 初始化编 cuda_utils.c 时炸。
-    """
-    return flagtree_pim_site_packages() / "triton" / "backends" / "nvidia"
 
 
 def pim_options() -> dict:

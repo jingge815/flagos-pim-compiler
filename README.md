@@ -37,19 +37,20 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20。每个新 shell 都要先 s
 
 ### 站点相关路径
 
-`genesim_bridge` 需要知道两份 flagTree 安装与 GeneSim 仓库的位置——成本从
-pim mlir 抽时要用带 PIM 支持的那份（普通 flagTree 安装的 `libtriton.so` 里
-没有 PIM pass）。默认值是当前开发机路径，换机器时**不要改代码**，用环境变量
-或配置文件覆盖：
+`genesim_bridge` 需要知道 flagTree 安装与 GeneSim 仓库的位置。统一到单一
+`flagTree` 安装（2026-08-29 起）：这份安装重新编译后，已经把带 PIM pass 的
+`libtriton.so`/`pim_sidecar.py`/nvidia backend 同步进了 pytorch 环境
+（`0-install-flagtree.sh::sync_triton_to_pytorch`），任何时候 `import triton`
+都自带 PIM 支持，不再需要维护第二份独立的 `flagTree-pim` 安装。默认值是当前
+开发机路径，换机器时**不要改代码**，用环境变量或配置文件覆盖：
 
 ```bash
 # 方式 1：环境变量
 export FLAGTREE_PREFIX=/path/to/flagOS-installed/flagTree
-export FLAGTREE_PIM_PREFIX=/path/to/flagOS-installed/flagTree-pim
 export GENESIM_ROOT=/path/to/genesim
 
 # 方式 2：仓库根建 paths.local.json（已被 .gitignore 忽略）
-echo '{"flagtree_prefix": "...", "flagtree_pim_prefix": "...", "genesim_root": "..."}' > paths.local.json
+echo '{"flagtree_prefix": "...", "genesim_root": "..."}' > paths.local.json
 ```
 
 PIM pass 的硬件参数（`FLAGTREE_PIM_TARGET` / `_NUM_DPUS` / `_NUM_TASKLETS` /

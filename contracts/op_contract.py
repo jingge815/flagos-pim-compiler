@@ -78,6 +78,19 @@ class PIMHardwareConfig:
         )
 
 
+# 全仓唯一的硬件参数权威来源。8 DPU、单台 MRAM ≤8GB 是方案既定约束
+# （与 tests/test_executor_llama2_7b.py 等的 NUM_DPUS=8 一致）。genesim_bridge
+# 的 pim_options()、opcompiler_bridge 的 selftest 都应从这里派生，不再各自
+# 硬编码一份默认值。
+DEFAULT_HARDWARE_CONFIG = PIMHardwareConfig(
+    num_dpus=8,
+    num_tasklets=16,
+    mram_bytes_per_dpu=8 * 2**30,
+    wram_bytes_per_dpu=65536,
+    dma_align=8,
+)
+
+
 def flatten_leading_dims(shape: tuple[int, ...]) -> tuple[int, int]:
     """把一个 rank>=2 的 shape 按最后一维为 K、其余维展平成 M，返回 `(M, K)`。
 

@@ -38,6 +38,13 @@ from .paths import pim_options
 
 SIDECAR_VERSION = "1.1"
 
+# 交叉验证探针（融合 flash attention）专用的 WRAM 预算。真实硬件是 64KiB
+# （contracts/op_contract.py::DEFAULT_HARDWARE_CONFIG.wram_bytes_per_dpu），
+# 融合 kernel 实测要 131584 B——放不进去正是 GeneSim 把 attention 拆成 96 个
+# 分离算子的原因。这里取 256KiB（大于实测值、仍是 2 的幂）只为让对照量测得
+# 出来，不代表任何硬件假设，也不参与真实算子的成本提取。见 `_cross_validate`。
+_PROBE_WRAM_BYTES = 256 * 1024
+
 
 @dataclass
 class Measurement:
@@ -137,6 +144,13 @@ def _pim_kernel_dict(cost) -> Dict[str, Any]:
         # （doc 9.5），比值低说明 PIM 后端能利用的 DMA 信息有限
         "dma_ops_with_proven_layout": cost.dma_ops_with_layout,
         "loop_trip_counts": cost.loop_trip_counts,
+        # add_tile_to_budget 接入后新增：真实硬件预算与按预算选出的 tile。
+        "mram_bytes_budget": cost.mram_bytes_budget,
+        "dma_align": cost.dma_align,
+        "tile_m": cost.tile_m,
+        "tile_n": cost.tile_n,
+        "tile_k": cost.tile_k,
+        "tile_wram_bytes": cost.tile_wram_bytes,
     }
 
 
@@ -411,16 +425,43 @@ def _cross_validate(
 
     FlagGems 实跑 attention 走的是融合 flash_fwd，而 GeneSim 图骨架要求
     96 个分离算子。代表实现（bmm/softmax）成本之和应与融合 kernel 同量级。
+
+    **这个探针必须放宽两个 PIM 约束**，否则 pimir 层根本降不下来（实测报
+    `PassManager::run failed`，sidecar 里只剩一条 error）：
+
+    - `tile_to_budget=False`：`flash_fwd_splitkv_kernel` 有 4 个 `tt.dot`
+      （QK^T 与 PV 两段串在一条 online-softmax 链上），不是
+      `pim-tile-to-budget` 假设的「单个线性算子」，跑它只得到
+      `could not infer the linear tile shape`。
+    - `wram_bytes=_PROBE_WRAM_BYTES`：融合 kernel 的 WRAM staging 实测
+      131584 B，超过真实硬件 65536 B 预算，而 `pim-explicit-dma` 超预算时
+      直接 `signalPassFailure()`。
+
+    放宽只作用于这个对照探针，不影响 3200 个真实算子的测量——它们各自单独
+    调 `run_and_capture`，用的是 `pim_options()` 里的真实硬件参数。而且
+    「融合 kernel 塞不进单个 DPU 的 WRAM」这个结论本身就是已知的，正是
+    GeneSim 把 attention 拆成 96 个分离算子的原因；这里要的只是 flops 与
+    MRAM 搬运量的量级对照，实测这两个值不随 WRAM 预算变化。
     """
     result: Dict[str, Any] = {
         "note": "FlagGems 实跑 attention 为融合 flash 路径；"
                 "此处记录融合 kernel 的单层全 head 成本，供与代表实现求和对照",
     }
     pimir = ir_level == "pimir"
+    if pimir:
+        result["probe_relaxations"] = {
+            "wram_bytes": _PROBE_WRAM_BYTES,
+            "tile_to_budget": False,
+            "why": "融合 flash kernel 有 4 个 tt.dot 且 WRAM staging 131584 B "
+                   "超过真实预算 65536 B；放宽仅用于取 flops/MRAM 量级对照，"
+                   "不影响真实算子的测量",
+        }
     for name, point in (("prefill", prefill_point), ("decode", decode_point)):
         try:
             captured = run_and_capture(
-                flash_attention_probe(dims, point), emit_pimir=pimir
+                flash_attention_probe(dims, point), emit_pimir=pimir,
+                tile_to_budget=False,
+                wram_bytes=_PROBE_WRAM_BYTES if pimir else None,
             )
         except Exception as exc:                     # noqa: BLE001
             result[name] = {"error": f"{type(exc).__name__}: {exc}"}

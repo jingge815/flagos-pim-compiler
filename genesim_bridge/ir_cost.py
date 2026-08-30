@@ -116,6 +116,16 @@ class KernelCost:
     wram_buffers: List[WramBuffer] = field(default_factory=list)
     dma_ops: int = 0
     dma_ops_with_layout: int = 0                 # 指针分析证明了 stride 的那些
+    # add_tile_to_budget 接入后新增：真实硬件预算 + 按预算选出的 tile 形状。
+    # mram_bytes_budget/dma_align 是传给 convert-triton-to-pim 的硬件契约本身
+    # （module 属性 pim.mram-bytes/pim.dma-align）；tile_m/n/k/wram_bytes 是
+    # pim-tile-to-budget 按该预算算出的选择（module 属性 pim.tile-*）。
+    mram_bytes_budget: Optional[int] = None
+    dma_align: Optional[int] = None
+    tile_m: Optional[int] = None
+    tile_n: Optional[int] = None
+    tile_k: Optional[int] = None
+    tile_wram_bytes: Optional[int] = None
 
 
 def _tensor_numel(dims: str) -> int:
@@ -355,6 +365,12 @@ def analyze_ir(
     cost.dma_ops_with_layout = dma_ops_with_layout
     cost.wram_bytes_used = _module_int_attr(text, "pim.wram-bytes-used")
     cost.wram_bytes_budget = _module_int_attr(text, "pim.wram-bytes")
+    cost.mram_bytes_budget = _module_int_attr(text, "pim.mram-bytes")
+    cost.dma_align = _module_int_attr(text, "pim.dma-align")
+    cost.tile_m = _module_int_attr(text, "pim.tile-m")
+    cost.tile_n = _module_int_attr(text, "pim.tile-n")
+    cost.tile_k = _module_int_attr(text, "pim.tile-k")
+    cost.tile_wram_bytes = _module_int_attr(text, "pim.tile-wram-bytes")
 
     assert dma_ops, f"{kernel_name} 的 pim mlir 里没有 pim.dma_*，pass 可能没生效"
     # 超预算时 pim-explicit-dma 只发 warning、不重切 tile（doc 15.3），

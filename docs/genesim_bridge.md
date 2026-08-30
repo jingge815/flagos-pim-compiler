@@ -13,7 +13,7 @@ ModelIR。对应 `spec.md:829` 问题 4。GeneSim 与 FlagTree 源码均零改�
 from genesim_bridge import (
     prepare_triton_env, assert_pim_passes_available, export_costs_to_genesim)
 
-prepare_triton_env(pim=True)         # 必须在 import triton / flag_gems 之前
+prepare_triton_env(pim=True)         # 补 cuda.h / ptxas；pim 参数保留仅为兼容旧调用方签名
 assert_pim_passes_available()        # pimir 路专用，缺 PIM pass 直接抛
 sidecar = export_costs_to_genesim(
     ir_path=Path("models/llama2_7b.ir"),          # GeneSim 图骨架（输入）
@@ -29,8 +29,8 @@ sidecar = export_costs_to_genesim(
 
 | 模块 | 职责 |
 | --- | --- |
-| `paths.py` | 两份 flagTree 安装路径 + PIM pass 硬件参数（唯一允许绝对路径处） |
-| `env.py` | 补 `CPATH` / `TRITON_PTXAS_PATH`；`pim=True` 时切到 PIM triton 安装 |
+| `paths.py` | 单一 flagTree 安装路径 + PIM pass 硬件参数（唯一允许绝对路径处） |
+| `env.py` | 补 `CPATH` / `TRITON_PTXAS_PATH`（2026-08-29 起不再需要切换 triton 安装，见下） |
 | `flagtree_driver.py` | 包 `LibEntry.run` 捕获 grid + TTIR + 实参；就地降 pim mlir |
 | `ir_cost.py` | 解析 TTIR / pim mlir 得 flops、dtype、`mram_traffic_bytes` |
 | `op_classify.py` | op_type ↔ FlagGems 代表实现 + shape 构造 |
@@ -62,13 +62,17 @@ padding 开销达 159 倍。无约束两点解会给出负斜率，在 Tq=512 �
 FlagGems 命中自身 kernel_cache 后直接 `kernel[grid](...)` 发射，不再经过
 `JITFunction.run`；在那一层挂钩子会漏掉所有热路径 launch（实测捕获 0 个）。
 
-**6. pim mlir 靠 `sys.path` 前插切安装，不装 wheel、不改 FlagTree。**
-pytorch env 里那份 triton 的 `libtriton.so` **没有** PIM 支持（0 个
-`convert-triton-to-pim` 符号，也没有 `backends/pim_sidecar.py`）；带 PIM 的
-`flagTree-pim` 安装是个裸 venv、没有 torch / flag_gems。两个 wheel 只差 5 个
-文件。把 PIM 安装的 site-packages 前插 `sys.path` 后三者共存正常（实测 torch
-2.9.1 + CUDA + flag_gems 全通）。`TRITON_CACHE_DIR` 必须隔离——两份 triton 的
-kernel 二进制不可互换。
+**6.（历史，2026-08-29 起不再适用）pim mlir 靠 `sys.path` 前插切安装。**
+早期 pytorch env 里那份 triton 的 `libtriton.so` **没有** PIM 支持（0 个
+`convert-triton-to-pim` 符号，也没有 `backends/pim_sidecar.py`），只能靠
+`prepare_triton_env(pim=True)` 把独立的 `flagTree-pim` 裸 venv 前插
+`sys.path` 来借用它的 PIM triton（torch/flag_gems 仍从 pytorch env 解析）。
+现在统一到单一 `flagTree` 安装：重新编译后用
+`0-install-flagtree.sh::sync_triton_to_pytorch` 把带 PIM pass 的
+`libtriton.so`/`pim_sidecar.py`/nvidia backend 直接同步进了 pytorch 环境，
+任何时候 `import triton` 都自带 PIM 支持，不再需要维护第二份安装或运行时
+切换 `sys.path`——`flagTree-pim` 已删除，`flagtree_pim_prefix()` 等函数已
+从 `paths.py` 移除，`prepare_triton_env` 的 `pim` 参数只保留向后兼容签名。
 
 **7. pim mlir 从捕获到的 TTIR 文本就地降，不读 `pim_sidecar` dump 的 `.pimir`。**
 三个理由：不依赖 `FLAGTREE_EMIT_PIM` / `TRITON_DUMP_DIR`；不依赖编译缓存

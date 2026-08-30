@@ -54,12 +54,13 @@ import tempfile
 from pathlib import Path
 
 from contracts.op_contract import (
+    DEFAULT_HARDWARE_CONFIG,
     OpCompileRequest,
     OpCompileResult,
     PIMHardwareConfig,
     flatten_leading_dims,
 )
-from genesim_bridge.paths import flagtree_pim_prefix, pim_options
+from genesim_bridge.paths import flagtree_prefix, pim_options
 
 # 编译产物缓存目录：按 (op, arg_shapes) 的哈希分文件，同一 shape 只编译一次。
 # 与 pim_sidecar/genesim 的缓存目录分开，理由同它们互相分开——不同 pass 链的
@@ -103,19 +104,20 @@ def _torch_dtypes() -> dict:
 def _triton_opt() -> Path:
     """带 `pim-lower-to-emitc` 的 `triton-opt`。
 
-    可用 `OPCOMPILER_TRITON_OPT` 覆盖。默认指向 `flagTree-pim` 安装里的构建
-    目录——注意这台机器上还有一份 `FlagTree-back/build-pim` 构建树，改了 pass
-    源码后**两份都要重新 `ninja bin/triton-opt`**，否则这里用到的是旧二进制、
-    症状是报一个源码里已经不存在的错误（踩过一次）。
+    可用 `OPCOMPILER_TRITON_OPT` 覆盖。默认指向 `flagTree` 安装里的构建
+    目录（2026-08-29 起统一到单一安装，不再是独立的 `flagTree-pim`——见
+    `genesim_bridge/paths.py` 模块 docstring）。改了 pass 源码后要重新跑
+    `0-install-flagtree.sh` 才会拿到新二进制，否则这里用到的是旧的、症状是
+    报一个源码里已经不存在的错误（踩过一次）。
     """
     override = os.environ.get("OPCOMPILER_TRITON_OPT")
     if override:
         return Path(override)
-    return flagtree_pim_prefix() / "build" / "flagtree-cmake" / "bin" / "triton-opt"
+    return flagtree_prefix() / "build" / "flagtree-cmake" / "bin" / "triton-opt"
 
 
 def _mlir_translate() -> Path:
-    return flagtree_pim_prefix() / "llvm-7d5de303" / "bin" / "mlir-translate"
+    return flagtree_prefix() / "llvm-7d5de303" / "bin" / "mlir-translate"
 
 
 def _cache_key(request: OpCompileRequest) -> str:
@@ -376,6 +378,7 @@ def _selftest() -> None:
     在接入 runtime/kernels.py 之前先跑这个，隔离"编译产物本身对不对"和
     "跟执行器接线对不对"两类问题。
     """
+    import dataclasses
     import numpy as np
 
     os.environ.setdefault("FLAGTREE_PIM_NUM_DPUS", "1")
@@ -384,7 +387,9 @@ def _selftest() -> None:
     request = OpCompileRequest(
         op="linear",
         arg_shapes=[(2, 16), (4, 16)],
-        hardware=PIMHardwareConfig(1, 1, 1 << 20, 64 * 1024, 4096),
+        hardware=dataclasses.replace(
+            DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1, mram_bytes_per_dpu=1 << 20
+        ),
     )
     result = compile_op(request, force=True)
     print(f"compiled: {result}")

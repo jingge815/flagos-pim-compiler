@@ -320,9 +320,13 @@ def test_refined_ir_preserves_structure(refined_name):
 
     assert ref["dependencies"] == base["dependencies"]
     assert ref["subgraphs"] == base["subgraphs"]
-    # ModelIR.to_dict() 丢这两个字段，故走原始 JSON 改写
-    assert ref["max_seq"] == base["max_seq"]
-    assert ref["vocab_size"] == base["vocab_size"]
+    # ModelIR.to_dict() 丢这两个字段，故走原始 JSON 改写；但这两个字段本身只
+    # 存在于 GPT-2 builtin IR（scripts/generate_builtin_gpt2_ir.py），llama2
+    # 的 build_from_hf_config 产物顶层没有，只在两侧都有时才比较。
+    if "max_seq" in base:
+        assert ref["max_seq"] == base["max_seq"]
+    if "vocab_size" in base:
+        assert ref["vocab_size"] == base["vocab_size"]
 
     assert len(ref["operators"]) == len(base["operators"])
     for new_op, old_op in zip(ref["operators"], base["operators"]):
