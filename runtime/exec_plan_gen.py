@@ -336,10 +336,19 @@ def build_execution_plan(
 
         if node.meta.get(DEVICE_META_KEY) == DEVICE_DPU:
             spec = node.meta[SPEC_META_KEY]
-            if len(spec.shard_map) != hardware.num_dpus:
+            # 分片数可以少于 num_dpus：流水切分下一个张量只落在本 stage 的
+            # tp_width 台上，不是全部 DPU 上都有一份（张量并行下两者相等）。
+            # 仍然校验「不超过总台数」与「每个编号合法」——越界的 dpu_id 会让
+            # 下游按不存在的地址空间生成命令。
+            if not spec.shard_map or len(spec.shard_map) > hardware.num_dpus:
                 raise ValueError(
-                    f"hardware.num_dpus ({hardware.num_dpus}) must match "
-                    f"{node.name} shard count ({len(spec.shard_map)})"
+                    f"{node.name} shard count ({len(spec.shard_map)}) must be in "
+                    f"[1, hardware.num_dpus={hardware.num_dpus}]"
+                )
+            if any(not 0 <= dpu_id < hardware.num_dpus for dpu_id in spec.shard_map):
+                raise ValueError(
+                    f"{node.name} shard_map 含越界 dpu_id: {sorted(spec.shard_map)}，"
+                    f"hardware.num_dpus={hardware.num_dpus}"
                 )
             landing_by_src = {
                 e.src: e for e in node.meta.get(REDISTRIBUTE_META_KEY, [])

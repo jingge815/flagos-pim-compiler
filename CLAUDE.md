@@ -22,10 +22,10 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 | 目录              | 内容                                                                                                                            | 问题 |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---- |
 | `contracts/`      | `PIMTensorSpec` / `ExecutionPlan` / `node.meta` 字段约定——全仓唯一真源                                                        | 共用 |
-| `graph/`          | `partition.py` 图拆分打标、`spec_prop.py` 切分传播 + redistribute 标注                                                          | 1、2 |
+| `graph/`          | `partition.py` 图拆分打标、`strategy.py` 切分策略（TP/PP/混合）、`spec_prop.py` 切分传播 + redistribute 标注                    | 1、2 |
 | `comm/`           | `plan.py` 编译期通信计划表、`lowering.py` 运行时 redistribute→DMA                                                              | 3    |
 | `memory/`         | `kv_layout.py` KV 布局 + runtime、`mem_planner.py` 三区 offset 规划                                                             | 7、8 |
-| `runtime/`        | `exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                                                            | 6    |
+| `runtime/`        | `compile.py` 统一编译入口（模型+策略→蓝图）、`exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                | 6    |
 | `backend/`        | `dpu_sdk.py` 厂商 SDK（pre-g-driver-api）的 numpy 镜像 / `hal_numpy.py` 异步 HAL（存储架在 dpu_sdk 上）/ `hal_vendor.py` 真硬件 | 底座 |
 | `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                                                                 | 4    |
 | `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                                                                          | 验证 |

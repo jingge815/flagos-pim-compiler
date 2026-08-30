@@ -79,7 +79,7 @@ def kv_specs(llama2_two_graphs):
     ]
     return kv_specs_from_placement(
         k_proj.meta[SPEC_META_KEY],
-        num_layers=cfg.num_hidden_layers,
+        layers=list(range(cfg.num_hidden_layers)),
         num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads,
         head_dim=head_dim,

@@ -100,8 +100,14 @@ def make_sdpa_handler(layer: int, kv_specs, state: DecodeState, np_dtype: np.dty
     出: `handler(hal, cmd, args, kwargs) -> np.ndarray`，`args` =
     `(q, k, v, mask)`（`exec_plan_gen` 已解析成具体 numpy/torch 值）。
     """
+    # 只看持有**本层**的 DPU：流水切分下同一个 KV head 在不同层归属不同 DPU
+    # （每个 stage 为自己那几层各存一份 KV），不按层过滤就会被后写的 stage 覆盖，
+    # 于是读到别的 stage 的 KV 区——数值全错且不报错。张量并行下每台 DPU 都持有
+    # 全部层，过滤条件恒真，与推广之前等价。
     dpu_of_head: dict[int, int] = {}
     for dpu_id, spec in kv_specs.items():
+        if layer not in spec.layers:
+            continue
         for head in spec.kv_heads:
             dpu_of_head[head] = dpu_id
 
@@ -118,9 +124,12 @@ def make_sdpa_handler(layer: int, kv_specs, state: DecodeState, np_dtype: np.dty
         # 本步新算的 K/V 写入 KV 区：一次写 tq 个位置（prefill 一次写整段
         # 提示词，decode 每步写 1 个新 token），逐位置调用 update（接口按
         # 单步定义，这里循环覆盖 prefill 的多位置写入）。
+        # 只喂持有本层的 DPU（与 `PIMStaticKVCache.update` 的过滤一致）：流水下
+        # 别的 stage 的 DPU 没有本层的 KV 区。
+        owners = {dpu_id: spec for dpu_id, spec in kv_specs.items() if layer in spec.layers}
         for t in range(tq):
-            k_by_dpu = {dpu_id: {h: k[0, h, t] for h in spec.kv_heads} for dpu_id, spec in kv_specs.items()}
-            v_by_dpu = {dpu_id: {h: v[0, h, t] for h in spec.kv_heads} for dpu_id, spec in kv_specs.items()}
+            k_by_dpu = {dpu_id: {h: k[0, h, t] for h in spec.kv_heads} for dpu_id, spec in owners.items()}
+            v_by_dpu = {dpu_id: {h: v[0, h, t] for h in spec.kv_heads} for dpu_id, spec in owners.items()}
             cache.update(layer, pos + t, k_by_dpu, v_by_dpu)
 
         valid_len = pos + tq  # 写完这一步后，历史可读到的有效长度

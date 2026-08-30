@@ -79,7 +79,7 @@ def kv_specs(annotated_llama2):
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     specs = kv_specs_from_placement(
         _weight_spec(gm, "layers.0.self_attn.k_proj.weight"),
-        num_layers=cfg.num_hidden_layers,
+        layers=list(range(cfg.num_hidden_layers)),
         num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads,
         head_dim=head_dim,

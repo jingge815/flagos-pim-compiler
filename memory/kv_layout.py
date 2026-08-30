@@ -3,8 +3,15 @@
 编译期（图层编译器一侧）：`KVRegionSpec` 记录单台 DPU 持有哪些层、哪些 KV head；
 `build_kv_layout` 按 max_seq 把 KV 区切成定长 [max_seq, head_dim] 子块、算死每块
 MRAM offset，产出含对齐 padding 的真实占用 `kv_allocated_bytes` 喂问题 8（方案三.②）。
-`kv_bytes` 只是未对齐下界估算，不作分配依据。`kv_specs_from_placement` 从问题 2 的
-k_proj 切分结果推出每台 DPU 驻留的 (layer, kv_head)——KV 按 head 切是硬约束（三.①）。
+`kv_bytes` 只是未对齐下界估算，不作分配依据。`kv_specs_from_strategy` 按切分策略
+定「每台 DPU 持有哪些层 × 哪些 head」：head 划分从问题 2 的 k_proj 切分结果推出
+（KV 按 head 切是硬约束，三.①），层划分来自策略的 stage 划分——张量并行下每台
+DPU 持有全部层、只持自己那几个 head；流水并行下只持本 stage 那几层、但持全部 head。
+
+**单台 DPU 的 KV 占用与策略无关**（实测）：`层数/num_stages × head数/tp_width`
+里 `num_stages × tp_width == num_dpus`，两项相乘恒为 `总量/num_dpus`。流水改变的是
+KV 的**切法**（按层切 vs 按 head 切），不是每台的总量——不要按「流水能省 KV」来
+理解。
 
 运行时（编排器一侧，问题 6 调用）：`PIMStaticKVCache` 无内部序列指针，读写位置由
 编排器 `DecodeState.valid_len` 显式传入（唯一真值源，方案三.④）；追加与读取全部落在
@@ -113,7 +120,7 @@ def build_kv_layout(spec: KVRegionSpec, align: int) -> KVRegionSpec:
 def kv_specs_from_placement(
     k_proj_spec: PIMTensorSpec,
     *,
-    num_layers: int,
+    layers: list[int],
     num_kv_heads: int,
     num_q_heads: int,
     head_dim: int,
@@ -123,13 +130,19 @@ def kv_specs_from_placement(
 ) -> dict[int, KVRegionSpec]:
     """从问题 2 的 k_proj 切分结果推出每台 DPU 的 KVRegionSpec——KV 跟着 head 切（方案问题 7 三.①）。
 
-    入: k_proj_spec —— 任一层 self_attn.k_proj.weight 的 PIMTensorSpec（第 1 阶段
-        Megatron 列切 Shard(0) 且各层切法一致）；num_* / head_dim 取自模型 config；
-        kv_base 来自问题 8 的 plan.kv_base（规划前可先填 0 做容量粗估）。
+    入: k_proj_spec —— 某一层 self_attn.k_proj.weight 的 PIMTensorSpec（Megatron
+        列切 Shard(0)）；layers —— 这批 DPU 持有哪些层的 KV（张量并行下是全部层，
+        流水并行下是本 stage 的那几层，由 `kv_specs_from_strategy` 传入）；
+        num_* / head_dim 取自模型 config；kv_base 来自问题 8 的 plan.kv_base
+        （规划前可先填 0 做容量粗估）。
     出: dpu_id -> KVRegionSpec。每个 DPU 的 kv_heads 由其 k_proj 分片行区间
         [start_idx, end_idx) 按 head_dim 换算；q_heads_by_kv 按 GQA 通用写法生成
         （一个 KV head 服务连续 group 个 Q head），MHA 时 group=1 退化为恒等映射。
         切点未对齐 head 边界（KV 本地驻留的前提被破坏）直接抛错。
+
+    head 覆盖校验只针对**传进来的这份 shard_map**：流水并行下它是某一个 stage 的
+    DPU 集合，该 stage 内部必须恰好覆盖每个 KV head 一次（全局会被覆盖
+    num_stages 次，那是正确的——每个 stage 为自己那几层各存一份 KV）。
     """
     if k_proj_spec.placement.kind != "Shard" or k_proj_spec.placement.dim != 0:
         raise ValueError("KV 按 head 切要求 k_proj 为列切 Shard(0)，got "
@@ -145,7 +158,7 @@ def kv_specs_from_placement(
         heads = list(range(det.start_idx // head_dim, det.end_idx // head_dim))
         specs[dpu_id] = KVRegionSpec(
             dpu_id=dpu_id,
-            layers=list(range(num_layers)),  # 第 1 阶段不按层切，各层 KV 都驻留本 DPU 的 head
+            layers=list(layers),
             kv_heads=heads,
             q_heads_by_kv={h: list(range(h * group, (h + 1) * group)) for h in heads},
             max_seq=max_seq,
@@ -161,6 +174,75 @@ def kv_specs_from_placement(
             f"{sorted(assigned_heads)}，expected {sorted(expected_heads)}"
         )
     return specs
+
+
+def kv_specs_from_strategy(
+    gm,
+    strategy,
+    *,
+    num_layers: int,
+    num_kv_heads: int,
+    num_q_heads: int,
+    head_dim: int,
+    max_seq: int,
+    dtype_bytes: int,
+    kv_base: int = 0,
+) -> dict[int, KVRegionSpec]:
+    """按切分策略给每台 DPU 定 KV 区规格：持有哪些层 × 哪些 head。
+
+    每个 stage 各取自己第一层的 k_proj 布局，算出该 stage 内 DPU 的 head 划分，
+    层则是该 stage 持有的那几层。张量并行（num_stages=1）下退化为「一个 stage、
+    全部层」，与推广之前逐字等价。
+
+    入: gm —— 已跑完 `propagate_specs` 的标注图（从中读 k_proj 的 spec）；
+        strategy —— 切分策略；其余为模型结构参数。
+    出: dpu_id -> KVRegionSpec，覆盖 `strategy.dpu_ids` 的每一台。
+
+    同一 stage 内各层的 k_proj 必须切法一致（同一个 DPU 子集、同样的 head 划分），
+    不一致即上游 bug，直接抛错而不静默择一。
+    """
+    specs: dict[int, KVRegionSpec] = {}
+    for stage in range(strategy.num_stages):
+        layers = strategy.layers_of_stage(stage, num_layers)
+        stage_specs = [_k_proj_spec_of_layer(gm, layer) for layer in layers]
+        first = stage_specs[0]
+        for layer, spec in zip(layers[1:], stage_specs[1:]):
+            if set(spec.shard_map) != set(first.shard_map) or spec.placement != first.placement:
+                raise ValueError(
+                    f"stage{stage} 内 layer{layer} 的 k_proj 切法与 layer{layers[0]} 不一致："
+                    f"{sorted(spec.shard_map)}@{spec.placement} vs "
+                    f"{sorted(first.shard_map)}@{first.placement}"
+                )
+        specs.update(
+            kv_specs_from_placement(
+                first,
+                layers=layers,
+                num_kv_heads=num_kv_heads,
+                num_q_heads=num_q_heads,
+                head_dim=head_dim,
+                max_seq=max_seq,
+                dtype_bytes=dtype_bytes,
+                kv_base=kv_base,
+            )
+        )
+    missing = [dpu_id for dpu_id in strategy.dpu_ids if dpu_id not in specs]
+    if missing:
+        raise ValueError(f"策略里的 DPU {missing} 没有分到 KV 区（stage 划分与 k_proj 切分不一致）")
+    return specs
+
+
+def _k_proj_spec_of_layer(gm, layer: int) -> PIMTensorSpec:
+    """取某一层 self_attn.k_proj.weight 的 PIMTensorSpec（KV 按 head 切的依据）。"""
+    from contracts.graph_meta import SPEC_META_KEY
+
+    pattern = f"layers.{layer}.self_attn.k_proj.weight"
+    matches = [
+        node for node in gm.graph.nodes
+        if node.op == "get_attr" and pattern in str(node.target)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"{pattern} 应恰好匹配 1 个 get_attr 节点，实际 {len(matches)} 个")
+    return matches[0].meta[SPEC_META_KEY]
 
 
 def kv_access(
@@ -206,10 +288,16 @@ class PIMStaticKVCache:
         """把本步各 DPU 本地算出的新 K/V 写到位置 pos（真机在 K/V 投影 kernel 内做）。
 
         入: layer；pos —— 写入格（= 调用方 DecodeState.valid_len，唯一真值源）；
-            k_by_dpu / v_by_dpu —— {dpu_id: {head: [head_dim] 向量}}，本步新算的 K/V。
+            k_by_dpu / v_by_dpu —— {dpu_id: {head: [head_dim] 向量}}，本步新算的 K/V，
+            只需含持有本层的那些 DPU。
         出: 无（原地写各 DPU 本地 MRAM；空间编译期已定长预留，这里不涉及分配）。
+
+        只写**持有本层**的 DPU：流水切分下每台 DPU 只为自己那几层留 KV 区，别的层
+        在它的 `kv_off` 里根本没有条目。张量并行下每台都持有全部层，过滤条件恒真。
         """
         for dpu_id, spec in self.specs.items():
+            if layer not in spec.layers:
+                continue
             if not 0 <= pos < spec.max_seq:
                 raise ValueError(f"pos={pos} 越界 [0,{spec.max_seq})")
             row = spec.head_dim * spec.dtype_bytes

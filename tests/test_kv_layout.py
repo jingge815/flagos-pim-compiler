@@ -156,7 +156,7 @@ def test_kv_region_spec_crud_and_rebuild() -> None:
 def test_kv_specs_from_placement_mha() -> None:
     """怎么切（问题 2 的 k_proj 列切）→ 每台 DPU 驻留的 kv head，MHA 时 q 映射为恒等。"""
     spec = _k_proj_spec(num_dpus=4, num_kv_heads=32, head_dim=128, hidden=4096)
-    specs = kv_specs_from_placement(spec, num_layers=32, num_kv_heads=32, num_q_heads=32,
+    specs = kv_specs_from_placement(spec, layers=list(range(32)), num_kv_heads=32, num_q_heads=32,
                                     head_dim=128, max_seq=256, dtype_bytes=2, kv_base=0)
     assert set(specs) == {0, 1, 2, 3}
     for d in range(4):
@@ -168,18 +168,18 @@ def test_kv_specs_from_placement_mha() -> None:
 def test_kv_specs_from_placement_gqa() -> None:
     """GQA 通用写法：8 KV head / 32 Q head，一个 KV head 服务连续 4 个 Q head。"""
     spec = _k_proj_spec(num_dpus=4, num_kv_heads=8, head_dim=128, hidden=4096)
-    specs = kv_specs_from_placement(spec, num_layers=2, num_kv_heads=8, num_q_heads=32,
+    specs = kv_specs_from_placement(spec, layers=list(range(2)), num_kv_heads=8, num_q_heads=32,
                                     head_dim=128, max_seq=16, dtype_bytes=2, kv_base=0)
     assert specs[0].kv_heads == [0, 1]
     assert specs[0].q_heads_by_kv == {0: [0, 1, 2, 3], 1: [4, 5, 6, 7]}
     with pytest.raises(ValueError):  # 切点未对齐 head 边界 → KV 本地驻留前提被破坏
         bad = _k_proj_spec(4, 8, 128, 4096)
         bad.shard_map[0] = TensorShardDetail(0, 0, 64, 320, (256, 4096))
-        kv_specs_from_placement(bad, num_layers=2, num_kv_heads=8, num_q_heads=32,
+        kv_specs_from_placement(bad, layers=list(range(2)), num_kv_heads=8, num_q_heads=32,
                                 head_dim=128, max_seq=16, dtype_bytes=2, kv_base=0)
     with pytest.raises(ValueError):  # 非列切不满足"KV 按 head 切"
         rep = PIMTensorSpec("dpu", Placement("Replicate"), "pinned", None, {}, None)
-        kv_specs_from_placement(rep, num_layers=2, num_kv_heads=8, num_q_heads=32,
+        kv_specs_from_placement(rep, layers=list(range(2)), num_kv_heads=8, num_q_heads=32,
                                 head_dim=128, max_seq=16, dtype_bytes=2, kv_base=0)
 
 
@@ -188,13 +188,13 @@ def test_kv_specs_from_placement_rejects_incomplete_or_overlapping_heads() -> No
     incomplete = _k_proj_spec(2, 4, 2, 8)
     incomplete.shard_map[1] = TensorShardDetail(1, 0, 2, 6, (4, 8))
     with pytest.raises(ValueError, match="覆盖"):
-        kv_specs_from_placement(incomplete, num_layers=2, num_kv_heads=4, num_q_heads=4,
+        kv_specs_from_placement(incomplete, layers=list(range(2)), num_kv_heads=4, num_q_heads=4,
                                 head_dim=2, max_seq=16, dtype_bytes=2, kv_base=0)
 
     overlapping = _k_proj_spec(2, 4, 2, 8)
     overlapping.shard_map[1] = TensorShardDetail(1, 0, 2, 8, (6, 8))
     with pytest.raises(ValueError, match="覆盖"):
-        kv_specs_from_placement(overlapping, num_layers=2, num_kv_heads=4, num_q_heads=4,
+        kv_specs_from_placement(overlapping, layers=list(range(2)), num_kv_heads=4, num_q_heads=4,
                                 head_dim=2, max_seq=16, dtype_bytes=2, kv_base=0)
 
 

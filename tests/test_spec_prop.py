@@ -29,12 +29,16 @@ from contracts.pim_tensor_spec import PIMTensorSpec, Placement, TensorShardDetai
 from graph.partition import partition_graph
 from graph.spec_prop import (
     _Req,
+    _diff_edge,
+    _dpu_req,
+    _dpu_spec,
     _edge_type,
-    ShardConfig,
+    _layer_of_node,
     format_spec_report,
     llama_shard_config,
     propagate_specs,
 )
+from graph.strategy import ShardStrategy
 from tests.test_partition import _export_random_llama
 
 REPLICATE = Placement("Replicate")
@@ -58,6 +62,77 @@ def test_shard_dimension_change_between_dpus_is_all_to_all() -> None:
     )
 
     assert _edge_type(producer, actual, _Req(DEVICE_DPU, Placement("Shard", 1))) == "all_to_all"
+
+
+def test_same_placement_on_different_dpus_still_needs_a_redistribute_edge() -> None:
+    """流水切分的核心缺口：placement 与 device 都相同、只有 DPU 集合不同的边。
+
+    `Replicate@dpu{0}` → `Replicate@dpu{1}` 两端 placement 相等、device 相等，只
+    比这两项会判成「无需搬运」——跨 stage 的数据于是永远留在上一段，logits 全错
+    且不报错。这条锁住 `_diff_edge` 必须同时比较 shard_map 的 DPU 集合。
+
+    单测层面直接构造两端 spec，不经整图传播：这个判断本身与图结构无关，端到端的
+    覆盖在 `tests/test_strategy_sweep.py`。
+    """
+    graph = Graph()
+    producer = graph.placeholder("producer")
+    producer.meta["val"] = torch.zeros(2, 4)
+    consumer = graph.placeholder("consumer")
+
+    on_dpu0 = _dpu_spec(REPLICATE, (2, 4), (0,))
+    edge = _diff_edge(0, producer, consumer, on_dpu0, _dpu_req(REPLICATE), (1,))
+
+    assert edge is not None, "同 placement、不同 DPU 集合必须产生一条搬运边"
+    assert edge.type == "all_gather"
+    assert edge.src_loc == {"device": DEVICE_DPU, "dpus": [0]}
+    assert edge.dst_loc == {"device": DEVICE_DPU, "dpus": [1]}
+
+    # 同一个 DPU 集合仍然判定为无需搬运（张量并行下的既有行为不受影响）
+    assert _diff_edge(0, producer, consumer, on_dpu0, _dpu_req(REPLICATE), (0,)) is None
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        # torch.export 实测的两种 nn_module_stack 路径格式，两种都真实出现过
+        ("L['s'].model.model.layers[slice(None, 32, None)]._modules['0'].self_attn", 0),
+        ("L['s'].model.model.layers[slice(None, 32, None)]._modules['31'].mlp", 31),
+        ("model.model.layers.slice(None, 4, None).0.input_layernorm", 0),
+        ("model.model.layers.slice(None, 4, None).13.mlp", 13),
+        # 层外节点：解不出层号，归最后一个 stage（见 _dpus_of_node）
+        ("model.model.norm", None),
+        ("L['s'].model.model.embed_tokens", None),
+        ("model.lm_head", None),
+    ],
+)
+def test_layer_number_parsed_from_both_module_stack_formats(path: str, expected) -> None:
+    """层号解析必须同时认两种 stack 格式，且不把 `slice(...)` 里的上界当成层号。
+
+    只认一种格式时，另一种格式下全部计算节点都解不出层号 → 全归最后一个 stage →
+    权重与消费方落在不同 DPU 上 → pinned 权重校验直接抛错（真实踩到过）。
+    `slice(None, 4, None)` 里的 4 是层数，不剥掉会被当作层号。
+    """
+    graph = Graph()
+    node = graph.placeholder("n")
+    node.meta["nn_module_stack"] = {"k": (path, type(None))}
+
+    assert _layer_of_node(node) == expected
+
+
+def test_layer_number_of_weight_comes_from_its_name() -> None:
+    """get_attr 权重没有 nn_module_stack（实测全为 None），层号只能从名字取。
+
+    真实图里的权重节点由 `_appendix_a_graph`/`torch.export` 建，这里只需要一个
+    `op == "get_attr"` 且 `target` 是真实权重名的节点来驱动 `_layer_of_node`，
+    用真图节点避免 fx 对空 GraphModule 插 get_attr 的告警。
+    """
+    gm, _ = _appendix_a_graph()
+    (weight,) = [
+        node for node in gm.graph.nodes if node.op == "get_attr" and node.target == "w1"
+    ]
+    weight.target = "model.model.layers.7.self_attn.q_proj.weight"
+
+    assert _layer_of_node(weight) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +164,7 @@ def _appendix_a_graph() -> tuple[GraphModule, dict[str, Node]]:
 
 
 def _appendix_a_config() -> ShardConfig:
-    return ShardConfig(num_dpus=2, weight_rules=(("w1", "col"), ("w2", "row")))
+    return ShardStrategy(name="a", num_dpus=2, weight_rules=(("w1", "col"), ("w2", "row")))
 
 
 def test_physical_dpu_ids_key_shard_maps_and_report_endpoint_ranges() -> None:
@@ -99,7 +174,8 @@ def test_physical_dpu_ids_key_shard_maps_and_report_endpoint_ranges() -> None:
 
     edges = propagate_specs(
         gm,
-        ShardConfig(
+        ShardStrategy(
+            name="a",
             num_dpus=2,
             dpu_ids=(2, 5),
             weight_rules=(("w1", "col"), ("w2", "row")),
@@ -137,7 +213,7 @@ def test_keyword_operand_edges_materialize_endpoint_specs() -> None:
     gm, nodes = _keyword_add_graph()
     partition_graph(gm)
 
-    edges = propagate_specs(gm, ShardConfig(num_dpus=2, dpu_ids=(2, 5), weight_rules=()))
+    edges = propagate_specs(gm, ShardStrategy(name="a", num_dpus=2, dpu_ids=(2, 5), weight_rules=()))
 
     assert {edge.src for edge in edges if edge.dst == nodes["add"].name} == {"left", "right"}
     for edge in nodes["add"].meta[REDISTRIBUTE_META_KEY]:
@@ -159,7 +235,7 @@ def test_replicate_dpu_to_host_is_degenerate_all_gather_from_smallest_dpu() -> N
         node.meta["val"] = torch.empty(2, 4)
     partition_graph(gm)
 
-    edges = propagate_specs(gm, ShardConfig(num_dpus=2, dpu_ids=(5, 2), weight_rules=()))
+    edges = propagate_specs(gm, ShardStrategy(name="a", num_dpus=2, dpu_ids=(5, 2), weight_rules=()))
 
     (edge,) = [edge for edge in edges if edge.src == dpu_tanh.name and edge.dst == host_neg.name]
     assert edge.type == "all_gather"
@@ -181,7 +257,7 @@ def test_propagation_clears_stale_metadata_and_reuses_stable_edge_ids() -> None:
     nodes["left"].meta[REDISTRIBUTE_META_KEY] = ["stale"]
     output.meta[SPEC_META_KEY] = object()
     output.meta[REDISTRIBUTE_META_KEY] = ["stale"]
-    config = ShardConfig(num_dpus=2, dpu_ids=(2, 5), weight_rules=())
+    config = ShardStrategy(name="a", num_dpus=2, dpu_ids=(2, 5), weight_rules=())
 
     first = propagate_specs(gm, config)
     second = propagate_specs(gm, config)
@@ -193,10 +269,7 @@ def test_propagation_clears_stale_metadata_and_reuses_stable_edge_ids() -> None:
     assert all("stale" not in node.meta[REDISTRIBUTE_META_KEY] for node in gm.graph.nodes)
 
 
-@pytest.mark.parametrize("dpu_ids", [(), (2,), (2, 2), (2, -1)])
-def test_invalid_physical_dpu_ids_are_rejected(dpu_ids: tuple[int, ...]) -> None:
-    with pytest.raises(ValueError, match="dpu_ids"):
-        ShardConfig(num_dpus=2, dpu_ids=dpu_ids, weight_rules=())
+# dpu_ids 合法性校验已随 ShardStrategy 迁到 tests/test_strategy.py，不在此重复。
 
 
 @pytest.mark.parametrize(
@@ -397,6 +470,7 @@ def test_tiny_llama_propagation_structure() -> None:
 
 
 def test_llama_shard_config_rejects_contract_violations() -> None:
+    """纯张量并行下 tp_width == num_dpus，契约校验的报错落在 tp_width 上。"""
     kwargs = dict(num_heads=4, num_kv_heads=4, intermediate_size=176, vocab_size=32000)
     with pytest.raises(ValueError, match="num_dpus must be positive"):
         llama_shard_config(0, **kwargs)
@@ -418,4 +492,4 @@ def test_linear_weight_must_be_configured() -> None:
     gm, _ = _appendix_a_graph()
     partition_graph(gm)
     with pytest.raises(ValueError, match="w2"):
-        propagate_specs(gm, ShardConfig(num_dpus=2, weight_rules=(("w1", "col"),)))
+        propagate_specs(gm, ShardStrategy(name="a", num_dpus=2, weight_rules=(("w1", "col"),)))

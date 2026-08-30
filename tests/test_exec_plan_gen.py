@@ -29,6 +29,7 @@ from runtime.exec_plan_gen import build_execution_plan, overlap
 from runtime.kernels import register_all
 from contracts.exec_plan import Access
 from contracts.op_contract import PIMHardwareConfig
+from graph.strategy import ShardStrategy
 from tests.test_spec_prop import _appendix_a_config, _appendix_a_graph
 
 
@@ -281,7 +282,8 @@ def test_build_execution_plan_requires_explicit_hardware() -> None:
         build_execution_plan(graph_nodes, gm, entries_by_id, pending)
 
 
-def test_build_execution_plan_rejects_per_node_shard_count_mismatch() -> None:
+def _appendix_a_planned() -> tuple[list, object, dict, dict]:
+    """附录 A 图跑完问题 7/8 蓝图，返回 build_execution_plan 所需的四份入参。"""
     gm, _, edges = _built_appendix_a()
     kv_specs = {
         d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
@@ -294,17 +296,59 @@ def test_build_execution_plan_rejects_per_node_shard_count_mismatch() -> None:
     pending = {}
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
+    return graph_nodes, gm, {e.edge_id: e for e in build_comm_plan(edges)}, pending
+
+
+def test_build_execution_plan_accepts_shard_count_below_num_dpus() -> None:
+    """流水切分下一个张量只落在本 stage 的几台上，分片数少于 num_dpus 是合法的。
+
+    附录 A 的图切在 2 台上，配 num_dpus=4 的硬件即「4 台机器、每个张量用 2 台」，
+    正是 2 stage × tp2 的形状——推广前这里会被当成配置错误直接抛错。
+    """
+    graph_nodes, gm, entries_by_id, pending = _appendix_a_planned()
+
+    compiled = build_execution_plan(
+        graph_nodes, gm, entries_by_id, pending,
+        hardware=PIMHardwareConfig(
+            num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=1 << 16,
+            wram_bytes_per_dpu=65536, dma_align=64,
+        ),
+    )
+    assert [c for c in compiled.plan.commands if c.op == "launch"]
+
+
+def test_build_execution_plan_rejects_out_of_range_dpu_id() -> None:
+    """越界 dpu_id 仍要抛错：会让下游按不存在的地址空间生成命令。
+
+    分片数（2）本身在 [1, num_dpus=4] 内、过得了数量校验，但物理编号 5 超出
+    4 台机器的地址空间——放宽数量校验之后，编号合法性是唯一还能拦住它的判断。
+    """
+    gm, _ = _appendix_a_graph()
+    partition_graph(gm)
+    edges = propagate_specs(
+        gm,
+        ShardStrategy(name="oob", num_dpus=2, dpu_ids=(2, 5),
+                      weight_rules=(("w1", "col"), ("w2", "row"))),
+    )
+    kv_specs = {
+        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[i], q_heads_by_kv={i: [i]},
+                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+        for i, d in enumerate((2, 5))
+    }
+    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
+    graph_nodes = list(gm.graph.nodes)
+    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (2, 5)}
+    pending = {}
+    for plan in plans.values():
+        pending.update(plan.pending_readers_prefill)
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
 
-    with pytest.raises(ValueError, match="shard count"):
+    with pytest.raises(ValueError, match="越界 dpu_id"):
         build_execution_plan(
             graph_nodes, gm, entries_by_id, pending,
             hardware=PIMHardwareConfig(
-                num_dpus=4,
-                num_tasklets=4,
-                mram_bytes_per_dpu=1 << 16,
-                wram_bytes_per_dpu=65536,
-                dma_align=64,
+                num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=1 << 16,
+                wram_bytes_per_dpu=65536, dma_align=64,
             ),
         )
 
@@ -342,29 +386,3 @@ def test_build_execution_plan_rejects_tasklet_mismatch() -> None:
         )
 
 
-def test_build_execution_plan_rejects_dpu_count_mismatch() -> None:
-    gm, _, edges = _built_appendix_a()
-    kv_specs = {
-        d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
-                         max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
-        for d in (0, 1)
-    }
-    hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
-    graph_nodes = list(gm.graph.nodes)
-    plans = {d: plan_dpu(d, graph_nodes, graph_nodes, kv_specs, hw) for d in (0, 1)}
-    pending = {}
-    for plan in plans.values():
-        pending.update(plan.pending_readers_prefill)
-    entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
-
-    with pytest.raises(ValueError, match="num_dpus"):
-        build_execution_plan(
-            graph_nodes, gm, entries_by_id, pending,
-            hardware=PIMHardwareConfig(
-                num_dpus=4,
-                num_tasklets=4,
-                mram_bytes_per_dpu=1 << 16,
-                wram_bytes_per_dpu=65536,
-                dma_align=64,
-            ),
-        )

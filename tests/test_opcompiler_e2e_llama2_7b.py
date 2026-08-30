@@ -53,6 +53,7 @@ from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import kv_specs_from_placement
 from memory.mem_planner import HwBudget, plan_dpu
+from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
 from runtime.executor import DecodeState, make_sdpa_handler, run_decode_loop
 from runtime.kernels import register_all
@@ -103,18 +104,6 @@ def _export_graph(model: LlamaForCausalLM, seq_len: int, position_ids: torch.Ten
     partition_graph(gm)
     return gm
 
-
-def _q_proj_layer_of(node) -> int:
-    seen, stack = set(), [node]
-    while stack:
-        cur = stack.pop()
-        if cur in seen:
-            continue
-        seen.add(cur)
-        if cur.op == "get_attr" and "q_proj.weight" in str(cur.target):
-            return int(str(cur.target).split(".")[3])
-        stack.extend(a for a in cur.args if hasattr(a, "name"))
-    raise ValueError(f"未能从 {node.name} 回溯到 q_proj 权重")
 
 
 def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
@@ -202,7 +191,7 @@ def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklet
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     (k_proj,) = [n for n in prefill_gm.graph.nodes if n.op == "get_attr" and "layers.0.self_attn.k_proj.weight" in n.target]
     kv_specs = kv_specs_from_placement(
-        k_proj.meta[SPEC_META_KEY], num_layers=cfg.num_hidden_layers, num_kv_heads=cfg.num_key_value_heads,
+        k_proj.meta[SPEC_META_KEY], layers=list(range(cfg.num_hidden_layers)), num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
@@ -231,8 +220,6 @@ def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklet
 
     state = DecodeState(valid_len=0)
 
-    def sdpa_layer_map(gm):
-        return {n.name: _q_proj_layer_of(n.args[0]) for n in gm.graph.nodes if "scaled_dot_product_attention" in str(n.target)}
 
     def make_host_handler(layer_map):
         def host_handler_of(node):
@@ -257,22 +244,7 @@ def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklet
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))
     register_all(backend, use_compiled_linear=True)
 
-    by_target = {n.target: n for n in prefill_gm.graph.nodes if n.op == "get_attr"}
-    for dpu_id in range(NUM_DPUS):
-        for name, off in plans[dpu_id].weight.items():
-            node = by_target[name]
-            detail = node.meta[SPEC_META_KEY].shard_map[dpu_id]
-            obj = prefill_gm
-            for part in name.split("."):
-                obj = getattr(obj, part)
-            obj = obj.detach()
-            if detail.shard_dim == 0:
-                local = obj[detail.start_idx:detail.end_idx].numpy()
-            elif detail.shard_dim == 1:
-                local = obj[:, detail.start_idx:detail.end_idx].numpy()
-            else:
-                local = obj.numpy()
-            backend.write_local(dpu_id, off, np.ascontiguousarray(local))
+    write_weight_shards(prefill_gm, plans, backend)
 
     def greedy(logits_1d):
         return int(np.argmax(logits_1d))

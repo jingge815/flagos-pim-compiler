@@ -8,6 +8,7 @@
 | 3.3 接口契约 | 85 | 图层↔算子编译器双向接口、图层→编排器单向蓝图 | `contracts/` |
 | 问题 1 图拆分 | 159 | 白名单 + 连通分组、device/part_id 打标 | `graph/partition.py` |
 | 问题 2 切分传播 | 275 | DeviceMesh、placement 推导、redistribute 边识别 | `graph/spec_prop.py` |
+| 切分策略调优 | — | TP/PP/混合的表达与遍历（**方案外扩展**，见 `docs/strategy.md`） | `graph/strategy.py`、`runtime/compile.py` |
 | 问题 3 redistribute 下沉 | 605 | 编译期通信计划表 + 运行时 DMA 序列 | `comm/` |
 | 问题 4 GeneSim 接入 | 829 | 从 TTIR / pim mlir 抽 flops、data_bytes | `genesim_bridge/` |
 | 问题 5 算子实现 | 1079 | ttir→pim mlir（**在 FlagTree 仓，不在本仓**） | — |
