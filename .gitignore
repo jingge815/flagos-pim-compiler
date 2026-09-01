@@ -6,3 +6,6 @@ paths.local.json
 
 # opcompiler_bridge 的编译产物缓存（.so/.c/.meta），按机器/shape 各自生成
 .opcompiler_cache/
+
+# pytest 每次执行生成的最新结果表格
+test-results/

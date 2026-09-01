@@ -140,6 +140,12 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Numpy是模拟存算一体架构的伪后端验证平台，用于检查图编译、通信、算子、编排器、内存管理和 Llama-2-7B 推理链路。当前仓库全量测试均已通过，表中列出对应测试项和验证结论。
 
+git clone https://github.com/jingge815/flagos-pim-compiler.git
+cd https://github.com/jingge815/flagos-pim-compiler.git
+source /path/flagOS-installed/pytorch/env-pytorch.sh 
+例如：source /media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh 
+python -m pytest tests/ -x -q
+
 
 | 验证层次       | 验证点                                                                                                           | 文字描述                                                                                                   | 对应测试指标                                                                                                      | 验证结果 |
 | -------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------- |
