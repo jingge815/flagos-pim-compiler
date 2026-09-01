@@ -1,27 +1,4 @@
-"""厂商 SDK（pre-g-driver-api，api/include/dpu.h）的 Python 镜像——numpy 伪硬件实现。
-
-函数名与语义逐一对齐 C API，通信库（comm/lowering.py）与编排器（runtime/，问题 6）
-只面对这层签名；换真硬件时以同签名绑定厂商库（backend/hal_vendor.py），上层不动。
-
-与 C API 的对应：
-
-- ``struct dpu_set_t`` → ``DpuSet``；``DPU_FOREACH`` → ``DpuSet`` 迭代产出单 DPU 子集；
-- ``dpu_error_t`` 的非零返回 → ``DpuError`` 异常（镜像不做错误码）；
-- ``dpu_load`` 的 program：numpy 镜像下是一个 ``fn(dpu_id, mram)`` 的 Python callable
-  （真硬件对应 kernel 二进制路径/字节流，镜像无法执行，装载后 launch 抛 DpuError）；
-- rank 层：``dpu_alloc_ranks`` / ``dpu_get_nr_ranks`` / ``DpuSet.by_rank``
-  （镜像 ``DPU_RANK_FOREACH``）现在有了——但只是 ``dpu_id -> rank_id`` 的
-  只读分组标签，不影响任何寻址/迭代语义，扁平 dpu_id 仍是图编译器侧唯一的
-  切分粒度（rank 不进 graph/spec_prop.py 的切分决策、不进 comm/ 的通信
-  计划，这是范围边界,不是尚未做完）；
-- 所有拷贝/launch 同步阻塞（C 版同步语义）；异步事件由问题 6 的 HAL（hal_numpy）提供。
-
-容量：C 版 MRAM/WRAM 容量由硬件定，镜像由 ``dpu_alloc(..., mram_bytes=...,
-wram_bytes=...)`` 显式给定，默认 MRAM 64MiB、WRAM 64KiB（UPMEM 规格）。WRAM
-是每台 DPU 一块独立的真实字节数组（不是校验用的数字）——DPU 内多 tasklet
-并发建模（backend/hal_numpy.py 的 HazardTracker）依赖它是真实内存，才能让
-"tasklet 读写 WRAM 的哪个区间"这件事有具体地址可以记录、可以检测重叠。
-"""
+"""提供厂商 DPU SDK 的 NumPy 镜像，实现设备、DMA 和程序装载接口。"""
 
 from __future__ import annotations
 
@@ -40,7 +17,7 @@ DPU_SYNCHRONOUS: DpuLaunchPolicy = "sync"
 DEFAULT_MRAM_BYTES = 64 * 2**20  # UPMEM MRAM 64MiB
 DEFAULT_WRAM_BYTES = 64 * 2**10  # UPMEM WRAM 64KiB
 
-# numpy 镜像下的 DPU kernel：fn(dpu_id, mram)，直接读写本 DPU 的 MRAM 字节数组
+# NumPy 镜像中的 DPU 内核函数类型。
 DpuKernel = Callable[[int, np.ndarray], None]
 
 
@@ -49,12 +26,7 @@ class DpuError(RuntimeError):
 
 
 class _Dpu:
-    """单台 DPU 的硬件状态：独立 MRAM/WRAM 地址空间 + 已装载程序（设备模型）。
-
-    WRAM 与 MRAM 是两块独立的字节数组——真实硬件上 tasklet 只能直接算
-    WRAM 里的数据，MRAM 要先 DMA 进 WRAM。这里两者都建成真实内存（不是
-    只有 MRAM），供 backend/hal_numpy.py 的多 tasklet hazard 检测使用。
-    """
+    """保存单台 DPU 的 MRAM、WRAM 和已装载程序。"""
 
     __slots__ = ("mram", "wram", "program")
 
@@ -65,12 +37,7 @@ class _Dpu:
 
 
 class _Machine:
-    """整机：扁平编号的 DPU 阵列 + push_xfer 的 per-DPU host buffer 登记表。
-
-    ``rank_of`` 是 dpu_id -> rank_id 的只读分组标签（镜像 pre-g-driver-api
-    的 rank 概念），均匀按 ``dpus_per_rank`` 分组，不影响任何寻址/迭代
-    语义——扁平 dpu_id 仍是全部 DMA/launch 原语的唯一寻址方式。
-    """
+    """保存 DPU 阵列、DMA 缓冲区和 rank 分组信息。"""
 
     def __init__(self, nr_dpus: int, mram_bytes: int, wram_bytes: int,
                  dpus_per_rank: int | None = None) -> None:
@@ -155,11 +122,6 @@ def _c_bytes(buffer: np.ndarray) -> np.ndarray:
     return buffer.view(np.uint8).reshape(-1)
 
 
-# ---------------------------------------------------------------------------
-# 设备管理（dpu.h：归属编排器层，镜像一并给出供问题 6 使用）
-# ---------------------------------------------------------------------------
-
-
 def dpu_alloc(
     nr_dpus: int, profile: str | None = None, *,
     mram_bytes: int = DEFAULT_MRAM_BYTES, wram_bytes: int = DEFAULT_WRAM_BYTES,
@@ -174,12 +136,7 @@ def dpu_alloc_ranks(
     nr_ranks: int, profile: str | None = None, *, dpus_per_rank: int,
     mram_bytes: int = DEFAULT_MRAM_BYTES, wram_bytes: int = DEFAULT_WRAM_BYTES,
 ) -> DpuSet:
-    """镜像 pre-g-driver-api 的 ``dpu_alloc_ranks``：按 rank 批量分配 DPU。
-
-    只是给扁平 dpu_id 打上 rank 分组标签（``_Machine.rank_of``），不改变
-    任何寻址/迭代语义——`dpu_alloc` 分配的单 rank 集合与这里分配的多 rank
-    集合，对 `dpu_copy_to`/`dpu_launch` 等原语完全一样地使用。
-    """
+    """按 rank 批量分配 DPU，并返回全集。"""
     if nr_ranks <= 0:
         raise DpuError(f"nr_ranks={nr_ranks} 必须为正")
     if dpus_per_rank <= 0:
@@ -202,11 +159,6 @@ def dpu_get_nr_dpus(dpu_set: DpuSet) -> int:
 def dpu_get_nr_ranks(dpu_set: DpuSet) -> int:
     _check_live(dpu_set)
     return len({dpu_set._machine.rank_of[i] for i in dpu_set._ids})
-
-
-# ---------------------------------------------------------------------------
-# DMA 三件套 + broadcast（dpu.h：归属通信库层，comm/lowering.py 的唯一底座）
-# ---------------------------------------------------------------------------
 
 
 def dpu_copy_to(dpu_set: DpuSet, offset: int, src: object, length: int) -> None:
@@ -239,11 +191,7 @@ def dpu_prepare_xfer(dpu_set: DpuSet, buffer: np.ndarray) -> None:
 
 
 def dpu_push_xfer(dpu_set: DpuSet, xfer: DpuXfer, offset: int, length: int, flags: int = 0) -> None:
-    """批量传输：对集合内每台 DPU，用其 prepare_xfer 登记的 buffer 做同 offset 同长 DMA。
-
-    把"对 N 个 DPU 的 N 次同位 DMA"合并为一次调用（方案问题 3 二.(2)：缓解主机带宽
-    瓶颈）；成员间 offset/length 必须一致是 C 版原语本身的约束。
-    """
+    """使用各 DPU 已登记的缓冲区执行同偏移、同长度的批量 DMA。"""
     _check_live(dpu_set)
     if xfer not in (DPU_XFER_TO_DPU, DPU_XFER_FROM_DPU):
         raise DpuError(f"未知 xfer 方向: {xfer!r}")
@@ -267,11 +215,6 @@ def dpu_broadcast_to(dpu_set: DpuSet, offset: int, src: object, length: int, fla
     dpu_copy_to(dpu_set, offset, src, length)
 
 
-# ---------------------------------------------------------------------------
-# kernel 装载 / 执行 / 同步（dpu.h：归属编排器层；镜像内同步执行）
-# ---------------------------------------------------------------------------
-
-
 def dpu_load(dpu_set: DpuSet, program: DpuKernel | bytes) -> None:
     """装载程序到集合内每台 DPU。numpy 镜像接受 callable；bytes 仅登记、不可执行。"""
     _check_live(dpu_set)
@@ -280,7 +223,7 @@ def dpu_load(dpu_set: DpuSet, program: DpuKernel | bytes) -> None:
 
 
 def dpu_launch(dpu_set: DpuSet, policy: DpuLaunchPolicy) -> None:
-    """触发集合内每台 DPU 执行已装载程序。镜像内同步执行（异步由问题 6 HAL 提供）。"""
+    """触发集合内每台 DPU 执行已装载程序，并同步返回。"""
     _check_live(dpu_set)
     for dpu_id in dpu_set._ids:
         program = dpu_set._machine.dpus[dpu_id].program

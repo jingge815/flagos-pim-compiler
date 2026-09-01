@@ -1,14 +1,4 @@
-"""真实自然语言 prompt 的端到端验证：输入可读文本、走完整编排器、输出可读文本。
-
-`tests/test_decode_loop_llama2_7b.py`（验证 3）用的 prompt 是
-`torch.arange(16)` 的合成 token 序列，只在 token id 层面比对，从未验证过
-"喂真实提示词、通过真实 tokenizer、解码出可读文本"这条链路——用户明确要求
-这一点必须单独确认，本文件补上。
-
-判据：`tokenizer.decode(编排器产出的 token 序列)` 与 HF 官方
-`model.generate()`（相同贪心策略、相同真实提示词）解码出的文本逐字符一致；
-同时打印生成文本供人工阅读确认"输出正常的推理内容"。
-"""
+"""验证自然语言提示词的编排器生成结果。"""
 
 from __future__ import annotations
 
@@ -26,6 +16,7 @@ from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from comm.plan import build_comm_plan
 from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import PIMHardwareConfig
+from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import kv_specs_from_placement
@@ -35,21 +26,21 @@ from runtime.exec_plan_gen import build_execution_plan
 from runtime.executor import DecodeState, make_sdpa_handler, run_decode_loop
 from runtime.kernels import register_all
 
-MODEL_DIR = Path(
-    "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf"
-)
+MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
 PROMPT = "The capital of France is"
 DECODE_STEPS = 16
 MAX_SEQ = 64
 KV_DTYPE_BYTES = 2  # fp16
 
-pytestmark = pytest.mark.skipif(not MODEL_DIR.is_dir(), reason="需要本地 Llama-2-7b-hf 权重")
+pytestmark = pytest.mark.skipif(
+    MODEL_DIR is None or not MODEL_DIR.is_dir(),
+    reason="需要在 paths.json 配置 llama2_7b_model_dir",
+)
 
 
 class _PositionalLlama(torch.nn.Module):
-    """RoPE 位置显式作为图输入（问题 6 decode 循环专用，见
-    `tests/test_decode_loop_llama2_7b.py` 模块 docstring 的说明）。"""
+    """将 RoPE 位置作为图输入的 Llama 包装。"""
 
     def __init__(self, model: LlamaForCausalLM) -> None:
         super().__init__()
@@ -82,9 +73,7 @@ def _export_graph(model: LlamaForCausalLM, seq_len: int, position_ids: torch.Ten
 
 
 def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
-    """输入真实英文提示词、走完整问题 1→2→3→6→7→8 编排器，输出可读文本，
-    与 HF `model.generate()`（同样贪心策略）逐 token、逐字符一致。
-    """
+    """验证自然语言提示词的生成 token 和文本与 HF 一致。"""
     torch.set_grad_enabled(False)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
@@ -115,11 +104,7 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
         num_tasklets=4,
         mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536,
-        # dma_align 是 WRAM tile 搬运的对齐要求，跟 hw.align（MRAM 里
-        # 张量摆放对齐，供 memory/mem_planner.py 用）是两个不同量级的概念，
-        # 不能共用同一个值——用 hw.align=1024 会让 kernel_src.py 编出的
-        # tile（几百到几万字节）几乎全部不整除，实测触发
-        # pim-tile-to-budget 的 DMA 对齐报错。
+        # DMA 分块使用独立于 MRAM 布局的字节对齐。
         dma_align=64,
     )
     prefill_nodes = list(prefill_gm.graph.nodes)

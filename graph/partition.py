@@ -1,4 +1,4 @@
-"""Problem-1 DPU capability annotation and direct-edge graph partitioning."""
+"""标记 FX 图中的 DPU 节点并划分连通子图。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ DPU_LOWERABLE = frozenset(
 
 @dataclass
 class Partition:
-    """A DPU-only connected component in FX topological order."""
+    """按拓扑顺序保存一个只含 DPU 节点的连通子图。"""
 
     part_id: int
     nodes: list[Node]
@@ -34,7 +34,7 @@ def _is_dpu_node(node: Node) -> bool:
 
 
 def partition_graph(gm: GraphModule) -> list[Partition]:
-    """Annotate ``gm`` in place and return its DPU direct-edge components."""
+    """原地标记 `gm`，并返回 DPU 直连子图。"""
 
     nodes = list(gm.graph.nodes)
     node_order = {node: index for index, node in enumerate(nodes)}
@@ -59,7 +59,7 @@ def partition_graph(gm: GraphModule) -> list[Partition]:
             parent[right_root] = left_root
 
     for node in parent:
-        # Host nodes are not in parent, so they can never bridge two DPU groups.
+        # 仅连接直接相邻的 DPU 节点。
         for input_node in node.all_input_nodes:
             if input_node in parent:
                 union(node, input_node)

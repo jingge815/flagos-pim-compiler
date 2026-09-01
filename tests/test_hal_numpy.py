@@ -86,17 +86,12 @@ def test_submit_wait_query_and_kernel_stub() -> None:
 
 
 def test_submit_launch_propagates_tasklet_hazard_from_kernel() -> None:
-    """kernel 内部通过 hal.record_access 触发的冲突要能穿过 submit/wait 传出来。
-
-    对应验收标准 (b)：故意让 kernel 漏加 barrier（两个 tasklet 写同一地址
-    之间不调用 hal.barier()），hazard 检测必须能抓到——不是只验证
-    HazardTracker 本身，而是验证它真的接进了 launch 的执行路径。
-    """
+    """验证内核的 tasklet 冲突会由 submit 和 wait 传出。"""
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
 
     def bad_kernel(hal, dpu_id, cmd) -> None:
         hal.record_access(0, "mram", 0, 8, is_write=True)
-        # 漏掉这里该有的 hal.barrier()
+        # 不执行同步屏障。
         hal.record_access(1, "mram", 4, 8, is_write=True)  # 与 tasklet 0 重叠
 
     backend.register_kernel("bad", bad_kernel)
@@ -302,7 +297,7 @@ def test_hazard_tracker_allows_concurrent_reads() -> None:
 
 
 def test_hazard_tracker_barrier_clears_epoch() -> None:
-    """barrier 之后同一区间可以被另一个 tasklet 写——上一 epoch 的记录不该跨 barrier 生效。"""
+    """验证 barrier 清空访问记录，使后续 tasklet 可写入同一区间。"""
     tracker = HazardTracker()
     tracker.record(0, "mram", offset=0, length=16, is_write=True)
     tracker.check_and_advance()  # barrier

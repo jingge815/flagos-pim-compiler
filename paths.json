@@ -1,0 +1,6 @@
+{
+  "pytorch_env_script": "/media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh",
+  "llama2_7b_model_dir": "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf",
+  "flagtree_prefix": "/media/disk/fengjingge/src/flagOS/flagOS-installed/flagTree",
+  "genesim_root": "/media/disk/fengjingge/src/genesim"
+}

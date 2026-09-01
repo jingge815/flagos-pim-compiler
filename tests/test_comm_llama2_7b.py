@@ -1,13 +1,4 @@
-"""真实 Llama-2-7B 的问题 1 → 问题 2 → 问题 3 端到端验证（编译期结构 + 运行时数值）。
-
-结构判据（继承 test_spec_prop_llama2_7b 的 Megatron 配对，方案二.(4)/附录 B）：
-每层 o_proj、down_proj 各一条 all_reduce，展开为 8 收集段 + 8 回写段，DMA 序列
-= [push_from ×1, broadcast_to ×1]；logits 经 Shard(2) all_gather 回 host，S=16
-时 8 台 × 16 行 = 128 收集段、无广播段；scatter 边全部 src 在 host。
-数值判据：真实权重 + 真实计划条目，gate/up→down 的 Megatron 链在 numpy 伪硬件
-上经 SDK DMA 与通信原语执行，与单卡 torch 参考对齐；logits all_gather 与一条
-scatter 边做纯搬运的逐字节对齐（fp16 无算术，必须精确相等）。
-"""
+"""验证 Llama-2-7B 的通信计划结构和通信数值。"""
 
 from __future__ import annotations
 
@@ -25,22 +16,24 @@ from backend.dpu_sdk import dpu_alloc
 from comm.lowering import DmaEngine, all_gather, all_reduce, scatter
 from comm.plan import build_comm_plan, dma_sequence, format_comm_plan, plan_cost
 from contracts.graph_meta import REDISTRIBUTE_META_KEY
+from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from tests.test_partition import _FixedMaskLlama
 
-MODEL_DIR = Path(
-    "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf"
-)
+MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
 SEQ_LEN = 16
 
-pytestmark = pytest.mark.skipif(not MODEL_DIR.is_dir(), reason="需要本地 Llama-2-7b-hf 权重")
+pytestmark = pytest.mark.skipif(
+    MODEL_DIR is None or not MODEL_DIR.is_dir(),
+    reason="需要在 paths.json 配置 llama2_7b_model_dir",
+)
 
 
 @pytest.fixture(scope="module")
 def llama2_comm_plan():
-    """真实 7B：加载 → export → partition → propagate → build_comm_plan，模块内一次。"""
+    """构建一次 Llama-2-7B 通信计划并供模块内测试共享。"""
     model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
     cfg = model.config
     input_ids = torch.arange(SEQ_LEN, dtype=torch.long).unsqueeze(0)
@@ -106,7 +99,7 @@ def test_all_reduce_entries_match_megatron_structure(llama2_comm_plan) -> None:
         for seg in writeback:  # 残差 add 要求 Replicate@dpu：回写全体
             assert seg.src_dpu is None and seg.dst_dpu is not None
             assert seg.global_range == (0, numel) and seg.dst_local_offset == 0
-        # DMA 序列：收集合批为一次 push_xfer，回写合并为一次 broadcast_to
+        # 收集段批量传输，回写段广播传输。
         assert [(op.kind, len(op.segments)) for op in dma_sequence(entry)] == [
             ("push_from", NUM_DPUS),
             ("broadcast_to", NUM_DPUS),
@@ -158,11 +151,7 @@ def test_plan_report_and_total_cost(llama2_comm_plan) -> None:
 
 
 def test_megatron_mlp_numeric_matches_torch(llama2_comm_plan) -> None:
-    """第 0 层 MLP：gate/up 列切 → silu·mul → down 行切 → all_reduce，对单卡 torch。
-
-    数值在 fp32 下模拟 DPU 本地计算，DMA 搬运按图 dtype 走 fp16（验证搬运与归约
-    正确性，不验证算子精度），容差按 fp16 精度给。
-    """
+    """验证第 0 层 MLP 的分片计算和归约结果。"""
     model, _, gm, _, entries = llama2_comm_plan
     entry = _all_reduce_entry(gm, entries, "layers.0.mlp.down_proj.weight")
     mlp = model.model.layers[0].mlp

@@ -1,17 +1,4 @@
-"""切分策略遍历：小模型上对全部策略跑完整推理并与单卡 PyTorch 对齐（验证 2）。
-
-用小 config Llama（4 层 / 4 head / hidden 64）而非真实 7B，是为了让「遍历全部
-策略 × 完整 prefill+decode」进 pytest 常规集（秒级）。真实 7B 的逐策略验证在
-`tests/test_strategy_llama2_7b.py`（分钟级，按需单跑）。
-
-两类判据：
-
-- **数值**：每种策略贪心解码出的 token 序列与 HF 单卡 `use_cache=True` 自回归
-  推进逐 token 完全一致。这是「这种切分下模型还能正确推理」的判据，比容差比较更
-  贴近实际可观察行为。
-- **结构**：策略真的生效了，不是同一份产物换了个名字——跨 stage 通信边数、KV 区
-  层数、权重分布都必须随策略变化，且符合手推的不变量。
-"""
+"""遍历小型 Llama 的切分策略并验证推理和内存布局。"""
 
 from __future__ import annotations
 
@@ -50,7 +37,7 @@ STRATEGY_KWARGS = dict(
 
 @pytest.fixture(scope="module")
 def small_llama():
-    """固定随机种子的小 Llama——同一个模型实例喂给全部策略，保证判据可比。"""
+    """创建固定随机种子的小型 Llama 模型。"""
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     return LlamaForCausalLM(LlamaConfig(**MODEL_KWARGS)).eval().to(torch.float16)
@@ -58,7 +45,7 @@ def small_llama():
 
 @pytest.fixture(scope="module")
 def hf_reference(small_llama):
-    """HF 单卡 `use_cache=True` 自回归贪心解码——全部策略共用的参考序列。"""
+    """生成所有策略共享的 HF 贪心解码参考。"""
     prompt = torch.arange(PREFILL_SEQ_LEN, dtype=torch.long)
     tokens: list[int] = []
     with torch.no_grad():
@@ -89,7 +76,7 @@ def _hw_and_hardware():
 
 @pytest.fixture(scope="module")
 def compiled_by_strategy(small_llama):
-    """每种策略编译一次（模块内共享）：编译期产物供结构判据，命令 DAG 供数值判据。"""
+    """按策略编译并缓存运行计划。"""
     hw, hardware = _hw_and_hardware()
     return {
         strategy.name: compile_llama2(
@@ -104,12 +91,7 @@ def compiled_by_strategy(small_llama):
 def test_every_strategy_decodes_the_same_tokens_as_single_card_pytorch(
     strategy, compiled_by_strategy, hf_reference
 ) -> None:
-    """遍历判据：每种切分下贪心解码序列与 HF 单卡逐 token 一致。
-
-    这条覆盖了图编译（切分传播）、通信（跨 stage all_gather）、内存（三区
-    offset）、KV（按 stage 存层）、编排器（命令 DAG 解释）全链路——任何一环在
-    这种切分下算错，token 序列就会偏离。
-    """
+    """验证每种切分策略的解码 token 与 HF 参考一致。"""
     compiled = compiled_by_strategy[strategy.name]
     _, hardware = _hw_and_hardware()
     backend = NumpyBackend(NumpyBackendConfig(
@@ -133,11 +115,7 @@ def test_every_strategy_decodes_the_same_tokens_as_single_card_pytorch(
 
 
 def test_cross_stage_edge_count_grows_with_stage_count(compiled_by_strategy) -> None:
-    """结构判据：跨 stage 的搬运边恰好 num_stages-1 条（每个 stage 边界一条残差链）。
-
-    这是 PP 真的生效的最直接证据：`_diff_edge` 若不比较 DPU 集合，这个数字恒为 0
-    而其余一切看起来照常——数据永远留在第一个 stage，logits 全错。
-    """
+    """验证跨 stage 的通信边数量。"""
     counts = {}
     for name, compiled in compiled_by_strategy.items():
         cross = [
@@ -160,7 +138,7 @@ def test_kv_region_holds_only_this_stage_layers(compiled_by_strategy) -> None:
         for dpu_id, spec in compiled.kv_specs.items():
             assert spec.layers == strategy.layers_of_dpu(dpu_id, NUM_LAYERS), name
             assert len(spec.layers) == per_stage, name
-        # 全部 stage 合起来覆盖每一层
+        # 所有流水段覆盖全部层。
         covered = {
             layer
             for dpu_id in strategy.dpu_ids
@@ -170,16 +148,7 @@ def test_kv_region_holds_only_this_stage_layers(compiled_by_strategy) -> None:
 
 
 def test_kv_bytes_per_dpu_are_invariant_across_strategies(compiled_by_strategy) -> None:
-    """结构判据：单台 DPU 的 KV 占用与策略无关——流水改变 KV 的切法，不改变总量。
-
-    「流水下每台只留本 stage 的层，所以 KV 区变小」这个直觉是错的：
-    `层数/num_stages × head数/tp_width`，而 `num_stages × tp_width == num_dpus`，
-    两项相乘恒为 `总量/num_dpus`。张量并行按 **head** 切（每台全部层、少数 head），
-    流水按 **层** 切（每台全部 head、少数层），每台总量因此相同。
-
-    这条锁住该不变量，避免把 `test_kv_region_holds_only_this_stage_layers` 的
-    「KV 区只含本 stage 的层」误读成「流水省了 KV」。
-    """
+    """验证各策略的单 DPU KV 占用相同。"""
     expected_cells = NUM_LAYERS * MODEL_KWARGS["num_key_value_heads"] // NUM_DPUS
     per_dpu_bytes = set()
     for name, compiled in compiled_by_strategy.items():
@@ -210,21 +179,12 @@ def _weight_bytes_by_kind(compiled) -> dict[str, int]:
 def test_sharded_weight_bytes_are_invariant_while_replication_shrinks(
     compiled_by_strategy,
 ) -> None:
-    """结构判据：被切的权重总量四种策略恒等，被复制的权重随 tp 变窄而减少。
-
-    切分只改变**分布**：每台 DPU 承担 `num_layers/num_stages` 层 × 每层
-    `1/tp_width`，相乘恒为 `1/num_dpus`，所以 Shard 类权重的全机总量与策略无关
-    （证明没有哪种策略偷偷少存或多存了权重）。
-
-    Replicate 类权重（RMSNorm）不同：它在**一个 stage 内**每台 DPU 各存一份，
-    所以份数 = tp_width。tp 越窄复制开销越小，这是流水切分的一项真实收益，不是
-    误差——实测 4608 / 2304 / 1152 字节，正比于 tp_width 4 / 2 / 1。
-    """
+    """验证分片权重总量不变且复制权重随并行宽度变化。"""
     shard_totals = {}
     for name, compiled in compiled_by_strategy.items():
         kinds = _weight_bytes_by_kind(compiled)
         shard_totals[name] = kinds["Shard"]
-        # 复制份数恰好等于 tp_width：全机 Replicate 字节 = 单份 × tp_width
+        # 复制字节数等于单份大小乘张量并行宽度。
         per_copy = kinds["Replicate"] // compiled.strategy.tp_width
         assert kinds["Replicate"] == per_copy * compiled.strategy.tp_width, name
 
@@ -238,16 +198,12 @@ def test_replicated_weight_bytes_scale_with_tp_width(compiled_by_strategy) -> No
         kinds = _weight_bytes_by_kind(compiled)
         per_copy_bytes.add(kinds["Replicate"] // compiled.strategy.tp_width)
 
-    # 所有策略折算回「单份」后必须相同——差异全部来自复制份数
+    # 各策略的单份复制权重大小相同。
     assert len(per_copy_bytes) == 1, f"单份 Replicate 权重量不一致: {per_copy_bytes}"
 
 
 def test_each_dpu_carries_a_balanced_share_of_weights(compiled_by_strategy) -> None:
-    """结构判据：每台 DPU 的权重负载均衡（最重的不超过最轻的 2 倍）。
-
-    不用严格相等：lm_head 与最终 norm 归最后一个 stage（`_dpus_of_node` 对无层号
-    节点的规定），那一段因此比其他段多一份 vocab 权重。
-    """
+    """验证各 DPU 的权重负载基本均衡。"""
     for name, compiled in compiled_by_strategy.items():
         per_dpu = {
             dpu_id: sum(

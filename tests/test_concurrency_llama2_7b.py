@@ -1,13 +1,4 @@
-"""真实 Llama-2-7B 上 8 DPU 并发调度的显式验证（验证 3b）。
-
-用户明确指出：只用 8 台 DPU 跑通不足以证明"可并行性/交互性"，需要专门验证
-`execute_plan` 确实把无依赖命令一次性提交给 8 条独立 DPU 流并发执行，而不是
-隐式串行；同时验证 `waits` 精确等待生效——依赖命令不会在前驱完成前抢跑。
-
-两条断言都基于 `NumpyBackend` 已有的线程池执行模型（每个 DPU 一条独立线程
-流，`ThreadPoolExecutor`），不新增编排器代码，只在 kernel 外面包一层记录
-时间戳的探针（测试专用，不改 `runtime/kernels.py` 本体）。
-"""
+"""验证 Llama-2-7B 计划在多 DPU 上的并发和依赖等待。"""
 
 from __future__ import annotations
 
@@ -27,6 +18,7 @@ from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from comm.plan import build_comm_plan
 from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import PIMHardwareConfig
+from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import kv_specs_from_placement
@@ -37,22 +29,22 @@ from runtime.exec_plan_gen import build_execution_plan
 from runtime.executor import DecodeState, execute_plan, make_sdpa_handler
 from tests.test_partition import _FixedMaskLlama
 
-MODEL_DIR = Path(
-    "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf"
-)
+MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
 SEQ_LEN = 16
 MAX_SEQ = 64
 KV_DTYPE_BYTES = 2
 
-pytestmark = pytest.mark.skipif(not MODEL_DIR.is_dir(), reason="需要本地 Llama-2-7b-hf 权重")
+pytestmark = pytest.mark.skipif(
+    MODEL_DIR is None or not MODEL_DIR.is_dir(),
+    reason="需要在 paths.json 配置 llama2_7b_model_dir",
+)
 
 
 
 @pytest.fixture(scope="module")
 def llama2_instrumented_run():
-    """真实 7B 单次 prefill，kernel 包一层时间戳探针，记录每条 launch 命令
-    的 (cmd_id, dpu_id, start, end)（模块内一次）。"""
+    """执行一次预填充并记录每条启动命令的时间区间。"""
     torch.set_grad_enabled(False)
     model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
     cfg = model.config
@@ -82,11 +74,7 @@ def llama2_instrumented_run():
         num_tasklets=4,
         mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536,
-        # dma_align 是 WRAM tile 搬运的对齐要求，跟 hw.align（MRAM 里
-        # 张量摆放对齐，供 memory/mem_planner.py 用）是两个不同量级的概念，
-        # 不能共用同一个值——用 hw.align=1024 会让 kernel_src.py 编出的
-        # tile（几百到几万字节）几乎全部不整除，实测触发
-        # pim-tile-to-budget 的 DMA 对齐报错。
+        # DMA 分块使用独立于 MRAM 布局的字节对齐。
         dma_align=64,
     )
     nodes = list(gm.graph.nodes)
@@ -112,8 +100,7 @@ def llama2_instrumented_run():
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))
 
-    # 逐条 launch 命令包一层时间戳探针 + 人为延时（放大并发窗口，让"确实
-    # 重叠"这件事在真实硬件级并发下也能被稳定观察到，不依赖运气）。
+    # 在 launch 前后记录时间并扩大并发窗口。
     intervals: list[tuple[int, int, float, float]] = []
     lock = threading.Lock()
 
@@ -139,9 +126,7 @@ def llama2_instrumented_run():
 
 
 def test_independent_dpu_launches_overlap_in_time(llama2_instrumented_run) -> None:
-    """无依赖的 8 台 DPU 的同一层 q_proj launch，执行区间确有真实重叠——
-    证明 `execute_plan` 把它们一次性交给 8 条独立线程流，不是隐式串行。
-    """
+    """验证无依赖 DPU 启动命令的执行区间重叠。"""
     compiled, intervals = llama2_instrumented_run
     q_proj_cmds = [c for c in compiled.plan.commands if c.op == "launch" and c.payload.get("node") == "linear"]
     assert len(q_proj_cmds) == 8
@@ -162,11 +147,7 @@ def test_independent_dpu_launches_overlap_in_time(llama2_instrumented_run) -> No
 
 
 def test_dependent_launch_waits_for_true_completion(llama2_instrumented_run) -> None:
-    """同 DPU 上有 RAW 依赖的两条 `launch`（如 q_proj 输出被同层内下一个
-    DPU 算子读取）：依赖方的开始时刻不早于被依赖方的完成时刻——证明
-    `waits` 精确等待生效，不是碰巧先后执行。两者都在探针覆盖范围内（都是
-    `launch`），不依赖 host_op 的计时。
-    """
+    """验证依赖启动命令在前驱完成后执行。"""
     compiled, intervals = llama2_instrumented_run
     by_id = {cid: (dpu, t0, t1) for cid, dpu, t0, t1 in intervals}
 

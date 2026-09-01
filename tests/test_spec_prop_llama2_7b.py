@@ -1,11 +1,4 @@
-"""真实 Llama-2-7B 的问题 1 → 问题 2 端到端结构验证（编译期判据，方案二.(11) 契约）。
-
-加载官方权重 torch.export 出静态图（2139 节点），过 partition_graph 后做切分传播。
-第 1 阶段窄白名单下，注意力/RMSNorm 的大量分解算子（view、rope、softmax、pow/mean
-等）留在 host，其 host↔dpu 往返产生 scatter / all_gather 边——属预期行为；结构性判据
-是 Megatron 配对保持完好：每层恰有 o_proj、down_proj 两条 all_reduce（32 层共 64 条），
-权重 pinned 且永不重分布，logits 经一次 all_gather 回 host。
-"""
+"""验证 Llama-2-7B 图的设备映射和分片结构。"""
 
 from __future__ import annotations
 
@@ -26,20 +19,22 @@ from contracts.graph_meta import (
     SPEC_META_KEY,
 )
 from contracts.pim_tensor_spec import Placement
+from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import format_spec_report, llama_shard_config, propagate_specs
 from tests.test_partition import _FixedMaskLlama
 
-MODEL_DIR = Path(
-    "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf"
-)
+MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8  # 7B fp16 ≈ 13.5GiB，8 台 8GB DPU 容量充裕；8 整除 32 heads / 11008 / 32000
 SEQ_LEN = 16
 
 REPLICATE = Placement("Replicate")
 PARTIAL_SUM = Placement("Partial", reduce_type="sum")
 
-pytestmark = pytest.mark.skipif(not MODEL_DIR.is_dir(), reason="需要本地 Llama-2-7b-hf 权重")
+pytestmark = pytest.mark.skipif(
+    MODEL_DIR is None or not MODEL_DIR.is_dir(),
+    reason="需要在 paths.json 配置 llama2_7b_model_dir",
+)
 
 
 @pytest.fixture(scope="module")

@@ -1,9 +1,4 @@
-"""问题 6 阶段 B 单测：DPU 白名单算子的 NumPy 镜像 kernel 逐算子对拍。
-
-判据：每个 kernel 直接构造一条 `Command`（不经 exec_plan_gen，隔离验证 kernel
-本身的 payload 解析 + 计算），在 NumpyBackend 上写输入、submit、读回，与
-torch 参考逐元素对齐。
-"""
+"""验证 DPU 白名单内核的 NumPy 结果。"""
 
 from __future__ import annotations
 
@@ -103,11 +98,7 @@ def test_tanh_kernel_matches_torch() -> None:
 
 @pytest.mark.parametrize("num_tasklets", [1, 2, 3, 5, 8])
 def test_tasklet_linear_kernel_matches_torch_for_various_tasklet_counts(num_tasklets) -> None:
-    """按 M 维切分给 num_tasklets 个 tasklet 顺序模拟，数值必须与 torch 参考逐元素一致。
-
-    num_tasklets 覆盖：整除 M（2）、不整除 M（3，M=7）、大于 M（8，M=7，尾部
-    tasklet 空转）——见 tasklet_linear_kernel 里 `row_start >= row_end: continue`。
-    """
+    """验证不同 tasklet 数下的线性计算结果。"""
     backend = _backend()
     backend.register_kernel("tasklet_linear", tasklet_linear_kernel)
     rng = np.random.default_rng(4)
@@ -139,10 +130,7 @@ def test_tasklet_linear_kernel_row_ranges_are_disjoint_and_cover_m() -> None:
 
 
 def test_tasklet_linear_kernel_hazard_detection_catches_broken_split() -> None:
-    """故意构造一个"漏隔离"的坏 kernel：两个 tasklet 各自算出的行区间人为重叠
-    写同一段输出、且都不调 hal.barrier() ——hazard 检测必须能抓到，这是方案
-    验收标准 (b) 的直接落地：不仅要数值对，还要能验证同步/依赖问题本身。
-    """
+    """验证重叠写入且缺少屏障时会触发冲突检测。"""
     backend = _backend()
 
     def broken_tasklet_linear(hal, dpu_id, cmd) -> None:
@@ -152,8 +140,7 @@ def test_tasklet_linear_kernel_hazard_detection_catches_broken_split() -> None:
         dtype = np.dtype(cmd.payload["dtype"])
         out_access = cmd.writes[0]
         row_bytes = w.shape[0] * dtype.itemsize
-        # 故意让两个 tasklet 的"行区间"重叠（都写 [0, 2) ），且中间不调用
-        # hal.barrier()——真实硬件上这就是两个 tasklet 同时写同一段 MRAM。
+        # 两个 tasklet 写入重叠 MRAM 区间。
         for tid in (0, 1):
             hal.record_access(tid, "mram", out_access.offset, 2 * row_bytes, is_write=True)
             y_slice = x[0:2].astype(np.float32) @ w.astype(np.float32).T

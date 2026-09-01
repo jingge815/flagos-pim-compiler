@@ -1,9 +1,4 @@
-"""通信库（comm/lowering.py）在厂商 SDK numpy 镜像上的数值验证。
-
-判据：与 host 端 numpy 参考逐元素对齐——每种 redistribute 类型的收集/归约/回写
-结果等于对全局张量的直接切片/求和；附录 A 的 Megatron 配对作为端到端数值基准。
-数据搬运全部经 dpu_sdk 的 DMA 原语（host-star 两跳），不读写 DPU 内部数组。
-"""
+"""验证通信原语在 SDK NumPy 镜像上的数值结果。"""
 
 from __future__ import annotations
 
@@ -44,7 +39,7 @@ def test_all_reduce_sums_partials_and_writes_back() -> None:
     acc = all_reduce(entry, engine)
 
     assert np.array_equal(acc, sum(partials).reshape(shape))
-    for dpu_id in (0, 1):  # dst_loc 为 DPU 集合：逐台回写完整结果
+    for dpu_id in (0, 1):  # 向每个目标 DPU 回写结果。
         assert np.array_equal(_read(engine, dpu_id, 8), sum(partials))
 
 
@@ -62,30 +57,30 @@ def test_all_reduce_to_host_leaves_dpus_untouched_and_supports_mean() -> None:
     acc = all_reduce(entry, engine)
 
     assert np.array_equal(acc, (partials[0] + partials[1]) / 2)
-    for dpu_id, part in enumerate(partials):  # dst_loc 为 host：无回写段，DPU 内容不变
+    for dpu_id, part in enumerate(partials):  # 主机目标不改变 DPU 内容。
         assert np.array_equal(_read(engine, dpu_id, 4), part)
 
 
 def test_all_gather_orders_shards_by_global_range_not_dpu_id() -> None:
-    """附录 B.4：DPU0 持后半段、DPU1 持前半段，拼接仍按全局位置。"""
+    """验证分片按全局位置而非 DPU 编号拼接。"""
     shape = (6,)
     src = _dpu_spec(Placement("Shard", 0), shape, (0, 1), permuted=True)
     dst = _dpu_spec(REPLICATE, shape, (0, 1))
     (entry,) = build_comm_plan([_edge(0, "all_gather", src, dst, shape)])
     engine = _engine()
     global_tensor = np.arange(6, dtype=np.float32)
-    engine.copy_to_dpu(0, 0, global_tensor[3:6])  # DPU0 持后半段
-    engine.copy_to_dpu(1, 0, global_tensor[0:3])  # DPU1 持前半段
+    engine.copy_to_dpu(0, 0, global_tensor[3:6])
+    engine.copy_to_dpu(1, 0, global_tensor[0:3])
 
     merged = all_gather(entry, engine)
 
     assert np.array_equal(merged, global_tensor)
-    for dpu_id in (0, 1):  # 广播段：每台收回完整张量
+    for dpu_id in (0, 1):  # 每个 DPU 接收完整张量。
         assert np.array_equal(_read(engine, dpu_id, 6), global_tensor)
 
 
 def test_all_gather_multidim_shard_interleaves_rows() -> None:
-    """[1,4,8] 沿 dim2 切：全局缓冲中的交错布局由逐外维 run 正确还原。"""
+    """验证多维分片按外维连续区间合并。"""
     shape = (1, 4, 8)
     src = _dpu_spec(Placement("Shard", 2), shape, (0, 1))
     (entry,) = build_comm_plan([_edge(0, "all_gather", src, _host_spec(), shape)])
@@ -96,7 +91,7 @@ def test_all_gather_multidim_shard_interleaves_rows() -> None:
 
     merged = all_gather(entry, engine)
 
-    assert np.array_equal(merged, global_tensor)  # dst host：只返回，无回写
+    assert np.array_equal(merged, global_tensor)
     assert np.array_equal(_read(engine, 0, 16), global_tensor[:, :, 0:4].reshape(-1))
 
 
@@ -107,7 +102,7 @@ def test_all_to_all_reshards_via_host_staging() -> None:
     (entry,) = build_comm_plan([_edge(0, "all_to_all", src, dst, shape)])
     engine = _engine()
     global_tensor = np.arange(24, dtype=np.float32).reshape(shape)
-    engine.copy_to_dpu(0, 0, global_tensor[0:2, :].reshape(-1))  # Shard(0) 分片
+    engine.copy_to_dpu(0, 0, global_tensor[0:2, :].reshape(-1))
     engine.copy_to_dpu(1, 0, global_tensor[2:4, :].reshape(-1))
 
     all_to_all(entry, engine)
@@ -153,11 +148,7 @@ def test_primitive_rejects_mismatched_entry_type() -> None:
 
 
 def test_megatron_pair_end_to_end_matches_torch() -> None:
-    """附录 A 端到端：列切 → 行切 → all_reduce，与单卡 torch 逐元素对齐。
-
-    X 经 scatter 广播下发（Replicate→Replicate 退化）；每台本地算
-    y1 = X@W1_d.T、y2_d = y1@W2_d.T（部分和）；all_reduce 求和回 host。
-    """
+    """验证列切、行切和 all_reduce 的端到端结果。"""
     torch.manual_seed(0)
     x = torch.randn(1, 4)
     w1 = torch.randn(6, 4)  # HF [out, in]，列切 Shard(0)

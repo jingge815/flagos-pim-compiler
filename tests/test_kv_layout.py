@@ -1,9 +1,4 @@
-"""问题 7 KV cache 管理单测：编译期布局 + 运行时 update/read_tile/mask。
-
-判据分两类（CLAUDE.md）：编译期布局对照手推结果（offset 表、对齐 padding、
-kv_bytes 公式）；运行时数值在 NumpyBackend 上与单卡 PyTorch 逐元素对齐——
-用 read_tile 逐 tile 拼出的注意力（softmax 在 host）必须等于 torch 参考实现。
-"""
+"""验证 KV 缓存布局、读写、掩码和注意力计算。"""
 
 from __future__ import annotations
 
@@ -31,11 +26,11 @@ from memory.kv_layout import (
     prefill_mask,
 )
 
-# 小配置：2 层、每台 DPU 2 个 KV head（共 4 头 MHA）、head_dim=8、max_seq=16、fp32
+# 小型 KV 布局配置。
 NUM_LAYERS, HEAD_DIM, MAX_SEQ = 2, 8, 16
 DTYPE_BYTES = 4
 BLOCK = MAX_SEQ * HEAD_DIM * DTYPE_BYTES  # 512 B，一个 (layer, head, k|v) 子块
-WRAM_BUDGET = 4 * BLOCK  # 测试用 WRAM 预算：真机由问题 5 的桥按 WRAM 容量定
+WRAM_BUDGET = 4 * BLOCK
 
 
 def _spec(dpu_id: int, kv_base: int = 0, kv_heads=(0, 1), layers=(0, 1)) -> KVRegionSpec:
@@ -69,7 +64,7 @@ def _random_kv(rng) -> tuple[np.ndarray, np.ndarray]:
 
 def _write_one_step(cache: PIMStaticKVCache, rng, layer: int, pos: int,
                     ref: dict[int, list] | None = None) -> None:
-    """模拟编排器一个 decode step 的 KV 追加：pos = DecodeState.valid_len（唯一真值源）。"""
+    """在指定位置写入一轮 KV 数据。"""
     k_by_dpu, v_by_dpu = {}, {}
     for dpu_id, spec in cache.specs.items():
         k_by_dpu[dpu_id], v_by_dpu[dpu_id] = {}, {}
@@ -82,7 +77,7 @@ def _write_one_step(cache: PIMStaticKVCache, rng, layer: int, pos: int,
 
 
 def _k_proj_spec(num_dpus: int, num_kv_heads: int, head_dim: int, hidden: int) -> PIMTensorSpec:
-    """仿问题 2 产物：k_proj.weight [num_kv_heads*head_dim, hidden] 列切 Shard(0)。"""
+    """构造沿输出维分片的 k_proj 权重规格。"""
     rows = num_kv_heads * head_dim
     width = rows // num_dpus
     return PIMTensorSpec(
@@ -98,7 +93,7 @@ def _k_proj_spec(num_dpus: int, num_kv_heads: int, head_dim: int, hidden: int) -
     )
 
 
-# ---------- 编译期：kv_bytes / build_kv_layout / 怎么切 ----------
+# 编译期 KV 布局。
 
 
 def test_align_up() -> None:
@@ -109,9 +104,9 @@ def test_align_up() -> None:
 
 
 def test_kv_bytes_lower_bound() -> None:
-    # 手推：2(K/V) × 2层 × 16 × 2头 × 8 × 4B = 4096
+    # 手工计算的 KV 总字节数。
     assert kv_bytes(_spec(0)) == 2 * 2 * 16 * 2 * 8 * 4 == 4096
-    # Llama-2-7B 每台 DPU（8 DPU 均分 32 头）：2 × 32层 × 256 × 4头 × 128 × 2B = 16 MiB
+    # Llama-2-7B 单 DPU 的 KV 字节数。
     llama = KVRegionSpec(0, list(range(32)), [0, 1, 2, 3], {h: [h] for h in range(4)},
                          max_seq=256, head_dim=128, dtype_bytes=2, kv_base=0)
     assert kv_bytes(llama) == 2 * 32 * 256 * 4 * 128 * 2 == 16 * 2**20
@@ -126,7 +121,7 @@ def test_build_kv_layout_offsets_exact() -> None:
         (1, 1, "k"): 4096, (1, 1, "v"): 4608,
     }
     assert spec.kv_allocated_bytes == 4096 == kv_bytes(spec)  # 无 padding 时二者相等
-    # 对齐 padding：align=1024 时每个 512B 子块补到 1024B，allocated 是 kv_bytes 两倍
+    # 对齐填充后的已分配字节数。
     padded = build_kv_layout(_spec(0, kv_base=1024), align=1024)
     assert padded.kv_allocated_bytes == 8192 == 2 * kv_bytes(padded)
     assert all(off % 1024 == 0 for off in padded.kv_off.values())
@@ -154,7 +149,7 @@ def test_kv_region_spec_crud_and_rebuild() -> None:
 
 
 def test_kv_specs_from_placement_mha() -> None:
-    """怎么切（问题 2 的 k_proj 列切）→ 每台 DPU 驻留的 kv head，MHA 时 q 映射为恒等。"""
+    """验证列切 k_proj 的 KV head 按 DPU 分配。"""
     spec = _k_proj_spec(num_dpus=4, num_kv_heads=32, head_dim=128, hidden=4096)
     specs = kv_specs_from_placement(spec, layers=list(range(32)), num_kv_heads=32, num_q_heads=32,
                                     head_dim=128, max_seq=256, dtype_bytes=2, kv_base=0)
@@ -184,7 +179,7 @@ def test_kv_specs_from_placement_gqa() -> None:
 
 
 def test_kv_specs_from_placement_rejects_incomplete_or_overlapping_heads() -> None:
-    """问题 2 的 k_proj shard_map 必须恰好覆盖每个 KV head 一次。"""
+    """验证 k_proj 分片恰好覆盖每个 KV head。"""
     incomplete = _k_proj_spec(2, 4, 2, 8)
     incomplete.shard_map[1] = TensorShardDetail(1, 0, 2, 6, (4, 8))
     with pytest.raises(ValueError, match="覆盖"):
@@ -199,7 +194,7 @@ def test_kv_specs_from_placement_rejects_incomplete_or_overlapping_heads() -> No
 
 
 def test_kv_access_matches_layout() -> None:
-    """问题 6 填 Command.reads/writes 的区间必须与 update/read_tile 实际访问一致。"""
+    """验证命令访问区间与 KV 实际地址一致。"""
     spec = _specs()[0]
     acc = kv_access(spec, layer=1, head=0, which="v", pos_start=3, pos_end=7)
     assert acc.loc == ("dpu", 0)
@@ -214,7 +209,7 @@ def test_format_kv_layout_printable() -> None:
     assert "dpu0" in text and "kv_allocated_bytes=4096" in text and "kv_heads=[0..1]" in text
 
 
-# ---------- 运行时：update / read_tile / mask，NumpyBackend 数值验证 ----------
+# 运行时 KV 读写和掩码。
 
 
 def test_update_then_read_tile_roundtrip() -> None:
@@ -253,7 +248,7 @@ def test_cache_object_holds_no_state() -> None:
     fresh = PIMStaticKVCache(backend, specs, wram_budget_bytes=WRAM_BUDGET)
     K, V = fresh.read_tile(0, 0, 0, 0, 1)
     assert np.array_equal(K[0], k0) and np.array_equal(V[0], v0)
-    # 契约：未过 build_kv_layout 的 spec 直接抛
+    # 未布局的规格不能创建缓存。
     with pytest.raises(ValueError):
         PIMStaticKVCache(backend, {0: _spec(0)}, WRAM_BUDGET)
 
@@ -283,7 +278,7 @@ def test_update_and_read_tile_contract_violations() -> None:
 
 
 def test_masks() -> None:
-    # prefill_mask(3, 5)：可见 = 因果(j<=i) 且 真实 token(j<3)；j>=3 的预留列全 -inf
+    # 预填充掩码屏蔽未来位置和预留位置。
     expected = np.array([
         [0, -np.inf, -np.inf, -np.inf, -np.inf],
         [0, 0, -np.inf, -np.inf, -np.inf],
@@ -305,22 +300,18 @@ def test_masks() -> None:
         decode_mask(1.5, 5)
 
 
-# ---------- 端到端数值：逐 tile 读 KV 的注意力 vs 单卡 PyTorch ----------
+# 按分块读取 KV 的注意力数值验证。
 
 
 def _host_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    """softmax 第 1 阶段在 host（B 类算子留 host，方案问题 7 三.③）。"""
+    """计算主机端 softmax。"""
     e = np.exp(x - np.max(x, axis=axis, keepdims=True))
     return e / e.sum(axis=axis, keepdims=True)
 
 
 def _pim_decode_attention(kv: PIMStaticKVCache, layer: int, q_by_head: dict[int, np.ndarray],
                           valid_len: int, tile: int) -> dict[int, np.ndarray]:
-    """单步 decode 的 PIM 路径：DPU 逐 tile 读 K 算 scores → host softmax → 逐 tile 读 V 累加。
-
-    对应方案问题 7 的 attention_on_dpu：满预留满算（scores 为 [max_seq] 向量），
-    无效尾部由 decode_mask 盖掉；KV 本地驻留，全程零跨 DPU。
-    """
+    """按分块读取 KV 并计算单步解码注意力。"""
     mask = decode_mask(valid_len, MAX_SEQ)
     scale = 1.0 / np.sqrt(HEAD_DIM)
     out = {}
@@ -341,7 +332,7 @@ def _pim_decode_attention(kv: PIMStaticKVCache, layer: int, q_by_head: dict[int,
 
 
 def test_attention_decode_matches_torch() -> None:
-    """逐 tile（tile=6，max_seq=16 故意不整除）读 KV 的注意力 == torch 单卡参考。"""
+    """验证分块 KV 注意力与 Torch 参考一致。"""
     cache = PIMStaticKVCache(_backend(), _specs(), wram_budget_bytes=WRAM_BUDGET)
     rng = np.random.default_rng(2)
     layer = 1

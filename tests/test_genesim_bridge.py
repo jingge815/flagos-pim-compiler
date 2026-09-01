@@ -1,13 +1,4 @@
-"""genesim_bridge 单测。
-
-IR 分析器的判据是理论值：bmm 的 flops 必须等于 2*M*N*K；且同一 kernel 的
-flops 在 TTIR 与 pim mlir 两层上必须逐位相等（PIM pass 不改 tt.dot / scf.for）。
-pim mlir 侧另判 mram_traffic_bytes 按循环次数与 grid 正确还原到算子级。
-拟合器的判据是非负性——GeneSim 的 scheduler 直接消费求值结果，
-负的 flops / data_bytes 会让 roofline 与分区判据失效。
-
-不需要 GPU：两层 IR 都用文件内固化的骨架样本，拟合用构造的 Measurement。
-"""
+"""验证 GeneSim IR 成本分析、拟合和结果回填。"""
 
 from __future__ import annotations
 
@@ -26,7 +17,7 @@ from genesim_bridge.ir_cost import analyze_ir
 
 DATA = Path(__file__).parent / "data"
 
-# 一个最小的 bmm TTIR 骨架：tile 32x32x32，循环次数 ceil(K/32)
+# 最小的 BMM TTIR 样例。
 BMM_TTIR = """
 module {
   tt.func public @bmm_kernel(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>, %O: !tt.ptr<f16>, %K: i32) {
@@ -50,7 +41,7 @@ module {
 
 
 def test_bmm_flops_matches_theory():
-    """M=128, N=128, K=64 -> grid (4,4,1), flops 应等于 2*M*N*K。"""
+    """验证 BMM 浮点运算量与理论值一致。"""
     cost = analyze_ir(BMM_TTIR, "bmm_kernel", (4, 4, 1), {"K": 64})
     assert cost.loop_trip_counts == [2]       # ceil(64/32)
     assert cost.tile_flops_per_program == 2 * (2 * 32 * 32 * 32)
@@ -60,7 +51,7 @@ def test_bmm_flops_matches_theory():
     assert not cost.notes
 
 
-# 两个顺序排列的顶层循环，次数不同（flash_fwd 的结构：masking 段 + 非 masking 段）
+# 含两个不同迭代次数的顶层循环。
 TWO_LOOP_TTIR = """
 module {
   tt.func public @two_loop(%A: !tt.ptr<f16>, %P: i32, %Q: i32) {
@@ -81,11 +72,7 @@ module {
 
 
 def test_sequential_top_level_loops_keep_own_trip_counts():
-    """两个顺序顶层循环各用自己的次数，不能共用一个 trip。
-
-    早期实现只保留一个 trip，后一个循环的次数会覆盖前一个并被同时应用到
-    两个循环体上（P=3,Q=5 会算成 (1+1)*5=10 个 dot 而不是 3+5=8 个）。
-    """
+    """验证顺序顶层循环使用各自的迭代次数。"""
     dot = 2 * 8 * 8 * 8
     cost = analyze_ir(TWO_LOOP_TTIR, "two_loop", (1,), {"P": 3, "Q": 5})
     assert cost.loop_trip_counts == [3, 5]
@@ -94,12 +81,7 @@ def test_sequential_top_level_loops_keep_own_trip_counts():
 
 
 def test_dot_with_attributes_is_counted():
-    """带属性的 tt.dot 必须照样计入。
-
-    flash_fwd 的 dot 形如 `tt.dot %a, %b, %c, inputPrecision = tf32 : ...`。
-    早期正则要求「三个操作数后紧跟冒号」，遇到属性直接匹配失败，把整个
-    flash kernel 的矩阵乘静默算成 0 flops，交叉验证结果因此偏低 37 倍。
-    """
+    """验证带属性的 tt.dot 计入浮点运算量。"""
     line = ("      %S = tt.dot %Q, %K, %cst, inputPrecision = tf32 : "
             "tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>")
     ttir = "module {\n  tt.func public @k(%A: !tt.ptr<f16>) {\n" + line + "\n    tt.return\n  }\n}\n"
@@ -114,10 +96,7 @@ def test_unresolved_loop_is_flagged_not_silently_zero():
     assert any("循环次数" in n for n in cost.notes)
 
 
-# 上面 BMM_TTIR 经 convert-triton-to-pim + pim-explicit-dma 之后的形态：
-# 张量类型带上 #pim.tasklet_tiled 布局，两个 tt.load 换成
-# wram_alloc（提到循环外）+ dma_load + barrier + wram_load，tt.store 换成
-# wram_store + barrier + dma_store。tt.dot 与 scf.for 原样保留。
+# BMM TTIR 对应的 PIM IR 样例。
 _LAYOUT = "#pim.tasklet_tiled<{sizePerTasklet = [1, 1], taskletsPerDpu = [1, 16], order = [1, 0]}>"
 BMM_PIMIR = """
 module attributes {"pim.num-dpus" = 1 : i32, "pim.num-tasklets" = 16 : i32, pim.target = "pim:v1", "pim.wram-bytes" = 65536 : i32, "pim.wram-bytes-used" = 6144 : i32} {
@@ -151,16 +130,7 @@ module attributes {"pim.num-dpus" = 1 : i32, "pim.num-tasklets" = 16 : i32, pim.
 
 
 def test_pimir_flops_identical_to_ttir():
-    """同一 kernel 的 flops 在两层 IR 上必须逐位相等。
-
-    这不是巧合而是 pass 语义：convert-triton-to-pim 只给张量类型加布局，
-    pim-explicit-dma 只改 tt.load/store，`tt.dot` 与 `scf.for` 原样保留。
-    实测 LLaMA2 默认链路的算子代表点应保持逐位相等。
-
-    早期正则把 tensor 类型锚定成 `tensor<...>` 结尾，在 pim mlir 的
-    `tensor<32x32xf16, #pim.tasklet_tiled<...>>` 上 tt.dot 命中 0 次，会把
-    矩阵乘静默算成 0 flops——本测试正是为守住这一点。
-    """
+    """验证 TTIR 和 PIM IR 的浮点运算量一致。"""
     ttir = analyze_ir(BMM_TTIR, "bmm_kernel", (4, 4, 1), {"K": 64})
     pimir = analyze_ir(BMM_PIMIR, "bmm_kernel", (4, 4, 1), {"K": 64}, ir_level="pimir")
 
@@ -171,15 +141,7 @@ def test_pimir_flops_identical_to_ttir():
 
 
 def test_pimir_mram_traffic_counts_tile_level_repeats():
-    """mram_traffic_bytes 要按循环次数与 grid 还原到算子级。
-
-    循环体内两个 dma_load 各 32*32*f16 = 2048 B，循环跑 2 次；循环外一个
-    dma_store 32*32*f32 = 4096 B。单 program 共 2*2*2048 + 4096 = 12288 B，
-    grid 16 个 program -> 196608 B。
-
-    这个量必然大于「净读写字节数」——WRAM 装不下整个算子，同一份 MRAM 数据
-    要按 tile 反复搬入。按方案三.(3) 它只落 sidecar，不进 data_bytes。
-    """
+    """验证 MRAM 搬运字节数包含循环和网格重复。"""
     cost = analyze_ir(BMM_PIMIR, "bmm_kernel", (4, 4, 1), {"K": 64}, ir_level="pimir")
     assert cost.mram_traffic_bytes == 16 * (2 * 2 * 2048 + 4096)
     assert cost.dma_ops == 3
@@ -190,10 +152,7 @@ def test_pimir_mram_traffic_counts_tile_level_repeats():
 
 
 def test_ttir_level_leaves_pim_fields_unset():
-    """TTIR 上没有 pim.* 算子，这些字段必须留 None/空，不能编造 0。
-
-    0 与 None 的区别在于：0 会让下游误以为「测过了，搬运量就是 0」。
-    """
+    """验证 TTIR 不填充 PIM 专用成本字段。"""
     cost = analyze_ir(BMM_TTIR, "bmm_kernel", (4, 4, 1), {"K": 64})
     assert cost.mram_traffic_bytes is None
     assert cost.wram_bytes_used is None
@@ -202,19 +161,14 @@ def test_ttir_level_leaves_pim_fields_unset():
 
 
 def test_wram_over_budget_is_flagged():
-    """WRAM 超预算必须留 note。
-
-    FlagTree 的 pim-explicit-dma 超预算时只发 warning、不重切 tile，IR 仍可能
-    不可执行。实测 flash_fwd_kernel 用 66048 B / 预算 65536 B，
-    flash_fwd_splitkv_kernel 用 82432 B——必须让它在 sidecar 里可见。
-    """
+    """验证 WRAM 超预算记录说明。"""
     over = BMM_PIMIR.replace('"pim.wram-bytes" = 65536', '"pim.wram-bytes" = 4096')
     cost = analyze_ir(over, "bmm_kernel", (1, 1, 1), {"K": 64}, ir_level="pimir")
     assert any("WRAM 超预算" in n for n in cost.notes)
 
 
 def test_pimir_without_dma_is_rejected():
-    """pim mlir 里没有 pim.dma_* 说明 pass 没生效，必须抛而不是算出 0 搬运量。"""
+    """验证缺少 DMA 指令的 PIM IR 会被拒绝。"""
     with pytest.raises(AssertionError, match="pass 可能没生效"):
         analyze_ir(BMM_TTIR, "bmm_kernel", (1, 1, 1), {"K": 64}, ir_level="pimir")
 
@@ -242,13 +196,13 @@ def _score_op():
 
 
 def test_gemm_net_bytes_includes_weight():
-    """GEMM 的 input_shapes 不含权重，必须补上，否则 decode 访存量低估两个量级。"""
+    """验证 GEMM 成本包含输入、权重和输出的字节数。"""
     op = _gemm_op()
     decode = ShapePoint(tq=1, tp=512)
     got = _net_data_bytes(op, decode, element_bytes=2)
-    # 激活 (1*512 + 1*2048) + 权重 (512*2048)，按 fp16
+    # 按 fp16 统计激活和权重字节数。
     assert got == float((512 + 2048 + 512 * 2048) * 2)
-    # 权重项占绝对主导
+    # 权重字节数占主要部分。
     assert got > 100 * float((512 + 2048) * 2)
 
 
@@ -277,12 +231,7 @@ def test_fit_two_point_linear():
 
 
 def test_fit_rejects_negative_slope_from_padding():
-    """padding 主导的小 term 点会导致负斜率，必须降级为过原点解。
-
-    实测 GEMV_SCORE：decode 点 term 更小(129 vs 16384) 但实测 flops 更大
-    (2.62e6 vs 2.10e6)，因为 bmm 对 1 行输入 padding 到 32 行 tile。
-    无约束两点解会给出负斜率，在 Tq=512 的 prefill 上算出负 flops。
-    """
+    """验证负斜率拟合改用过原点解。"""
     prefill, decode = ShapePoint(128, 0), ShapePoint(1, 128)
     f, b, mode = _fit_coeffs(
         _score_op(),
@@ -294,24 +243,22 @@ def test_fit_rejects_negative_slope_from_padding():
     assert f["Tq(Tp+Tq)"] > 0
     assert "constant" not in f          # 过原点，无常数项
 
-    # 关键判据：在真实 trace 长度上求值必须非负
+    # 预测成本为非负值。
     for tq, tp in ((512, 0), (1024, 0), (1, 512), (1, 2048)):
         term = tq * (tp + tq)
         value = f["Tq(Tp+Tq)"] * term + f.get("constant", 0.0)
         assert value >= 0, f"Tq={tq},Tp={tp} 算出负 flops: {value}"
 
-    # 过原点解应还原理论标度 2*head_dim = 128
+    # 过原点拟合恢复理论斜率。
     assert f["Tq(Tp+Tq)"] == pytest.approx(128.0, rel=0.02)
 
 
 @pytest.mark.parametrize("refined_name", ["llama2_7b_flagtree.ir", "llama2_7b_pimir.ir"])
 def test_refined_ir_preserves_structure(refined_name):
-    """精化只改成本，不动图结构；且保留 ModelIR.to_dict() 不含的字段。
-
-    两条路（ttir / pimir）的产物都要满足——回填的口径两层相同，改的只是
-    成本数值来源。
-    """
-    ir_dir = genesim_models_dir()
+    """验证成本回填不改变 IR 结构。"""
+    ir_dir = genesim_models_dir(required=False)
+    if ir_dir is None:
+        pytest.skip("需要在 paths.json 配置 genesim_root")
     base_path, ref_path = ir_dir / "llama2_7b.ir", ir_dir / refined_name
     if not (base_path.is_file() and ref_path.is_file()):
         pytest.skip("需要先跑 scripts/refine_ir_with_flagtree.py 生成产物")
@@ -320,9 +267,7 @@ def test_refined_ir_preserves_structure(refined_name):
 
     assert ref["dependencies"] == base["dependencies"]
     assert ref["subgraphs"] == base["subgraphs"]
-    # ModelIR.to_dict() 丢这两个字段，故走原始 JSON 改写；但这两个字段本身只
-    # 存在于 GPT-2 builtin IR（scripts/generate_builtin_gpt2_ir.py），llama2
-    # 的 build_from_hf_config 产物顶层没有，只在两侧都有时才比较。
+    # 仅比较两侧均存在的原始 JSON 字段。
     if "max_seq" in base:
         assert ref["max_seq"] == base["max_seq"]
     if "vocab_size" in base:
@@ -347,13 +292,10 @@ def test_refined_ir_preserves_structure(refined_name):
 
 
 def test_pimir_sidecar_agrees_with_ttir_on_flops():
-    """整模型两条路的 flops 必须逐个算子相等，且 pimir 独有字段都有值。
-
-    这是「换 pim mlir」这一步的实际收益边界：flops 不变（PIM pass 不动计算），
-    新增的是 mram_traffic_bytes。LLaMA2 默认链路应保持同一算子两层 flops 相等，
-    并把搬运放大倍数写入 sidecar。
-    """
-    ir_dir = genesim_models_dir()
+    """验证 PIM IR 与 TTIR 的运算量和附加成本字段。"""
+    ir_dir = genesim_models_dir(required=False)
+    if ir_dir is None:
+        pytest.skip("需要在 paths.json 配置 genesim_root")
     ttir_path = ir_dir / "llama2_7b_flagtree_extensions.json"
     pimir_path = ir_dir / "llama2_7b_pimir_extensions.json"
     if not (ttir_path.is_file() and pimir_path.is_file()):
@@ -371,7 +313,7 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
             want = ttir["operators"][op_id]["measurements"][point]
             assert got["flops"] == want["flops"], f"op {op_id} {point} flops 两层不一致"
             assert got["data_bytes"] == want["data_bytes"]
-            # pimir 独有：搬运量必须有值、为正，且不小于净读写字节数
+            # PIM IR 的搬运字节数为正且不小于净读写字节数。
             assert got["mram_traffic_bytes"] > 0
             assert got["mram_amplification"] >= 1.0
             assert got["pim_kernels"], f"op {op_id} {point} 缺 pim_kernels"
@@ -379,6 +321,6 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
                 assert kernel["dma_ops"] > 0
                 assert kernel["wram_bytes_used"] is not None
 
-        # ttir 路该字段恒为 None，pimir 路必须填上
+        # 仅 PIM IR 填充该字段。
         assert ttir["operators"][op_id]["mram_traffic_bytes"] is None
         assert set(entry["mram_traffic_bytes"]) == {"prefill", "decode"}

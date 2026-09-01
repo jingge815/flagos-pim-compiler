@@ -1,9 +1,4 @@
-"""Tests for problem-2 device mapping and sharding propagation.
-
-判据（CLAUDE.md 测试约定）：编译期模块的判据是方案手推结果——附录 A 的
-placement 推演（元数据对拍），另加 NumpyBackend 上的数值对拍证明
-shard_map 的 start/end/local_shape 在真实数据搬运下正确。
-"""
+"""验证设备映射和张量分片传播。"""
 
 from __future__ import annotations
 
@@ -46,7 +41,7 @@ PARTIAL_SUM = Placement("Partial", reduce_type="sum")
 
 
 def test_shard_dimension_change_between_dpus_is_all_to_all() -> None:
-    """问题 3 已支持的 Shard(i) → Shard(j) 必须能由问题 2 产生。"""
+    """验证不同切分维度之间生成 all_to_all 通信边。"""
     graph = Graph()
     producer = graph.placeholder("producer")
     actual = PIMTensorSpec(
@@ -65,15 +60,7 @@ def test_shard_dimension_change_between_dpus_is_all_to_all() -> None:
 
 
 def test_same_placement_on_different_dpus_still_needs_a_redistribute_edge() -> None:
-    """流水切分的核心缺口：placement 与 device 都相同、只有 DPU 集合不同的边。
-
-    `Replicate@dpu{0}` → `Replicate@dpu{1}` 两端 placement 相等、device 相等，只
-    比这两项会判成「无需搬运」——跨 stage 的数据于是永远留在上一段，logits 全错
-    且不报错。这条锁住 `_diff_edge` 必须同时比较 shard_map 的 DPU 集合。
-
-    单测层面直接构造两端 spec，不经整图传播：这个判断本身与图结构无关，端到端的
-    覆盖在 `tests/test_strategy_sweep.py`。
-    """
+    """验证相同布局在不同 DPU 集合间仍生成重分布边。"""
     graph = Graph()
     producer = graph.placeholder("producer")
     producer.meta["val"] = torch.zeros(2, 4)
@@ -87,31 +74,26 @@ def test_same_placement_on_different_dpus_still_needs_a_redistribute_edge() -> N
     assert edge.src_loc == {"device": DEVICE_DPU, "dpus": [0]}
     assert edge.dst_loc == {"device": DEVICE_DPU, "dpus": [1]}
 
-    # 同一个 DPU 集合仍然判定为无需搬运（张量并行下的既有行为不受影响）
+    # 相同 DPU 集合无需数据搬运。
     assert _diff_edge(0, producer, consumer, on_dpu0, _dpu_req(REPLICATE), (0,)) is None
 
 
 @pytest.mark.parametrize(
     "path, expected",
     [
-        # torch.export 实测的两种 nn_module_stack 路径格式，两种都真实出现过
+        # 两种模块栈路径格式。
         ("L['s'].model.model.layers[slice(None, 32, None)]._modules['0'].self_attn", 0),
         ("L['s'].model.model.layers[slice(None, 32, None)]._modules['31'].mlp", 31),
         ("model.model.layers.slice(None, 4, None).0.input_layernorm", 0),
         ("model.model.layers.slice(None, 4, None).13.mlp", 13),
-        # 层外节点：解不出层号，归最后一个 stage（见 _dpus_of_node）
+        # 层外节点没有层号。
         ("model.model.norm", None),
         ("L['s'].model.model.embed_tokens", None),
         ("model.lm_head", None),
     ],
 )
 def test_layer_number_parsed_from_both_module_stack_formats(path: str, expected) -> None:
-    """层号解析必须同时认两种 stack 格式，且不把 `slice(...)` 里的上界当成层号。
-
-    只认一种格式时，另一种格式下全部计算节点都解不出层号 → 全归最后一个 stage →
-    权重与消费方落在不同 DPU 上 → pinned 权重校验直接抛错（真实踩到过）。
-    `slice(None, 4, None)` 里的 4 是层数，不剥掉会被当作层号。
-    """
+    """验证从两种模块栈格式中提取层号。"""
     graph = Graph()
     node = graph.placeholder("n")
     node.meta["nn_module_stack"] = {"k": (path, type(None))}
@@ -120,12 +102,7 @@ def test_layer_number_parsed_from_both_module_stack_formats(path: str, expected)
 
 
 def test_layer_number_of_weight_comes_from_its_name() -> None:
-    """get_attr 权重没有 nn_module_stack（实测全为 None），层号只能从名字取。
-
-    真实图里的权重节点由 `_appendix_a_graph`/`torch.export` 建，这里只需要一个
-    `op == "get_attr"` 且 `target` 是真实权重名的节点来驱动 `_layer_of_node`，
-    用真图节点避免 fx 对空 GraphModule 插 get_attr 的告警。
-    """
+    """验证从权重名称中提取层号。"""
     gm, _ = _appendix_a_graph()
     (weight,) = [
         node for node in gm.graph.nodes if node.op == "get_attr" and node.target == "w1"
@@ -135,10 +112,7 @@ def test_layer_number_of_weight_comes_from_its_name() -> None:
     assert _layer_of_node(weight) == 7
 
 
-# ---------------------------------------------------------------------------
-# 附录 A 最小示例：hidden=4, ffn=6, 2 DPU（torch.export 的图自带 meta["val"]，
-# 手搭的图需要手填）
-# ---------------------------------------------------------------------------
+# 最小的两 DPU 分片示例。
 
 
 def _appendix_a_graph() -> tuple[GraphModule, dict[str, Node]]:
@@ -196,7 +170,7 @@ def test_physical_dpu_ids_key_shard_maps_and_report_endpoint_ranges() -> None:
 
 
 def _keyword_add_graph() -> tuple[GraphModule, dict[str, Node]]:
-    """A DPU add with its right operand supplied through ``kwargs[\"other\"]``."""
+    """构造右操作数位于 ``kwargs[\"other\"]`` 的 DPU 加法图。"""
     graph = Graph()
     left = graph.placeholder("left")
     right = graph.placeholder("right")
@@ -209,7 +183,7 @@ def _keyword_add_graph() -> tuple[GraphModule, dict[str, Node]]:
 
 
 def test_keyword_operand_edges_materialize_endpoint_specs() -> None:
-    """Both positional and keyword add operands receive concrete DPU endpoint specs."""
+    """验证位置参数和关键字参数都生成具体端点规格。"""
     gm, nodes = _keyword_add_graph()
     partition_graph(gm)
 
@@ -224,7 +198,7 @@ def test_keyword_operand_edges_materialize_endpoint_specs() -> None:
 
 
 def test_replicate_dpu_to_host_is_degenerate_all_gather_from_smallest_dpu() -> None:
-    """A replicated DPU result reaches host as one canonical full-copy transfer."""
+    """验证复制布局从编号最小的 DPU 向主机生成单次全量传输。"""
     graph = Graph()
     x = graph.placeholder("x")
     dpu_tanh = graph.call_function(torch.ops.aten.tanh.default, (x,))
@@ -245,11 +219,11 @@ def test_replicate_dpu_to_host_is_degenerate_all_gather_from_smallest_dpu() -> N
     assert edge.dst_spec.device == DEVICE_HOST
     assert edge.src_loc == {"device": DEVICE_DPU, "dpus": [2, 5]}
     assert edge.dst_loc == {"device": DEVICE_HOST}
-    assert min(edge.src_spec.shard_map) == 2  # Problem 3's canonical one-copy DMA source.
+    assert min(edge.src_spec.shard_map) == 2  # 复制布局使用编号最小的 DPU 作为传输源。
 
 
 def test_propagation_clears_stale_metadata_and_reuses_stable_edge_ids() -> None:
-    """Rerunning propagation replaces stale metadata instead of accumulating old edges/specs."""
+    """验证重复传播会重建节点规格和通信边。"""
     gm, nodes = _keyword_add_graph()
     partition_graph(gm)
     output = next(node for node in gm.graph.nodes if node.op == "output")
@@ -269,7 +243,7 @@ def test_propagation_clears_stale_metadata_and_reuses_stable_edge_ids() -> None:
     assert all("stale" not in node.meta[REDISTRIBUTE_META_KEY] for node in gm.graph.nodes)
 
 
-# dpu_ids 合法性校验已随 ShardStrategy 迁到 tests/test_strategy.py，不在此重复。
+# DPU 编号范围测试。
 
 
 @pytest.mark.parametrize(
@@ -298,7 +272,7 @@ def test_appendix_a_placements() -> None:
     assert w1_spec.shard_map[0] == TensorShardDetail(0, 0, 0, 3, (3, 4))
     assert w1_spec.shard_map[1] == TensorShardDetail(1, 0, 3, 6, (3, 4))
 
-    # A.1：列切产出 Shard(1)，per-DPU 持 [0,3) / [3,6) 列分片
+    # 列切输出沿第 1 维分片。
     y1_spec = nodes["y1"].meta[SPEC_META_KEY]
     assert y1_spec.device == DEVICE_DPU
     assert y1_spec.placement == Placement("Shard", 1)
@@ -306,20 +280,20 @@ def test_appendix_a_placements() -> None:
     assert (y1_spec.shard_map[0].start_idx, y1_spec.shard_map[0].end_idx) == (0, 3)
     assert (y1_spec.shard_map[1].start_idx, y1_spec.shard_map[1].end_idx) == (3, 6)
 
-    # X 从 host 进 DPU：同布局纯跨位置，scatter（broadcast 退化）；此外计算阶段零通信
+    # 输入从主机复制到各 DPU。
     (x_edge,) = nodes["y1"].meta[REDISTRIBUTE_META_KEY]
     assert x_edge.type == "scatter"
     assert x_edge.src_loc == {"device": DEVICE_HOST}
     assert x_edge.dst_loc == {"device": DEVICE_DPU, "dpus": [0, 1]}
 
-    # A.2：行切权重与 Shard(1) 输入天然对齐（Megatron 列→行配对），产出 Partial(sum)
+    # 行切层消费对齐分片并输出部分和。
     y2_spec = nodes["y2"].meta[SPEC_META_KEY]
     assert y2_spec.placement == PARTIAL_SUM
     assert y2_spec.reduce_type == "sum"
     assert y2_spec.shard_map[0].local_shape == (1, 4)  # Partial 每台持完整形状
     assert nodes["y2"].meta[REDISTRIBUTE_META_KEY] == []
 
-    # A.4：host LayerNorm 要求 Replicate@host → Partial→Replicate 的 all_reduce 边
+    # 主机归一化层需要全量归约结果。
     (edge,) = nodes["norm"].meta[REDISTRIBUTE_META_KEY]
     assert edge.from_placement == PARTIAL_SUM
     assert edge.to_placement == REPLICATE
@@ -353,20 +327,20 @@ def test_appendix_a_numeric_on_numpy_backend() -> None:
         sl[det.shard_dim] = slice(det.start_idx, det.end_idx)
         return t[tuple(sl)].numpy()
 
-    # 1. 按 shard_map 装载：X 广播（Replicate 全量），W1/W2 各持分片
+    # 将输入和权重写入对应 DPU。
     specs = {k: nodes[k].meta[SPEC_META_KEY] for k in ("x", "w1", "w2", "y1", "y2")}
     for dpu_id in range(2):
         backend.copy_to_dpu(dpu_id, offsets["x"], x_ref.numpy())
         backend.copy_to_dpu(dpu_id, offsets["w1"], shard_of(w1_ref, specs["w1"].shard_map[dpu_id]))
         backend.copy_to_dpu(dpu_id, offsets["w2"], shard_of(w2_ref, specs["w2"].shard_map[dpu_id]))
 
-    # 2. A.1 列切：每 DPU 读本地 X、W1 分片，算 Y1 分片并写回本地 MRAM
+    # 计算列切线性层的本地输出。
     for dpu_id, det in specs["y1"].shard_map.items():
         x_local = backend.copy_from_dpu(dpu_id, offsets["x"], (1, 4), np.float32)
         w1_local = backend.copy_from_dpu(dpu_id, offsets["w1"], (3, 4), np.float32)
         backend.copy_to_dpu(dpu_id, offsets["y1"], x_local @ w1_local.T)
 
-    # 3. host 按 global_range（start_idx）排序拼接 = Shard→Replicate 的 all_gather
+    # 按全局区间拼接分片。
     y1_parts = [
         backend.copy_from_dpu(dpu_id, offsets["y1"], det.local_shape, np.float32)
         for dpu_id, det in sorted(specs["y1"].shard_map.items(), key=lambda kv: kv[1].start_idx)
@@ -374,7 +348,7 @@ def test_appendix_a_numeric_on_numpy_backend() -> None:
     y1 = np.concatenate(y1_parts, axis=1)
     np.testing.assert_allclose(y1, (x_ref @ w1_ref.T).numpy(), rtol=1e-6)
 
-    # 4. A.2 行切：每 DPU 用本地 Y1 分片 × W2 列分片 = 部分和；host 累加 = all_reduce
+    # 累加行切层的局部结果。
     y2 = np.zeros((1, 4), dtype=np.float32)
     for dpu_id, det in specs["y2"].shard_map.items():
         y1_local = backend.copy_from_dpu(dpu_id, offsets["y1"], (1, 3), np.float32)
@@ -384,9 +358,7 @@ def test_appendix_a_numeric_on_numpy_backend() -> None:
     np.testing.assert_allclose(y2, ((x_ref @ w1_ref.T) @ w2_ref.T).numpy(), rtol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# tiny Llama 全图：问题 1 + 问题 2 衔接的结构断言
-# ---------------------------------------------------------------------------
+# 小型 Llama 图的分片断言。
 
 
 def _propagate_tiny_llama():
@@ -413,7 +385,7 @@ def test_tiny_llama_weight_initial_sharding() -> None:
             assert spec.placement == REPLICATE and spec.device == DEVICE_DPU, target
         if "embed_tokens" in target:
             assert spec.device == DEVICE_HOST, target
-    # hidden=64 / 4 DPU = 16 = head_dim，即每台恰好 1 个 head（切点对齐 head 边界）
+    # 每个 DPU 对应一个注意力头。
     q_weight = by_name["model_model_layers_0_self_attn_q_proj_weight"].meta[SPEC_META_KEY]
     assert q_weight.shard_map[0].local_shape == (16, 64)
     assert q_weight.shard_map[3].start_idx == 48
@@ -422,7 +394,7 @@ def test_tiny_llama_weight_initial_sharding() -> None:
 def test_tiny_llama_propagation_structure() -> None:
     gm, by_name, edges = _propagate_tiny_llama()
 
-    # 每个张量节点都有 spec；非张量 get_attr（子图）除外
+    # 每个张量节点都具有规格信息。
     for node in gm.graph.nodes:
         if node.op == "output":
             continue
@@ -430,7 +402,7 @@ def test_tiny_llama_propagation_structure() -> None:
             continue
         assert SPEC_META_KEY in node.meta, node.name
 
-    # o_proj / down_proj 行切产出 Partial；其后的残差 add 上各有一条 all_reduce 边
+    # 行切输出在残差相加前归约。
     for proj in ("o_proj", "down_proj"):
         weight = next(n for n in gm.graph.nodes if n.op == "get_attr" and f"{proj}.weight" in n.target)
         (linear,) = weight.users
@@ -440,30 +412,30 @@ def test_tiny_llama_propagation_structure() -> None:
         assert edge.type == "all_reduce"
         assert edge.dst_loc == {"device": DEVICE_DPU, "dpus": [0, 1, 2, 3]}
 
-    # 行切 down_proj 的输入（silu 之后的 mul）已是 Shard(2)，零通信进入（无 scatter 边）
+    # 行切输入已位于目标 DPU，无需 scatter。
     down_weight = next(n for n in gm.graph.nodes if n.op == "get_attr" and "down_proj.weight" in n.target)
     (down_linear,) = down_weight.users
     act = down_linear.args[0]
     assert act.meta[SPEC_META_KEY].placement == Placement("Shard", 2)
     assert all(e.src != act.name for e in down_linear.meta[REDISTRIBUTE_META_KEY])
 
-    # 每层两处 all_reduce（o_proj、down_proj 各一），与问题 6 的通信点表一致
+    # 每层包含两次 all_reduce。
     assert sum(e.type == "all_reduce" for e in edges) == 2
     assert {e.type for e in edges} <= {"all_reduce", "all_gather", "scatter"}
-    # 权重是 pinned，永不出现在 redistribute 边的任何一端
+    # 常驻权重不参与重分布。
     for edge in edges:
         assert by_name[edge.src].op != "get_attr"
         for loc in (edge.src_loc, edge.dst_loc):
             assert loc["device"] in ("host", "dpu")
             assert loc["device"] == "host" or sorted(loc["dpus"]) == [0, 1, 2, 3]
 
-    # 图出口：logits 列切 Shard(2) 经 all_gather 回 host
+    # 输出 logits 经 all_gather 返回主机。
     output = next(n for n in gm.graph.nodes if n.op == "output")
     (final_edge,) = output.meta[REDISTRIBUTE_META_KEY]
     assert final_edge.type == "all_gather"
     assert final_edge.from_placement == Placement("Shard", 2)
 
-    # 报告可打印且重跑幂等
+    # 报告可打印，重复传播结果一致。
     assert "all_reduce" in format_spec_report(gm, edges, max_nodes=10)
     assert len(propagate_specs(gm, llama_shard_config(
         4, num_heads=4, num_kv_heads=4, intermediate_size=176, vocab_size=32000))) == len(edges)

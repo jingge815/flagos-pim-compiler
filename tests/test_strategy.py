@@ -1,8 +1,4 @@
-"""切分策略的分组数学与契约校验（验证 1：切分方法的有效表达）。
-
-纯编译期、无模型依赖，秒级。判据是「划分本身自洽」：每台 DPU 恰好属一个
-stage、每层恰好属一个 stage、张量并行退化为推广前的行为。
-"""
+"""验证 DPU、层和张量并行宽度的切分关系。"""
 
 from __future__ import annotations
 
@@ -21,14 +17,14 @@ from graph.strategy import (
     llama_strategy,
 )
 
-# llama2-7b 的真实结构参数，契约校验用
+# Llama-2-7B 结构参数。
 LLAMA2_7B = dict(
     num_heads=32, num_kv_heads=32, intermediate_size=11008, vocab_size=32000, num_layers=32
 )
 
 
 def test_tensor_parallel_covers_every_dpu_in_one_stage() -> None:
-    """num_stages=1：全部 DPU 一个 stage，任何层都返回全体——推广前的行为。"""
+    """验证单流水段包含全部 DPU 和层。"""
     strategy = ShardStrategy(name="tp8", num_dpus=8, num_stages=1)
 
     assert strategy.tp_width == 8
@@ -78,7 +74,7 @@ def test_partition_is_exact_every_dpu_and_layer_belongs_to_one_stage(num_stages:
         seen_layers.extend(strategy.layers_of_stage(stage, 32))
     assert sorted(seen_dpus) == list(range(8))  # 无重复、无遗漏
     assert sorted(seen_layers) == list(range(32))
-    # 反查与正查一致
+    # DPU 与流水段的双向映射。
     for dpu_id in range(8):
         stage = strategy.stage_of_dpu(dpu_id)
         assert dpu_id in strategy.dpus_of_stage(stage)
@@ -127,9 +123,7 @@ def test_out_of_range_stage_is_rejected() -> None:
         strategy.dpus_of_stage(2)
 
 
-# ---------------------------------------------------------------------------
-# llama_strategy / llama_strategies：契约校验与搜索空间
-# ---------------------------------------------------------------------------
+# Llama 策略构造和枚举。
 
 
 def test_llama_strategy_carries_the_megatron_pairing() -> None:
@@ -142,8 +136,7 @@ def test_llama_strategy_carries_the_megatron_pairing() -> None:
 
 
 def test_llama_strategy_validates_contract_against_tp_width_not_num_dpus() -> None:
-    """契约的除数是 tp_width：8 台 DPU 切 4 个 head 在张量并行下非法，
-    但在 4 stage × tp2 下合法（被切的是段内那一维）。"""
+    """验证 Llama 维度按每个流水段的张量并行宽度校验。"""
     kwargs = dict(num_heads=4, num_kv_heads=4, intermediate_size=176, vocab_size=32000, num_layers=8)
 
     with pytest.raises(ValueError, match="num_heads=4 不能被 tp_width=8 整除"):
@@ -168,15 +161,14 @@ def test_llama_strategies_enumerates_four_points_for_llama2_7b() -> None:
 
 
 def test_llama_strategies_skips_contract_violating_stage_counts() -> None:
-    """4 个 head / 4 层、4 台 DPU：pp4 需要 tp1（合法），但层数 4 整除 4 也合法；
-    把层数改成 2 后 pp4 因层数不整除被跳过，搜索空间自动收窄。"""
+    """验证策略枚举排除无法均分层数的流水段数量。"""
     wide = llama_strategies(4, num_heads=4, num_kv_heads=4, intermediate_size=128,
                             vocab_size=128, num_layers=4)
     assert [s.num_stages for s in wide] == [1, 2, 4]
 
     narrow = llama_strategies(4, num_heads=4, num_kv_heads=4, intermediate_size=128,
                               vocab_size=128, num_layers=2)
-    assert [s.num_stages for s in narrow] == [1, 2]  # pp4 切不到 2 层，被跳过
+    assert [s.num_stages for s in narrow] == [1, 2]  # 2 层不能均分到 4 个流水段。
 
 
 def test_llama_strategies_raises_when_nothing_is_legal() -> None:

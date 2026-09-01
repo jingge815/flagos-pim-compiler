@@ -1,11 +1,4 @@
-"""真实 Llama-2-7B 的问题 1→2→7→8 端到端验证：三区内存规划 + 容量校验。
-
-prefill/decode 两张图取 SEQ_LEN=16 与 SEQ_LEN=1 的两次独立 export（问题 6 的
-双图机制尚未实现，这里只借两个不同形状撑起"两图联合规划"的机制验证，不代表
-真实的 KV 感知 decode 图）。判据：权重区字节数与手推值一致、offset 在两图间
-共享、三区互不重叠、容量校验通过、真实数据经回填的权重 offset 在 NumpyBackend
-上写入/读回与 torch 参考逐字节一致、KV 区基址落地后 update/read_tile 仍可用。
-"""
+"""验证 Llama-2-7B 的内存分区、容量和回填地址。"""
 
 from __future__ import annotations
 
@@ -21,22 +14,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from contracts.graph_meta import SPEC_META_KEY
+from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import PIMStaticKVCache, kv_specs_from_placement
 from memory.mem_planner import HwBudget, format_mem_plan, plan_dpu
 from tests.test_partition import _FixedMaskLlama
 
-MODEL_DIR = Path(
-    "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf"
-)
+MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
 PREFILL_SEQ_LEN = 16
 DECODE_SEQ_LEN = 1
 MAX_SEQ = 256
 KV_DTYPE_BYTES = 2  # fp16
 
-pytestmark = pytest.mark.skipif(not MODEL_DIR.is_dir(), reason="需要本地 Llama-2-7b-hf 权重")
+pytestmark = pytest.mark.skipif(
+    MODEL_DIR is None or not MODEL_DIR.is_dir(),
+    reason="需要在 paths.json 配置 llama2_7b_model_dir",
+)
 
 
 def _export_and_annotate(model: LlamaForCausalLM, shard_config, seq_len: int):
@@ -54,7 +49,7 @@ def _export_and_annotate(model: LlamaForCausalLM, shard_config, seq_len: int):
 
 @pytest.fixture(scope="module")
 def llama2_two_graphs():
-    """真实 7B：一次加载权重，各以 SEQ_LEN=16/1 export 两张图并各自标注（模块内一次）。"""
+    """导出并标记预填充和解码两张图。"""
     model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
     cfg = model.config
     shard_config = llama_shard_config(
@@ -85,13 +80,13 @@ def kv_specs(llama2_two_graphs):
         head_dim=head_dim,
         max_seq=MAX_SEQ,
         dtype_bytes=KV_DTYPE_BYTES,
-        kv_base=0,  # plan_dpu 会覆写为真实 kv_base
+        kv_base=0,
     )
 
 
 @pytest.fixture(scope="module")
 def hw_budget():
-    # 权重区 ≈13.5GiB/8 ≈ 1.7GiB/台；给足量级验证真实容量校验能通过
+    # 容量覆盖每个 DPU 的权重分片。
     return HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
 
 
@@ -112,7 +107,7 @@ def _weight_node(gm, pattern: str):
 
 
 def test_weight_region_matches_hand_computed_bytes(llama2_two_graphs, plans) -> None:
-    """权重区总字节 == 该 DPU 分到的全部本地分片字节和（手推交叉验证）。"""
+    """验证权重区容纳该 DPU 的全部本地分片。"""
     _, _, prefill_gm, _ = llama2_two_graphs
     by_target = {n.target: n for n in prefill_gm.graph.nodes if n.op == "get_attr"}
     for dpu_id, plan in plans.items():
@@ -125,7 +120,7 @@ def test_weight_region_matches_hand_computed_bytes(llama2_two_graphs, plans) -> 
             for dim in detail.local_shape:
                 size *= dim
             expected += size * itemsize
-        # 权重区终点应等于对齐后的总字节数，>= 未对齐总和
+        # 对齐后的权重区覆盖未对齐字节总数。
         assert plan.kv_base >= expected
 
 
@@ -163,7 +158,7 @@ def test_capacity_check_rejects_too_small_budget(llama2_two_graphs, kv_specs) ->
 
 
 def test_weight_offset_is_a_real_usable_address_on_numpy_backend(llama2_two_graphs, plans, hw_budget) -> None:
-    """按回填的 offset 真实写入 q_proj 某台的本地分片、读回，与 torch 参考逐字节一致。"""
+    """验证回填的权重偏移可用于读写本地分片。"""
     model, cfg, prefill_gm, _ = llama2_two_graphs
     dpu_id = 0
     plan = plans[dpu_id]
@@ -184,7 +179,7 @@ def test_weight_offset_is_a_real_usable_address_on_numpy_backend(llama2_two_grap
 
 
 def test_kv_region_lands_at_planned_kv_base_and_stays_usable(kv_specs, plans, hw_budget) -> None:
-    """plan_dpu 回填的 kv_base 落地后，问题 7 的 update/read_tile 仍按预期地址工作。"""
+    """验证规划的 KV 区起点可用于缓存读写。"""
     dpu_id = 0
     spec = kv_specs[dpu_id]
     assert spec.kv_base == plans[dpu_id].kv_base
@@ -210,13 +205,7 @@ def test_format_mem_plan_printable(plans, hw_budget) -> None:
 
 
 def test_redistribute_landing_offsets_reach_comm_plan_dst_addr(llama2_two_graphs, plans) -> None:
-    """问题 8 缺口修复的真实 7B 回归：build_comm_plan 的写回段 dst_addr 正确反映
-    plan_dpu 回填的 edge.dst_spec.mram_offset，不再是构造默认值 0。
-
-    修复前 mram_offset 恒为 0：dst_addr = 0 + 局部偏移 × itemsize，低地址段
-    看起来"非零"只是局部偏移的贡献，容易误判成"本来就是对的"。这里直接比对
-    dst_addr 与 (mram_offset + 局部偏移 × itemsize) 手算值，而非只看非零。
-    """
+    """验证通信回写地址包含规划的落地缓冲偏移。"""
     from comm.plan import build_comm_plan
 
     _, _, prefill_gm, _ = llama2_two_graphs

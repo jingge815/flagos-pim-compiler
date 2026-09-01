@@ -1,46 +1,4 @@
-"""算子编译驱动：`OpCompileRequest` → 一个可 `ctypes.CDLL` 加载的 `.so`。
-
-完整链路（每一步都已经手工跑通过一次，细节见 `docs/opcompiler_bridge-20260825.md`）：
-
-    triton.compile（FLAGTREE_EMIT_PIM=1，num_dpus=1 num_tasklets=<request.num_tasklets>）
-        -> pim_sidecar 产出 `.pimir`（其实是重新对 TTIR 跑
-           convert-triton-to-pim + pim-explicit-dma，见下）
-        -> triton-opt -pim-lower-to-emitc -convert-func-to-emitc
-        -> mlir-translate --mlir-to-cpp
-        -> gcc -shared -fPIC
-        -> .so，签名 `void <symbol>(float*, float*, float*)`
-
-    `pim-lower-to-emitc`（原名 `pim-lower-single-tasklet`，已泛化，不再要求
-    `num-tasklets==1`——见 FlagTree 该 pass 的 Passes.td 说明）按
-    `num_tasklets` 把 M 维静态切成对应块数，每块各自做一次 WRAM staging，
-    `num_tasklets=1` 时退化成原来的单块行为，不是走另一条 pass。
-
-不直接读 `pim_sidecar` 的 dump（同 `genesim_bridge/flagtree_driver.py` 的理由：
-不依赖 `FLAGTREE_EMIT_PIM`/`TRITON_DUMP_DIR`、不依赖编译缓存 miss），而是拿到
-`CompiledKernel.asm['ttir']` 后重新 parse 成 module，自己跑 pass。
-
-用法：
-
-    from opcompiler_bridge.driver import compile_op
-    from contracts.op_contract import OpCompileRequest
-    result = compile_op(OpCompileRequest(op="linear", arg_shapes=[(2, 16), (4, 16)]))
-    # result.so_path / result.symbol / result.argtypes
-
-**环境要求（2026-08-25 之后不再需要 `prepare_triton_env(pim=True)`）**：
-这台机器上原来有两份 triton 安装——pytorch 环境自带的普通版和
-`flagTree-pim` venv 里带 PIM pass 支持的版本——`import triton` 只认进程内第
-一次加载的那份，且不能中途切换（`genesim_bridge.env.prepare_triton_env`
-的限制）。真实端到端场景下 `transformers`/`torch` 会在任何人想切环境之前就
-先 `import triton`，导致 `compiled_linear_kernel` 实际编译时永远只能拿到没
-有 PIM pass 的普通版——这是从真实 llama2-7b 端到端测试插桩里实测到的、不是
-猜的。修法是不再维护两份 triton：已经把 pytorch 环境这份 triton 的
-`_C/libtriton.so`、`backends/pim_sidecar.py`、
-`backends/nvidia/{compiler.py,bin,include,lib/cupti}` 换成 `flagTree-pim`
-venv 里的对应文件（两者用同一个 LLVM commit 构建，ABI 兼容，已验证换过去后
-普通 Triton kernel 和 PIM pass 都能跑）。现在只有一份 triton，任何时候
-`import triton` 都自带 PIM pass 支持，不需要也不应该再调
-`prepare_triton_env`。
-"""
+"""将算子编译请求转换为可由 `ctypes` 加载的共享库。"""
 
 from __future__ import annotations
 
@@ -62,9 +20,7 @@ from contracts.op_contract import (
 )
 from genesim_bridge.paths import flagtree_prefix, pim_options
 
-# 编译产物缓存目录：按 (op, arg_shapes) 的哈希分文件，同一 shape 只编译一次。
-# 与 pim_sidecar/genesim 的缓存目录分开，理由同它们互相分开——不同 pass 链的
-# 产物不可混用。
+# 保存按编译请求区分的共享库缓存。
 _CACHE_DIR = Path(
     os.environ.get(
         "OPCOMPILER_CACHE_DIR",
@@ -72,10 +28,7 @@ _CACHE_DIR = Path(
     )
 )
 
-# 生成的 C 函数签名固定形如 `void <name>(float* v1, float* v2, ...)`——
-# LowerPIMToEmitC 把每个原始 !tt.ptr<f32> 参数改写成一个 !emitc.ptr<f32>，
-# 不带偏移量参数（见 kernel_src.py 顶部注释、docs/opcompiler_bridge-20260825.md）。
-# 这里解析实际产出的签名，而不是硬编码假设，一旦形状不对就直接报错。
+# 匹配生成的 C 函数名和裸指针参数。
 _SIG_RE = re.compile(r"void\s+(\w+)\s*\(([^)]*)\)")
 _PARAM_RE = re.compile(r"^\s*(\w+)\s*\*\s*\w+\s*$")
 
@@ -87,8 +40,7 @@ _CTYPE_BY_C_ELEM = {
     "int64_t": ctypes.c_int64,
 }
 
-# 契约里的存储 dtype（NumPy 名）-> 建 Triton 实参用的 torch dtype。只列这条
-# 链路支持的两种：新 pass 的 checkElementType 也只接受 f16/f32。
+# 将存储数据类型映射为 Triton 实参的 PyTorch 数据类型。
 _TORCH_DTYPES: dict[str, object] = {}
 
 
@@ -102,14 +54,7 @@ def _torch_dtypes() -> dict:
 
 
 def _triton_opt() -> Path:
-    """带 `pim-lower-to-emitc` 的 `triton-opt`。
-
-    可用 `OPCOMPILER_TRITON_OPT` 覆盖。默认指向 `flagTree` 安装里的构建
-    目录（2026-08-29 起统一到单一安装，不再是独立的 `flagTree-pim`——见
-    `genesim_bridge/paths.py` 模块 docstring）。改了 pass 源码后要重新跑
-    `0-install-flagtree.sh` 才会拿到新二进制，否则这里用到的是旧的、症状是
-    报一个源码里已经不存在的错误（踩过一次）。
-    """
+    """返回带有 PIM 降级 pass 的 ``triton-opt`` 路径。"""
     override = os.environ.get("OPCOMPILER_TRITON_OPT")
     if override:
         return Path(override)
@@ -121,10 +66,7 @@ def _mlir_translate() -> Path:
 
 
 def _cache_key(request: OpCompileRequest) -> str:
-    # dtype 必须进 key：同一 shape 的 f16 / f32 产物读写的元素宽度不同，
-    # 互换会静默算错（见 contracts/op_contract.py 里记的那个 bug）。
-    # num_tasklets 也必须进 key：`pim-lower-to-emitc` 按这个数字把 M 维静态
-    # 切成不同块数，同一 shape 不同 num_tasklets 生成的 C 代码结构不同。
+    # 缓存键包含数据类型、tasklet 数和硬件配置。
     payload = (
         f"{request.op}:{request.arg_shapes}:{request.dtype}:"
         f"{request.num_tasklets}:{request.hardware.to_payload()}"
@@ -142,8 +84,7 @@ def _kernel_launcher(request: OpCompileRequest):
             f"linear 契约要求 arg_shapes=[x.shape, weight.shape]，收到: "
             f"{request.arg_shapes!r}"
         )
-    # x 可能带 batch 维（真实图上是 (batch, seq, hidden) 三维，见
-    # contracts/op_contract.py 顶部注释），展平成 (M, K)；weight 恒二维。
+    # 将输入前导维合并为 M，权重保持二维。
     m, k = flatten_leading_dims(request.arg_shapes[0])
     n, k2 = request.arg_shapes[1]
     if k != k2:
@@ -175,19 +116,13 @@ def _kernel_launcher(request: OpCompileRequest):
 
 
 def _make_ttir(request: OpCompileRequest) -> str:
-    """在 GPU 上真的调一次目标 shape 的 kernel，拿到 Triton 编译出的 TTIR。
-
-    不手搓 ASTSource——同 `genesim_bridge/flagtree_driver.py` 的理由：手写会
-    绕开 Triton 自己的类型/layout 推导，编出的 IR 与真实 launch 不符。
-    """
+    """在 GPU 上编译目标形状并返回 TTIR 文本。"""
     import torch
 
     launch = _kernel_launcher(request)
     m, k = flatten_leading_dims(request.arg_shapes[0])
     n, _ = request.arg_shapes[1]
-    # Triton 从实参的 dtype 推出 `!tt.ptr<f16>` / `!tt.ptr<f32>`，新 pass 再
-    # 据此决定生成的 C 里每个元素怎么读写（f16 走位转换 helper）。所以这里
-    # 必须用契约里的存储 dtype 建张量，不能一律 float32。
+    # 使用请求指定的数据类型构造 Triton 输入张量。
     dtypes = _torch_dtypes()
     if request.dtype not in dtypes:
         raise ValueError(
@@ -203,20 +138,7 @@ def _make_ttir(request: OpCompileRequest) -> str:
 
 
 def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> str:
-    """ttir 文本 -> 跑完 convert-triton-to-pim/pim-explicit-dma/
-    pim-lower-to-emitc/convert-func-to-emitc 之后的 emitc 文本。
-
-    `pim-lower-to-emitc`（原名 `pim-lower-single-tasklet`）已经泛化,支持
-    `pim.num-tasklets >= 1`——不再是"选哪个 pass"，只是同一个 pass 的一个
-    参数,`num_tasklets=1` 时退化成原来的单块行为。这个参数只影响
-    `pim-lower-to-emitc` 内部怎么把 M 维切成几块（每块各自一次 WRAM
-    staging），不影响 `pim-explicit-dma` 的 `wram_bytes` 预算检查——那条检查
-    针对的是 Triton 侧未拆分的整个 M 行 tile（Triton kernel 本身没有
-    tasklet 概念，`grid=(1,)`），发生在 `pim-lower-to-emitc` 之前。
-
-    硬件预算从 `request.hardware` 直接取，不能再由 shape 反推：
-    `pim-explicit-dma` 的预算检查必须与图层编译器给出的硬件契约一致。
-    """
+    """将 TTIR 依次转换为 PIM、显式 DMA 和 EmitC 文本。"""
     opts = pim_options()
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -272,12 +194,7 @@ def _translate_to_c(emitc_text: str) -> str:
 
 
 def _parse_signature(c_source: str) -> tuple[str, list[str]]:
-    """从生成的 C 源码里解析出函数名和 ctypes.argtypes 列表。
-
-    不硬编码假设 ABI——按 LowerPIMToEmitC 的设计，参数应该全是
-    `<elem>*`（没有偏移量参数），但这里仍然去读实际文本，形状不对就直接报错，
-    而不是静默假设。
-    """
+    """从生成的 C 源码解析函数名和参数类型。"""
     match = _SIG_RE.search(c_source)
     if not match:
         raise RuntimeError(
@@ -301,12 +218,7 @@ def _parse_signature(c_source: str) -> tuple[str, list[str]]:
 
 
 def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileResult:
-    """编译 `request` 对应的算子，返回可加载的 `.so` 描述。
-
-    按 `(op, arg_shapes)` 缓存（`_CACHE_DIR`），同一 shape 不会重复编译——
-    对应图编译器每个不同 M（prefill 长度 vs decode M=1）本来就是独立
-    `ExecutionPlan` 这件事，见 `contracts/op_contract.py` 顶部注释。
-    """
+    """编译算子请求并返回共享库描述，结果按请求参数缓存。"""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = _cache_key(request)
     so_path = _CACHE_DIR / f"{key}.so"
@@ -325,23 +237,11 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
     c_source = _translate_to_c(emitc_text)
     symbol, argtypes = _parse_signature(c_source)
 
-    # 编译到 <key>.<pid>.<tid>.so 这个每次调用独有的临时名，成功后再原子
-    # rename 到最终的 <key>.so——两个调用者并发编译同一个 shape 时（runtime/
-    # kernels.py 用 _COMPILE_LOCK 序列化了这条路径上唯一会真的并发的调用者，
-    # 但这里不假设所有调用方都会拿那把锁），各自写各自的临时文件，不会互相
-    # 踩到对方正在写的目标路径。同名旧文件直接被 rename 覆盖，也是原子的。
-    # 之前踩过的坑：两个 gcc 进程并发 `-o <key>.so` 写同一个路径，产出的
-    # .so 被截断，ctypes 加载时报 `undefined symbol`（8 卡 decode 第一次遇到
-    # 新 shape 时稳定复现）。
+    # 使用进程和线程唯一的临时路径编译共享库。
     tmp_tag = f"{os.getpid()}.{threading.get_ident()}"
     c_path = _CACHE_DIR / f"{key}.{tmp_tag}.c"
     so_tmp_path = _CACHE_DIR / f"{key}.{tmp_tag}.so"
-    # stdlib.h: LowerPIMToEmitC emits malloc/free to snapshot MRAM
-    # operands into a private heap buffer before computing (mem_planner can
-    # alias an op's output onto a dead input's address, and the compiled
-    # kernel runs in a ThreadPoolExecutor worker whose pthread stack is too
-    # small for a multi-MiB local array -- see LowerPIMToEmitC.cpp's
-    # snapshotToLocal for both).
+    # 生成的 C 代码需要 `malloc` 和 `free`。
     try:
         c_path.write_text("#include <stdint.h>\n#include <stdlib.h>\n" + c_source)
         proc = subprocess.run(
@@ -361,10 +261,7 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
 
 
 def load_kernel(result: OpCompileResult):
-    """加载 `compile_op` 的产物，返回一个 `ctypes` 函数对象，argtypes 已设置好
-    （全部是 `c_void_p`——裸指针，调用方自己用 `ndarray.ctypes.data_as` 转换，
-    偏移量在 Python 侧用指针地址算术提前加好，见 `runtime/kernels.py`）。
-    """
+    """加载共享库并返回已设置参数类型的 ``ctypes`` 函数。"""
     lib = ctypes.CDLL(result.so_path)
     fn = getattr(lib, result.symbol)
     fn.argtypes = [ctypes.c_void_p for _ in result.argtypes]
@@ -373,11 +270,7 @@ def load_kernel(result: OpCompileResult):
 
 
 def _selftest() -> None:
-    """`python -m opcompiler_bridge.driver --selftest`：固定小 shape
-    （M=2,K=16,N=4，K=16 是 tl.dot 的硬下限）跑完整链路，和 numpy 对拍。
-    在接入 runtime/kernels.py 之前先跑这个，隔离"编译产物本身对不对"和
-    "跟执行器接线对不对"两类问题。
-    """
+    """编译固定形状的线性算子并与 NumPy 结果比较。"""
     import dataclasses
     import numpy as np
 

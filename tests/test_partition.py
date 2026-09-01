@@ -1,4 +1,4 @@
-"""Tests for problem-1 DPU capability annotation and graph grouping."""
+"""验证 FX 图的 DPU 标记和连通子图划分。"""
 
 from __future__ import annotations
 

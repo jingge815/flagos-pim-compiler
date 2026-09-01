@@ -1,13 +1,4 @@
-"""genesim_bridge/placement_export.py 单测（本轮只对接 GEMM 类算子）。
-
-用一个小随机 Llama（同 tests/test_partition.py 的 `_export_random_llama` 规格）
-过 partition_graph + propagate_specs，构造一份手写的 GeneSim .ir 骨架（1 层、
-4 个 GEMM，op_type/顺序对应 qkv/o_proj/gate_proj/down_proj），验证：
-
-- 每层恰好 4 个 GEMM 的 device_hint 从 "gpu" 改写为 "pim"；
-- 写回的 dpu_id 落在 [0, num_dpus)；
-- 非 GEMM 算子（如 attention 三类）不被改写。
-"""
+"""验证图编译器放置结果写入 GeneSim IR 的逻辑。"""
 
 from __future__ import annotations
 
@@ -71,10 +62,7 @@ def annotated_tiny_llama() -> GraphModule:
 
 
 def _write_fixture_ir(path: Path) -> None:
-    """手写一份最小 GeneSim .ir：1 层，4 个 GEMM（顺序对应 qkv/proj/fc1/fc2）
-    加 3 个 attention 算子（不应被改写），device_hint 全部先设成 GeneSim 的
-    默认假设（qkv/proj/fc1/fc2 -> gpu，attention -> pim）。
-    """
+    """写入含四个 GEMM 和注意力算子的最小 GeneSim IR。"""
     operators = [
         {"op_id": 0, "op_type": "GEMM", "device_hint": "gpu",
          "input_shapes": [], "output_shapes": []},

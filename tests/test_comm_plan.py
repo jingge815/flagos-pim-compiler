@@ -1,9 +1,4 @@
-"""通信计划表（comm/plan.py）的编译期验证。
-
-判据：方案问题 3 二.(4) 的生成规则 + 附录 B 的手推实例——逐 segment 的
-src/dst、区间与字节数与手推一致；多维切分（Shard(2)）按全局摊平坐标展开为
-逐外维 run；dma_sequence 的合批与 push_xfer/broadcast_to 语义对齐。
-"""
+"""验证通信计划条目、DMA 序列和传输成本。"""
 
 from __future__ import annotations
 
@@ -43,11 +38,7 @@ def _dpu_spec(
     permuted: bool = False,
     mram_offset: int = 0,
 ) -> PIMTensorSpec:
-    """手搭的均匀单段切 spec（与问题 2 的契约 1/2/5 一致）。
-
-    permuted=True 时把第 i 段分给 dpu_ids[-1-i]（附录 B.4：分片顺序与 DPU 编号
-    不一致的合法情形）。
-    """
+    """构造均匀单段分片规格，可选反转 DPU 到分片的映射。"""
     if placement.kind == "Shard":
         dim = placement.dim
         width = shape[dim] // len(dpu_ids)
@@ -109,9 +100,7 @@ def _edge(
     )
 
 
-# ---------------------------------------------------------------------------
-# 附录 B.1：Partial → Replicate@host（MLP 行切后接 host LayerNorm）
-# ---------------------------------------------------------------------------
+# Partial 到主机 Replicate。
 
 
 def test_all_reduce_segments_match_appendix_b1() -> None:
@@ -148,9 +137,7 @@ def test_all_reduce_writeback_only_to_dst_loc_dpus() -> None:
         assert seg.global_range == (0, 8) and seg.nbytes == 32
 
 
-# ---------------------------------------------------------------------------
-# 附录 B.4：Shard → Replicate，分片顺序与 DPU 编号无关
-# ---------------------------------------------------------------------------
+# Shard 到 Replicate。
 
 
 def test_all_gather_collect_segments_carry_global_position() -> None:
@@ -194,7 +181,7 @@ def test_all_gather_multidim_shard_unfolds_to_per_row_runs() -> None:
 
 
 def test_all_gather_from_replicate_source_collects_only_one_copy() -> None:
-    """同布局 dpu→host 退化（方案二.(9)）：源为全量副本，只收一份。"""
+    """复制布局到主机时只收集一份数据。"""
     shape = (4,)
     src = _dpu_spec(REPLICATE, shape, (0, 1, 2, 3))
     (entry,) = build_comm_plan([_edge(3, "all_gather", src, _host_spec(), shape)])
@@ -204,9 +191,7 @@ def test_all_gather_from_replicate_source_collects_only_one_copy() -> None:
     assert seg.src_dpu == 0 and seg.global_range == (0, 4) and seg.dst_dpu is None
 
 
-# ---------------------------------------------------------------------------
-# Shard(i) → Shard(j)：run 两两求交
-# ---------------------------------------------------------------------------
+# Shard 到 Shard 的区间交集。
 
 
 def test_all_to_all_segments_are_run_intersections() -> None:
@@ -220,15 +205,13 @@ def test_all_to_all_segments_are_run_intersections() -> None:
     assert seg00.global_range == (3, 6)  # DPU0 前 2 行的后 3 列 → 目标 DPU1
     assert seg00.src_local_range == (3, 6) and seg00.dst_local_offset == 0
     assert seg00.nbytes == 12
-    # 源 DPU0 的数据被拆分发往两个目标（方案二.(4)：一源多段是常态）
+    # 一个源分片可对应多个目标分片。
     assert sum(1 for s in entry.segments if s.src_dpu == 0) == 4
     targets_of_src0 = {s.dst_dpu for s in entry.segments if s.src_dpu == 0}
     assert targets_of_src0 == {0, 1}
 
 
-# ---------------------------------------------------------------------------
-# scatter 与 local_slice
-# ---------------------------------------------------------------------------
+# scatter 与 local_slice。
 
 
 def test_scatter_segments_slice_host_tensor_per_dst_shard() -> None:
@@ -244,7 +227,7 @@ def test_scatter_segments_slice_host_tensor_per_dst_shard() -> None:
 
 
 def test_scatter_to_replicate_degenerates_to_broadcast() -> None:
-    """同布局 host→dpu（方案二.(9)：目标全量即 broadcast 退化）：每 DPU 收全量。"""
+    """主机到复制布局使用一次广播写入全部 DPU。"""
     shape = (4,)
     dst = _dpu_spec(REPLICATE, shape, (0, 1))
     (entry,) = build_comm_plan([_edge(6, "scatter", _host_spec(), dst, shape)])
@@ -262,9 +245,7 @@ def test_local_slice_keeps_empty_placeholder_entry() -> None:
     assert dma_sequence(entry) == []
 
 
-# ---------------------------------------------------------------------------
-# DMA 序列展开与接口成本
-# ---------------------------------------------------------------------------
+# DMA 序列和接口成本。
 
 
 def test_dma_sequence_batches_uniform_transfers() -> None:
@@ -284,7 +265,7 @@ def test_dma_sequence_multidim_gather_batches_per_row() -> None:
     (entry,) = build_comm_plan([_edge(9, "all_gather", src, dst, shape)])
 
     ops = dma_sequence(entry)
-    # 每行一次 push_from（2 台同地址同长度），共 4 次；广播一次 broadcast_to
+    # 相同地址的段合并为批量传输，复制结果使用广播。
     assert [(op.kind, len(op.segments)) for op in ops] == [
         ("push_from", 2), ("push_from", 2), ("push_from", 2), ("push_from", 2),
         ("broadcast_to", 2),
@@ -308,7 +289,7 @@ def test_plan_cost_counts_batched_transfers_and_bytes() -> None:
 def test_coverage_check_catches_gaps_and_dtype_mismatch() -> None:
     shape = (8,)
     broken = _dpu_spec(Placement("Shard", 0), shape, (0, 1))
-    broken.shard_map[1] = TensorShardDetail(1, 0, 5, 8, (3,))  # [4,5) 缺口
+    broken.shard_map[1] = TensorShardDetail(1, 0, 5, 8, (3,))  # 全局区间存在缺口。
     with pytest.raises(ValueError, match="断裂/重叠"):
         build_comm_plan([_edge(11, "all_gather", broken, _host_spec(), shape)])
     good = _dpu_spec(Placement("Shard", 0), shape, (0, 1))
@@ -323,7 +304,7 @@ def test_coverage_check_catches_gaps_and_dtype_mismatch() -> None:
 
 
 def test_plan_rejects_endpoint_locations_inconsistent_with_specs() -> None:
-    """计划表只能使用问题 2 产物的真实 DPU 端点，不能信任漂移的 loc 元数据。"""
+    """验证端点位置必须与张量规格一致。"""
     shape = (8,)
     src = _dpu_spec(Placement("Shard", 0), shape, (0, 1))
     edge = _edge(14, "all_gather", src, _host_spec(), shape)

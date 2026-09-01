@@ -74,23 +74,19 @@ class PIMTensorSpec:
 
 @dataclass(frozen=True)
 class RedistributeEdge:
-    """一条布局不一致边上的一次逻辑重分布（方案问题 2 二.(9)）。
+    """记录生产节点和消费节点之间的一次张量重分布。"""
 
-    打在消费方节点的 ``node.meta["redistribute"]`` 列表里；``DPU→host→DPU``
-    两跳展开为 DMA 段是问题 3 的事，这里只记录类型、端点与总量。
-    """
-
-    edge_id: int                    # 全图唯一编号，问题 3 通信计划表的主键
-    src: str                        # 上游（生产方）节点名
-    dst: str                        # 下游（消费方）节点名
-    from_placement: Placement       # 上游实际产出布局
-    to_placement: Placement         # 下游要求布局
-    src_spec: PIMTensorSpec         # 上游实际产出 tensor spec
-    dst_spec: PIMTensorSpec         # 下游输入要求 materialize 后的 tensor spec
+    edge_id: int                    # 全图唯一编号。
+    src: str                        # 生产节点名称。
+    dst: str                        # 消费节点名称。
+    from_placement: Placement       # 生产节点的张量布局。
+    to_placement: Placement         # 消费节点要求的张量布局。
+    src_spec: PIMTensorSpec         # 生产节点的张量规格。
+    dst_spec: PIMTensorSpec         # 消费节点的张量规格。
     type: Literal["all_reduce", "all_gather", "all_to_all", "scatter", "local_slice"]
-    src_loc: dict                   # {"device": "dpu", "dpus": [...]} 或 {"device": "host"}
-    dst_loc: dict                   # 同上
-    nbytes: int                     # 逻辑张量总字节数；逐 segment 字节由问题 3 按 shard_map 展开
-    reduce_type: str | None = None  # 仅 all_reduce 使用，取自 Partial 的规约类型
-    shape: tuple[int, ...] = ()     # 全局逻辑张量形状，问题 3 通信计划表按它做摊平坐标换算
-    dtype: str = ""                 # torch dtype 名（如 "float16"），问题 3 映射为 np.dtype
+    src_loc: dict                   # 源位置及参与的 DPU。
+    dst_loc: dict                   # 目标位置及参与的 DPU。
+    nbytes: int                     # 全局张量字节数。
+    reduce_type: str | None = None  # `all_reduce` 的规约类型。
+    shape: tuple[int, ...] = ()     # 全局张量形状。
+    dtype: str = ""                 # PyTorch 数据类型名称。

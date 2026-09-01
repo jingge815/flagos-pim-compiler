@@ -24,39 +24,42 @@
 
 ## 第 1 阶段目标
 
-固定 shape 全链路打通，默认模型选定 `meta-llama/Llama-2-7b-hf`，例如，设置本地路径为 `/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/meta-llama-Llama-2-7b-hf`。编译器日常单测使用缩小的随机 LLaMA 配置避免下载权重，端到端验证加载官方 HuggingFace LLaMA2-7B 权重，在 NumpyBackend 上跑通 prefill + decode 路径并与单卡 PyTorch 逐元素对齐。GPT-2 只保留为显式 legacy/debug smoke。
+固定 shape 全链路打通，默认模型选定 `meta-llama/Llama-2-7b-hf`。编译器日常单测使用缩小的随机 LLaMA 配置避免下载权重，端到端验证加载官方 HuggingFace LLaMA2-7B 权重，在 NumpyBackend 上跑通 prefill + decode 路径并与单卡 PyTorch 逐元素对齐。GPT-2 只保留为显式 legacy/debug smoke。
 
 ## 环境
 
+### 站点相关路径
+
+本仓以根目录的 `paths.json` 作为随代码交付的站点配置。甲方拿到代码后，先把
+四个 `/path/to/...` 占位路径改为自己的实际路径：
+
 ```bash
-source /media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+vim paths.json
+```
+
+```json
+{
+  "pytorch_env_script": "/path/to/env-pytorch.sh",
+  "llama2_7b_model_dir": "/path/to/Llama-2-7b-hf",
+  "flagtree_prefix": "/path/to/flagTree",
+  "genesim_root": "/path/to/genesim"
+}
+```
+
+配置完成后加载 PyTorch 环境并运行测试：
+
+```bash
+source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
 python -m pytest tests/ -x -q
 ```
 
-torch 2.9.1 / transformers 4.57.6 / python 3.10.20。每个新 shell 都要先 source。
+`llama2_7b_model_dir` 只供真实 7B 端到端测试使用；未配置时这些测试会跳过，常规
+单元测试仍可运行。`flagtree_prefix` 供算子编译器与 Triton 环境使用，`genesim_root`
+供 GeneSim 产物读写使用。
 
-### 站点相关路径
-
-`genesim_bridge` 需要知道 flagTree 安装与 GeneSim 仓库的位置。统一到单一
-`flagTree` 安装（2026-08-29 起）：这份安装重新编译后，已经把带 PIM pass 的
-`libtriton.so`/`pim_sidecar.py`/nvidia backend 同步进了 pytorch 环境
-（`0-install-flagtree.sh::sync_triton_to_pytorch`），任何时候 `import triton`
-都自带 PIM 支持，不再需要维护第二份独立的 `flagTree-pim` 安装。默认值是当前
-开发机路径，换机器时**不要改代码**，用环境变量或配置文件覆盖：
-
-```bash
-# 方式 1：环境变量
-export FLAGTREE_PREFIX=/path/to/flagOS-installed/flagTree
-export GENESIM_ROOT=/path/to/genesim
-
-# 方式 2：仓库根建 paths.local.json（已被 .gitignore 忽略）
-echo '{"flagtree_prefix": "...", "genesim_root": "..."}' > paths.local.json
-```
-
-PIM pass 的硬件参数（`FLAGTREE_PIM_TARGET` / `_NUM_DPUS` / `_NUM_TASKLETS` /
-`_WRAM_BYTES`）走同一套优先级，键名去掉 `FLAGTREE_` 前缀改小写即为配置文件键。
-
-优先级：环境变量 > `paths.local.json` > `genesim_bridge/paths.py` 里的默认值。
+需要临时覆盖时，可设置同名环境变量：`PYTORCH_ENV_SCRIPT`、
+`LLAMA2_7B_MODEL_DIR`、`FLAGTREE_PREFIX`、`GENESIM_ROOT`。优先级为环境变量
+高于 `paths.json`。PIM 硬件参数（如 `FLAGTREE_PIM_NUM_DPUS`）也沿用该优先级。
 查看当前生效路径与参数：
 
 ```bash

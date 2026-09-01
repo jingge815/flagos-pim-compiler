@@ -1,8 +1,4 @@
-"""厂商 SDK numpy 镜像（backend/dpu_sdk.py）的逐函数验证。
-
-判据：每个 SDK 函数在 numpy 伪硬件上的行为与 pre-g-driver-api（api/include/dpu.h）
-的语义一致——独立地址空间、越界报错、push_xfer 的 prepare/push 两段式、集合语义。
-"""
+"""验证厂商 SDK NumPy 镜像的内存和传输语义。"""
 
 from __future__ import annotations
 
@@ -114,7 +110,7 @@ def test_push_xfer_without_prepare_or_with_short_buffer_raises() -> None:
 
 
 def test_copy_from_and_prepare_xfer_reject_non_contiguous_host_buffers() -> None:
-    """DPU→host 写入必须直达调用方缓冲，不能被 numpy 临时副本吞掉。"""
+    """验证 DPU 到主机的数据写入原地更新目标缓冲区。"""
     dpu_set = dpu_alloc(1, mram_bytes=64)
     dpu_copy_to(dpu_set.dpu(0), 0, np.array([10, 20], dtype=np.int32), 8)
     destination = np.zeros((2, 2), dtype=np.int32)[:, 0]
@@ -138,7 +134,7 @@ def test_prepare_xfer_allows_read_only_input_but_not_read_only_output() -> None:
 
 
 def test_dpu_to_host_rejects_non_array_buffers_that_would_be_copied() -> None:
-    """Python 容器不是 DMA 缓冲；np.asarray 产生的临时数组不能作为接收端。"""
+    """验证非数组对象不能作为 DMA 接收缓冲区。"""
     dpu_set = dpu_alloc(1, mram_bytes=64)
     dpu_copy_to(dpu_set.dpu(0), 0, np.array([10, 20], dtype=np.int32), 8)
 
@@ -149,7 +145,7 @@ def test_dpu_to_host_rejects_non_array_buffers_that_would_be_copied() -> None:
 
 
 def test_push_xfer_rejects_unknown_direction() -> None:
-    """dpu_xfer_t 是封闭枚举，未知方向不能被误当成 DPU→host。"""
+    """验证 DMA 方向必须属于定义的传输枚举。"""
     dpu_set = dpu_alloc(1, mram_bytes=64)
     payload = np.array([10, 20], dtype=np.int32)
     dpu_prepare_xfer(dpu_set.dpu(0), payload)
@@ -195,7 +191,7 @@ def test_log_read_and_no_direct_dpu_to_dpu_primitive() -> None:
     stream = io.StringIO()
     dpu_log_read(dpu_set, stream)
     assert "DPU0" in stream.getvalue() or "DpuSet" in stream.getvalue()
-    # host-star 拓扑：SDK 不提供任何 dpu→dpu 直达传输原语
+    # 跨 DPU 数据通过主机转发。
     import backend.dpu_sdk as sdk
 
     assert not any(
@@ -211,11 +207,7 @@ def test_dpu_alloc_default_wram_matches_upmem() -> None:
 
 
 def test_dpu_alloc_ranks_groups_dpus_and_reports_rank_count() -> None:
-    """镜像 pre-g-driver-api 的 dpu_alloc_ranks/dpu_get_nr_ranks/DPU_RANK_FOREACH。
-
-    只是给扁平 dpu_id 打分组标签，dpu_id 本身仍然从 0 连续编号——rank 不改变
-    任何寻址语义（方案确认的范围边界：rank 只在 SDK 元数据层）。
-    """
+    """验证 rank 分组和 rank 数量查询。"""
     dpu_set = dpu_alloc_ranks(2, dpus_per_rank=4, mram_bytes=1024, wram_bytes=256)
     assert dpu_get_nr_dpus(dpu_set) == 8
     assert dpu_get_nr_ranks(dpu_set) == 2

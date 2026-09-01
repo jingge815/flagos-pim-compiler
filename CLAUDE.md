@@ -14,7 +14,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 
 ## 技术方案
 
-完整方案在 `docs/spec.md`（2494 行，287KB）。**禁止整篇读入**——按 `docs/spec-index.md` 的行号表用 `Read(offset, limit)` 只读当前任务对应的那一节。附录 A（`spec.md:2358`）是问题 2 的数值验收基准，附录 B（`spec.md:2429`）是问题 3 的。
+完整方案在 `docs/spec.md`（2494 行，287KB）。**禁止整篇读入**——按 `docs/spec-index.md` 的行号表用 `Read(offset, limit)` 只读当前任务对应的那一节。
 
 ## 目录职责
 
@@ -25,7 +25,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 | `graph/`          | `partition.py` 图拆分打标、`strategy.py` 切分策略（TP/PP/混合）、`spec_prop.py` 切分传播 + redistribute 标注                    | 1、2 |
 | `comm/`           | `plan.py` 编译期通信计划表、`lowering.py` 运行时 redistribute→DMA                                                              | 3    |
 | `memory/`         | `kv_layout.py` KV 布局 + runtime、`mem_planner.py` 三区 offset 规划                                                             | 7、8 |
-| `runtime/`        | `compile.py` 统一编译入口（模型+策略→蓝图）、`exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环                | 6    |
+| `runtime/`        | `compile.py` 统一编译入口（模型+策略→蓝图）、`exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环              | 6    |
 | `backend/`        | `dpu_sdk.py` 厂商 SDK（pre-g-driver-api）的 numpy 镜像 / `hal_numpy.py` 异步 HAL（存储架在 dpu_sdk 上）/ `hal_vendor.py` 真硬件 | 底座 |
 | `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                                                                 | 4    |
 | `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                                                                          | 验证 |
@@ -51,7 +51,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 
 - 数据结构用 `@dataclass` + 类型标注，不用裸 dict 传结构化数据。
 - 命名跟方案术语一致：`part_id`、`dpu_id`、`placement`、`mram_offset`、`valid_len`——不另起别名。
-- 注释写「为什么这么做」和方案依据（如 `# 附录 A：Linear2 权重按行切 → 输出为 Partial`），实现原理简述，字数不要太多，不要中英文混合，除非英文专有名词，通俗易懂。
+- 注释1，2句话简单描述功能，字数不要太多，不要中英文混合，除非英文专有名词，通俗易懂。
 - 关键中间产物（标注图、通信计划表、`DPU_k.plan`、`ExecutionPlan`）要能 `print` 出可读文本，方便定位问题。
 - 函数保持短、单一职责；避免深嵌套和长参数表。
 - **关键结构体**（`contracts/` 里定义的、跨模块传递的 `@dataclass`）：字段名字已经自解释就不用注释；含义不直观的字段（如单位、取值范围、何时为 `None`）补一行说明。
@@ -70,7 +70,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 
 ## 文档
 
-每个模块在 `docs/<module>.md` 留一份短文档（**几十行量级，不要长篇**），只写三件事：对外接口签名、关键设计决策及理由、与方案哪一节对应。不复述代码，不贴大段实现。接口变了同步改。
+每次研发后在 `docs/<module>-日期.md` 留一份文档，概述修改内容，增删修改文件或函数，关键结构体，描述通俗易懂，拒绝中英文混合，除非英文专有名词，推荐画流程图，或者表格，描述已实施的测试，当前存在的不足。
 
 ## 提交
 

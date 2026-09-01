@@ -1,11 +1,4 @@
-"""问题 8 内存管理器单测：权重区打包 + 激活区 liveness/贪心装箱 + 容量校验。
-
-判据（CLAUDE.md）：编译期模块对照手推结果——权重区 offset/对齐 padding 手推值，
-greedy_reuse 的复用/不复用手推区间关系，plan_dpu 三区互不重叠、容量超限抛错。
-借附录 A 的两层 Linear 图（hidden=4, ffn=6, 2 DPU）作 prefill/decode 两图的
-最小可用夹具：两次独立构图给出两套不同 Node 对象，权重/占位算子形状相同，
-足以练手"两图共用权重 offset、各自跑一遍激活区"的机制，不代表真实解码。
-"""
+"""验证权重、KV 和激活区的内存规划。"""
 
 from __future__ import annotations
 
@@ -61,9 +54,7 @@ def _kv_specs() -> dict[int, KVRegionSpec]:
     }
 
 
-# ---------------------------------------------------------------------------
-# bytes_of / weights_of / 权重区打包
-# ---------------------------------------------------------------------------
+# 字节统计和权重区布局。
 
 
 def test_bytes_of() -> None:
@@ -87,7 +78,7 @@ def test_pack_weights_offsets_and_alignment() -> None:
     assert offsets[first] == 0
     assert offsets[second] == 64  # 48 对齐到 64
     assert total == 128
-    # 回填：两图同名权重的 mram_offset 相同
+    # 两张图的同名权重共用 MRAM 偏移。
     for name in (w1_name, w2_name):
         off = offsets[name]
         for nodes in (nodes1, nodes2):
@@ -104,9 +95,7 @@ def test_pack_weights_rejects_cross_graph_shape_mismatch() -> None:
         _pack_weights(0, list(gm1.graph.nodes), list(gm2.graph.nodes), align=64)
 
 
-# ---------------------------------------------------------------------------
-# transient_tensors：本地读者 + redistribute 隐式读者
-# ---------------------------------------------------------------------------
+# 临时张量和重分布读者。
 
 
 def test_transient_tensors_local_and_redistribute_readers() -> None:
@@ -116,25 +105,22 @@ def test_transient_tensors_local_and_redistribute_readers() -> None:
     tensors = {t.name: t for t in transient_tensors(all_nodes, dpu_id=0)}
 
     y1, y2, norm = nodes["y1"], nodes["y2"], nodes["norm"]
-    # x/w1/w2 非 transient，norm 是 host 节点；多出一个 redist_dst:e0——x（host）
-    # scatter 到 y1 的输入落在本 DPU 的落地缓冲（问题 8 缺口修复新增的一类张量）。
+    # scatter 输入作为 DPU 的落地缓冲。
     (scatter_edge,) = y1.meta[REDISTRIBUTE_META_KEY]
     assert set(tensors) == {y1.name, y2.name, f"redist_dst:e{scatter_edge.edge_id}"}
 
-    # y1 本地读者是 y2（列切输出天然对齐行切输入，零通信）；读取时刻用细粒度
-    # 步骤号（问题 8 缺口修复：不能再用粗粒度节点位置，见 _build_step_index）。
+    # y1 的本地读取按细粒度步骤编号记录。
     assert tensors[y1.name].readers == [y2.name]
     assert tensors[y1.name].last_read_at == node_step[y2]
 
-    # y2 是 Partial，被 host norm 消费须 all_reduce，读者记为 redist:eN，
-    # 读取时刻是该边自己搬运命令的步骤号，不是 norm 节点自己的步骤号。
+    # y2 的归约读取使用重分布命令步骤编号。
     (edge,) = norm.meta[REDISTRIBUTE_META_KEY]
     assert tensors[y2.name].readers == [f"redist:e{edge.edge_id}"]
     assert tensors[y2.name].last_read_at == edge_step[edge.edge_id]
 
 
 def test_redistribute_landing_tensor_offset_backfilled_after_plan_dpu() -> None:
-    """问题 8 缺口修复：edge.dst_spec 的 mram_offset 在 plan_dpu 后落在激活区内，不再是默认值 0。"""
+    """验证重分布落地缓冲获得激活区偏移。"""
     (gm1, nodes1), (gm2, nodes2) = _two_appendix_a_graphs()
     kv_specs = _kv_specs()
     hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
@@ -144,20 +130,18 @@ def test_redistribute_landing_tensor_offset_backfilled_after_plan_dpu() -> None:
     detail = scatter_edge.dst_spec.shard_map[0]
     assert detail.mram_offset != 0
     assert plan.act_base <= detail.mram_offset < plan.total
-    # 与 greedy_reuse 记的落地缓冲 offset 完全一致，不是另算的
+    # 偏移与贪心复用结果一致。
     assert plan.act_prefill[f"redist_dst:e{scatter_edge.edge_id}"] == detail.mram_offset
 
 
 def test_transient_tensors_no_readers_defaults_last_read_to_produced() -> None:
-    """无读者的临时张量（如死端）：last_read_at 退化为 produced_at，立即可复用。"""
+    """验证无读者临时张量的读写区间仅包含生成步骤。"""
     tensor = TransientTensor(name="t", size=8, produced_at=5, last_read_at=5)
     assert tensor.readers == []
     assert tensor.last_read_at == tensor.produced_at
 
 
-# ---------------------------------------------------------------------------
-# greedy_reuse：不重叠复用同一 offset，重叠则各开新 offset
-# ---------------------------------------------------------------------------
+# 贪心复用临时缓冲。
 
 
 def test_greedy_reuse_shares_offset_for_disjoint_lifetimes() -> None:
@@ -173,8 +157,7 @@ def test_greedy_reuse_shares_offset_for_disjoint_lifetimes() -> None:
 
 
 def test_greedy_reuse_processes_largest_first_so_slots_always_fit_later_tensors() -> None:
-    """按 size 降序处理：已开的 slot 一定 >= 后处理张量的 size，size 从不成为复用的阻碍，
-    真正阻碍复用的只有时间区间冲突（体现在 shares_offset 用例）。"""
+    """验证较小且生命周期不重叠的张量复用较大张量的地址。"""
     big = TransientTensor("big", size=100, produced_at=0, last_read_at=1)
     small_disjoint = TransientTensor("small", size=8, produced_at=2, last_read_at=3)  # 与 big 不冲突
 
@@ -193,9 +176,7 @@ def test_greedy_reuse_aligns_new_slots() -> None:
     assert end == 128
 
 
-# ---------------------------------------------------------------------------
-# pending_readers_of_reused_addresses
-# ---------------------------------------------------------------------------
+# 复用地址的待完成读者。
 
 
 def test_pending_readers_only_for_shared_addresses() -> None:
@@ -210,9 +191,7 @@ def test_pending_readers_only_for_shared_addresses() -> None:
     assert (("dpu", 0), 64) not in pending  # c 未被复用，不出现
 
 
-# ---------------------------------------------------------------------------
-# plan_dpu 端到端 + format_mem_plan
-# ---------------------------------------------------------------------------
+# plan_dpu 和内存计划格式化。
 
 
 def _plan_both_dpus(hw: HwBudget):
@@ -231,11 +210,11 @@ def test_plan_dpu_regions_do_not_overlap() -> None:
 
     for d, plan in plans.items():
         weight_end = max(plan.weight.values()) if plan.weight else 0
-        # 权重区终点（含对齐）不超过 kv_base：逐权重重算一遍对齐字节数交叉验证
+        # 对齐后的权重区终点不超过 KV 区起点。
         assert weight_end < plan.kv_base
         assert plan.kv_base + kv_specs[d].kv_allocated_bytes == plan.act_base
         assert plan.act_base <= plan.total
-        # 激活区两图各自的 offset 表都不越过 plan.total
+        # 两张图的激活区偏移不超过总容量。
         for offsets in (plan.act_prefill, plan.act_decode):
             for name, off in offsets.items():
                 assert plan.act_base <= off < plan.total
@@ -253,10 +232,7 @@ def test_plan_dpu_weight_offsets_shared_across_both_graphs() -> None:
 
 
 def test_plan_dpu_backfills_activation_node_own_spec_offset() -> None:
-    """问题 8 缺口修复：DPU 节点自己的 spec.shard_map[dpu].mram_offset 也要回填
-    （此前只回填权重与 redistribute 落地缓冲，节点自身激活输出漏了，
-    exec_plan_gen 若照 spec 取地址会全部读到默认值 0）。
-    """
+    """验证计划将 DPU 节点输出偏移写回张量规格。"""
     hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=0)
     plans, _, (nodes1, nodes2) = _plan_both_dpus(hw)
     plan = plans[0]
@@ -264,9 +240,7 @@ def test_plan_dpu_backfills_activation_node_own_spec_offset() -> None:
         off = plan.act_prefill[nodes1[key].name]
         assert nodes1[key].meta["spec"].shard_map[0].mram_offset == off
         assert off != 0
-        # decode 图（nodes2）的同名节点走同一份 act_prefill 表？不——act_decode 是
-        # 它自己那张图独立装箱的表，键是 nodes2 的节点名（这里两图结构相同，节点名
-        # 也相同，但 offset 来自 act_decode，不能拿 act_prefill 的值比）。
+        # decode 图使用独立的激活区偏移表。
         off2 = plan.act_decode[nodes2[key].name]
         assert nodes2[key].meta["spec"].shard_map[0].mram_offset == off2
 

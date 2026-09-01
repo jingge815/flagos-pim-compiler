@@ -1,11 +1,4 @@
-"""问题 6 编译期半单测：`build_execution_plan` 的依赖算法 + 端到端数值验证。
-
-判据（CLAUDE.md 运行时模块判据）：结构判据对照方案表格（RAW/WAR 依赖、四类
-redistribute 命令序列）；数值判据是编排器执行完整 `ExecutionPlan` 与单卡
-PyTorch 逐元素对齐——借附录 A 两层 Linear + LayerNorm 的最小图，在
-NumpyBackend 上真正跑一遍 `submit`/`wait`，而不是像问题 2/3 测试那样手动
-摆数据验证单个算子。
-"""
+"""验证执行计划的依赖关系和端到端数值。"""
 
 from __future__ import annotations
 
@@ -51,7 +44,7 @@ def _hardware(num_tasklets=4):
 
 
 def _plan_and_compile(gm, edges, num_tasklets=4):
-    """跑一遍问题 8（拿两台 dpu 的 pending_readers 合并）+ 问题 3 + 问题 6。"""
+    """生成内存、通信和执行计划。"""
     kv_specs = {
         d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
                          max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
@@ -71,9 +64,7 @@ def _plan_and_compile(gm, edges, num_tasklets=4):
     return compiled, plans
 
 
-# ---------------------------------------------------------------------------
-# 结构判据
-# ---------------------------------------------------------------------------
+# 结构验证。
 
 
 def test_overlap_detects_intersecting_and_disjoint_ranges() -> None:
@@ -87,16 +78,7 @@ def test_overlap_detects_intersecting_and_disjoint_ranges() -> None:
 
 
 def test_pending_readers_join_reader_cmds_so_war_deps_are_not_dropped() -> None:
-    """WAR 依赖必须真的查得到命令编号——问题 8 的 `pending_readers` 给的是
-    **读者节点名**，`reader_cmds` 必须按同一套名字建键，两张表才能 join 上。
-
-    这条测试固化一个真实 bug：早先 `register_reader` 错按"被读张量名"建键，
-    与 `pending_readers` 的"读者名"方向相反，导致**全部 WAR 依赖被静默丢弃**
-    （实测查询命中率 11%），并发执行下就会出现"新命令覆盖旧值、旧值的读者
-    还没读完"的数据损坏——症状是 decode 循环偶发 NaN、argmax 崩成 0，且同
-    一份输入多次运行结果不一致，靠端到端数值断言只能偶尔抓到。这里改为直接
-    断言两张表的 join 命中率，让回归立刻暴露而不依赖运气。
-    """
+    """验证 pending_readers 能正确转换为 WAR 等待命令。"""
     gm, nodes, edges = _built_appendix_a()
     kv_specs = {
         d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
@@ -113,9 +95,7 @@ def test_pending_readers_join_reader_cmds_so_war_deps_are_not_dropped() -> None:
 
     assert pending, "附录 A 图上应当存在被复用的地址，否则这条测试没有覆盖到东西"
 
-    # 直接探测真正的 join：把 `_war_waits` 换成同逻辑但带统计的版本，数清
-    # "查到命令编号"与"查不到"的次数。查不到又不属于前向引用（读者排在这次
-    # 写之后、还没发射，本就不需要等）的，就是被丢弃的真实 WAR 依赖。
+    # 统计 WAR 依赖的命中情况。
     graph_order = {n.name: i for i, n in enumerate(graph_nodes)}
     stats = {"resolved": 0, "dropped": 0}
 
@@ -138,7 +118,7 @@ def test_pending_readers_join_reader_cmds_so_war_deps_are_not_dropped() -> None:
         exec_plan_gen_module._war_waits = original
 
     assert stats["resolved"] + stats["dropped"] > 0, "没有触发任何 WAR 查询，测试无效"
-    # 修复前这里 resolved 恒为 0（两张表方向相反）；修复后必须有真实命中。
+    # 必须存在已解析的 WAR 依赖。
     assert stats["resolved"] > 0, (
         f"全部 {stats['dropped']} 次 WAR 查询都没命中——pending_readers 与 "
         f"reader_cmds 的键对不上，WAR 依赖被静默丢弃"
@@ -153,8 +133,7 @@ def test_scatter_edge_emits_host_slice_then_dma_out_only() -> None:
     host_slice = [c for c in cmds if c.op == "host_slice"]
     assert len(host_slice) == 1
     assert host_slice[0].waits == []  # scatter 源在 host，无 dpu 收集依赖
-    # 本实现把该边的收集/回写并入同一条粗粒度命令（设计决策 2），没有独立的
-    # dma_in/dma_out——消费该 scatter 结果的两台 launch 直接等 host_slice。
+    # 收集和回写由同一条主机命令完成。
     assert all(c.op != "dma_in" and c.op != "dma_out" for c in cmds)
 
 
@@ -179,7 +158,7 @@ def test_dpu_node_with_redistributed_input_waits_for_its_landing_buffer() -> Non
     assert len(launches) == 2
     for launch in launches:
         assert host_slice.id in launch.waits
-        # reads 里必须含落地缓冲区间（长度与 x 的本地分片一致：1x4 fp32=16B）
+        # reads 包含落地缓冲区间。
         assert any(a.length == 16 for a in launch.reads)
 
 
@@ -193,21 +172,13 @@ def test_raw_dependency_between_consecutive_local_launches() -> None:
     assert l1.id in l2.waits
 
 
-# ---------------------------------------------------------------------------
-# 端到端数值：真正在 NumpyBackend 上 submit/wait 跑完整个 ExecutionPlan
-# ---------------------------------------------------------------------------
+# 在 NumpyBackend 上执行完整计划并校验数值。
 
 
 def test_execute_plan_matches_torch_reference() -> None:
-    """附录 A 完整图（scatter 输入 -> 两层 Linear -> all_reduce -> LayerNorm）
-    在 NumpyBackend 上跑一遍 ExecutionPlan，权重真实写入问题 8 规划的 MRAM
-    地址、用问题 6 阶段 B 的真实 `runtime.kernels` 计算，与单卡 torch 参考
-    逐元素对齐——不是手写替身 kernel，是真正要跑的那套代码。
-    """
+    """执行完整计划并将结果与单卡 Torch 参考比较。"""
     gm, nodes_by_key, _ = _built_appendix_a()
-    # layer_norm 是 host 算子，第 1 阶段 host_op 直接调 node.target；把它换成能
-    # 接 numpy 输入的包装（真机场景下这层转换由 SDPA 之外的通用 host handler
-    # 负责，这里手工模拟，不影响依赖算法/kernel 本身的验证）。
+    # 为 host layer_norm 提供 NumPy 包装。
     for n in gm.graph.nodes:
         if "layer_norm" in str(n.target):
             n.target = lambda x, *a, orig=n.target, **k: orig(torch.from_numpy(np.asarray(x)), *a, **k).numpy()
@@ -223,8 +194,7 @@ def test_execute_plan_matches_torch_reference() -> None:
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=2, mram_bytes_per_dpu=1 << 16))
     register_all(backend)
 
-    # 权重真实搬进各 DPU 的 MRAM（对应方案"运行时层：照蓝图把权重一次性搬进
-    # 去"），地址取问题 8 plan_dpu 回填的 offset，不是随便挑的。
+    # 将权重写入各 DPU 的 MRAM 规划地址。
     for dpu_id in (0, 1):
         w1_off = plans[dpu_id].weight[nodes_by_key["w1"].target]
         w2_off = plans[dpu_id].weight[nodes_by_key["w2"].target]
@@ -250,8 +220,7 @@ def test_execute_plan_matches_torch_reference() -> None:
 @pytest.mark.parametrize("num_tasklets", [1, 4])
 def test_build_execution_plan_stamps_num_tasklets_on_every_launch(num_tasklets) -> None:
     """`build_execution_plan(..., num_tasklets=N)` 要落到每一条 launch 命令上——
-    覆盖默认值 4（主线路径）和显式 1（退化情形回归，泛化后单 tasklet 行为不变）。
-    非 launch 命令（host_op 等）不受影响，仍是 Command 的默认值。
+    覆盖默认值 4 和显式值 1。非 launch 命令保持 Command 的默认值。
     """
     gm, _, edges = _built_appendix_a()
     for n in gm.graph.nodes:
@@ -283,7 +252,7 @@ def test_build_execution_plan_requires_explicit_hardware() -> None:
 
 
 def _appendix_a_planned() -> tuple[list, object, dict, dict]:
-    """附录 A 图跑完问题 7/8 蓝图，返回 build_execution_plan 所需的四份入参。"""
+    """生成执行计划所需的图、通信条目和读者信息。"""
     gm, _, edges = _built_appendix_a()
     kv_specs = {
         d: KVRegionSpec(dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
@@ -300,11 +269,7 @@ def _appendix_a_planned() -> tuple[list, object, dict, dict]:
 
 
 def test_build_execution_plan_accepts_shard_count_below_num_dpus() -> None:
-    """流水切分下一个张量只落在本 stage 的几台上，分片数少于 num_dpus 是合法的。
-
-    附录 A 的图切在 2 台上，配 num_dpus=4 的硬件即「4 台机器、每个张量用 2 台」，
-    正是 2 stage × tp2 的形状——推广前这里会被当成配置错误直接抛错。
-    """
+    """验证张量分片数少于硬件 DPU 总数时仍可生成执行计划。"""
     graph_nodes, gm, entries_by_id, pending = _appendix_a_planned()
 
     compiled = build_execution_plan(
@@ -318,11 +283,7 @@ def test_build_execution_plan_accepts_shard_count_below_num_dpus() -> None:
 
 
 def test_build_execution_plan_rejects_out_of_range_dpu_id() -> None:
-    """越界 dpu_id 仍要抛错：会让下游按不存在的地址空间生成命令。
-
-    分片数（2）本身在 [1, num_dpus=4] 内、过得了数量校验，但物理编号 5 超出
-    4 台机器的地址空间——放宽数量校验之后，编号合法性是唯一还能拦住它的判断。
-    """
+    """验证执行计划拒绝超出硬件地址空间的 DPU 编号。"""
     gm, _ = _appendix_a_graph()
     partition_graph(gm)
     edges = propagate_specs(
@@ -384,5 +345,3 @@ def test_build_execution_plan_rejects_tasklet_mismatch() -> None:
             graph_nodes, gm, entries_by_id, pending, hardware=_hardware(num_tasklets=4),
             num_tasklets=2,
         )
-
-

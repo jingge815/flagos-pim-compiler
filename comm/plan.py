@@ -1,21 +1,4 @@
-"""问题 3（编译期半）：通信计划表——把问题 2 的 RedistributeEdge 按数据段展开。
-
-每条 redistribute 边展开为一个 CommPlanEntry（方案问题 3 二.(4) 的表）：
-边级 ``wait_for``（读前等待的生产者 DPU 集合）+ 逐 segment 行。segment 字段与
-方案表格一一对应；``dst_ready_after`` 的数据源是问题 8 的 pending_readers，问题 8
-未就位前恒为空。
-
-区间换算统一在"全局摊平（行主序）元素坐标"下进行：任何 Shard(d) 的连续分片
-= 摊平后 prod(shape[:d]) 段连续 run（外维循环 × 切维连续段），每段在全局缓冲与
-本 DPU 本地缓冲各自连续。这修正了方案 nbytes 公式只在一维/最内维切分下成立的
-漏洞，使任意维切分（如 logits 的 Shard(2)，S>1 时全局缓冲中交错分布）的段描述
-与真实字节布局一致。
-
-segment 上除方案表格的元素区间外，另烘烤两个绝对字节地址字段（src_addr/dst_addr
-= TensorShardDetail.mram_offset + 本地元素偏移 × itemsize），使本表自包含：
-编排器/通信库照表执行即可，无需回查 shard_map。问题 8 就位后只改 mram_offset
-取值，生成规则不变。
-"""
+"""根据张量分片信息生成通信计划和 DMA 序列。"""
 
 from __future__ import annotations
 
@@ -32,13 +15,7 @@ CommType = Literal["all_reduce", "all_gather", "all_to_all", "scatter", "local_s
 
 @dataclass(frozen=True)
 class CommSegment:
-    """通信计划表的一行（方案问题 3 二.(4) 表，逐段字段）。
-
-    元素区间均为半开 [start, end)。src_dpu/dst_dpu 为 None 表示该端是 host
-    归约/合并缓冲区；host 端的 src_local_range/dst_local_offset 解释为 host
-    缓冲区内的元素位置（host 缓冲即全局摊平张量布局）。all_to_all 的段
-    src_dpu 与 dst_dpu 均非 None（两跳经 host，源段与目标段合一描述）。
-    """
+    """通信计划中的数据段，区间采用半开形式 ``[start, end)``。"""
 
     edge_id: int
     type: CommType
@@ -51,7 +28,7 @@ class CommSegment:
     reduce: str | None = None
     src_addr: int = 0              # 源端绝对字节地址（DPU 侧=MRAM，host 侧=缓冲内偏移）
     dst_addr: int = 0              # 目标端绝对字节地址，同上
-    dst_ready_after: tuple = ()    # 写前等待的读者；问题 8 pending_readers 填入
+    dst_ready_after: tuple = ()    # 写入前等待的读者。
 
 
 @dataclass
@@ -78,23 +55,17 @@ class CommPlanEntry:
 
     @property
     def writeback_segments(self) -> list[CommSegment]:
-        """host → DPU 的回写段；dst_loc 为 host 时为空（方案二.(4)：结果只落 host）。"""
+        """返回主机到 DPU 的回写段。"""
         return [s for s in self.segments if s.dst_dpu is not None]
 
 
-# ---------------------------------------------------------------------------
-# 分片 → 全局摊平坐标下的连续 run 列表
-# ---------------------------------------------------------------------------
+# 分片到全局摊平坐标的连续区间。
 
 
 def _runs(
     shape: tuple[int, ...], placement_kind: str, shard_dim: int, detail: TensorShardDetail
 ) -> Iterator[tuple[int, int, int]]:
-    """一个分片展开为 [(global_start, local_start, length)]（元素单位，摊平坐标）。
-
-    Shard(d) 的分片在摊平坐标下是 prod(shape[:d]) 段连续 run（外维每行一段，
-    段长 = 切宽 × 内维积）；Replicate/Partial 恒为单段 [0, numel)。
-    """
+    """将一个分片展开为全局和本地坐标下的连续区间。"""
     if placement_kind != "Shard":
         yield 0, 0, prod(shape)
         return
@@ -131,9 +102,7 @@ def _spec_runs(spec: PIMTensorSpec) -> Iterator[tuple[int, TensorShardDetail, in
             yield dpu_id, detail, global_start, local_start, length
 
 
-# ---------------------------------------------------------------------------
-# RedistributeEdge → CommPlanEntry（方案二.(4) 各类型生成规则）
-# ---------------------------------------------------------------------------
+# 重分布边到通信计划条目。
 
 
 def _segment(
@@ -165,10 +134,7 @@ def _segment(
 
 
 def _collect_segments(edge: RedistributeEdge, itemsize: int) -> list[CommSegment]:
-    """收集段：源 shard_map 每个分片按其全局 run 展开，dst_dpu=None（去向 host）。
-
-    源为 Replicate（同布局 dpu→host 退化，方案二.(9)：只收一份）时只取一台。
-    """
+    """生成 DPU 到主机的收集段；复制布局只收集一份。"""
     segs = []
     for dpu_id, detail, g, local, length in _spec_runs(edge.src_spec):
         segs.append(
@@ -180,21 +146,17 @@ def _collect_segments(edge: RedistributeEdge, itemsize: int) -> list[CommSegment
                 src_base=detail.mram_offset,
                 global_range=(g, g + length),
                 dst_dpu=None,
-                dst_offset=g,  # 分片在 host 合并缓冲区中的位置 = 全局摊平偏移
+                dst_offset=g,  # 主机缓冲区中的全局偏移。
                 dst_base=0,
             )
         )
         if edge.src_spec.placement.kind == "Replicate":
-            break  # 全量副本只收一台（方案：源为全量副本时只收一份）
+            break  # 复制布局只收集一份。
     return segs
 
 
 def _writeback_segments(edge: RedistributeEdge, itemsize: int) -> list[CommSegment]:
-    """回写段：dst_loc 为 host 时不生成；为 dpu 时按 dst_spec 分片逐 run 展开。
-
-    目标 DPU 集合取自 dst_spec 的 shard_map（与 dst_loc.dpus 一致），与源集合
-    相互独立（方案二.(4)：不隐含源集合 = 目标集合）。src_dpu=None（来源 host）。
-    """
+    """生成主机到目标 DPU 的回写段；主机目标不生成回写。"""
     if edge.dst_loc["device"] == "host":
         return []
     return [
@@ -202,7 +164,7 @@ def _writeback_segments(edge: RedistributeEdge, itemsize: int) -> list[CommSegme
             edge,
             itemsize,
             src_dpu=None,
-            src_range=(g, g + length),  # host 源：缓冲内区间即全局摊平区间
+            src_range=(g, g + length),  # 主机缓冲区的全局区间。
             src_base=0,
             global_range=(g, g + length),
             dst_dpu=dpu_id,
@@ -255,7 +217,7 @@ def _check_coverage(segs: list[CommSegment], expect_full: bool, expected: int, l
 
 
 def _check_endpoint_location(name: str, location: dict, spec: PIMTensorSpec) -> None:
-    """校验问题 2 写入的 loc 与同一边的 tensor spec 指向同一组设备。"""
+    """校验端点位置和张量规格使用相同设备集合。"""
     expected = {"device": "host"} if spec.device == "host" else {
         "device": "dpu", "dpus": sorted(spec.shard_map)
     }
@@ -284,7 +246,7 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
         wait_for=wait_for,
     )
     if edge.type == "local_slice":
-        return entry  # 本地视角切换，零 DMA（方案二.(8)）
+        return entry  # 本地视图切换不需要 DMA。
     if edge.type == "all_to_all":
         entry.segments = _all_to_all_segments(edge, dtype.itemsize)
         _check_coverage(entry.segments, False, numel, f"edge {edge.edge_id} all_to_all")
@@ -303,28 +265,16 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
 
 
 def build_comm_plan(edges: list[RedistributeEdge]) -> list[CommPlanEntry]:
-    """问题 3 编译期主入口：redistribute 边列表 → 通信计划表（每边一个条目）。
-
-    入: edges —— propagate_specs 的产出（问题 2）。
-    出: CommPlanEntry 列表（与 edges 同序）；local_slice 边保留空 segments 的
-        占位条目（零 DMA，供问题 6 统一按 edge_id 查表）。
-    """
+    """将重分布边列表转换为同序的通信计划条目。"""
     return [_entry_of_edge(edge) for edge in edges]
 
 
-# ---------------------------------------------------------------------------
-# DMA 序列展开（附录 B.3）：编译期可算，成本模型与 comm/lowering.py 执行共用
-# ---------------------------------------------------------------------------
+# DMA 序列展开。
 
 
 @dataclass(frozen=True)
 class DmaOp:
-    """一条展开的厂商 SDK 传输调用。
-
-    kind: copy_from/copy_to（点对点单段）；push_from/push_to（同地址同长度的
-    逐 DPU 传输合批为一次 dpu_push_xfer，方案二.(2) 的批量优化）；broadcast_to
-    （同一份 host 数据写全部目标 DPU，一次 dpu_broadcast_to）。
-    """
+    """一条展开的 DMA 调用及其数据段。"""
 
     kind: Literal["copy_from", "copy_to", "push_from", "push_to", "broadcast_to"]
     segments: tuple[CommSegment, ...]
@@ -339,13 +289,7 @@ def _batch(segs: list[CommSegment], key) -> Iterator[list[CommSegment]]:
 
 
 def dma_sequence(entry: CommPlanEntry) -> list[DmaOp]:
-    """把条目展开为有序的 SDK 传输调用序列（收集方向在前，回写方向在后）。
-
-    host 端的归约/拼接/重排发生在这两个方向之间，由 comm/lowering.py 的各原语
-    完成，不在本序列内。回写段全体共享同一 host 区间与同一 dst_addr 时（同一份
-    结果写全部目标），合并为一次 broadcast_to；否则按 (dst_addr, nbytes) 合批为
-    push_to；收集段按 (src_addr, nbytes) 合批为 push_from；单段退化为 copy_*。
-    """
+    """按收集、回写顺序生成 DMA 调用，并合并可批量传输的段。"""
     ops: list[DmaOp] = []
     for group in _batch(entry.collect_segments, lambda s: (s.src_addr, s.nbytes)):
         ops.append(DmaOp("push_from" if len(group) > 1 else "copy_from", tuple(group)))
@@ -358,18 +302,12 @@ def dma_sequence(entry: CommPlanEntry) -> list[DmaOp]:
     return ops
 
 
-# ---------------------------------------------------------------------------
-# 接口成本模型（host-star 拓扑）
-# ---------------------------------------------------------------------------
+# 主机星型拓扑成本模型。
 
 
 @dataclass(frozen=True)
 class HostStarCostModel:
-    """host-star 拓扑的接口成本：每次 SDK 传输一次固定建立开销 + 主机带宽线性项。
-
-    DPU 间无直连，一切跨 DPU 交换经 host 两跳，成本只按 host↔DPU 字节计；
-    push_xfer/broadcast_to 合批只付一次建立开销。
-    """
+    """主机星型拓扑下的传输建立开销和带宽参数。"""
 
     dma_setup_s: float = 1e-5
     host_bytes_per_s: float = 25e9
@@ -395,9 +333,7 @@ def plan_cost(entry: CommPlanEntry, model: HostStarCostModel | None = None) -> C
     )
 
 
-# ---------------------------------------------------------------------------
-# 可读报告（定位问题用）
-# ---------------------------------------------------------------------------
+# 通信计划报告。
 
 
 def format_comm_plan(entries: list[CommPlanEntry], *, max_segments: int | None = None) -> str:

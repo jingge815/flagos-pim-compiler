@@ -43,19 +43,11 @@ class _AccessRecord:
 
 
 class TaskletHazardError(RuntimeError):
-    """两个 tasklet 在同一 epoch 内访问重叠地址且至少一方写——漏加 barrier 或
-    行区间切分算错，真实硬件上这就是一次数据竞争。"""
+    """表示同一同步区间内的 tasklet 存在冲突访问。"""
 
 
 class HazardTracker:
-    """单次 launch 命令内、一个 epoch（两次 barrier 之间）的访问记录。
-
-    按方案确认的模型：多个 tasklet 按固定顺序（0..num_tasklets-1）依次跑完
-    自己的工作分片，不是真并发（不用 pthread，保持数值确定可复现）。每次
-    WRAM/MRAM 读写在 `record()` 里就地和本 epoch 已有记录比对——顺序模拟下
-    后到的访问和已记录的比较即可发现冲突，不需要等 epoch 结束再批量扫描。
-    命中重叠即抛异常，模拟真实硬件上"少加 barrier 导致数据竞争"的后果。
-    """
+    """记录一个同步区间内的 tasklet 内存访问并检测写冲突。"""
 
     def __init__(self) -> None:
         self._epoch: list[_AccessRecord] = []
@@ -100,12 +92,7 @@ class MRAMAllocator:
 
 
 class NumpyBackend:
-    """问题 6 的异步 HAL：submit/wait/query + 每 DPU 一条有序流。
-
-    存储与 DMA 底座架在 backend/dpu_sdk（厂商 SDK 的 numpy 镜像）之上：本类只提供
-    Command/Event 异步语义，MRAM 字节数组由 dpu_sdk 的机器持有，通信库与编排器共享
-    同一份伪硬件状态。
-    """
+    """提供异步命令执行、每 DPU 有序流和共享 MRAM 的 HAL。"""
 
     def __init__(self, config: NumpyBackendConfig) -> None:
         if config.allow_device_to_device:
@@ -121,23 +108,11 @@ class NumpyBackend:
             wram_bytes=config.wram_bytes_per_dpu,
         )
         self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
-        # 每次 launch 命令私有的 HazardTracker——多个 DPU 的 launch 在
-        # ThreadPoolExecutor 的不同 worker 线程上并发跑，不能挂在 self 的
-        # 单一属性上，否则会互相踩；见 submit() 的 "launch" 分支。
+        # 每个并发执行的 launch 使用独立的冲突检测器。
         self._tracker_local = threading.local()
 
     def reset_events(self) -> None:
-        """清空命令 id -> Event 的查找表（问题 6 `execute_plan` 每次调用前必调）。
-
-        命令 id 只在单次 `build_execution_plan` 产出的一份 `ExecutionPlan`
-        内唯一，两图各自从 0 编号；decode 循环对同一份 decode_plan 重复调
-        `execute_plan` 多次（每步一次），id 会重复出现。`_events_by_id` 是
-        这唯一会跨调用累积、导致 `submit` 误判"重复 id"的状态——不清空
-        `_stream_tail`（每 DPU 的异步 future 链要跨步真实串行，代表"这台
-        DPU 上一步的最后一条命令必须先跑完"，这是 KV cache 跨步累积写入
-        MRAM 的正确性所需要的，问题 6 三.(1) 的"编排器持有横跨两张图的状态"
-        正是靠它落地）。
-        """
+        """清空本次执行的命令事件表，保留各 DPU 的执行顺序。"""
         self._events_by_id = {}
 
     @property
@@ -169,27 +144,12 @@ class NumpyBackend:
         self.copy_to_dpu(dpu_id, offset, data)
 
     def raw_mram_ptr(self, dpu_id: int) -> int:
-        """DPU `dpu_id` 的 MRAM 起始地址（`ctypes` 裸指针，`int`）。
-
-        供 `opcompiler_bridge` 编译出的 C kernel 直接原地读写用——`read_local`/
-        `write_local` 永远拷贝，这里给的是内存的地址，跟 `dpu_sdk.py` 里
-        `_Dpu.mram`（每 DPU 一块独立连续 `np.zeros(mram_bytes, dtype=uint8)`）
-        是同一份存储，调用方对着这个地址加 offset 写等价于直接改 MRAM。
-
-        调用方必须保证：(1) 只在本 DPU 的 launch 线程内使用，不跨线程持有；
-        (2) offset+length 落在 `mram_bytes_per_dpu` 之内——本方法不做越界检查，
-        因为它连长度都不知道，检查在编译出的 kernel 自己算下标之前完成。
-        """
+        """返回指定 DPU 的 MRAM 起始地址，供已编译内核直接访问。"""
         _, dpu = self._dpu_set.dpu(dpu_id)._member()
         return dpu.mram.ctypes.data
 
     def wram_ptr(self, dpu_id: int) -> int:
-        """DPU `dpu_id` 的 WRAM 起始地址（`ctypes` 裸指针），镜像 `raw_mram_ptr`。
-
-        供 opcompiler_bridge 编译出的多 tasklet C kernel 用——每个 tasklet
-        把自己的行区间 snapshot 进 WRAM 再算，不是像单 tasklet 版本一样
-        直接算 MRAM。
-        """
+        """返回指定 DPU 的 WRAM 起始地址，供已编译内核直接访问。"""
         _, dpu = self._dpu_set.dpu(dpu_id)._member()
         return dpu.wram.ctypes.data
 
@@ -310,15 +270,7 @@ class NumpyBackend:
         return event.future.done()
 
     def bind_inputs(self, values: dict[str, object], *, pos: int | None = None) -> None:
-        """问题 6 编排器的输入绑定入口（方案三.(3) `execute_plan` 的 `hal.bind_inputs`）。
-
-        `values`：本次调用的图 placeholder 节点名 -> 具体值（如
-        `{"input_ids": tensor, "causal_mask": tensor}`），供
-        `runtime/exec_plan_gen.py` 的 `_resolve_value` 在运行时读取。
-        `pos`：写 KV 的位置（= 编排器 `DecodeState.valid_len`），KV/SDPA
-        handler 用；不是图输入，图本身不含"位置"这个 placeholder。每次
-        `execute_plan` 前必须重新绑定，本方法不做跨调用累积。
-        """
+        """绑定本次计划执行的占位符值和可选 KV 写入位置。"""
         self._bound_values = values
         self._bound_pos = pos
 
@@ -332,7 +284,5 @@ class NumpyBackend:
         return self._bound_pos
 
     def result_of(self, cmd_id: int) -> object:
-        """取某条已提交命令的返回值（问题 6 host handler 读上游数值用，见
-        `runtime/exec_plan_gen.py` 模块 docstring 的"编译期只捕获命令 id、
-        运行时按 id 查具体值"设计）。"""
+        """返回指定命令的执行结果。"""
         return self._events_by_id[cmd_id].future.result()
