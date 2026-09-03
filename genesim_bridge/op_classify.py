@@ -5,8 +5,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-# 使用 GeneSim 模板成本的算子类型。
-UNCOVERED_OP_TYPES = frozenset({"GELU"})
+# 使用 GeneSim 模板成本的算子类型：本桥接不为它们编译 FlagGems 代表实现，
+# 直接保留 model_parser 写进 IR 的模板系数，并记入 sidecar 的 coverage.template。
+#
+# 逐元素/归约类（RMSNORM、SILU、VECTOR_ADD、VECTOR_MUL）：GeneSim 侧的
+# model_parser 已经给出 flops_coeffs / data_bytes_coeffs，而且它们在
+# pim_compiler 里有各自的 trace 编译器，成本由那条路径负责。这里不硬编一套
+# FlagGems 配方去覆盖，否则等于引入一组未经校准的数值。
+#
+# 图的边界节点（MODEL_INPUT、MODEL_OUTPUT）：零成本占位，flops 和 data_bytes
+# 都是 0、也没有系数，本来就没有什么可测量的。
+UNCOVERED_OP_TYPES = frozenset({
+    "GELU",
+    "RMSNORM",
+    "SILU",
+    "VECTOR_ADD",
+    "VECTOR_MUL",
+    "MODEL_INPUT",
+    "MODEL_OUTPUT",
+})
 
 
 @dataclass(frozen=True)

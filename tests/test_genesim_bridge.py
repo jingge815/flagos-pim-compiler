@@ -18,7 +18,12 @@ from genesim_bridge.cost_extractor import (
     load_local_shapes,
     validate_local_shapes_against_ir,
 )
-from genesim_bridge.op_classify import ShapePoint, gemm_features
+from genesim_bridge.op_classify import (
+    UNCOVERED_OP_TYPES,
+    ShapePoint,
+    build_recipes,
+    gemm_features,
+)
 from genesim_bridge.paths import genesim_models_dir
 from genesim_bridge.ir_cost import analyze_ir
 
@@ -402,6 +407,42 @@ def test_refined_ir_preserves_structure(refined_name):
             for field in ("flops_coeffs", "data_bytes_coeffs"):
                 value = sum(c * table[k] for k, c in op[field].items())
                 assert value >= 0, f"op {op['op_id']} {field} 负值 @Tq={tq},Tp={tp}"
+
+
+def test_every_op_type_is_either_measurable_or_explicitly_uncovered():
+    """IR 里的每个算子类型都必须有归属：能测量，或明确列入模板成本。
+
+    漏掉一种就会让 export_costs_to_genesim 抛 KeyError 挂在半路。GeneSim 侧
+    更新 model_parser 后确实发生过：IR 从 3232 个算子扩到 3491 个，新增了
+    RMSNORM/SILU/VECTOR_ADD/VECTOR_MUL 和 MODEL_INPUT/MODEL_OUTPUT，其中
+    MODEL_INPUT 第一个撞上 `KeyError: 'MODEL_INPUT'`。
+
+    这个测试对着真实 IR 检查，所以下次 model_parser 再引入新类型时会立刻失败，
+    而不是等到跑精化脚本才发现。
+    """
+    ir_dir = genesim_models_dir(required=False)
+    if ir_dir is None:
+        pytest.skip("需要在 paths.json 配置 genesim_root")
+    ir_path = ir_dir / "llama2_7b.ir"
+    if not ir_path.is_file():
+        pytest.skip("需要先在 GeneSim 侧生成 llama2_7b.ir")
+
+    ir = json.loads(ir_path.read_text())
+    dims = {
+        "hidden_size": ir["hidden_size"],
+        "head_dim": ir["head_dim"],
+        "num_heads": ir["num_heads"],
+        "ffn_dim": 4 * ir["hidden_size"],
+    }
+    measurable = set(build_recipes(dims))
+    present = {op["op_type"] for op in ir["operators"]}
+    orphans = sorted(present - measurable - set(UNCOVERED_OP_TYPES))
+    assert not orphans, (
+        f"IR 里的算子类型 {orphans} 既没有 FlagGems 配方、也不在 "
+        "UNCOVERED_OP_TYPES 里。export_costs_to_genesim 会对它们抛 KeyError。"
+        "要么在 op_classify.build_recipes 里加配方，要么把它们列入 "
+        "UNCOVERED_OP_TYPES 以保留 model_parser 的模板成本。"
+    )
 
 
 def test_pimir_sidecar_agrees_with_ttir_on_flops():

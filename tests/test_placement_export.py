@@ -114,26 +114,52 @@ def annotated_gqa_llama() -> GraphModule:
     return gm
 
 
+# 每层的七个投影各自一个 GEMM，与当前 model_parser 的产出一致：先前的图骨架把
+# q/k/v 合并成一个 GEMM、并用 gate_proj 顶替整个 fc1，现在逐个独立表示。
+#
+# op_id 的升序**故意不等于** _GEMM_WEIGHT_SUFFIXES 的声明顺序：导出侧必须按权重名
+# 匹配，如果退回"按 subgraph 顺序 zip"，这里就会把 down_proj 的分片宽度套到
+# q_proj 上，测试随即失败。顺序一致的 fixture 测不出这个区别。
+_FIXTURE_GEMM_WEIGHTS = (
+    (0, "down_proj.weight"),
+    (4, "up_proj.weight"),
+    (5, "gate_proj.weight"),
+    (7, "o_proj.weight"),
+    (8, "v_proj.weight"),
+    (9, "k_proj.weight"),
+    (10, "q_proj.weight"),
+)
+
+
 def _write_fixture_ir(path: Path) -> None:
-    """写入含四个 GEMM 和注意力算子的最小 GeneSim IR。"""
-    operators = [
-        {"op_id": 0, "op_type": "GEMM", "device_hint": "gpu",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 1, "op_type": "GEMV_SCORE", "device_hint": "pim",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 2, "op_type": "SOFTMAX", "device_hint": "pim",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 3, "op_type": "GEMV_CONTEXT", "device_hint": "pim",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 4, "op_type": "GEMM", "device_hint": "gpu",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 5, "op_type": "GEMM", "device_hint": "gpu",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 6, "op_type": "GELU", "device_hint": "cpu",
-         "input_shapes": [], "output_shapes": []},
-        {"op_id": 7, "op_type": "GEMM", "device_hint": "gpu",
-         "input_shapes": [], "output_shapes": []},
+    """写入每层七个 GEMM 加注意力算子的最小 GeneSim IR。
+
+    GEMM 的身份由 `dependencies` 里的权重 `tensor_id` 给出，导出侧按名字匹配，
+    不依赖 subgraph 里的出现顺序——所以这里故意把 op_id 打散排列。
+    """
+    gemm_ids = {op_id for op_id, _ in _FIXTURE_GEMM_WEIGHTS}
+    operators = []
+    for op_id in range(11):
+        if op_id in gemm_ids:
+            op_type, hint = "GEMM", "gpu"
+        elif op_id == 1:
+            op_type, hint = "GEMV_SCORE", "pim"
+        elif op_id == 2:
+            op_type, hint = "SOFTMAX", "pim"
+        elif op_id == 3:
+            op_type, hint = "GEMV_CONTEXT", "pim"
+        else:
+            op_type, hint = "GELU", "cpu"
+        operators.append({
+            "op_id": op_id, "op_type": op_type, "device_hint": hint,
+            "input_shapes": [], "output_shapes": [],
+        })
+
+    dependencies = [
+        {"src_op_id": -1, "dst_op_id": op_id, "tensor_id": f"layer.0.{suffix}"}
+        for op_id, suffix in _FIXTURE_GEMM_WEIGHTS
     ]
+
     ir = {
         "model_id": "tiny-llama-fixture",
         "num_layers": 1,
@@ -141,7 +167,7 @@ def _write_fixture_ir(path: Path) -> None:
         "head_dim": HIDDEN_SIZE // NUM_HEADS,
         "hidden_size": HIDDEN_SIZE,
         "operators": operators,
-        "dependencies": [],
+        "dependencies": dependencies,
         "subgraphs": [[op["op_id"] for op in operators]],
     }
     path.write_text(json.dumps(ir))
@@ -158,12 +184,13 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
     placed = json.loads(out_ir_path.read_text())
     ops_by_id = {op["op_id"]: op for op in placed["operators"]}
 
-    gemm_ids = [0, 4, 5, 7]
-    for op_id in gemm_ids:
+    for op_id, suffix in _FIXTURE_GEMM_WEIGHTS:
         assert ops_by_id[op_id]["device_hint"] == "pim", op_id
-        assert str(op_id) in sidecar["operators"], op_id
-        dpu_id = sidecar["operators"][str(op_id)]["dpu_id"]
-        assert 0 <= dpu_id < NUM_DPUS, dpu_id
+        entry = sidecar["operators"].get(str(op_id))
+        assert entry is not None, op_id
+        assert 0 <= entry["dpu_id"] < NUM_DPUS, entry
+        # 身份由权重名确定，与 subgraph 里的出现顺序无关。
+        assert entry["weight"] == f"layer.0.{suffix}"
 
     for op_id in (1, 2, 3, 6):
         assert ops_by_id[op_id]["device_hint"] == {
@@ -172,15 +199,14 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
         assert str(op_id) not in sidecar["operators"], op_id
 
 
-def test_local_shard_widths_written_with_qkv_summed(
+def test_local_shard_widths_follow_each_projection(
     annotated_tiny_llama, tmp_path
 ) -> None:
-    """sidecar 要带上本地分片宽度，qkv 那个 GEMM 的输出宽度是 q/k/v 三者之和。
+    """每个投影的本地分片宽度都要如实写进 sidecar。
 
-    GeneSim 的 IR 把 q/k/v 合并成一个 GEMM（真实 7B 上是 4096 -> 12288），
-    而代表权重只是 q_proj。只算 q 一份的话这个 GEMM 的成本会被低估到三分之一。
-    这个 fixture 是多头注意力（kv 头数等于 q 头数），所以三者宽度相同、
-    累加结果恰好等于 q 的三倍；GQA 下不成立，见下一个测试。
+    IR 里七个投影各自是一个 GEMM，所以每个 GEMM 的宽度直接取自它自己的权重，
+    不需要累加或折算。切分方向决定哪一侧变窄：按输出维切（q/k/v/gate/up）是
+    出口变窄，按规约维切（o_proj/down）是入口变窄。
     """
     ir_path = tmp_path / "base.ir"
     _write_fixture_ir(ir_path)
@@ -190,42 +216,41 @@ def test_local_shard_widths_written_with_qkv_summed(
         tmp_path / "placed.ir", tmp_path / "sc.json",
     )
 
-    tp_width = NUM_DPUS          # 该 fixture 是纯张量并行，段内宽度即 DPU 数
+    tp = NUM_DPUS            # 该 fixture 是纯张量并行，段内宽度即 DPU 数
     ops = sidecar["operators"]
+    H, I = HIDDEN_SIZE, INTERMEDIATE_SIZE
 
-    # op0 = qkv：q/k/v 都按输出维切，各 HIDDEN/tp，累加三份。
-    qkv = ops["0"]
-    assert qkv["local_in_features"] == HIDDEN_SIZE
-    assert qkv["local_out_features"] == 3 * (HIDDEN_SIZE // tp_width)
-
-    # op4 = o_proj：按规约维切，所以是入口宽度变窄、出口保持全宽。
-    o_proj = ops["4"]
-    assert o_proj["local_in_features"] == HIDDEN_SIZE // tp_width
-    assert o_proj["local_out_features"] == HIDDEN_SIZE
-
-    # op5 = fc1（gate_proj）：按输出维切，倍数为一。
-    fc1 = ops["5"]
-    assert fc1["local_in_features"] == HIDDEN_SIZE
-    assert fc1["local_out_features"] == INTERMEDIATE_SIZE // tp_width
-
-    # op7 = fc2（down_proj）：按规约维切。
-    fc2 = ops["7"]
-    assert fc2["local_in_features"] == INTERMEDIATE_SIZE // tp_width
-    assert fc2["local_out_features"] == HIDDEN_SIZE
+    # (op_id, 期望 in_features, 期望 out_features)
+    # op_id 与投影的对应见 _FIXTURE_GEMM_WEIGHTS —— 那里的顺序是打散的。
+    expected = [
+        (0, I // tp, H),          # down_proj：按规约维切
+        (4, H, I // tp),          # up_proj：按输出维切，不再被漏掉
+        (5, H, I // tp),          # gate_proj：按输出维切
+        (7, H // tp, H),          # o_proj：按规约维切
+        (8, H, H // tp),          # v_proj：按输出维切
+        (9, H, H // tp),          # k_proj：同上
+        (10, H, H // tp),         # q_proj：同上
+    ]
+    for op_id, want_in, want_out in expected:
+        entry = ops[str(op_id)]
+        assert entry["local_in_features"] == want_in, (op_id, entry)
+        assert entry["local_out_features"] == want_out, (op_id, entry)
 
     assert sidecar["version"] == 2
-    assert sidecar["ir_num_operators"] == 8
+    assert sidecar["ir_num_operators"] == 11
 
 
-def test_qkv_local_width_sums_actual_kv_shards_under_gqa(
+def test_kv_projections_keep_their_own_width_under_gqa(
     annotated_gqa_llama, tmp_path
 ) -> None:
-    """分组查询注意力下，qkv 的本地宽度必须按 q/k/v 实际分片累加。
+    """分组查询注意力下，k/v 的本地宽度比 q 窄，各自如实写出。
 
-    早先的实现是拿 q_proj 的本地宽度乘三，这在 k/v 头数等于 q 头数时才成立。
-    GQA 下 k/v 更窄，乘三会高估——这个 fixture 是 8 个 q 头、4 个 kv 头，
-    乘三算出 48 而真实只有 32，高估一点五倍。llama2-7b 恰好是 32/32，
+    这里曾经踩过一个坑：那时 IR 把 q/k/v 合并成一个 GEMM，导出侧只好拿 q_proj
+    的宽度乘三来凑。GQA 下 k/v 的头数少于 q，乘三会高估——8 个 q 头、4 个 kv 头
+    的模型，真实宽度之和是 32+16+16=64，乘三却算出 96。llama2-7b 恰好是 32/32
     掩盖了这个缺陷，但 `llama_strategy` 是接受 num_kv_heads != num_heads 的。
+
+    现在每个投影独立成 GEMM，各取自己的 local_shape，这类折算不再存在。
     """
     ir_path = tmp_path / "base.ir"
     _write_fixture_ir(ir_path)
@@ -238,29 +263,65 @@ def test_qkv_local_width_sums_actual_kv_shards_under_gqa(
     head_dim = GQA_HIDDEN_SIZE // GQA_NUM_HEADS
     q_out = GQA_HIDDEN_SIZE // GQA_TP_WIDTH                       # 32
     kv_out = (GQA_NUM_KV_HEADS * head_dim) // GQA_TP_WIDTH        # 16
+    assert kv_out < q_out, "fixture 必须真的是 GQA，否则测不到这件事"
 
-    qkv = sidecar["operators"]["0"]
-    assert qkv["local_in_features"] == GQA_HIDDEN_SIZE
-    assert qkv["local_out_features"] == q_out + 2 * kv_out        # 32 + 16 + 16
-    # 明确记下：按 q 乘三会得到 48，不是这里的 64 // 2 == 32 之和。
-    assert qkv["local_out_features"] != 3 * q_out
+    ops = sidecar["operators"]
+    # op_id 与投影的对应见 _FIXTURE_GEMM_WEIGHTS：q 是 op10，k 是 op9，v 是 op8。
+    assert ops["10"]["local_out_features"] == q_out      # q_proj
+    assert ops["9"]["local_out_features"] == kv_out      # k_proj，更窄
+    assert ops["8"]["local_out_features"] == kv_out      # v_proj，更窄
 
 
-def test_layer_gemm_count_mismatch_raises(annotated_tiny_llama, tmp_path) -> None:
+def test_gemm_without_weight_dependency_raises(annotated_tiny_llama, tmp_path) -> None:
+    """GEMM 在 dependencies 里找不到权重时必须报错，而不是静默跳过。
+
+    身份靠权重 tensor_id 确定；缺了它就无法判断这个 GEMM 是哪个投影，继续下去
+    只会把某个投影的分片宽度套到别的算子上。
+    """
     ir_path = tmp_path / "bad.ir"
     ir = {
         "model_id": "bad-fixture",
         "num_layers": 1,
+        "num_heads": NUM_HEADS,
+        "head_dim": HIDDEN_SIZE // NUM_HEADS,
+        "hidden_size": HIDDEN_SIZE,
         "operators": [
             {"op_id": 0, "op_type": "GEMM", "device_hint": "gpu",
              "input_shapes": [], "output_shapes": []},
         ],
-        "dependencies": [],
+        "dependencies": [],          # 故意不给权重依赖
         "subgraphs": [[0]],
     }
     ir_path.write_text(json.dumps(ir))
 
-    with pytest.raises(ValueError, match="期望 4 个 GEMM"):
+    with pytest.raises(ValueError, match="找不到"):
+        export_placement_to_genesim(
+            annotated_tiny_llama, ir_path, tmp_path / "out.ir", tmp_path / "out_sidecar.json"
+        )
+
+
+def test_unknown_projection_weight_raises(annotated_tiny_llama, tmp_path) -> None:
+    """权重名不在已知投影表里时必须报错，提示同步那张表。"""
+    ir_path = tmp_path / "unknown.ir"
+    ir = {
+        "model_id": "unknown-fixture",
+        "num_layers": 1,
+        "num_heads": NUM_HEADS,
+        "head_dim": HIDDEN_SIZE // NUM_HEADS,
+        "hidden_size": HIDDEN_SIZE,
+        "operators": [
+            {"op_id": 0, "op_type": "GEMM", "device_hint": "gpu",
+             "input_shapes": [], "output_shapes": []},
+        ],
+        "dependencies": [
+            {"src_op_id": -1, "dst_op_id": 0,
+             "tensor_id": "layer.0.some_new_proj.weight"},
+        ],
+        "subgraphs": [[0]],
+    }
+    ir_path.write_text(json.dumps(ir))
+
+    with pytest.raises(ValueError, match="不在已知投影列表里"):
         export_placement_to_genesim(
             annotated_tiny_llama, ir_path, tmp_path / "out.ir", tmp_path / "out_sidecar.json"
         )
