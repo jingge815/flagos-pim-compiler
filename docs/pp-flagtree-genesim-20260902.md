@@ -543,7 +543,7 @@ GeneSim 仓：
 | 文件 | 变化 |
 | --- | --- |
 | `src/scheduler/gene_sim_scheduler.py` | `_prepare_pim_traces` 跳过被钉住的算子；新增 `_validate_compiler_placement`；`pim_resources` 按 vpu_id 去重（+95 / -8） |
-| `scripts/test_compiler_placement.py` | 新增 8 个回归测试：trace 准备 2 个、sidecar 一致性 5 个、vpu 去重 1 个（+211） |
+| `tests/sim/test_compiler_placement.py` | 新增 8 个回归测试：trace 准备 2 个、sidecar 一致性 5 个、vpu 去重 1 个（+211）。合并 develop 后随该仓测试布局从 `scripts/` 迁到 `tests/sim/` |
 | `scripts/refine_ir_with_flagtree.py` | 新增 `--placement` 参数，把本地分片宽度接进成本提取（+21 / -3） |
 | `conf/sim_llama2_7b_pp.yaml` | 新增，`tp1_pp8` 的仿真配置，补上 `PIM_Intra_Cluster` 链路 |
 | `conf/sim_llama2_7b_pp_tp2pp4.yaml` | 新增，`tp2_pp4` 的配置，指向按本地分片形状精化的 IR |
@@ -554,7 +554,7 @@ GeneSim 仓：
 
 三份配置的注释头都写明了各自的用途、产出命令、以及当前仍存在的局限。这一点是复查时补的：最初三份都是从第一版复制的，注释里还留着"通信不计入""本配置写死 tp1_pp8"这类已经过时或对不上号的说法，会误导使用者。
 
-该仓的测试入口是 `./run.sh --test compiler_placement`（对应 `scripts/test_compiler_placement.py`），不是 pytest；`./run.sh --list-tests` 列出全部目标。开发时也可以直接 `python -m pytest scripts/test_compiler_placement.py`（同一批用例、输出更详细），但提交前建议用 `./run.sh --test` 跑一遍，那才是该仓在 `uv` 环境下的正式入口。
+该仓的测试入口是 `./run.sh --test compiler_placement`（对应 `tests/sim/test_compiler_placement.py`），不是 pytest；`./run.sh --list-tests` 列出全部目标。开发时也可以直接 `python -m pytest tests/sim/test_compiler_placement.py`（同一批用例、输出更详细），但提交前建议用 `./run.sh --test` 跑一遍，那才是该仓在 `uv` 环境下的正式入口。
 
 ### 每处修复都做过变异验证
 
