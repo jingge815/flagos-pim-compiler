@@ -264,3 +264,73 @@ def test_compiled_linear_with_tight_wram_budget_triggers_tile_rewrite() -> None:
     )
     ref = torch.nn.functional.linear(torch.from_numpy(x), torch.from_numpy(w)).numpy()
     np.testing.assert_allclose(result, ref, atol=1e-4)
+
+
+def _run_with_offsets(backend, arg_shapes, reads_data, out_shape, out_off,
+                      dtype, hardware):
+    """按调用方指定的 offset 布置输入和输出，用于构造读写别名。"""
+    npdt = np.dtype(dtype)
+    reads = []
+    for data, off in reads_data:
+        blob = data.astype(npdt)
+        backend.write_local(0, off, blob)
+        reads.append(Access(("dpu", 0), off, blob.nbytes))
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": str(torch.ops.aten.linear.default), "node": "n",
+                  "arg_kinds": ["tensor", "tensor"], "arg_shapes": arg_shapes,
+                  "dtype": dtype, "out_shape": out_shape,
+                  "hardware": hardware.to_payload()},
+        reads=reads,
+        writes=[Access(("dpu", 0), out_off, int(np.prod(out_shape)) * npdt.itemsize)],
+        waits=[], num_tasklets=hardware.num_tasklets,
+    )
+    backend.wait(backend.submit(cmd))
+    return backend.read_local(0, out_off, out_shape, npdt)
+
+
+def test_compiled_linear_requires_non_aliasing_output_buffer() -> None:
+    """记录已编译内核的读写别名契约：out 与 x 不得重叠。
+
+    已编译内核把裸指针交给 C 函数，逐块读输入、逐块写输出，所以 out 与 x 同基址
+    且 out 更大时会覆盖尚未读取的 x 行，算出错误结果。NumPy 内核先整块读入再写回，
+    对别名安全，两者因此会不一致。
+
+    这个前提由 `memory/mem_planner.py` 的 `greedy_reuse` 保证：它的两个生命周期
+    判据都用严格不等号，不会把某个节点的输出复用到它自己输入的地址上。本测试固定
+    这条契约的方向——如果哪天内核改成先把输入读进暂存区（对别名安全），这里会失败，
+    提示可以把规划器的判据放宽回去，把激活区省回来。
+    """
+    M, K, N = 4, 64, 256          # out 2048B > x 512B，M>1：最容易踩的形状
+    dtype = "float16"
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((M, K)).astype(np.float16)
+    w = rng.standard_normal((N, K)).astype(np.float16)
+    mram = 1 << 22
+    hardware = PIMHardwareConfig(1, 4, mram, 65536, 64)
+    x_off, w_off = _ALIGN, _ALIGN + 65536
+    disjoint_off = _ALIGN + 2 * 65536
+
+    def run(use_compiled: bool, out_off: int):
+        backend = _backend(mram)
+        register_all(backend, use_compiled_linear=use_compiled)
+        return _run_with_offsets(
+            backend, [(M, K), (N, K)], [(x, x_off), (w, w_off)], (M, N),
+            out_off, dtype, hardware,
+        )
+
+    # out 与输入不重叠：两条内核必须一致。
+    np.testing.assert_allclose(
+        run(True, disjoint_off).astype(np.float32),
+        run(False, disjoint_off).astype(np.float32),
+        rtol=2e-2, atol=2e-2,
+    )
+
+    # out 与 x 同基址：已编译内核会算错，规划器必须避免造出这种布局。
+    aliased = run(True, x_off).astype(np.float32)
+    reference = run(False, disjoint_off).astype(np.float32)
+    scale = max(np.abs(reference).max(), 1e-6)
+    assert np.abs(aliased - reference).max() / scale > 1.0, (
+        "已编译内核在读写别名下竟与参考值接近——若内核已改为对别名安全，"
+        "可以放宽 greedy_reuse 的判据并删除本断言"
+    )

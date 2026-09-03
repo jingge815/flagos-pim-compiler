@@ -10,7 +10,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from genesim_bridge.cost_extractor import Measurement, _fit_coeffs, _net_data_bytes
+from genesim_bridge.cost_extractor import (
+    Measurement,
+    _fit_coeffs,
+    _net_data_bytes,
+    export_costs_to_genesim,
+    load_local_shapes,
+    validate_local_shapes_against_ir,
+)
 from genesim_bridge.op_classify import ShapePoint, gemm_features
 from genesim_bridge.paths import genesim_models_dir
 from genesim_bridge.ir_cost import analyze_ir
@@ -208,6 +215,112 @@ def test_gemm_net_bytes_includes_weight():
 
 def test_gemm_features_from_symbolic_shapes():
     assert gemm_features(_gemm_op()) == (512, 2048)
+
+
+def test_gemm_net_bytes_uses_local_shard_widths():
+    """给了本地分片宽度时，激活和权重都按分片算，而不是全局形状。"""
+    op = _gemm_op()                      # 全局 512 -> 2048
+    decode = ShapePoint(tq=1, tp=512)
+    local = (512, 256)                   # tp8：输出维切成 1/8
+    got = _net_data_bytes(op, decode, element_bytes=2, local_features=local)
+    assert got == float((1 * 512 + 1 * 256 + 512 * 256) * 2)
+    # 必须显著小于全局口径，否则说明分片没生效。
+    assert got < _net_data_bytes(op, decode, element_bytes=2)
+
+
+def test_local_shapes_absent_falls_back_to_global():
+    """不传本地形状时结果与改造前完全一致。"""
+    op = _gemm_op()
+    decode = ShapePoint(tq=1, tp=512)
+    assert (_net_data_bytes(op, decode, element_bytes=2, local_features=None)
+            == _net_data_bytes(op, decode, element_bytes=2))
+
+
+def test_load_local_shapes_reads_placement_sidecar(tmp_path):
+    """从放置 sidecar 读出本地宽度，跳过缺字段的条目。"""
+    path = tmp_path / "placement.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "operators": {
+            "0": {"dpu_id": 0, "local_in_features": 4096,
+                  "local_out_features": 1536},
+            "97": {"dpu_id": 0, "local_in_features": 512,
+                   "local_out_features": 4096},
+            # 旧版条目没有本地宽度，必须被跳过而不是报错。
+            "98": {"dpu_id": 0},
+        },
+    }))
+    assert load_local_shapes(path) == {0: (4096, 1536), 97: (512, 4096)}
+
+
+def test_load_local_shapes_on_version1_sidecar_is_empty(tmp_path):
+    """version 1 的 sidecar 完全没有这两个字段，返回空字典让调用方退回全局口径。"""
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "operators": {"0": {"device_hint": "pim", "dpu_id": 0}},
+    }))
+    assert load_local_shapes(path) == {}
+
+
+def _ir_with(operators):
+    return {"operators": operators}
+
+
+def test_validate_local_shapes_accepts_matching_gemm_ids():
+    """op_id 都存在且都是 GEMM 时通过。"""
+    ir = _ir_with([
+        {"op_id": 0, "op_type": "GEMM"},
+        {"op_id": 1, "op_type": "SOFTMAX"},
+    ])
+    validate_local_shapes_against_ir({0: (4096, 12288)}, ir)
+
+
+def test_validate_local_shapes_rejects_unknown_op_id():
+    """引用了当前 IR 里不存在的 op_id —— IR 重新生成后编号变了。"""
+    ir = _ir_with([{"op_id": 0, "op_type": "GEMM"}])
+    with pytest.raises(ValueError, match="不存在的 op_id"):
+        validate_local_shapes_against_ir({0: (16, 16), 99: (16, 16)}, ir)
+
+
+def test_validate_local_shapes_rejects_shifted_ids_landing_on_non_gemm():
+    """算子数相同但编号错位，本地宽度落到了非 GEMM 上。
+
+    这是最危险的一类：不校验就会把某个 GEMM 的本地宽度套到 SOFTMAX 上，
+    成本悄悄算错而不报错。
+    """
+    ir = _ir_with([
+        {"op_id": 0, "op_type": "GEMM"},
+        {"op_id": 1, "op_type": "SOFTMAX"},
+    ])
+    with pytest.raises(ValueError, match="不是 GEMM"):
+        validate_local_shapes_against_ir({1: (4096, 12288)}, ir)
+
+
+def test_export_costs_validates_local_shapes_before_measuring(tmp_path):
+    """`export_costs_to_genesim` 必须在开始编译前就把错位的 op_id 拦下。
+
+    否则会先花时间编译一批 kernel，再把结果套到错误的算子上。
+    """
+    ir = {
+        "hidden_size": 64, "head_dim": 16, "num_heads": 4, "num_layers": 1,
+        "operators": [{"op_id": 0, "op_type": "SOFTMAX",
+                       "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]}],
+        "dependencies": [], "subgraphs": [[0]],
+    }
+    ir_path = tmp_path / "in.ir"
+    ir_path.write_text(json.dumps(ir))
+    with pytest.raises(ValueError, match="不是 GEMM"):
+        export_costs_to_genesim(
+            ir_path=ir_path,
+            out_ir_path=tmp_path / "out.ir",
+            sidecar_path=tmp_path / "sc.json",
+            seq_len=128,
+            cross_validate=False,
+            local_shapes={0: (64, 64)},
+        )
+    # 拦在编译之前：不应产出任何文件。
+    assert not (tmp_path / "out.ir").exists()
 
 
 def _m(point, flops, data_bytes=1.0):

@@ -176,6 +176,35 @@ def test_greedy_reuse_aligns_new_slots() -> None:
     assert end == 128
 
 
+def test_greedy_reuse_never_aliases_same_step_read_and_write() -> None:
+    """产出步与前一个张量的最后读取步相同时，不得复用同一地址。
+
+    这正是「某节点在同一 step 里既读旧张量、又写自己的输出」的情形。已编译内核
+    逐块读输入、逐块写输出，共用地址会覆盖尚未读取的输入行，算出错误结果
+    （实测相对误差可达 5.9 到 110）。两个生命周期判据都必须取严格不等号：
+    大张量先进槽，所以危险场景可能落在任一分支上。
+    """
+    # 旧张量在 step 5 被最后一次读取，新张量正好在 step 5 产出。
+    consumed = TransientTensor("consumed", size=512, produced_at=4, last_read_at=5)
+    produced = TransientTensor("produced", size=2048, produced_at=5, last_read_at=9)
+
+    offsets, _ = greedy_reuse([consumed, produced], base=0, align=64)
+    assert offsets["consumed"] != offsets["produced"]
+
+    # 反向的大小关系（输出更小）走的是另一个判据分支，同样不得别名。
+    big_in = TransientTensor("big_in", size=2048, produced_at=4, last_read_at=5)
+    small_out = TransientTensor("small_out", size=512, produced_at=5, last_read_at=9)
+
+    offsets, _ = greedy_reuse([big_in, small_out], base=0, align=64)
+    assert offsets["big_in"] != offsets["small_out"]
+
+    # 真正隔开一步的生命周期仍然可以复用，严格化没有把复用能力废掉。
+    early = TransientTensor("early", size=512, produced_at=0, last_read_at=2)
+    late = TransientTensor("late", size=512, produced_at=3, last_read_at=5)
+    offsets, _ = greedy_reuse([early, late], base=0, align=64)
+    assert offsets["early"] == offsets["late"]
+
+
 # 复用地址的待完成读者。
 
 

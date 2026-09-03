@@ -190,7 +190,16 @@ def transient_tensors(dpu_nodes: list[Node], dpu_id: int) -> list[TransientTenso
 
 
 def greedy_reuse(tensors: list[TransientTensor], base: int, align: int) -> tuple[dict[str, int], int]:
-    """按生命周期和读者关系为临时张量复用激活区地址。"""
+    """按生命周期和读者关系为临时张量复用激活区地址。
+
+    两个生命周期判据都用严格不等号，故意不取等：取等意味着某个节点在同一个
+    step 里既读旧张量又写新张量，两者拿到同一个基址。已编译内核按裸指针逐块
+    读写，写输出的前几行会覆盖尚未读取的输入行，算出错误结果（NumPy 内核先
+    整块读入再写回，不受影响，所以这个坑只在编译产物路径上出现）。
+    `node_step` 给每个节点唯一编号，所以两个判据取等只可能是同节点的读写别名，
+    严格化不会误伤真正无重叠的复用。代价是激活区增大百分之二三十，都是千字节
+    量级，相对 MRAM 预算可以忽略。
+    """
     slots: list[dict] = []  # [{"offset", "size", "timeline": [(produced_at, last_read_at, readers_set)]}]
     offsets: dict[str, int] = {}
     top = base
@@ -199,7 +208,7 @@ def greedy_reuse(tensors: list[TransientTensor], base: int, align: int) -> tuple
         placed = False
         for slot in slots:
             if t.size <= slot["size"] and all(
-                (start >= t.last_read_at or t.produced_at >= end) and not (t_readers & readers)
+                (start > t.last_read_at or t.produced_at > end) and not (t_readers & readers)
                 for start, end, readers in slot["timeline"]
             ):
                 slot["timeline"].append((t.produced_at, t.last_read_at, t_readers))

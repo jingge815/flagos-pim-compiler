@@ -37,6 +37,8 @@ class Measurement:
     # 以下字段仅由 PIM IR 填充。
     mram_traffic_bytes: Optional[float] = None
     pim_kernels: List[Dict[str, Any]] = field(default_factory=list)
+    # 按本地分片形状测量时的 (in_features, out_features)，全局口径时为 None。
+    local_features: Optional[Tuple[int, int]] = None
 
 
 def _measure(
@@ -44,13 +46,22 @@ def _measure(
     point: ShapePoint,
     dims: Dict[str, int],
     ir_level: str,
+    local_features: Optional[Tuple[int, int]] = None,
 ) -> Measurement:
-    """编译一个形状点的算子，并测量其成本。"""
+    """编译一个形状点的算子，并测量其成本。
+
+    `local_features` 给出该算子在一台 DPU 上的 (in_features, out_features)，
+    来自图编译器的切分结果。传了就按本地分片形状编译和测量，不传则沿用 IR 里
+    的模型级全局形状。
+    """
     op_type = op_dict["op_type"]
     recipes = build_recipes(dims)
 
     if op_type == "GEMM":
-        in_features, out_features = gemm_features(op_dict)
+        if local_features is not None:
+            in_features, out_features = local_features
+        else:
+            in_features, out_features = gemm_features(op_dict)
         recipe = recipes["GEMM"](point, in_features, out_features)
     else:
         recipe = recipes[op_type](point)
@@ -85,13 +96,14 @@ def _measure(
     return Measurement(
         point=point,
         flops=total_flops,
-        data_bytes=_net_data_bytes(op_dict, point, element_bytes),
+        data_bytes=_net_data_bytes(op_dict, point, element_bytes, local_features),
         dtype=dtype,
         element_bytes=element_bytes,
         kernel_ids=kernel_ids,
         notes=notes,
         mram_traffic_bytes=total_mram if pimir else None,
         pim_kernels=pim_kernels,
+        local_features=local_features,
     )
 
 
@@ -131,8 +143,24 @@ def _resolve_dim(dim: Any, point: ShapePoint) -> int:
     return table[dim]
 
 
-def _net_data_bytes(op_dict: dict, point: ShapePoint, element_bytes: int) -> float:
-    """返回输入、权重和输出的净读写字节数。"""
+def _net_data_bytes(
+    op_dict: dict,
+    point: ShapePoint,
+    element_bytes: int,
+    local_features: Optional[Tuple[int, int]] = None,
+) -> float:
+    """返回输入、权重和输出的净读写字节数。
+
+    传了 `local_features` 时，激活和权重都按本地分片宽度算：这台 DPU 只读自己
+    那一份权重，产出的也只是切分后的那段激活。
+    """
+    if local_features is not None and op_dict["op_type"] == "GEMM":
+        in_features, out_features = local_features
+        # GEMM 的形状是 [Tq, in] -> [Tq, out]，Tq 由 shape point 决定。
+        tq = _resolve_dim("Tq", point)
+        total = tq * in_features + tq * out_features + in_features * out_features
+        return float(total * element_bytes)
+
     total = 0
     for shape in list(op_dict["input_shapes"]) + list(op_dict["output_shapes"]):
         numel = 1
@@ -190,6 +218,61 @@ def _fit_coeffs(
     return flops_coeffs, data_coeffs, {"flops": mode_f, "data_bytes": mode_b}
 
 
+def load_local_shapes(placement_sidecar_path: Path) -> Dict[int, Tuple[int, int]]:
+    """从放置结果 sidecar 读出每个算子的本地 (in_features, out_features)。
+
+    产出者是 `placement_export.export_placement_to_genesim`。版本 2 之前的
+    sidecar 没有这两个字段，此时返回空字典，调用方据此退回全局口径。
+
+    只读不校验：op_id 是否与目标 IR 对得上由
+    `validate_local_shapes_against_ir` 负责，`export_costs_to_genesim` 会调它。
+    """
+    sidecar = json.loads(Path(placement_sidecar_path).read_text())
+    local: Dict[int, Tuple[int, int]] = {}
+    for op_id, entry in sidecar.get("operators", {}).items():
+        in_f = entry.get("local_in_features")
+        out_f = entry.get("local_out_features")
+        if in_f is None or out_f is None:
+            continue
+        local[int(op_id)] = (int(in_f), int(out_f))
+    return local
+
+
+def validate_local_shapes_against_ir(
+    local_shapes: Dict[int, Tuple[int, int]], ir: Dict[str, Any]
+) -> None:
+    """核对本地形状表的 op_id 与目标 IR 是同一批编号。
+
+    sidecar 里的 op_id 属于导出时那份 IR。若之后重新生成过 IR 让编号变化，或者
+    传错了另一个模型的 sidecar，就会把某个算子的本地宽度套到别的算子上——不报错，
+    只是成本悄悄不对。GeneSim 侧读放置结果时有同样的校验，这条成本精化路径也要有，
+    否则错位会一路走到底。
+    """
+    operators = {op["op_id"]: op for op in ir["operators"]}
+
+    missing = sorted(op_id for op_id in local_shapes if op_id not in operators)
+    if missing:
+        raise ValueError(
+            f"放置结果引用了当前 IR 里不存在的 op_id：{missing[:8]}"
+            f"{' ...' if len(missing) > 8 else ''}（共 {len(missing)} 个）。"
+            "op_id 编号已经错位，请用当前 IR 重新导出放置结果。"
+        )
+
+    # 本地形状只对 GEMM 有意义（`_measure` 也只在 GEMM 上用它）。落到别的算子类型上
+    # 说明编号错位了——即使算子数恰好相同也能被这一条抓出来。
+    wrong_type = sorted(
+        (op_id, operators[op_id]["op_type"])
+        for op_id in local_shapes
+        if operators[op_id]["op_type"] != "GEMM"
+    )
+    if wrong_type:
+        head = ", ".join(f"op{op_id}={op_type}" for op_id, op_type in wrong_type[:4])
+        raise ValueError(
+            f"放置结果里有 {len(wrong_type)} 个 op_id 在当前 IR 里不是 GEMM：{head}。"
+            "op_id 编号已经错位，请用当前 IR 重新导出放置结果。"
+        )
+
+
 def export_costs_to_genesim(
     ir_path: Path,
     out_ir_path: Path,
@@ -197,10 +280,19 @@ def export_costs_to_genesim(
     seq_len: int,
     cross_validate: bool = True,
     ir_level: str = "pimir",
+    local_shapes: Optional[Dict[int, Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
-    """更新 GeneSim 成本系数，并写入 IR 文件和 sidecar 文件。"""
+    """更新 GeneSim 成本系数，并写入 IR 文件和 sidecar 文件。
+
+    `local_shapes` 给出 {op_id: (in_features, out_features)}，来自图编译器的
+    切分结果（见 `load_local_shapes`）。命中的算子按本地分片形状编译和测量，
+    未命中的沿用 IR 里的模型级全局形状。不传则全部按全局形状，与改造前一致。
+    """
     assert ir_level in ("ttir", "pimir"), f"未知 ir_level: {ir_level}"
     ir = json.loads(Path(ir_path).read_text())
+    local_shapes = local_shapes or {}
+    if local_shapes:
+        validate_local_shapes_against_ir(local_shapes, ir)
 
     dims = {
         "hidden_size": ir["hidden_size"],
@@ -236,13 +328,17 @@ def export_costs_to_genesim(
             sidecar["coverage"]["template"].append(op_id)
             continue
 
+        # 本地分片形状进缓存键：同一个全局形状在不同流水段/切分宽度下可能对应
+        # 不同的本地形状，漏掉它会让后面的算子错误复用前面的测量结果。
+        local_features = local_shapes.get(op_id)
         key = (op_type,
                tuple(tuple(s) for s in op["input_shapes"]),
-               tuple(tuple(s) for s in op["output_shapes"]))
+               tuple(tuple(s) for s in op["output_shapes"]),
+               local_features)
         if key not in cache:
             cache[key] = (
-                _measure(op, prefill_point, dims, ir_level),
-                _measure(op, decode_point, dims, ir_level),
+                _measure(op, prefill_point, dims, ir_level, local_features),
+                _measure(op, decode_point, dims, ir_level, local_features),
             )
         prefill, decode = cache[key]
 
@@ -284,8 +380,15 @@ def export_costs_to_genesim(
                     "decode": decode.mram_traffic_bytes,
                 }
             ),
-            # 当前成本使用单 DPU 的全局形状。
-            "shard_participants": None,
+            # 按本地分片形状测量时记下用的宽度；为 None 表示这个算子仍是
+            # 模型级全局口径（没有放置结果，或非 GEMM）。
+            "local_features": (
+                None if prefill.local_features is None
+                else {
+                    "in_features": prefill.local_features[0],
+                    "out_features": prefill.local_features[1],
+                }
+            ),
         }
 
     if cross_validate:

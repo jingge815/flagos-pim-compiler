@@ -1,4 +1,4 @@
-"""验证编译线性内核在 Llama-2-7B 解码中的数值和生成结果。"""
+"""验证编译线性内核在 Llama-2-7B 各切分策略下的数值和生成结果。"""
 
 from __future__ import annotations
 
@@ -14,25 +14,23 @@ from transformers import AutoTokenizer, LlamaForCausalLM
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
-from comm.plan import build_comm_plan
-from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
-from graph.partition import partition_graph
-from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement
-from memory.mem_planner import HwBudget, plan_dpu
-from runtime.compile import sdpa_layer_map, write_weight_shards
-from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, make_sdpa_handler, run_decode_loop
+from graph.strategy import llama_strategy
+from memory.mem_planner import HwBudget
+from runtime.compile import causal_mask_of, compile_llama2, load_weights
+from runtime.executor import run_decode_loop
 from runtime.kernels import register_all
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
+# build_execution_plan 的默认 tasklet 数，compile_llama2 不另传，硬件配置必须一致。
+NUM_TASKLETS = 4
 PROMPT = "The capital of France is"
 DECODE_STEPS = 16
 MAX_SEQ = 64
 KV_DTYPE_BYTES = 2  # fp16
+NUM_LAYERS = 32
 
 pytestmark = [
     pytest.mark.skipif(
@@ -43,37 +41,47 @@ pytestmark = [
 ]
 
 
-class _PositionalLlama(torch.nn.Module):
-    """将 RoPE 位置作为图输入的 Llama 包装。"""
-
-    def __init__(self, model: LlamaForCausalLM) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids: torch.Tensor, causal_mask: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        return self.model(
-            input_ids=input_ids, attention_mask=causal_mask, position_ids=position_ids,
-            use_cache=False, return_dict=True,
-        ).logits
+def _strategies():
+    """返回要验证编译产物的三种策略：纯张量、混合、纯流水。"""
+    return [
+        llama_strategy(
+            NUM_DPUS, num_stages=num_stages, num_heads=32, num_kv_heads=32,
+            intermediate_size=11008, vocab_size=32000, num_layers=NUM_LAYERS,
+        )
+        for num_stages in (1, 4, 8)
+    ]
 
 
-def _causal_mask_of(seq_len: int) -> torch.Tensor:
-    if seq_len == 1:
-        return torch.zeros(1, 1, 1, 1, dtype=torch.float16)
-    blocked = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
-    mask = torch.zeros(1, 1, seq_len, seq_len, dtype=torch.float16)
-    mask.masked_fill_(blocked, torch.finfo(mask.dtype).min)
-    return mask
+def test_strategy_set_covers_tensor_hybrid_and_pipeline() -> None:
+    """判据 0：三种策略分别落在张量、混合、流水三类上。"""
+    kinds = {s.name: s.kind for s in _strategies()}
+    assert kinds == {
+        "tp8_pp1": "tensor",
+        "tp2_pp4": "hybrid",
+        "tp1_pp8": "pipeline",
+    }
 
 
-def _export_graph(model: LlamaForCausalLM, seq_len: int, position_ids: torch.Tensor):
-    input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-    gm = torch.export.export(
-        _PositionalLlama(model), (input_ids, _causal_mask_of(seq_len), position_ids), strict=True
-    ).module()
-    partition_graph(gm)
-    return gm
+@pytest.fixture(scope="module")
+def tokenizer():
+    return AutoTokenizer.from_pretrained(MODEL_DIR)
 
+
+@pytest.fixture(scope="module")
+def llama2_model():
+    torch.set_grad_enabled(False)
+    return LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
+
+
+@pytest.fixture(scope="module")
+def hf_reference(tokenizer, llama2_model):
+    """返回单卡 HF 贪心解码的 token 序列和文本。"""
+    prompt_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"][0].tolist()
+    ref_ids = llama2_model.generate(
+        input_ids=torch.tensor([prompt_ids], dtype=torch.long),
+        max_new_tokens=DECODE_STEPS, do_sample=False,
+    )[0].tolist()
+    return prompt_ids, ref_ids, tokenizer.decode(ref_ids, skip_special_tokens=True)
 
 
 def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
@@ -114,110 +122,57 @@ def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
     return wrapped, stats
 
 
-@pytest.mark.parametrize("num_tasklets", [4])
-def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklets) -> None:
-    """验证已编译线性内核的数值和完整生成文本。"""
+@pytest.mark.parametrize("strategy", _strategies(), ids=lambda s: s.name)
+def test_compiled_linear_end_to_end_matches_hf_generate(
+    monkeypatch, strategy, tokenizer, llama2_model, hf_reference
+) -> None:
+    """判据 1：每种策略下编译产物都被真正调用，且生成结果与单卡 HF 一致。"""
     import runtime.kernels as km
 
+    # 包装必须在 register_all 之前完成，注册时才会取到包装后的内核。
     wrapped, stats = _wrap_with_numpy_cross_check(km.compiled_linear_kernel)
     monkeypatch.setattr(km, "compiled_linear_kernel", wrapped)
 
-    torch.set_grad_enabled(False)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
-    cfg = model.config
-
-    prompt_ids_list = tokenizer(PROMPT, return_tensors="pt")["input_ids"][0].tolist()
-    prefill_seq_len = len(prompt_ids_list)
-
-    prefill_gm = _export_graph(model, prefill_seq_len, torch.arange(prefill_seq_len, dtype=torch.long).unsqueeze(0))
-    decode_gm = _export_graph(model, 1, torch.tensor([[0]], dtype=torch.long))
-
-    shard_config = llama_shard_config(
-        NUM_DPUS, num_heads=cfg.num_attention_heads, num_kv_heads=cfg.num_key_value_heads,
-        intermediate_size=cfg.intermediate_size, vocab_size=cfg.vocab_size,
-    )
-    prefill_edges = propagate_specs(prefill_gm, shard_config)
-    decode_edges = propagate_specs(decode_gm, shard_config)
-
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    (k_proj,) = [n for n in prefill_gm.graph.nodes if n.op == "get_attr" and "layers.0.self_attn.k_proj.weight" in n.target]
-    kv_specs = kv_specs_from_placement(
-        k_proj.meta[SPEC_META_KEY], layers=list(range(cfg.num_hidden_layers)), num_kv_heads=cfg.num_key_value_heads,
-        num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
-    )
+    prompt_ids_list, ref_ids, ref_text = hf_reference
     hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS,
-        num_tasklets=num_tasklets,
+        num_tasklets=NUM_TASKLETS,
         mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536,
         # DMA 分块使用独立于 MRAM 布局的字节对齐。
         dma_align=64,
     )
-    prefill_nodes = list(prefill_gm.graph.nodes)
-    decode_nodes = list(decode_gm.graph.nodes)
-    plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw) for d in range(NUM_DPUS)}
-
-    prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}
-    decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
-    pending_prefill, pending_decode = {}, {}
-    for plan in plans.values():
-        pending_prefill.update(plan.pending_readers_prefill)
-        pending_decode.update(plan.pending_readers_decode)
-
-    state = DecodeState(valid_len=0)
-
-
-    def make_host_handler(layer_map):
-        def host_handler_of(node):
-            if "scaled_dot_product_attention" in str(node.target):
-                return make_sdpa_handler(layer_map[node.name], kv_specs, state, np.dtype(np.float16))
-            return None
-        return host_handler_of
-
-    prefill_compiled = build_execution_plan(
-        prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
-        hardware=hardware,
-        host_handler_of=make_host_handler(sdpa_layer_map(prefill_gm)),
-        num_tasklets=num_tasklets,
-    )
-    decode_compiled = build_execution_plan(
-        decode_nodes, decode_gm, decode_entries, pending_decode,
-        hardware=hardware,
-        host_handler_of=make_host_handler(sdpa_layer_map(decode_gm)),
-        num_tasklets=num_tasklets,
+    compiled = compile_llama2(
+        llama2_model, strategy, prefill_seq_len=len(prompt_ids_list), max_seq=MAX_SEQ,
+        hw=hw, hardware=hardware, kv_dtype_bytes=KV_DTYPE_BYTES,
     )
 
-    backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))
+    backend = NumpyBackend(NumpyBackendConfig(
+        num_dpus=NUM_DPUS, mram_bytes_per_dpu=hardware.mram_bytes_per_dpu,
+    ))
     register_all(backend, use_compiled_linear=True)
-
-    write_weight_shards(prefill_gm, plans, backend)
-
-    def greedy(logits_1d):
-        return int(np.argmax(logits_1d))
+    load_weights(compiled, backend)
+    compiled.state.valid_len = 0
 
     prompt_ids = torch.tensor(prompt_ids_list, dtype=torch.long)
     generated = run_decode_loop(
-        prefill_compiled.plan, decode_compiled.plan, backend,
-        prompt_ids=prompt_ids, max_new_tokens=DECODE_STEPS, eos_id=tokenizer.eos_token_id, state=state,
-        sample_fn=greedy, prefill_output_cmd_id=prefill_compiled.output_cmd_id,
-        decode_output_cmd_id=decode_compiled.output_cmd_id, causal_mask_of=_causal_mask_of,
+        compiled.prefill.plan, compiled.decode.plan, backend,
+        prompt_ids=prompt_ids, max_new_tokens=DECODE_STEPS,
+        eos_id=tokenizer.eos_token_id, state=compiled.state,
+        sample_fn=lambda logits: int(np.argmax(logits)),
+        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
+        decode_output_cmd_id=compiled.decode.output_cmd_id,
+        causal_mask_of=causal_mask_of,
     )
 
     our_ids = prompt_ids_list + generated
     our_text = tokenizer.decode(our_ids, skip_special_tokens=True)
 
-    ref_ids = model.generate(
-        input_ids=torch.tensor([prompt_ids_list], dtype=torch.long),
-        max_new_tokens=DECODE_STEPS, do_sample=False,
-    )[0].tolist()
-    ref_text = tokenizer.decode(ref_ids, skip_special_tokens=True)
-
     per = defaultdict(list)
     for shapes, dtype, rel in stats:
         per[(shapes, dtype)].append(rel)
-    print(f"\n=== 编译产物逐次对拍统计：共 {len(stats)} 次调用 ===")
+    print(f"\n=== 策略 {strategy.name}（{strategy.kind}）编译产物对拍：共 {len(stats)} 次调用 ===")
     for (shapes, dtype), rels in per.items():
         a = np.array(rels)
         print(
@@ -225,14 +180,18 @@ def test_compiled_linear_end_to_end_matches_hf_generate(monkeypatch, num_tasklet
             f"max_rel={a.max():.4e} mean_rel={a.mean():.4e} "
             f"超 5% 容差次数={int((a > 0.05).sum())}"
         )
-
-    print(f"\nprompt: {PROMPT!r}")
-    print(f"generated (our orchestrator, 含编译产物): {our_text!r}")
+    print(f"generated (含编译产物): {our_text!r}")
     print(f"generated (HF model.generate): {ref_text!r}")
 
-    assert len(stats) > 0, "没有任何调用走到编译产物路径——检查 shape 是否满足 2 的幂约束"
+    assert len(stats) > 0, (
+        f"策略 {strategy.name} 没有任何调用走到编译产物路径——"
+        "检查本地分片 shape 是否满足 2 的幂约束"
+    )
     for (shapes, dtype), rels in per.items():
-        assert max(rels) < 0.05, f"{shapes} ({dtype}) 编译产物与 NumPy 参考值偏差过大: max_rel={max(rels):.4e}"
+        assert max(rels) < 0.05, (
+            f"{strategy.name} {shapes} ({dtype}) 编译产物与 NumPy 参考值偏差过大: "
+            f"max_rel={max(rels):.4e}"
+        )
 
     assert our_ids == ref_ids
     assert our_text == ref_text
