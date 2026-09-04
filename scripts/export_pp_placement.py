@@ -31,9 +31,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.op_contract import PIMHardwareConfig
+from contracts.partition_plan import PartitionPlan
 from genesim_bridge.paths import genesim_models_dir, llama2_7b_model_dir
 from genesim_bridge.placement_export import export_placement_to_genesim
-from graph.strategy import format_strategy, llama_strategy
+from graph.strategy import (
+    format_strategy,
+    llama_strategy,
+    strategy_from_partition_plan,
+)
 from memory.mem_planner import HwBudget
 from runtime.compile import compile_llama2
 
@@ -46,8 +51,18 @@ MAX_SEQ = 64
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--num-stages", type=int, required=True,
-        help="流水段数：1=纯张量并行，num_dpus=纯流水，中间值为混合切分",
+        "--num-stages", type=int, default=None,
+        help=(
+            "流水段数：1=纯张量并行，num_dpus=纯流水，中间值为混合切分。"
+            "与 --partition-plan 二选一。"
+        ),
+    )
+    parser.add_argument(
+        "--partition-plan", default=None,
+        help=(
+            "GeneSim 给定的切分方案（scripts/export_partition_plan.py 的产物）。"
+            "给了它就由方案决定段数和 DPU 数，不再看 --num-stages/--num-dpus。"
+        ),
     )
     parser.add_argument("--num-dpus", type=int, default=NUM_DPUS)
     parser.add_argument(
@@ -58,7 +73,18 @@ def parse_args() -> argparse.Namespace:
         "--out-dir", default=None,
         help="产物目录，默认取 <genesim>/models",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--measure-kernel-tiles", action="store_true",
+        help=(
+            "对每种本地分片形状真跑一次算子编译，把 pim mlir 里选定的输出分块写进 "
+            "sidecar 的 kernel_tile_n；GeneSim 用它替掉 conf 里的 tile_size 常量。"
+            "需要 CUDA 和 FlagTree。"
+        ),
+    )
+    args = parser.parse_args()
+    if (args.num_stages is None) == (args.partition_plan is None):
+        parser.error("必须给 --num-stages 或 --partition-plan，且只能给一个")
+    return args
 
 
 def main() -> None:
@@ -79,20 +105,35 @@ def main() -> None:
     model = LlamaForCausalLM.from_pretrained(model_dir, dtype=torch.float16).eval()
     cfg = model.config
 
-    strategy = llama_strategy(
-        args.num_dpus,
-        num_stages=args.num_stages,
+    shard_kwargs = dict(
         num_heads=cfg.num_attention_heads,
         num_kv_heads=cfg.num_key_value_heads,
         intermediate_size=cfg.intermediate_size,
         vocab_size=cfg.vocab_size,
         num_layers=cfg.num_hidden_layers,
     )
+    plan: PartitionPlan | None = None
+    if args.partition_plan:
+        # GeneSim 给定切分方案：段数和 DPU 数由方案决定，命令行不再参与。
+        plan = PartitionPlan.read(Path(args.partition_plan))
+        if plan.model_id and plan.model_id not in str(model_dir):
+            print(
+                f"提示: 方案标注的 model_id={plan.model_id!r} 与本次加载的模型目录"
+                f"（{model_dir}）看起来不一致，请确认没有张冠李戴。"
+            )
+        strategy = strategy_from_partition_plan(plan, **shard_kwargs)
+        num_dpus = plan.num_dpus
+        print(f"切分方案来自 {args.partition_plan}（source={plan.source or '未标注'}）")
+    else:
+        strategy = llama_strategy(
+            args.num_dpus, num_stages=args.num_stages, **shard_kwargs
+        )
+        num_dpus = args.num_dpus
     print(format_strategy(strategy, cfg.num_hidden_layers))
 
     hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
-        num_dpus=args.num_dpus, num_tasklets=NUM_TASKLETS,
+        num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
         mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536, dma_align=64,
     )
     compiled = compile_llama2(
@@ -103,7 +144,12 @@ def main() -> None:
     out_ir = out_dir / f"llama2_7b_{strategy.name}_placed.ir"
     sidecar_path = out_dir / f"llama2_7b_{strategy.name}_placement.json"
     sidecar = export_placement_to_genesim(
-        compiled.prefill_gm, ir_path, out_ir, sidecar_path
+        compiled.prefill_gm, ir_path, out_ir, sidecar_path,
+        dtype="float16",
+        hardware=hardware,
+        measure_kernel_tiles=args.measure_kernel_tiles,
+        # GeneSim 给了方案就把它的 Cluster 映射原样带进 sidecar，往返用同一份声明。
+        dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,
     )
 
     # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。

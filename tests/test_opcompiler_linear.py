@@ -78,9 +78,11 @@ def test_compile_request_uses_explicit_hardware_budget(monkeypatch) -> None:
 
     def fake_run(ttir, hardware):
         seen["hardware"] = hardware
+        # 现在返回 (pim mlir, EmitC) 两段：pim mlir 要留给 GeneSim 的成本模型。
         return (
+            "module { func.func @k() { return } }",
             "module { func.func @k(%a: !emitc.ptr<f32>, %b: !emitc.ptr<f32>, "
-            "%c: !emitc.ptr<f32>) { return } }"
+            "%c: !emitc.ptr<f32>) { return } }",
         )
 
     monkeypatch.setattr(driver, "_make_ttir", fake_make_ttir)
@@ -246,6 +248,114 @@ def test_compiled_linear_falls_back_for_non_power_of_two_shapes() -> None:
     )
     ref = torch.nn.functional.linear(torch.from_numpy(x), torch.from_numpy(w)).numpy()
     np.testing.assert_allclose(result, ref, atol=1e-4)
+
+
+def test_pick_blocks_returns_power_of_two_below_default() -> None:
+    """分块必须自己是 2 的幂，而不只是能整除。
+
+    `_pick` 原先用 `min(want, full)` 起步：`full` 比 `want` 小且不是 2 的幂时
+    （如 176），`full % full == 0` 让折半循环一次都不走，返回的 176 直接触发
+    Triton 的 "arange's range must be a power of 2"。
+    """
+    from opcompiler_bridge.kernel_src import DEFAULT_BLOCK_N, _pick, pick_blocks
+
+    for full in (176, 688, 1376, 2752, 5504, 11008, 2048, 4096, 64):
+        block = _pick(full, DEFAULT_BLOCK_N, 16)
+        assert block & (block - 1) == 0, (full, block)
+        assert full % block == 0, (full, block)
+        assert block <= DEFAULT_BLOCK_N
+
+    # 最大 2 的幂因子小于下界时应明确报错，而不是返回一个非法分块。
+    # 344 = 2^3 × 43，最大 2 的幂因子是 8 < 16。
+    with pytest.raises(ValueError, match="2 的幂"):
+        _pick(344, DEFAULT_BLOCK_N, 16)
+
+    # llama2 的 MLP 本地形状：intermediate_size = 11008 = 2^8 × 43。
+    block_n, block_k = pick_blocks(4096, 5504)
+    assert 5504 % block_n == 0 and block_n & (block_n - 1) == 0
+    assert 4096 % block_k == 0 and block_k & (block_k - 1) == 0
+
+
+@pytest.mark.parametrize(
+    "M, K, N",
+    [
+        (1, 64, 176),     # N 不是 2 的幂，且小于默认 BLOCK_N
+        (1, 176, 64),     # K 不是 2 的幂
+        (2, 64, 688),     # 688 = 2^4 × 43，与 llama2 的 MLP 同构
+    ],
+)
+def test_compiled_linear_handles_non_power_of_two_k_and_n(M, K, N) -> None:
+    """K/N 不是 2 的幂时也要走真实编译产物，并与 NumPy 一致。
+
+    只有 M 需要自己是 2 的幂（`tl.arange(0, M)` 铺满 M）；K/N 是按分块遍历的，
+    约束是「存在既是 2 的幂、又能整除它的分块」。原先的守卫对三个维度一律要求
+    2 的幂，把 llama2-7b 的 MLP 整个挡在门外——intermediate_size = 11008
+    = 2^8 × 43，任何切分下都不是 2 的幂。
+    """
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    import ctypes
+    import dataclasses
+
+    hardware = dataclasses.replace(
+        DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1
+    )
+    request = OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hardware, dtype="float32"
+    )
+    result = compile_op(request)
+    fn = load_kernel(result)
+
+    rng = np.random.default_rng(11)
+    x = (rng.standard_normal((M, K)) * 0.05).astype(np.float32)
+    w = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+    fn(
+        x.ctypes.data_as(ctypes.c_void_p),
+        w.ctypes.data_as(ctypes.c_void_p),
+        out.ctypes.data_as(ctypes.c_void_p),
+    )
+    np.testing.assert_allclose(out, x @ w.T, atol=1e-4)
+
+
+def test_compile_result_carries_pim_mlir() -> None:
+    """算子编译要把 pim mlir 一起交回来，供 GeneSim 的代价模型解析真实分块。
+
+    没有它，GeneSim 只能用 conf/sim.yaml 里拍下的 tile_size 常量——llama2 的
+    4096 宽投影上真实分块是 512，差 16 倍。
+    """
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from genesim_bridge.ir_cost import analyze_ir
+    from opcompiler_bridge.driver import compile_op
+    import dataclasses
+
+    hardware = dataclasses.replace(
+        DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1
+    )
+    request = OpCompileRequest(
+        op="linear", arg_shapes=[(1, 4096), (2048, 4096)],
+        hardware=hardware, dtype="float16",
+    )
+    result = compile_op(request, force=True)
+    assert result.pimir, "编译产物没带上 pim mlir"
+    assert result.pimir_path and Path(result.pimir_path).is_file()
+    # pim mlir 该有的标志：显式 DMA 和 WRAM 暖存。
+    assert "pim.dma_load" in result.pimir
+    assert "pim.memdesc" in result.pimir
+
+    cost = analyze_ir(
+        result.pimir, kernel_name="linear_kernel", grid=(1,),
+        arg_values={}, ir_level="pimir",
+    )
+    # 真实分块必须读得出来，且不等于 GeneSim 的默认常量 32。
+    assert cost.tile_n and cost.tile_n > 0
+    assert cost.tile_n != 32, "分块与默认常量相同，测不出这条链路的价值"
+    assert cost.mram_traffic_bytes and cost.mram_traffic_bytes > 0
+    assert cost.wram_bytes_used and cost.wram_bytes_used <= hardware.wram_bytes_per_dpu
+
+    # 命中缓存时 pim mlir 也要能拿到（从 .pimir.mlir 读回），不必重编。
+    cached = compile_op(request)
+    assert cached.pimir == result.pimir
 
 
 def test_compiled_linear_with_tight_wram_budget_triggers_tile_rewrite() -> None:

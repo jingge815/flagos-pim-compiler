@@ -41,14 +41,22 @@ def linear_kernel(
 
 
 def _pick(full: int, want: int, floor: int) -> int:
-    """选一个能整除 `full`、不超过 `want`、不小于 `floor` 的 2 的幂分块大小。"""
-    block = min(want, full)
+    """选一个能整除 `full`、不超过 `want`、不小于 `floor` 的 2 的幂分块大小。
+
+    起点必须先向下取到 2 的幂再开始折半。直接用 `min(want, full)` 起步是不对的：
+    `full` 比 `want` 小且本身不是 2 的幂时（例如 `full=176`），`full % full == 0`
+    让循环一次都不走，返回的 176 不是 2 的幂，`tl.arange(0, BLOCK_N)` 随即报
+    "arange's range must be a power of 2"。llama2 的 MLP 宽度正是这一类：
+    `intermediate_size = 11008 = 2^8 × 43`，任何切分下都不是 2 的幂。
+    """
+    start = min(want, full)
+    block = 1 << (start.bit_length() - 1)   # 向下取到 2 的幂
     while block > floor and full % block != 0:
         block //= 2
-    if full % block != 0:
+    if full % block != 0 or block & (block - 1):
         raise ValueError(
-            f"找不到能整除 {full} 的分块大小（下界 {floor}）；这条链路要求 "
-            f"M/K/N 都是 2 的幂，driver.py 应该已经拦住了其它 shape"
+            f"找不到既是 2 的幂、又能整除 {full} 的分块大小（下界 {floor}）。"
+            f"这条链路要求各维能被 2 的幂整除；{full} 的最大 2 的幂因子小于下界。"
         )
     return block
 

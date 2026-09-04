@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:  # 只为类型标注，避免 contracts 与 graph 之间的运行时循环导入。
+    from contracts.partition_plan import PartitionPlan
 
 # Llama 权重的列切和行切规则。
 LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
@@ -177,6 +180,41 @@ def llama_strategies(
             f"（num_layers={num_layers} num_kv_heads={num_kv_heads}）"
         )
     return strategies
+
+
+def strategy_from_partition_plan(
+    plan: "PartitionPlan",
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    intermediate_size: int,
+    vocab_size: int,
+    num_layers: int,
+) -> ShardStrategy:
+    """把 GeneSim 给定的切分方案转成图编译器的 `ShardStrategy`。
+
+    这是四段接口里方向相反的那一段：其余三段是编译器算完告诉 GeneSim，这一段是
+    GeneSim 定下 PU 映射来约束编译器（契约见 contracts/partition_plan.py）。
+
+    方案里的段数、DPU 数、权重切分规则直接对应 `ShardStrategy` 的同名概念，所以
+    这里只做转换加校验，不做推断。校验走 `llama_strategy` 同一条路径——GeneSim
+    给的方案同样要满足切分契约（tp_width 是 2 的幂、各维可整除、层数可均分），
+    不满足就直接报错，而不是悄悄换一个能跑的策略。
+    """
+    strategy = llama_strategy(
+        plan.num_dpus,
+        num_stages=plan.num_stages,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        intermediate_size=intermediate_size,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+        dpu_ids=plan.dpu_ids,
+    )
+    if not plan.weight_rules:
+        return strategy
+    # 方案显式给了权重切分规则就用它的，覆盖 LLAMA_WEIGHT_RULES 的默认值。
+    return replace(strategy, weight_rules=plan.weight_rules)
 
 
 def format_strategy(strategy: ShardStrategy, num_layers: int) -> str:

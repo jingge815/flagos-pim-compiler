@@ -86,3 +86,13 @@ class OpCompileResult:
     so_path: str
     symbol: str
     argtypes: list[str]
+    # 算子编译产出的 pim mlir 文本。GeneSim 的代价模型靠它拿到真实分块和 DMA
+    # 结构（`genesim_bridge.ir_cost.analyze_ir` 负责解析），而不是沿用
+    # `conf/sim.yaml` 里拍下的 `tile_size` 常量。
+    #
+    # 命中编译缓存时为 None：`.so` 可以复用，pim mlir 不落盘。需要它的调用方
+    # 用 `compile_op(request, force=True)` 强制重编，或读 `pimir_path`。
+    pimir: str | None = None
+    # pim mlir 的缓存路径（与 `.so` 同名、后缀 `.pimir.mlir`）。命中缓存时
+    # `.so` 复用而 pim mlir 也在这里，直接读文件即可，不必重编。
+    pimir_path: str | None = None

@@ -98,17 +98,24 @@ def _kernel_launcher(request: OpCompileRequest):
             f"收到 K={k}。llama2-7b 的真实 K 远超这个下限，仅在自验证等极小 "
             f"shape 测试时可能触发。"
         )
-    for name, dim in (("M", m), ("K", k), ("N", n)):
-        if dim & (dim - 1) != 0:
-            raise ValueError(
-                f"kernel_src.py 用 tl.arange(0, {name}) 直接生成整块索引"
-                f"（第一期不做 tile 切分/padding，见该文件顶部注释），"
-                f"Triton 要求 arange 的范围是 2 的幂，收到 {name}={dim}。"
-                f"真实 llama2-7b 的 M/K/N 都满足这个约束（hidden_size/"
-                f"num_heads 等惯例上是 2 的幂），只有手工测试用到非 2 的幂"
-                f"形状时会触发；若未来需要支持任意 shape，需要在这一层加"
-                f"padding，不在本次范围内。"
-            )
+    # 只有 M 需要自己是 2 的幂：kernel_src.py 里 `tl.arange(0, M)` 直接铺满 M，
+    # 而 K/N 是按 BLOCK_K/BLOCK_N 分块遍历的，arange 作用在分块上。所以 K/N 的
+    # 约束是「存在一个既是 2 的幂、又能整除它的分块」，由 pick_blocks 判定。
+    #
+    # 这条约束以前对 M/K/N 一律要求 2 的幂，把 llama2-7b 的 MLP 直接挡在门外：
+    # intermediate_size = 11008 = 2^8 × 43，任何切分下都不是 2 的幂（tp2 是
+    # 5504、tp4 是 2752）。而 5504 = 128 × 43，分块 128 完全合法。
+    if m & (m - 1) != 0:
+        raise ValueError(
+            f"kernel_src.py 用 tl.arange(0, M) 直接生成整块索引，Triton 要求 "
+            f"arange 的范围是 2 的幂，收到 M={m}。decode 口径下 M=1，prefill 用 "
+            f"2 的幂序列长度即可。"
+        )
+
+    from .kernel_src import pick_blocks
+
+    # 分块不合法时在这里报错，而不是等 Triton 抛出含义模糊的 arange 报错。
+    pick_blocks(k, n)
 
     from .kernel_src import make_kernel_launcher
 
@@ -137,8 +144,16 @@ def _make_ttir(request: OpCompileRequest) -> str:
     return compiled.asm["ttir"]
 
 
-def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> str:
-    """将 TTIR 依次转换为 PIM、显式 DMA 和 EmitC 文本。"""
+def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> tuple[str, str]:
+    """将 TTIR 转换为 PIM IR 和 EmitC 文本，两者都返回。
+
+    分两次调用 `triton-opt`，而不是把五个 pass 串成一条命令：pim mlir 是
+    `-pim-lower-to-emitc` 的输入，串起来跑就只剩最后的 EmitC，中间态拿不到。
+    拆开后多一次进程启动，换来的是 pim mlir 文本——GeneSim 的代价模型要靠它
+    拿到真实分块和 DMA 结构（见 genesim_bridge/ir_cost.py 的 analyze_ir）。
+
+    两段的产物与合并跑完全一致：pass 顺序没变，只是在中间落了一次盘。
+    """
     opts = pim_options()
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -148,15 +163,31 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> str:
             "缺这个 pass）。"
         )
 
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".ttir", delete=False
-    ) as handle:
-        handle.write(ttir)
-        ttir_path = handle.name
-    try:
-        cmd = [
-            str(triton_opt),
-            ttir_path,
+    def _run(input_text: str, passes: list[str], stage: str) -> str:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".mlir", delete=False
+        ) as handle:
+            handle.write(input_text)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                [str(triton_opt), path, *passes],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"triton-opt {stage} 阶段失败 (exit {proc.returncode}):\n"
+                    f"{proc.stderr}"
+                )
+            return proc.stdout
+        finally:
+            os.unlink(path)
+
+    # 第一段到 pim mlir：这一层带 !pim.memdesc、pim.dma_load/store 和真实分块。
+    pimir = _run(
+        ttir,
+        [
             f"-convert-triton-to-pim=target={opts['pim_target']} "
             f"num-dpus={hardware.num_dpus} "
             f"num-tasklets={hardware.num_tasklets} "
@@ -165,17 +196,16 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> str:
             f"dma-align={hardware.dma_align}",
             "-pim-tile-to-budget",
             "-pim-explicit-dma",
-            "-pim-lower-to-emitc",
-            "-convert-func-to-emitc",
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"triton-opt pass 链失败 (exit {proc.returncode}):\n{proc.stderr}"
-            )
-        return proc.stdout
-    finally:
-        os.unlink(ttir_path)
+        ],
+        "pim mlir",
+    )
+    # 第二段到 EmitC：后续 mlir-translate 生成 C 的输入。
+    emitc = _run(
+        pimir,
+        ["-pim-lower-to-emitc", "-convert-func-to-emitc"],
+        "emitc",
+    )
+    return pimir, emitc
 
 
 def _translate_to_c(emitc_text: str) -> str:
@@ -223,17 +253,24 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
     key = _cache_key(request)
     so_path = _CACHE_DIR / f"{key}.so"
     meta_path = _CACHE_DIR / f"{key}.meta"
+    pimir_path = _CACHE_DIR / f"{key}.pimir.mlir"
 
     if not force and so_path.is_file() and meta_path.is_file():
         symbol, argtypes_str = meta_path.read_text().splitlines()
+        # pim mlir 与 `.so` 一起缓存，命中时直接读回来，成本模型不必重编。
+        cached_pimir = (
+            pimir_path.read_text() if pimir_path.is_file() else None
+        )
         return OpCompileResult(
             so_path=str(so_path),
             symbol=symbol,
             argtypes=argtypes_str.split(","),
+            pimir=cached_pimir,
+            pimir_path=str(pimir_path) if cached_pimir is not None else None,
         )
 
     ttir = _make_ttir(request)
-    emitc_text = _run_triton_opt(ttir, request.hardware)
+    pimir_text, emitc_text = _run_triton_opt(ttir, request.hardware)
     c_source = _translate_to_c(emitc_text)
     symbol, argtypes = _parse_signature(c_source)
 
@@ -257,7 +294,15 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
         so_tmp_path.unlink(missing_ok=True)  # no-op if os.replace already moved it
 
     meta_path.write_text(f"{symbol}\n{','.join(argtypes)}")
-    return OpCompileResult(so_path=str(so_path), symbol=symbol, argtypes=argtypes)
+    # pim mlir 与 `.so` 一起落盘：下次命中缓存时成本模型直接读它，不必重编。
+    pimir_path.write_text(pimir_text)
+    return OpCompileResult(
+        so_path=str(so_path),
+        symbol=symbol,
+        argtypes=argtypes,
+        pimir=pimir_text,
+        pimir_path=str(pimir_path),
+    )
 
 
 def load_kernel(result: OpCompileResult):
