@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
@@ -106,6 +107,19 @@ def _measure_kernel_tile_n(
         )
     cache[key] = (tile_n, str(result.pimir_path))
     return cache[key]
+
+
+def _file_sha256(path: str) -> str:
+    """算一个文件的 sha256，用于给 sidecar 记下 pim mlir 的内容身份。
+
+    GeneSim 侧把它放进 trace 缓存签名：只有内容变了才重编 trace，换机器导致
+    路径变化不会触发无谓的全量重编。
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _assert_every_gemm_has_known_role(ir: Dict[str, Any]) -> None:
@@ -265,7 +279,18 @@ def export_placement_to_genesim(
                 )
                 entry["kernel_tile_n"] = tile_n
                 # GeneSim 照这份 pim mlir 生成 PIM trace，而不是用手写模板。
+                #
+                # 这是导出这台机器上的绝对路径（算子编译缓存在仓库里）。换机器、
+                # 换 checkout 目录、或缓存被清掉之后就失效，GeneSim 侧会按文件名
+                # 在 `scheduler.pimir_search_dirs` 里再找一遍——文件名是算子编译
+                # 缓存的内容哈希，同名即同一份产物。
                 entry["pimir_path"] = pimir_path
+                # 内容哈希一并记下：GeneSim 侧把它放进 trace 缓存签名，这样
+                # 「同形状、同分块、但 pim mlir 换了」不会复用旧 trace。缓存里
+                # 真实存在这样的碰撞（同为 out=2048 in=4096 tile_n=512，但
+                # num-dpus/num-tasklets/dma-align 不同）。也便于换机器后核对
+                # 找回来的文件是不是同一份。
+                entry["pimir_sha256"] = _file_sha256(pimir_path)
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))

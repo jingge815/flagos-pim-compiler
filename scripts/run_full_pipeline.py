@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -194,6 +195,37 @@ def step_bcd_export(
     absent = [p for p in pimir_files if not Path(p).is_file()]
     if absent:
         raise StepFailed(f"pimir_path 指向的文件不存在：{absent[:3]}")
+
+    # 内容哈希要和磁盘上的文件对得上：sidecar 记的是绝对路径，如果缓存被重建过、
+    # 而 sidecar 还是旧的，路径可能存在但内容已经变了。哈希不符说明这份 sidecar
+    # 与当前的算子编译产物不是一套。
+    #
+    # pimir_sha256 是后加的字段（见 docs/genesimsupporTp-20260905.md 第五之二节）。
+    # 本步骤自己产出 sidecar，所以正常情况下一定有；缺了说明是早于该字段导出的旧
+    # 产物，此时提示一句并跳过这一项核对——报"缺 pimir_sha256"信息量太低，看起来
+    # 像 bug 而不是"重新导出即可"。注意只跳过哈希核对，后面的分块打印和
+    # dpu_to_cluster 核对照常执行。
+    without_hash = [op_id for op_id, e in ops.items() if not e.get("pimir_sha256")]
+    if without_hash:
+        print(
+            f"    注意: {len(without_hash)}/{len(ops)} 个算子的 sidecar 没有 "
+            "pimir_sha256（早于该字段导出的旧产物），跳过内容一致性核对；"
+            "重新跑一次本脚本即可补上。"
+        )
+    else:
+        stale = []
+        for op_id, entry in ops.items():
+            digest = hashlib.sha256(
+                Path(entry["pimir_path"]).read_bytes()
+            ).hexdigest()
+            if digest != entry["pimir_sha256"]:
+                stale.append(op_id)
+        if stale:
+            raise StepFailed(
+                f"{len(stale)} 个算子的 pimir_sha256 与磁盘上的 pim mlir 不一致"
+                f"（如 op{stale[:5]}）：sidecar 与当前算子编译产物不是一套，"
+                "请重新导出。"
+            )
 
     tiles = sorted({int(e["kernel_tile_n"]) for e in ops.values()})
     print(f"    放置 {len(ops)} 个 GEMM，本地形状 {len(pimir_files)} 种 pim mlir")
