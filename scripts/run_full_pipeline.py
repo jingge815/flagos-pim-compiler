@@ -174,9 +174,10 @@ def step_bcd_export(
 
     # 四类字段各自对应链路上的一段，逐个核对，不能只看文件存在。
     checks = {
-        "dpu_id（图切分归属）": lambda e: "dpu_id" in e,
-        "local_in/out_features（本地分片形状）": lambda e: (
-            e.get("local_in_features") and e.get("local_out_features")
+        "shards（图切分归属，每台参与 DPU 各一项）": lambda e: bool(e.get("shards")),
+        "shards[*].local_in/out_features（本地分片形状）": lambda e: all(
+            s.get("local_in_features") and s.get("local_out_features")
+            for s in e.get("shards", [])
         ),
         "semantic_role（投影身份）": lambda e: e.get("semantic_role") in _EXPECTED_ROLES,
         "kernel_tile_n（算子编译器实测分块）": lambda e: (e.get("kernel_tile_n") or 0) > 0,

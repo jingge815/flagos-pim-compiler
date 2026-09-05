@@ -226,7 +226,9 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
         assert ops_by_id[op_id]["device_hint"] == "pim", op_id
         entry = sidecar["operators"].get(str(op_id))
         assert entry is not None, op_id
-        assert 0 <= entry["dpu_id"] < NUM_DPUS, entry
+        assert entry["shards"], entry
+        for shard in entry["shards"]:
+            assert 0 <= shard["dpu_id"] < NUM_DPUS, entry
         # 身份由 semantic_role 确定，与 subgraph 里的出现顺序无关。
         assert entry["semantic_role"] == role
         # 记录的是实际匹配到的 fx 节点，据此可核对 role 落在了正确的权重上。
@@ -274,10 +276,13 @@ def test_local_shard_widths_follow_each_projection(
     ]
     for op_id, want_in, want_out in expected:
         entry = ops[str(op_id)]
-        assert entry["local_in_features"] == want_in, (op_id, entry)
-        assert entry["local_out_features"] == want_out, (op_id, entry)
+        # 该 fixture 是纯张量并行（num_stages=1），每个 shard 的本地宽度一致，
+        # 取哪个都行。
+        for shard in entry["shards"]:
+            assert shard["local_in_features"] == want_in, (op_id, entry)
+            assert shard["local_out_features"] == want_out, (op_id, entry)
 
-    assert sidecar["version"] == 2
+    assert sidecar["version"] == 3
     assert sidecar["ir_num_operators"] == 11
 
 
@@ -353,9 +358,36 @@ def test_kv_projections_keep_their_own_width_under_gqa(
 
     ops = sidecar["operators"]
     # op_id 与投影的对应见 _FIXTURE_GEMM_ROLES：q 是 op10，k 是 op9，v 是 op8。
-    assert ops["10"]["local_out_features"] == q_out      # q_proj
-    assert ops["9"]["local_out_features"] == kv_out      # k_proj，更窄
-    assert ops["8"]["local_out_features"] == kv_out      # v_proj，更窄
+    assert ops["10"]["shards"][0]["local_out_features"] == q_out      # q_proj
+    assert ops["9"]["shards"][0]["local_out_features"] == kv_out      # k_proj，更窄
+    assert ops["8"]["shards"][0]["local_out_features"] == kv_out      # v_proj，更窄
+
+
+def test_tp_shards_cover_every_participating_dpu(annotated_gqa_llama, tmp_path) -> None:
+    """TP 宽度 > 1 时，sidecar 必须记下组内每一台 DPU，不能只留一个代表。
+
+    之前这里只取 `min(spec.shard_map)`，GQA_TP_WIDTH=2 的组里另一台 DPU 会被
+    直接丢弃。这里用同一个 fixture 核对 `shards` 列表覆盖了两台不同的 DPU，
+    并且列切（q/k/v/gate/up）标 `output_channel`、行切（o_proj/down_proj）标
+    `input_channel`——这两个标签之后决定要不要插入 all_reduce。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    sidecar = export_placement_to_genesim(
+        annotated_gqa_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    ops = sidecar["operators"]
+    for op_id, role in _FIXTURE_GEMM_ROLES:
+        entry = ops[str(op_id)]
+        assert len(entry["shards"]) == GQA_TP_WIDTH, (op_id, entry)
+        dpu_ids = {shard["dpu_id"] for shard in entry["shards"]}
+        assert len(dpu_ids) == GQA_TP_WIDTH, (op_id, entry)
+
+        want_axis = "input_channel" if role in ("o_proj", "down_proj") else "output_channel"
+        assert entry["shard_axis"] == want_axis, (op_id, role, entry)
 
 
 def test_gemm_without_semantic_role_raises(annotated_tiny_llama, tmp_path) -> None:

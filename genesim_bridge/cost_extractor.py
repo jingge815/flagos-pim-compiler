@@ -221,8 +221,10 @@ def _fit_coeffs(
 def load_local_shapes(placement_sidecar_path: Path) -> Dict[int, Tuple[int, int]]:
     """从放置结果 sidecar 读出每个算子的本地 (in_features, out_features)。
 
-    产出者是 `placement_export.export_placement_to_genesim`。版本 2 之前的
-    sidecar 没有这两个字段，此时返回空字典，调用方据此退回全局口径。
+    产出者是 `placement_export.export_placement_to_genesim`。版本 3 起本地形状
+    挂在 `shards` 列表下（每台参与 DPU 各一项，TP 组内取第一个即可——成本测量
+    只关心大小，不关心放置在哪几台 DPU）；版本 2 及更早没有这两个字段，此时
+    返回空字典，调用方据此退回全局口径。
 
     只读不校验：op_id 是否与目标 IR 对得上由
     `validate_local_shapes_against_ir` 负责，`export_costs_to_genesim` 会调它。
@@ -230,8 +232,10 @@ def load_local_shapes(placement_sidecar_path: Path) -> Dict[int, Tuple[int, int]
     sidecar = json.loads(Path(placement_sidecar_path).read_text())
     local: Dict[int, Tuple[int, int]] = {}
     for op_id, entry in sidecar.get("operators", {}).items():
-        in_f = entry.get("local_in_features")
-        out_f = entry.get("local_out_features")
+        shards = entry.get("shards")
+        rep = shards[0] if shards else entry
+        in_f = rep.get("local_in_features")
+        out_f = rep.get("local_out_features")
         if in_f is None or out_f is None:
             continue
         local[int(op_id)] = (int(in_f), int(out_f))

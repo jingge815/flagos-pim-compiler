@@ -152,12 +152,14 @@ def main() -> None:
         dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,
     )
 
-    # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。
+    # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。一个 GEMM 可能切在多台
+    # DPU 上（TP 宽度 > 1），每台参与的 DPU 都记一次，而不是只数代表 DPU。
     by_dpu: dict[int, int] = {}
     for entry in sidecar["operators"].values():
-        by_dpu[entry["dpu_id"]] = by_dpu.get(entry["dpu_id"], 0) + 1
+        for shard in entry["shards"]:
+            by_dpu[shard["dpu_id"]] = by_dpu.get(shard["dpu_id"], 0) + 1
     print(f"\n放置的 GEMM 算子数: {len(sidecar['operators'])}")
-    print("每台 DPU 承担的 GEMM 数:")
+    print("每台 DPU 承担的 GEMM 分片数:")
     for dpu_id in sorted(by_dpu):
         print(f"  dpu{dpu_id}: {by_dpu[dpu_id]}")
 

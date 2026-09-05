@@ -176,7 +176,7 @@ def export_placement_to_genesim(
     # 真正可校验的是内容——算子总数和每个被放置算子的 op_type，见
     # GeneSim 侧 _load_compiler_placement 的比对。
     sidecar: Dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "source_ir": str(ir_path),
         "ir_num_operators": len(ir["operators"]),
         "operators": {},
@@ -206,11 +206,17 @@ def export_placement_to_genesim(
             if spec.device != DEVICE_DPU:
                 continue  # host 权重不写入 DPU 设备提示。
 
-            dpu_id = min(spec.shard_map)
+            # 之前这里只取 `min(spec.shard_map)` 当代表 DPU，TP 组内其余 shard
+            # 被直接丢弃——GeneSim 因此只看到一个"本地代表"，既算不出组内并行占用
+            # 的资源，也无从得知这个投影之后要不要归约。现在把 shard_map 的每个
+            # DPU 都如实列出来，代表值只用于 IR 的全局形状字段（供只关心大小的
+            # 消费者，如 ir_cost.py）。
+            dpu_ids = sorted(spec.shard_map)
+            rep_dpu_id = dpu_ids[0]
             # 权重的 local_shape 是 (out_features, in_features)，与这个 GEMM 在该
             # DPU 上要算的矩阵乘宽度一一对应——IR 里每个投影都是独立的 GEMM，
             # 不需要再累加或折算。
-            local_out, local_in = spec.shard_map[dpu_id].local_shape
+            rep_out, rep_in = spec.shard_map[rep_dpu_id].local_shape
             operators_by_id[op_id]["device_hint"] = "pim"
             # 本地分片形状写进 IR 的新字段，原 input/output_shapes 保持全局语义
             # 不动。GeneSim 的执行侧（compile_gemm 的 K/N、_execute_runtime 的
@@ -221,30 +227,42 @@ def export_placement_to_genesim(
             global_in = operators_by_id[op_id]["input_shapes"][0]
             global_out = operators_by_id[op_id]["output_shapes"][0]
             operators_by_id[op_id]["local_input_shapes"] = [
-                [global_in[0], int(local_in)]
+                [global_in[0], int(rep_in)]
             ]
             operators_by_id[op_id]["local_output_shapes"] = [
-                [global_out[0], int(local_out)]
+                [global_out[0], int(rep_out)]
             ]
-            sidecar["operators"][str(op_id)] = {
+            shards = [
+                {
+                    "dpu_id": dpu_id,
+                    "local_in_features": int(spec.shard_map[dpu_id].local_shape[1]),
+                    "local_out_features": int(spec.shard_map[dpu_id].local_shape[0]),
+                }
+                for dpu_id in dpu_ids
+            ]
+            entry: Dict[str, Any] = {
                 "device_hint": "pim",
-                "dpu_id": dpu_id,
                 # 供消费侧核对 op_id 没有错位（IR 重新生成后编号可能变化）。
                 "op_type": operators_by_id[op_id]["op_type"],
-                # 供成本提取按本地分片形状重新测量，而不是用模型级全局形状。
-                "local_in_features": int(local_in),
-                "local_out_features": int(local_out),
+                # 这个投影切分到的每台 DPU 及其本地分片宽度；len==1 即纯 PP。
+                "shards": shards,
                 # 这个 GEMM 的投影身份，以及它实际匹配到的 fx 节点——排错时不用
                 # 再猜「哪个 role 落到了哪个权重上」。
                 "semantic_role": role,
                 "weight": str(weight_node.target),
             }
+            if len(shards) > 1:
+                # dim==0 切在输出特征维（列切，之后 concat/all_gather 即可）；
+                # dim==1 切在输入特征维（行切，之后必须 all_reduce sum）。
+                entry["shard_axis"] = (
+                    "output_channel" if spec.placement.dim == 0 else "input_channel"
+                )
+            sidecar["operators"][str(op_id)] = entry
 
             if measure_kernel_tiles:
                 tile_n, pimir_path = _measure_kernel_tile_n(
-                    int(local_in), int(local_out), dtype, hardware, tile_cache
+                    int(rep_in), int(rep_out), dtype, hardware, tile_cache
                 )
-                entry = sidecar["operators"][str(op_id)]
                 entry["kernel_tile_n"] = tile_n
                 # GeneSim 照这份 pim mlir 生成 PIM trace，而不是用手写模板。
                 entry["pimir_path"] = pimir_path
