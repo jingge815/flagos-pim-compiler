@@ -286,6 +286,33 @@ def test_local_shard_widths_follow_each_projection(
     assert sidecar["ir_num_operators"] == 11
 
 
+def test_requires_pimir_declares_whether_opcompiler_products_are_carried(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """sidecar 要自己声明带没带算子编译产物。
+
+    GeneSim 据此自动进入严格模式（pim mlir 读不到就报错），不再依赖配置文件写对
+    `require_compiler_pimir`——tp4pp2 的配置就漏写过那一行，后果是实测分块不进
+    代价链、仿真照样跑完但数字悄悄偏掉。
+
+    这里只验纯放置导出（不带产物）声明为 false；带产物那条路径要真编 FlagTree，
+    由 scripts/run_full_pipeline.py 覆盖。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    assert sidecar["requires_pimir"] is False
+    # 没带产物时也不该出现这两个字段，否则消费侧会去找不存在的文件。
+    for entry in sidecar["operators"].values():
+        assert "pimir_path" not in entry
+        assert "kernel_tile_n" not in entry
+
+
 def test_local_shapes_written_into_ir_without_touching_global(
     annotated_tiny_llama, tmp_path
 ) -> None:

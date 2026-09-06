@@ -193,6 +193,11 @@ def export_placement_to_genesim(
         "version": 3,
         "source_ir": str(ir_path),
         "ir_num_operators": len(ir["operators"]),
+        # 这份 sidecar 是否带算子编译产物（pimir_path / kernel_tile_n）。
+        # GeneSim 据此自动进入严格模式：写了产物却读不到就报错，而不是静默退回
+        # 手写模板。让产物自己声明，配置文件漏写 require_compiler_pimir 也不会
+        # 悄悄退化。
+        "requires_pimir": bool(measure_kernel_tiles),
         "operators": {},
     }
     if dpu_to_cluster is not None:

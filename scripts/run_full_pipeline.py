@@ -173,6 +173,15 @@ def step_bcd_export(
     if not ops:
         raise StepFailed("sidecar 里没有任何放置结果")
 
+    # 本步骤用 --measure-kernel-tiles 编了算子，所以 sidecar 必须自报带产物。
+    # GeneSim 靠这个字段自动进严格模式；缺了就退回"看配置文件写没写对"，也就是
+    # 本脚本要防的那种静默退化。
+    if not sidecar.get("requires_pimir"):
+        raise StepFailed(
+            "sidecar 没有 requires_pimir=true。带算子编译产物的导出必须自报，"
+            "否则 GeneSim 不会自动进严格模式，pim mlir 读不到会静默退回手写模板。"
+        )
+
     # 四类字段各自对应链路上的一段，逐个核对，不能只看文件存在。
     checks = {
         "shards（图切分归属，每台参与 DPU 各一项）": lambda e: bool(e.get("shards")),
