@@ -28,6 +28,18 @@
 
 ## 环境
 
+### GPU 不是必需的
+
+算子编译产出的是 **pim mlir**（再往下是 EmitC → C → .so），全程在 CPU 上跑，不需要 GPU
+硬件。纯 CPU 的 Ubuntu 22.04 上编译、安装、测试、运行全部可用，产出的 pim mlir 与有卡
+机器**逐字节相同**。
+
+纯 CPU 环境下唯一不可用的是"需要真实执行 Triton kernel"的那类步骤（详见
+[`docs/pim-compiler-v0.0.4.md`](./docs/pim-compiler-v0.0.4.md) 第 7.1 节）：
+
+从零搭建的完整步骤（含系统包、四个安装脚本、五项测试的预期输出）见
+[`docs/pim-compiler-v0.0.4.md`](./docs/pim-compiler-v0.0.4.md) 第 5.0 节。
+
 ### 站点相关路径
 
 本仓以根目录的 `paths.json` 作为随代码交付的站点配置。甲方拿到代码后，先把
@@ -73,6 +85,9 @@ GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 另有一个 `PIM_COMPILER_R
 
 - `docs/spec.md` — 完整技术方案
 - `docs/spec-index.md` — 方案分节行号索引（按需定位，避免整篇读）
+- `docs/pim-compiler-v0.0.3.md` — v0.0.3 交付文档（技术方案的完整描述以此为准）
+- `docs/pim-compiler-v0.0.4.md` — **v0.0.4 交付文档**：TP/PP + PU 映射，以及纯 CPU 部署
+  （第 5.0 节是从零搭建的完整操作清单）
 - `docs/<module>.md` — 各模块接口与设计决策
 
 ## 开发约定

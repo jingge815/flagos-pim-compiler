@@ -139,13 +139,29 @@ def run_and_capture(
     tile_to_budget: bool = True,
     wram_bytes: Optional[int] = None,
 ) -> List[CapturedKernel]:
-    """执行预热调用，并捕获后续调用发射的内核。"""
+    """执行预热调用，并捕获后续调用发射的内核。
+
+    无 GPU 机器上先注入编译期 driver（见 `opcompiler_bridge/cpu_host.py`），否则
+    `import flag_gems` 在 import 期就会去读 `triton.runtime.driver.active` 而抛
+    "0 active drivers"。同样地，`torch.cuda.synchronize()` 只在真有卡时才有意义——
+    无卡时 CPU 执行本来就是同步的，调用它会直接抛 "No CUDA GPUs are available"。
+    """
+    from opcompiler_bridge.cpu_host import ensure_compile_driver, gpu_hardware_present
+
+    ensure_compile_driver()
+
     import torch
     import flag_gems
 
+    has_gpu = gpu_hardware_present()
+
+    def _sync() -> None:
+        if has_gpu:
+            torch.cuda.synchronize()
+
     with flag_gems.use_gems():
         fn()
-    torch.cuda.synchronize()
+    _sync()
 
     with capture_kernels(
         emit_pimir=emit_pimir,
@@ -154,5 +170,5 @@ def run_and_capture(
     ) as captured:
         with flag_gems.use_gems():
             fn()
-        torch.cuda.synchronize()
+        _sync()
     return list(captured)

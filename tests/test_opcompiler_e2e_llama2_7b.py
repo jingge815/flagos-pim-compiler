@@ -32,12 +32,28 @@ MAX_SEQ = 64
 KV_DTYPE_BYTES = 2  # fp16
 NUM_LAYERS = 32
 
+def _pim_passes_available() -> bool:
+    """这份 triton 带 PIM pass 吗（不问有没有 GPU 硬件）。"""
+    try:
+        from genesim_bridge.env import assert_pim_passes_available
+
+        assert_pim_passes_available()
+    except Exception:
+        return False
+    return True
+
+
 pytestmark = [
     pytest.mark.skipif(
         MODEL_DIR is None or not MODEL_DIR.is_dir(),
         reason="需要在 paths.json 配置 llama2_7b_model_dir",
     ),
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="opcompiler_bridge 编译期需要 GPU"),
+    # 算子编译不需要 GPU 硬件，只需要带 PIM pass 的 triton：无卡时走
+    # cpu_host 的前端路径，产出的 pim mlir 与有卡路径 sha256 相同。
+    pytest.mark.skipif(
+        not _pim_passes_available(),
+        reason="当前 triton 没有 PIM pass，需重跑 0-install-flagtree.sh",
+    ),
 ]
 
 

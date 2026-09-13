@@ -258,6 +258,30 @@ def step_bcd_export(
     return sidecar_path
 
 
+def _genesim_sim_command(genesim: Path, config_name: str) -> list[str]:
+    """返回跑 GeneSim 仿真的命令。
+
+    首选 `./run.sh`——那是 GeneSim 上游设计的入口。但它每个子命令都先 `check_uv` +
+    `check_venv`，机器上没装 uv、或者没跑过 `install.sh` 建 `.venv` 时会直接退出。
+
+    这种情况下退回"用当前 python 直接跑 src/main.py"：仿真读的是已经生成好的 pim
+    mlir，不自己编译算子，所以不需要 GeneSim 那套独立 venv。实测两条路径的
+    `total_time_s` 小数位完全一致（1418.1092459087413），uv 只是包管理工具。
+
+    这条退路的用途是让纯 CPU 容器里的验证能跑完；交付给用户仍应走 `install.sh` +
+    `run.sh`，因为 `run.sh` 的其余子命令（predictor、upmem_checker）没有这条退路。
+    """
+    uv_available = shutil.which("uv") is not None
+    venv_ready = (genesim / ".venv" / "bin" / "python").is_file()
+    if uv_available and venv_ready:
+        return ["./run.sh", "--config", f"conf/{config_name}"]
+
+    missing = "uv" if not uv_available else ".venv"
+    print(f"    （缺 {missing}，改用当前 python 直接跑 src/main.py；"
+          "结果与 run.sh 一致，见 _genesim_sim_command 的说明）")
+    return [sys.executable, "src/main.py", "--config", f"conf/{config_name}"]
+
+
 def step_e_simulate(
     genesim: Path, config_name: str, log_dir: Path, *, label: str,
     results_dir: Optional[Path] = None,
@@ -268,10 +292,8 @@ def step_e_simulate(
     traces = genesim / "pim_traces"
     if traces.is_dir():
         shutil.rmtree(traces)
-    _run(
-        ["./run.sh", "--config", f"conf/{config_name}"],
-        cwd=genesim, log_path=log_dir / f"e_sim_{label}.log",
-    )
+    _run(_genesim_sim_command(genesim, config_name),
+         cwd=genesim, log_path=log_dir / f"e_sim_{label}.log")
 
     summary_path = genesim / "results" / "summary.json"
     if not summary_path.is_file():

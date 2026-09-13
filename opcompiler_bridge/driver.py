@@ -122,26 +122,74 @@ def _kernel_launcher(request: OpCompileRequest):
     return make_kernel_launcher(m, k, n)
 
 
-def _make_ttir(request: OpCompileRequest) -> str:
-    """在 GPU 上编译目标形状并返回 TTIR 文本。"""
-    import torch
+_TRITON_DTYPE_BY_NAME = {"float16": "fp16", "float32": "fp32"}
 
-    launch = _kernel_launcher(request)
+
+def _make_ttir(request: OpCompileRequest) -> str:
+    """编译目标形状并返回 TTIR 文本。
+
+    有 GPU 时走原生路径（真实 launch 取 `asm["ttir"]`）；没有 GPU 时走
+    `cpu_host.make_ttir` 的纯前端路径。TTIR 是 AST → IR 的产物，本来就不需要设备，
+    两条路径产出的 pim mlir 一致（同形状同硬件参数下 sha256 相同，见
+    `opcompiler_bridge/cpu_host.py` 的说明）。
+
+    保留原生路径而不是一律走前端：有卡时 `asm["ttir"]` 是 Triton 自己维护的口径，
+    跟着上游演进最稳妥；前端路径要自己拼 signature 和特化，是无卡机器的补偿实现。
+    """
+    from .cpu_host import gpu_hardware_present
+
     m, k = flatten_leading_dims(request.arg_shapes[0])
     n, _ = request.arg_shapes[1]
-    # 使用请求指定的数据类型构造 Triton 输入张量。
     dtypes = _torch_dtypes()
     if request.dtype not in dtypes:
         raise ValueError(
             f"opcompiler_bridge 只支持 float16/float32 存储（新 pass 的 "
             f"checkElementType 同样），收到 dtype={request.dtype!r}"
         )
+
+    if not gpu_hardware_present():
+        return _make_ttir_without_gpu(request, m, k, n)
+
+    import torch
+
+    launch = _kernel_launcher(request)
     torch_dtype = dtypes[request.dtype]
     x = torch.empty((m, k), dtype=torch_dtype, device="cuda")
     w = torch.empty((n, k), dtype=torch_dtype, device="cuda")
     out = torch.empty((m, n), dtype=torch_dtype, device="cuda")
     compiled = launch(x, w, out)
     return compiled.asm["ttir"]
+
+
+def _make_ttir_without_gpu(
+    request: OpCompileRequest, m: int, k: int, n: int
+) -> str:
+    """无 GPU 机器上的 TTIR：不构造设备张量，直接前端编译。"""
+    from .cpu_host import make_ttir
+    from .kernel_src import NUM_STAGES, linear_kernel, pick_blocks
+
+    # 形状约束与有卡路径共用同一套判定（M 是 2 的幂、K/N 有合法分块）。
+    _kernel_launcher(request)
+    block_n, block_k = pick_blocks(k, n)
+    elem = _TRITON_DTYPE_BY_NAME[request.dtype]
+    return make_ttir(
+        linear_kernel,
+        signature={
+            "x_ptr": f"*{elem}",
+            "w_ptr": f"*{elem}",
+            "out_ptr": f"*{elem}",
+            "M": "constexpr",
+            "K": "constexpr",
+            "N": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+        },
+        constexprs={
+            "M": m, "K": k, "N": n,
+            "BLOCK_N": block_n, "BLOCK_K": block_k,
+        },
+        num_stages=NUM_STAGES,
+    )
 
 
 def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> tuple[str, str]:

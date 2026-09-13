@@ -5,6 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
+
+def _probe_device() -> str:
+    """探针张量该建在哪个设备上。
+
+    这些张量只是用来触发一次 FlagGems 调用、好让 `capture_kernels` 抓到内核并从中
+    取出 pim mlir——算的是什么值无关紧要，跑在哪个设备上也无关紧要。有卡时仍走
+    cuda（与历史行为一致），无卡时落到 cpu。
+    """
+    from opcompiler_bridge.cpu_host import gpu_hardware_present
+
+    return "cuda" if gpu_hardware_present() else "cpu"
+
 # 使用 GeneSim 模板成本的算子类型：本桥接不为它们编译 FlagGems 代表实现，
 # 直接保留 model_parser 写进 IR 的模板系数，并记入 sidecar 的 coverage.template。
 #
@@ -54,9 +66,9 @@ def _linear(dims: Dict[str, int], point: ShapePoint, in_features: int, out_featu
     """FlagGems linear：GeneSim 的 GEMM 都是 [Tq, in] x [in, out]。"""
     import torch
 
-    x = torch.randn(point.tq, in_features, device="cuda", dtype=torch.float16)
-    w = torch.randn(out_features, in_features, device="cuda", dtype=torch.float16)
-    b = torch.randn(out_features, device="cuda", dtype=torch.float16)
+    x = torch.randn(point.tq, in_features, device=_probe_device(), dtype=torch.float16)
+    w = torch.randn(out_features, in_features, device=_probe_device(), dtype=torch.float16)
+    b = torch.randn(out_features, device=_probe_device(), dtype=torch.float16)
     return lambda: torch.nn.functional.linear(x, w, b)
 
 
@@ -64,15 +76,15 @@ def _bmm(dims: Dict[str, int], m: int, k: int, n: int):
     """FlagGems bmm，单 head（batch=1）。"""
     import torch
 
-    a = torch.randn(1, m, k, device="cuda", dtype=torch.float16)
-    b = torch.randn(1, k, n, device="cuda", dtype=torch.float16)
+    a = torch.randn(1, m, k, device=_probe_device(), dtype=torch.float16)
+    b = torch.randn(1, k, n, device=_probe_device(), dtype=torch.float16)
     return lambda: torch.bmm(a, b)
 
 
 def _softmax(dims: Dict[str, int], rows: int, cols: int):
     import torch
 
-    x = torch.randn(rows, cols, device="cuda", dtype=torch.float16)
+    x = torch.randn(rows, cols, device=_probe_device(), dtype=torch.float16)
     return lambda: torch.softmax(x, dim=-1)
 
 
@@ -131,7 +143,7 @@ def flash_attention_probe(dims: Dict[str, int], point: ShapePoint):
 
     num_heads = dims["num_heads"]
     head_dim = dims["head_dim"]
-    q = torch.randn(1, num_heads, point.tq, head_dim, device="cuda", dtype=torch.float16)
-    k = torch.randn(1, num_heads, point.lkv, head_dim, device="cuda", dtype=torch.float16)
-    v = torch.randn(1, num_heads, point.lkv, head_dim, device="cuda", dtype=torch.float16)
+    q = torch.randn(1, num_heads, point.tq, head_dim, device=_probe_device(), dtype=torch.float16)
+    k = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
+    v = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
     return lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v)

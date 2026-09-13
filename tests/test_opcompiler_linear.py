@@ -16,9 +16,23 @@ from contracts.exec_plan import Access, Command
 from contracts.op_contract import PIMHardwareConfig
 from runtime.kernels import compiled_linear_kernel, linear_kernel, register_all
 
+
+def _pim_passes_available() -> bool:
+    """这份 triton 带 PIM pass 吗（不问有没有 GPU 硬件）。"""
+    try:
+        from genesim_bridge.env import assert_pim_passes_available
+
+        assert_pim_passes_available()
+    except Exception:
+        return False
+    return True
+
+# 算子编译不需要 GPU 硬件：TTIR 是纯前端产物，无卡时走 cpu_host 的前端路径，
+# 产出的 pim mlir 与有卡路径 sha256 相同（见 opcompiler_bridge/cpu_host.py）。
+# 真正的前提是这份 triton 里带 PIM pass——缺了它才没有可测的东西。
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="opcompiler_bridge.driver 编译时需要在 GPU 上跑一次目标 kernel",
+    not _pim_passes_available(),
+    reason="当前 triton 没有 PIM pass，需重跑 0-install-flagtree.sh",
 )
 
 

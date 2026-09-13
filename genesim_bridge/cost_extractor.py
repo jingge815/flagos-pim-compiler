@@ -69,6 +69,23 @@ def _measure(
     pimir = ir_level == "pimir"
     captured = run_and_capture(recipe.build, emit_pimir=pimir)
     if not captured:
+        from opcompiler_bridge.cpu_host import gpu_hardware_present
+
+        if not gpu_hardware_present():
+            # 这条路径靠"真的把 FlagGems 算子跑一遍、顺手抓下发的 kernel"来测成本，
+            # 无 GPU 时 Triton kernel 无处可跑，抓不到是必然的，不是配置问题。
+            #
+            # 另一条成本路径不受影响：scripts/export_pp_placement.py 走
+            # opcompiler_bridge.compile_op，只做 TTIR → pim mlir 的编译，不执行
+            # kernel，纯 CPU 上产物与有卡逐字节相同。全流程脚本用的就是那条。
+            raise RuntimeError(
+                f"op_type={op_type} 在 {point.label} 未捕获到任何 kernel："
+                "当前机器没有 GPU，而本路径需要真实执行 FlagGems 算子才能测量成本。\n"
+                "纯 CPU 环境请改用编译路径（不需要执行 kernel）：\n"
+                "  python scripts/export_pp_placement.py "
+                "--partition-plan <plan.json> --measure-kernel-tiles\n"
+                "或直接跑 scripts/run_full_pipeline.py，它默认走这条路径。"
+            )
         raise RuntimeError(
             f"op_type={op_type} 在 {point.label} 未捕获到任何 kernel；"
             "可能 FlagGems 未接管该算子"
