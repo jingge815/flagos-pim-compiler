@@ -19,6 +19,8 @@ _ENV_VARS = {
     "llama2_7b_model_dir": "LLAMA2_7B_MODEL_DIR",
     "flagtree_prefix": "FLAGTREE_PREFIX",
     "genesim_root": "GENESIM_ROOT",
+    "gml_reference_dir": "GML_REFERENCE_DIR",
+    "gml_llama2_reference_dir": "GML_LLAMA2_REFERENCE_DIR",
 }
 
 # Triton NVIDIA 后端目录。
@@ -91,6 +93,26 @@ def llama2_7b_model_dir(*, required: bool = True) -> Path | None:
     if path is not None or not required:
         return path
     return _resolve("llama2_7b_model_dir")
+
+
+def gml_reference_dir(*, required: bool = True) -> Path | None:
+    """GML 格式参考产物目录；结构与字段覆盖率测试要用，缺失时可传 ``required=False``。"""
+    path = _configured_path("gml_reference_dir")
+    if path is not None or not required:
+        return path
+    return _resolve("gml_reference_dir")
+
+
+def gml_llama2_reference_dir(*, required: bool = True) -> Path | None:
+    """llama2 W4A8 的 GML 参考产物目录。
+
+    比 ResNet50 那份更贴近目标模型：它是 decode block，带动态量化与 KV cache，
+    所以结构规则要在两份上同时成立才算可靠。
+    """
+    path = _configured_path("gml_llama2_reference_dir")
+    if path is not None or not required:
+        return path
+    return _resolve("gml_llama2_reference_dir")
 
 
 def flagtree_prefix() -> Path:
