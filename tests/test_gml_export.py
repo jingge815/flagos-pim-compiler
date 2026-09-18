@@ -109,6 +109,65 @@ def test_buffer_names_follow_the_naming_rules(artifact) -> None:
             names.activation_lut(node_id),
             names.fpsu_scale(node_id),
             names.fpsu_post_shift(node_id),
+            # RMSNorm 走向量单元：eps 常量 + 输出 requant scale
+            # （后者只在 vpu_params 子块里出现，顶层没有）。
+            names.rms_norm_epsilon(node_id),
+            names.output_scale(node_id),
+            names.output_zero_point(node_id),
+            names.weight_zero_point(node_id),
+            names.zero_point(node_id),
+            names.fpsu_bias(node_id),
+            names.phase_output_buffer_self(node_id),
+        }
+        # FPSU 三族与量化零点在逐元素算子上按槽出现。
+        for slot in range(4):
+            allowed |= {
+                names.fpsu_scale(node_id, slot),
+                names.fpsu_post_shift(node_id, slot),
+                names.fpsu_bias(node_id, slot),
+                names.zero_point(node_id, slot),
+            }
+        # DQ 的 4 相族。
+        for phase in range(5):
+            allowed |= {
+                names.phase_input_buffer(node_id, phase),
+                names.phase_output_buffer(node_id, phase),
+                names.phase_fpsu_scale(node_id, phase),
+                names.phase_fpsu_post_shift(node_id, phase),
+                names.phase_fpsu_bias(node_id, phase),
+                names.phase_lut(node_id, phase),
+                names.phase_kantor_scale(node_id, phase),
+                names.phase_kantor_bias(node_id, phase),
+                names.phase_kantor_shift(node_id, phase),
+            }
+        # RoPE 子块：6 个单元 × 定标/零点/Kantor + 中间态。
+        from contracts.gml_hw_table import ROPE_UNITS, ROPE_SCALE_BLOCKS, ROPE_KANTOR_BLOCKS
+        for unit, block in ROPE_UNITS:
+            allowed |= {
+                names.rope_scale(node_id, unit, block),
+                names.rope_post_shift(node_id, unit, block),
+                names.rope_bias(node_id, unit, block),
+            }
+        for block in ROPE_SCALE_BLOCKS:
+            allowed |= {
+                names.rope_quant_scale(node_id, block),
+                names.rope_quant_zero_point(node_id, block),
+            }
+        for block in ROPE_KANTOR_BLOCKS:
+            for side in ("A", "B"):
+                allowed |= {
+                    names.rope_kantor_bias(node_id, block, side),
+                    names.rope_kantor_shift(node_id, block, side),
+                    names.rope_kantor_scale(node_id, block, side),
+                }
+        allowed |= {
+            names.rope_kantor_bias(node_id, "Llama2Activation_add", "A"),
+            names.rope_kantor_scale(node_id, "Llama2Activation_add", "A"),
+            names.rope_kantor_shift(node_id, "Llama2Activation_add", "A"),
+            names.rope_intermediate(node_id, "cos"),
+            names.rope_intermediate(node_id, "sin"),
+            names.kv_updates_scale(node_id),
+            names.kv_updates_zero_point(node_id),
         }
         for slot in range(4):
             allowed |= {names.data_buffer(node_id, slot), names.scale(node_id, slot)}
@@ -182,10 +241,19 @@ def test_data_buffer_sizes_follow_the_edge_shapes(graph_and_artifact, tmp_path) 
         buffer_name = node.fields.get("input_buffer")
         if not dims or not isinstance(buffer_name, str) or dims == "unknown":
             continue
+        # 上游是 phase 型 DQ 时，这一路引用的是**生产者**的文件
+        # （`output_buffer_<DQ>.bin`），不由本节点的入边形状决定尺寸 ——
+        # 那份是 DQ 量化后的完整输出。跳过（另有 test_quant_pass 逐字节核对）。
+        if buffer_name.startswith(("output_buffer", "weight_buffer")):
+            continue
+
         expected = 1
         for part in dims.split("x"):
             expected *= int(part)
-        # int8 一字节一个元素。
+        # 字节宽度跟着**声明的** dtype：DQ 吃 fp16（上游还没量化），
+        # 其余吃 int8。一律按 int8 算会在 fp16 那几个节点上差一倍。
+        if node.fields.get("input_buffer_dtype") == "float16":
+            expected *= 2
         assert (out_dir / buffer_name).stat().st_size == expected
         checked += 1
     assert checked > 0, "应当有可核对尺寸的数据缓冲区"
@@ -208,6 +276,12 @@ def test_weights_are_quantized_and_written(graph_and_artifact, tmp_path) -> None
 
     assert artifact.weight_params, "图里应当有带权重的算子"
 
+    # 权重分两类，判据完全不同（实测参考产物 73 个权重里 int4 只有 7 个）：
+    #   int4 per-group  值域 [-8,7]，每 128 个共享一个 **fp16** scale
+    #   int8 per-tensor 值域 [-128,127]，整张张量一个 **fp32** scale
+    # RMSNorm 的一维缩放张量走后者，所以不能统一按 int4 断言。
+    by_id = {node.node_id: node for node in artifact.nodes}
+
     for node_id in artifact.weight_params:
         weight_path = out_dir / names.weight_buffer(node_id)
         scale_path = out_dir / names.weight_scale(node_id)
@@ -215,12 +289,19 @@ def test_weights_are_quantized_and_written(graph_and_artifact, tmp_path) -> None
         assert scale_path.is_file()
 
         weights = np.fromfile(weight_path, dtype=np.int8)
-        scales = np.fromfile(scale_path, dtype=np.float16)
+        fields = by_id[node_id].fields
 
-        # 一字节一个 int4，值域严格。
-        assert weights.min() >= INT4_MIN
-        assert weights.max() <= INT4_MAX
-        # 每组一个 scale。
-        assert weights.size == scales.size * WEIGHT_GROUP_SIZE
+        if fields.get("weight_sf_dtype") == "float32":
+            scales = np.fromfile(scale_path, dtype=np.float32)
+            assert scales.size == 1, "per-tensor 只有一个 scale"
+            assert weights.min() >= -128 and weights.max() <= 127
+        else:
+            scales = np.fromfile(scale_path, dtype=np.float16)
+            # 一字节一个 int4，值域严格。
+            assert weights.min() >= INT4_MIN
+            assert weights.max() <= INT4_MAX
+            # 每组一个 scale。
+            assert weights.size == scales.size * WEIGHT_GROUP_SIZE
+
         # scale 不能有 nan——全零组会踩到除零。
         assert not np.isnan(scales).any()

@@ -22,12 +22,19 @@ class Node:
     """一个 GML 节点，即一个整算子（已折入激活与池化）。
 
     `fields` 按插入顺序写出。值是 str 时加引号，int 直接写，list 展开成重复键。
-    `contraction` 是折进本节点的子算子，每项一个 (名字, 字段字典)。
+
+    两种嵌套块，层级不同，不能混用：
+
+    - `contraction`：折进本节点的子算子，**两层**
+      （`contraction [ fused_Silu_act [ ... ] ]`）。每项一个 (名字, 字段字典)。
+    - `nested`：字段直接放在块内的**一层**块，实测只有 RMSNorm 的
+      `vpu_params [ Vpu_Axis -1 ... ]`。
     """
 
     node_id: int
     fields: dict[str, object] = field(default_factory=dict)
     contraction: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    nested: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass
@@ -57,14 +64,29 @@ def _emit_field(name: str, value: object, depth: int) -> list[str]:
     return [f"{pad}{name} {_format_value(value)}"]
 
 
+# 内部字段前缀。这些键只在编译期各阶段之间传值（比如把 attention 定标系数
+# 从 meta 带到写盘阶段），**不进 GML 文本** —— 对方的解析器不认识它们。
+_INTERNAL_PREFIX = "pim_"
+
+
 def _emit_node(node: Node) -> list[str]:
     lines = [f"{_INDENT}node ["]
     # id 与 node_id 是同一个值，两者都要写（前者给 networkx，后者给 L2）。
     lines += _emit_field("id", node.node_id, 2)
     lines += _emit_field("node_id", node.node_id, 2)
     for name, value in node.fields.items():
+        if name.startswith(_INTERNAL_PREFIX):
+            continue
         lines += _emit_field(name, value, 2)
 
+    # 一层嵌套块（vpu_params）：字段直接写在块内。
+    for block_name, block_fields in node.nested.items():
+        lines.append(f"{_INDENT * 2}{block_name} [")
+        for name, value in block_fields.items():
+            lines += _emit_field(name, value, 3)
+        lines.append(f"{_INDENT * 2}]")
+
+    # 两层嵌套块（contraction）：块内还有一层子算子。
     if node.contraction:
         lines.append(f"{_INDENT * 2}contraction [")
         for child_name, child_fields in node.contraction:

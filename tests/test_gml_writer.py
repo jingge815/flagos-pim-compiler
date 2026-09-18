@@ -10,6 +10,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from contracts import gml_names as names
@@ -136,3 +138,87 @@ def test_booleans_are_rejected() -> None:
 
     with pytest.raises(TypeError, match="没有布尔类型"):
         write_gml([Node(1, {"flag": True})], [], version="26.10.1")
+
+
+# ---------------------------------------------------------------------------
+# 一层嵌套块（vpu_params）与连接键名
+# ---------------------------------------------------------------------------
+
+
+def test_nested_block_is_one_level_deep() -> None:
+    """`vpu_params` 的字段直接写在块内，比 contraction 少一层。
+
+    两种块的层级不同，混用会让对方的解析器读不到字段：
+        vpu_params [ Vpu_Axis -1 ]                       <- 一层
+        contraction [ fused_Silu_act [ name "..." ] ]    <- 两层
+    """
+    node = Node(25, {"Use_Scaling": 0}, nested={
+        "vpu_params": {"Vpu_Axis": -1, "Weights_buffer_file": "weight_buffer_25.bin"}})
+    text = write_gml([node], [], version="26.2.1")
+
+    assert "    vpu_params [\n" in text
+    assert '      Vpu_Axis -1\n' in text
+    assert '      Weights_buffer_file "weight_buffer_25.bin"\n' in text
+    # 块内不该再嵌一层。
+    assert "        " not in text
+
+
+def test_nested_block_indentation_matches_the_reference() -> None:
+    """缩进要与实物逐字符一致：块名 4 空格、字段 6 空格。"""
+    node = Node(25, {}, nested={"vpu_params": {"Vpu_Axis": -1}})
+    lines = write_gml([node], [], version="26.2.1").split("\n")
+
+    block = next(i for i, line in enumerate(lines) if "vpu_params" in line)
+    assert lines[block] == "    vpu_params ["
+    assert lines[block + 1] == "      Vpu_Axis -1"
+    assert lines[block + 2] == "    ]"
+
+
+def test_both_nested_kinds_can_coexist() -> None:
+    """一个节点同时带两种块时，各自的层级都要对。"""
+    node = Node(
+        195, {"label": "gate"},
+        contraction=[("fused_Silu_act", {"op_type": "Lut"})],
+        nested={"vpu_params": {"Vpu_Axis": -1}})
+    text = write_gml([node], [], version="26.2.1")
+
+    assert "    vpu_params [\n      Vpu_Axis -1\n    ]\n" in text
+    assert '    contraction [\n      fused_Silu_act [\n        op_type "Lut"\n' in text
+
+
+def test_residual_buffer_key_grows_an_underscore_past_port_nine() -> None:
+    """端口号 >= 10 时 `residual_*_buffer` 后面多一个下划线。
+
+    这是对方生成器的键名 bug，实测 662 处连接无例外（输出侧 88、输入侧 22 处
+    带下划线）。为兼容它的解析器，我方照样复现。
+    """
+    from contracts.gml_names import port_node_id_key, residual_buffer_key
+
+    assert residual_buffer_key("output", 0) == "residual_output_buffer"
+    assert residual_buffer_key("output", 9) == "residual_output_buffer"
+    assert residual_buffer_key("output", 10) == "residual_output_buffer_"
+    assert residual_buffer_key("input", 31) == "residual_input_buffer_"
+
+    # 端口号那一份键名不带这个 bug。
+    assert port_node_id_key("output", 9) == "output9_node_id"
+    assert port_node_id_key("output", 10) == "output10_node_id"
+
+
+def test_residual_buffer_key_rejects_bad_direction() -> None:
+    from contracts.gml_names import residual_buffer_key
+
+    with pytest.raises(ValueError, match="只能是 input 或 output"):
+        residual_buffer_key("sideways", 0)
+
+
+def test_repeated_keys_render_once_per_port() -> None:
+    """多端口节点上同名键重复出现，每个端口一次——不是写成数组。
+
+    实测 Split 节点有 32 个 `residual_output_buffer`，靠 list 展开机制产出。
+    """
+    node = Node(21, {"residual_output_buffer": [20, 41, 46]})
+    text = write_gml([node], [], version="26.2.1")
+
+    assert text.count("residual_output_buffer ") == 3
+    assert "residual_output_buffer 20\n" in text
+    assert "residual_output_buffer 41\n" in text

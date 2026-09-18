@@ -30,31 +30,60 @@ EMITTED = frozenset({
     # 权重与它的 per-group scale。量化路径已接通（见文档 27、29 节），
     # int4 布局用实物做过字节级往返验证。
     "weight_buffer", "weight_sf",
+    # 权重/scale 的 dtype。两条路径都已接通：
+    #   int4 per-group（q/k/v/o/gate/up/down_proj）
+    #   int8 per-tensor + **fp32** sf（RMSNorm 的一维缩放张量）
+    "weight_buffer_dtype", "weight_sf_dtype",
+    "input_sf_dtype", "output_sf_dtype",
+    # RMSNorm 走向量单元，配置在 vpu_params 子块里，eps 取自图。
+    "RMSNorm_Add_Const", "Use_Scaling", "vpu_params", "Vpu_Axis",
+    "input_scale_factor_buffer", "output_scale_factor_buffer",
+    "Weights_buffer_file", "weights_scaling_buffer_file", "bias_buffer_file",
+    # 硬件单元配置。由 (op_type, phase) 唯一确定，查 contracts/gml_hw_table.py
+    # 即得 —— 实测 364 个字段项里 353 项单值，无一需要算子编译器参与。
+    "nmu_mode", "fpsu_mode", "fpsu_spc", "fpsu_spc_axis", "fpsu_spg",
+    "pooling_dtype", "kantor_mode",
+    # 逐头展开产出的 attention 字段。
+    "weight_format", "split_channel_number", "MatMul_input_as_weight",
+    "group_attention_data_num", "group_attention_weight_num",
+    "transpose",
+    # 量化参数的零点。对称量化下恒为 0，但**文件必须存在**
+    # （实测 381 个 zp 文件全是 4 字节 int32 的 0）。
+    "input_zp", "input_0_zp", "input_1_zp", "input_2_zp",
+    "weight_zp", "output_zp", "output_sf",
+    # FPSU 定标三族。三个文件宽度各不相同（fp16 / u8 / fp32），对应硬件
+    # FPSU 的三个操作数：加 32 位 bias、乘 16 位 scale、round 后右移。
+    # attention 的 1/√head_dim 就折在 Scaling_buffer_file 里。
+    "Scaling_buffer_file", "Scaling_buffer_file_0", "Scaling_buffer_file_1",
+    "Scaling_PS_buffer_file", "Scaling_PS_buffer_file_0",
+    "Scaling_PS_buffer_file_1",
+    "Bias_buffer_file", "Bias_buffer_file_0", "Bias_buffer_file_1",
+    # DynamicScaling 的 4 相流水线。phase 在 GML 里不是独立节点，
+    # 而是同一节点内的 *_phase_<k> 字段族。
+    "use_dynamic_quantization",
+    "rtl_version",
+    # 数据通道声明。dtype **沿边传播**（上游是 DQ 就吃 int8），
+    # `*_data_extensions` 是它的编码（float16→3、int8→1）。
+    "input_buffer_dtype", "output_buffer_dtype",
+    "input_buffer_0_dtype", "input_buffer_1_dtype",
+    "input_data_extensions", "output_data_extension",
+    # 被量化张量的形状，以及按 group_size 拆开后的形状。
+    "original_shape", "output_shape_by_group",
 })
 
 # 第 4 轮（静态量化）要补的字段族。量化参数、定标系数、LUT 都依赖校准数据，
 # 结构轮拿不到。
 PENDING_QUANTIZATION = frozenset({
     # 输入/权重/偏置/输出的量化参数
-    "input_zp", "input_0_zp", "input_1_zp", "input_2_zp",
-    "input_buffer_dtype", "input_buffer_0_dtype", "input_buffer_1_dtype",
-    "input_sf_dtype", "input_0_sf_dtype", "input_1_sf_dtype",
-    "output_buffer_dtype", "output_sf", "output_sf_dtype", "output_zp",
-    "weight_buffer_dtype", "weight_sf_dtype",
-    "weight_zp", "bias_buffer", "bias_buffer_dtype", "bias_sf",
+    "input_0_sf_dtype", "input_1_sf_dtype",
+    "bias_buffer", "bias_buffer_dtype", "bias_sf",
     "bias_sf_dtype", "bias_zp",
-    "input_data_extensions", "output_data_extension",
     # 累加与定标
-    "nmu_mode", "fpsu_mode", "fpsu_mode_0", "fpsu_mode_1",
-    "fpsu_spc", "fpsu_spc_axis", "fpsu_spg",
+    "fpsu_mode_0", "fpsu_mode_1",
     "fpsu_0_spc", "fpsu_0_spg", "fpsu_1_spc", "fpsu_1_spg",
-    "Scaling_buffer_file", "Scaling_buffer_file_0", "Scaling_buffer_file_1",
-    "Scaling_PS_buffer_file", "Scaling_PS_buffer_file_0",
-    "Scaling_PS_buffer_file_1",
-    "Bias_buffer_file", "Bias_buffer_file_0", "Bias_buffer_file_1",
-    "pooling_dtype", "pooling_dtype_0", "pooling_dtype_1",
+    "pooling_dtype_0", "pooling_dtype_1",
     # kantor 重定标
-    "kantor_mode", "kantor_A_spc", "kantor_A_spg", "kantor_A_scale_axis",
+    "kantor_A_spc", "kantor_A_spg", "kantor_A_scale_axis",
     "kantor_A_scale_buffer_file", "kantor_A_bias_buffer_file",
     "kantor_A_Shift",
     # LUT 激活
@@ -89,7 +118,6 @@ NOT_APPLICABLE = {
     "clip_to_relu": "Clip 转 Relu 的标记，由 #pim.act_spec 的 relu_x 表达",
     "contraction": "融合块本身，已按结构产出",
     "subnetwork": "PDF 标 irrelevant, not used by NGC currently",
-    "use_dynamic_quantization": "本方案先做静态量化，恒为 0 即不产出",
     "link_node": "PDF 未说明用途，参考产物中不存在",
 }
 

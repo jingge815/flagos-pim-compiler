@@ -95,15 +95,17 @@ def check_rule1_fusion(nodes: list[str]) -> list[str]:
 def consumed_buffers(block: str) -> list[str]:
     """一个节点读取的全部缓冲区名，含多输入算子的每个槽位。
 
-    槽位数按 `input_count` 走，不写死上限：参考产物最多 2 个输入，但 attention
-    有 q/k/v 三个，写死 0/1 会把第三个槽漏掉。
+    **不能按 `input_count` 枚举槽位**：MatMul 的第二个 operand 走权重通路，
+    它的 `input_count` 故意比实际槽数少 1（实测参考产物 64 个 MatMul 全如此）。
+    按它枚举会漏掉最后一个槽，于是那个槽的缓冲区被判成「没人读」的悬空引用。
+
+    改为直接扫到 32 槽为止——GML 的槽号上限是 31（Concat 最多 32 个输入）。
     """
     names = []
     single = field(block, "input_buffer")
     if single:
         names.append(single)
-    count = field(block, "input_count")
-    for slot in range(int(count) if count else 0):
+    for slot in range(32):
         name = field(block, f"input_buffer_{slot}")
         if name:
             names.append(name)

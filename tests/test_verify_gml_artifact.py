@@ -268,13 +268,24 @@ def test_output_buffer_points_at_the_consumer(artifact_dir) -> None:
         downstream = attrs.get("output0_node_id")
         if not isinstance(produced, str) or downstream is None:
             continue
+        # phase 型节点（带 rtl_version 的 DQ）自命名 output_buffer_<self>，
+        # 不走「按消费者编号」那条规则。实测 37 个自命名节点与 37 个
+        # rtl_version 完全重合，所以这里跳过它们。
+        if produced.startswith("output_buffer_"):
+            continue
+        # 流进消费者**权重通路**的那一路命名为 `weight_buffer_<消费者>`
+        # （MatMul 的第二个 operand 不占数据槽），所以不会出现在下游的
+        # input_buffer 里 —— 见计划 §11.5.6 那张归属表。
+        if produced.startswith("weight_buffer_"):
+            continue
         consumer = by_node_id.get(downstream)
         if consumer is None:
             continue
-        consumed = [
-            consumer.get(key) for key in
-            ("input_buffer", "input_buffer_0", "input_buffer_1",
-             "input_buffer_2")
+        # 扫到 32 槽为止，不能只查 0..2：逐头展开后 Concat 有 32 个输入
+        # （每头一个），GML 的槽号上限就是 31。
+        consumed = [consumer.get("input_buffer")]
+        consumed += [
+            consumer.get(f"input_buffer_{slot}") for slot in range(32)
         ]
         assert produced in [name for name in consumed if name], (
             f"节点输出 {produced} 不在下游 {downstream} 的输入里")

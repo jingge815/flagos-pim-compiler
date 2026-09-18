@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from contracts.gml_quant import (
     ACTIVATION_LAYOUT,
-    DQ_PHASE_COUNT,
-    DQ_REDUCTION_WIDTH,
+    PHASE_COUNTS,
+    dq_group_size,
     DTYPES,
     INT4_BYTES_PER_VALUE,
     INT4_MAX,
@@ -141,12 +141,36 @@ def test_scaling_is_scalar_in_llama2(graph_text: str) -> None:
         assert len(scaling) == 1, f"{name} 有 {len(scaling)} 项，预期标量"
 
 
-def test_dynamic_quantization_phase_count(graph_text: str) -> None:
-    """phase 字段的编号范围要与契约一致。"""
+def test_phase_counts_are_per_operator(graph_text: str) -> None:
+    """相数按算子分，不是统一值。
+
+    实测 DynamicScaling 是 4 相、Softmax 是 5 相。原先统一记 5 相会给 DQ
+    多分配一整套 phase 文件与字段，所以这条要按算子逐个核对。
+    """
     phases = {int(n) for n in re.findall(r"input_buffer_phase_(\d+)", graph_text)}
     assert phases, "实物里应当有 phase 字段"
-    assert max(phases) < DQ_PHASE_COUNT
-    assert DQ_REDUCTION_WIDTH == 1024
+    # 全图最大相号由相数最多的算子（Softmax，5 相 -> 编号 0..4）决定。
+    assert max(phases) == max(PHASE_COUNTS.values()) - 1
+    assert PHASE_COUNTS["DynamicScaling"] == 4
+    assert PHASE_COUNTS["Softmax"] == 5
+
+
+def test_dq_group_size_follows_the_tensor() -> None:
+    """分组宽度按被量化的张量变化，它是唯一按节点变化的 phase 字段。
+
+    实测 global_pooling_group_size_phase_0 只有两种取值：128（5 个节点，
+    hidden 与 MLP 中间态）与 1024（32 个节点，attention scores 整条一组）。
+    """
+    assert dq_group_size(4096, is_attention_scores=False) == 128
+    assert dq_group_size(11008, is_attention_scores=False) == 128
+    assert dq_group_size(1024, is_attention_scores=True) == 1024
+
+
+def test_reference_group_sizes_match_the_rule(graph_text: str) -> None:
+    """实物的 group_size 取值集合必须被上面的规则覆盖。"""
+    sizes = {int(n) for n in re.findall(
+        r"global_pooling_group_size_phase_0 (\d+)", graph_text)}
+    assert sizes == {128, 1024}, sizes
 
 
 def test_lut_size_is_fixed(graph_text: str) -> None:
@@ -195,19 +219,29 @@ def test_near_empty_luts_are_legal() -> None:
 
 
 def test_layout_scale_counts() -> None:
-    """布局算出的 scale 数要符合定义。"""
-    assert ACTIVATION_LAYOUT.scale_count((128, 4096)) == 1
-    assert WEIGHT_LAYOUT.scale_count((4096, 4096)) == 4096 // WEIGHT_GROUP_SIZE
+    """布局算出的 scale 数要符合定义。
+
+    per_group 是 numel/group_size，不是「某根轴长/group_size」——
+    激活与权重都是 per-channel + per-group 同时开启，沿最后一维切。
+    """
+    # 激活侧实测：hidden 4096 -> 32 个 scale、MLP 中间态 11008 -> 86 个。
+    assert ACTIVATION_LAYOUT.scale_count((1, 1, 1, 4096)) == 32
+    assert ACTIVATION_LAYOUT.scale_count((1, 1, 1, 11008)) == 86
+
+    # 权重侧实测：两种形状的 scale 数都等于 numel/128（排布顺序不同）。
+    assert WEIGHT_LAYOUT.scale_count((4096, 4096)) == 4096 * 4096 // WEIGHT_GROUP_SIZE
+    assert WEIGHT_LAYOUT.scale_count((11008, 4096)) == 352256
+    assert WEIGHT_LAYOUT.scale_count((4096, 11008)) == 352256
 
     per_channel = QuantLayout("per_channel", axis=1)
     assert per_channel.scale_count((128, 256)) == 256
 
 
-def test_group_size_must_divide_the_axis() -> None:
-    """不能整除就直接抛——静默取整会让 scale 与权重错位。"""
-    layout = QuantLayout("per_group", group_size=128, axis=0)
+def test_group_size_must_divide_the_last_axis() -> None:
+    """最后一维不能整除就直接抛——静默取整会让 scale 与权重错位。"""
+    layout = QuantLayout("per_group", group_size=128, axis=-1)
     with pytest.raises(ValueError, match="不能被 group_size"):
-        layout.scale_count((100, 256))
+        layout.scale_count((256, 100))
 
 def test_identity_lut_matches_the_reference_byte_for_byte() -> None:
     """我们生成的恒等 LUT 必须与实物逐字节相同。

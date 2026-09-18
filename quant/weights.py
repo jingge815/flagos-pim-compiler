@@ -13,7 +13,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from contracts.gml_quant import INT4_MAX, INT4_MIN, WEIGHT_GROUP_SIZE
+from contracts.gml_quant import (
+    INT4_MAX,
+    INT4_MIN,
+    INT4_SCALE_DIVISOR,
+    WEIGHT_GROUP_SIZE,
+)
 
 
 @dataclass
@@ -39,8 +44,13 @@ def quantize_weight(
 ) -> QuantizedWeight:
     """按组量化一个权重张量。
 
-    每组独立取 scale：`scale = max(|w|) / 7`，这样组内最大值恰好映射到 int4 的
-    正端。用 7 而不是 8 是因为 `[-8, 7]` 不对称，按 8 缩放会让正端溢出。
+    每组独立取 scale：`scale = max(|w|) / 8`，即 absmax 映射到 **8**（满量程），
+    再 clamp 到 `[-8, 7]`。
+
+    分母是 8 而不是 7，这是实测结论：分母取 7 时 `|q| = 8` 数学上不可能出现
+    （`round(absmax / (absmax/7)) = 7`），而实测 5 个权重张量共 15000 组里
+    有 7801 组（52%）含 `q = -8`。分母 8 下 absmax 那一侧会 clamp 掉 1 个码点
+    （正端 8 -> 7），代价是 1 个 LSB，换来的是与实物一致的 scale。
 
     元素数必须能被 `group_size` 整除——不能整除就抛，静默补零会让 scale 与权重
     错位，而这种错在结构校验里看不出来。
@@ -53,7 +63,7 @@ def quantize_weight(
     grouped = flat.reshape(-1, group_size)
     # 全零组的 scale 取 1 而不是 0：除以 0 会产出 nan，而全零权重量化后本就该是全零。
     peak = np.abs(grouped).max(axis=1)
-    scales = np.where(peak > 0, peak / INT4_MAX, 1.0).astype(np.float16)
+    scales = np.where(peak > 0, peak / INT4_SCALE_DIVISOR, 1.0).astype(np.float16)
 
     quantized = np.rint(grouped / scales.astype(np.float32)[:, None])
     values = np.clip(quantized, INT4_MIN, INT4_MAX).astype(np.int8)
