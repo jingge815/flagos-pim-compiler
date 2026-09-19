@@ -193,7 +193,7 @@ def gml_text(graph):
     clone = copy.deepcopy(graph)
     fuse_for_pim(clone)
     split_attention_heads(clone)
-    nodes, edges, _ = convert(clone)
+    nodes, edges, _, _ = convert(clone)
     return write_gml(nodes, edges, version="26.2.1")
 
 
@@ -257,7 +257,7 @@ def test_input_count_identity_still_holds(graph) -> None:
     clone = copy.deepcopy(graph)
     fuse_for_pim(clone)
     split_attention_heads(clone)
-    nodes, edges, _ = convert(clone)
+    nodes, edges, _, _ = convert(clone)
 
     total = sum(int(n.fields.get("input_count", 0)) for n in nodes)
     matmuls = sum(1 for n in nodes if n.fields.get("op_type") == "MatMul")

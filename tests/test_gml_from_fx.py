@@ -33,7 +33,7 @@ def gml_text() -> str:
 
     gm = _export_random_llama()
     fuse_graph(gm)
-    nodes, edges, _ = convert(gm)
+    nodes, edges, _, _ = convert(gm)
     return write_gml(nodes, edges, version="26.10.1")
 
 
@@ -176,7 +176,7 @@ def test_residual_output_buffer_is_emitted() -> None:
     原实现只写了 `outputN_node_id`，漏了 residual 那一份 —— 三份连接信息
     （edge / outputN / residual）少一份，对方按 residual 推依赖时会缺边。
     """
-    nodes, edges, _ = convert(_llama_like_graph())
+    nodes, edges, _, _ = convert(_llama_like_graph())
 
     with_ports = [n for n in nodes if any(
         key.startswith("output") and key.endswith("_node_id")
@@ -200,7 +200,7 @@ def test_residual_output_buffer_is_emitted() -> None:
 
 def test_residual_input_buffer_matches_ports() -> None:
     """输入侧同理，三份信息要同步。"""
-    nodes, _, _ = convert(_llama_like_graph())
+    nodes, _, _, _ = convert(_llama_like_graph())
 
     for node in nodes:
         residual = [
@@ -223,7 +223,7 @@ def test_matmul_under_reports_input_count_by_one() -> None:
     第二个 operand 走**权重通路**、不占输入槽。实测参考产物 64 个 MatMul 全如此，
     且恒等式 `Σ input_count + MatMul 数 == 边数` 依赖它（267 + 64 == 331）。
     """
-    nodes, edges, _ = convert(_llama_like_graph())
+    nodes, edges, _, _ = convert(_llama_like_graph())
 
     matmuls = [n for n in nodes if n.fields.get("op_type") == "MatMul"]
     assert matmuls, "小图里应当有 MatMul"
@@ -241,7 +241,7 @@ def test_input_count_identity_holds() -> None:
     这条恒等式是独立于生成器推导出来的（从实物统计），所以它能抓到
     生成器与结构校验器「共享同一个错误假设」的那类 bug。
     """
-    nodes, edges, _ = convert(_llama_like_graph())
+    nodes, edges, _, _ = convert(_llama_like_graph())
 
     total = sum(int(n.fields.get("input_count", 0)) for n in nodes)
     matmuls = sum(1 for n in nodes if n.fields.get("op_type") == "MatMul")
@@ -254,7 +254,7 @@ def test_port_keys_use_the_naming_helpers() -> None:
     钉住这条是因为端口 >= 10 时 residual 的键名多一个下划线，
     自己拼字符串迟早会漏掉那个规则。
     """
-    nodes, _, _ = convert(_llama_like_graph())
+    nodes, _, _, _ = convert(_llama_like_graph())
 
     for node in nodes:
         for key in node.fields:

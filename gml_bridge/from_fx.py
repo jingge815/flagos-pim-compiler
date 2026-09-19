@@ -102,14 +102,11 @@ def _op_type_of(node):
     抽成函数是因为三处都要用它：发射本节点的字段、生产者给输出缓冲定槽号、
     以及 dtype 沿边传播时定键名 —— 三处必须得到同一个答案。
     """
-    if DQ_META_KEY in node.meta:
-        return "DynamicScaling"
-    if RMS_NORM_META_KEY in node.meta:
-        return "RMSNorm_vpu"
-    if KV_DMA_META_KEY in node.meta:
-        return "KV_Cache_DMA"
-    if SPLIT_META_KEY in node.meta:
-        return "Split"
+    # RoPE 要在 DQ **之前**判。K 路的 RoPE 节点两个标记都有：
+    # `fuse_rope` 打 ROPE，而本模块发射 `Llama2ActivationDQ` 时会补一个
+    # DQ 标记（为了复用 DQ 的写盘路径，见 `convert` 里那处 `node.meta[...]`）。
+    # 顺序反了的话，同一张图第二次 convert 就会把它降级成 DynamicScaling
+    # —— 实测会让 GML 从 200 节点变 206、op_type 也变掉。
     if ROPE_META_KEY in node.meta:
         # 折叠出来的 RoPE。实测两个变体各出现一次：
         #   第一条（Q）-> Llama2Activation（transpose=0，下游 Transpose）
@@ -118,6 +115,14 @@ def _op_type_of(node):
         # 不能靠「下游有没有 Split」判 —— 逐头展开之后 Q/K 都有 slice。
         return ("Llama2ActivationDQ"
                 if _is_second_rope(node) else "Llama2Activation")
+    if DQ_META_KEY in node.meta:
+        return "DynamicScaling"
+    if RMS_NORM_META_KEY in node.meta:
+        return "RMSNorm_vpu"
+    if KV_DMA_META_KEY in node.meta:
+        return "KV_Cache_DMA"
+    if SPLIT_META_KEY in node.meta:
+        return "Split"
     role = node.meta.get(HEAD_ROLE_META_KEY)
     if role in _ROLE_OP_TYPES:
         return _ROLE_OP_TYPES[role]
@@ -328,15 +333,58 @@ def _weight_param_of(node: FxNode) -> str | None:
     return None
 
 
-def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node], list[Edge], dict[int, str]]:
+def _phase_count_for(phase_source, op_type: str, label: str) -> int:
+    """一个多相算子发几套 `*_phase_N` 字段。
+
+    **真源是算子编译器**：`phase_source` 非空时按它给的相位数发字段，所以
+    FlagTree 的 `-pim-expand-phases` 改了相位结构，GML 的字段套数就跟着变。
+    没接上算子编译器时退回 `contracts.gml_quant.PHASE_COUNTS` 静态表。
+
+    `Llama2ActivationDQ` 的 DQ 部分查 `dq`：它是「RoPE 3 连 + DQ 4 相」，
+    `*_phase_N` 字段只对应后面那 4 相。
+    """
+    kind = {
+        "DynamicScaling": "dq",
+        "Llama2ActivationDQ": "dq",
+        "Softmax": "softmax",
+        "Llama2Activation": "rope",
+    }.get(op_type)
+    fallback = PHASE_COUNTS.get(op_type, 0)
+
+    if phase_source is None or kind is None:
+        return fallback
+    plan = phase_source.plan(label, kind)
+    return fallback if plan is None else plan.count
+
+
+def convert(
+    gm: GraphModule, *, version: str = GML_VERSION, phase_source=None
+) -> tuple[list[Node], list[Edge], dict[int, str], dict[int, object]]:
     """把融合后的图转成 GML 节点与边。
 
     要求 `gm` 已经跑过 `graph.fuse.fuse_graph`：图里若还有独立激活节点，
     GML 无法表达，这里会直接抛。
+
+    `phase_source` 是 `opcompiler_bridge.phase_source.PhaseSource`：**相位数的
+    真源**。给了它，每个多相算子发几套 `*_phase_N` 字段就由算子编译器
+    （FlagTree 的 `-pim-expand-phases`）决定；没给则退回
+    `contracts.gml_quant.PHASE_COUNTS` 静态表。
+
+    两条路径当前产出**相同**的 GML，因为算子编译器算出的相位数与静态表一致
+    ——这正是 `phase_source.cross_check()` 在保证的。但依赖是真的：pass 若改了
+    相位结构，GML 的字段套数会跟着变。
     """
     emittable = {node for node in gm.graph.nodes if _is_emittable(node)}
     if not emittable:
         raise ValueError("图里没有可映射到 GML 的算子")
+
+    def phase_count(op_type: str, label: str) -> int:
+        """这个算子发几套 `*_phase_N` 字段。
+
+        真源是算子编译器；没接上时退回静态表。两者不一致会在
+        `phase_source.cross_check()` 里被拦下，所以这里直接用。
+        """
+        return _phase_count_for(phase_source, op_type, label)
 
     # 逆拓扑编号：id 越小越靠输出。参考产物就是这个约定，最终输出是 id 2。
     ordered = [node for node in gm.graph.nodes if node in emittable]
@@ -350,6 +398,9 @@ def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node],
 
     gml_nodes: list[Node] = []
     edges: list[Edge] = []
+    # K 路 RoPE 那个节点也要走 DQ 的写盘路径。收在这里而不是写回
+    # `node.meta`，序列化才是纯函数（见下面赋值处的说明）。
+    extra_dq_specs: dict[int, object] = {}
     # node_id -> FX 参数名。写盘阶段按它从图里取 f32 权重去量化。
     weight_params: dict[int, str] = {}
 
@@ -622,7 +673,8 @@ def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node],
                 fields["original_shape"] = _shape_literal(shape)
                 fields["output_shape_by_group"] = _shape_literal(
                     tuple(shape[:-1]) + (dq_spec.groups, dq_spec.group_size))
-            for phase in range(PHASE_COUNTS["DynamicScaling"]):
+            # 相位数由算子编译器给出（没接上时退回静态表）。
+            for phase in range(phase_count("DynamicScaling", node.name)):
                 fields.update(hw_table.phase_fields(
                     "DynamicScaling", phase, group_size=dq_spec.group_size))
                 fields[f"input_buffer_phase_{phase}"] = (
@@ -679,7 +731,8 @@ def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node],
                 fields["rtl_version"] = hw_table.RTL_VERSION
                 fields["dq_contraction"] = 1
                 fields["transpose"] = 1
-                for phase in range(PHASE_COUNTS["DynamicScaling"]):
+                # 同样由算子编译器给相位数（查 dq：`*_phase_N` 只对应后 4 相）。
+                for phase in range(phase_count("Llama2ActivationDQ", node.name)):
                     fields.update(hw_table.phase_fields(
                         "Llama2ActivationDQ", phase, group_size=128))
                     fields[f"input_buffer_phase_{phase}"] = (
@@ -700,11 +753,15 @@ def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node],
                     names.phase_kantor_bias(node_id, 3))
                 fields["kantor_A_Shift_buffer_file_phase_3"] = (
                     names.phase_kantor_shift(node_id, 3))
-                # 复用已有的 DQ 写盘路径：给这个 FX 节点打上同样的标记，
-                # `_dq_specs` 会按 label 反查 node_id 然后 write_dq_phases。
+                # 复用已有的 DQ 写盘路径：这个节点也要 write_dq_phases。
+                #
+                # **不写 `node.meta`**：那会让 `convert()` 改图，同一份图序列化
+                # 两次结果就不同（`_dq_specs` 第二次会多认出这个节点，RoPE 的
+                # `output_sf` 等字段跟着变）。收集到局部 dict 里返回，序列化就是
+                # 纯函数。
                 from graph.quant_pass import DynamicScalingSpec
                 numel = _numel_of_fx(node)
-                node.meta[DQ_META_KEY] = DynamicScalingSpec(
+                extra_dq_specs[node_id] = DynamicScalingSpec(
                     group_size=128, numel=numel or 128,
                     is_attention_scores=False)
             for unit, block in hw_table.ROPE_UNITS:
@@ -787,4 +844,4 @@ def convert(gm: GraphModule, *, version: str = GML_VERSION) -> tuple[list[Node],
         for consumer in downstream:
             edges.append(Edge(node_id, node_ids[consumer], shape or "unknown"))
 
-    return gml_nodes, edges, weight_params
+    return gml_nodes, edges, weight_params, extra_dq_specs

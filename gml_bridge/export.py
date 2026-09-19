@@ -78,32 +78,72 @@ def _referenced_buffers(nodes: list[Node]) -> set[str]:
     return referenced
 
 
-def export_graph(gm: GraphModule, *, version: str = GML_VERSION) -> GmlArtifact:
+def export_graph(gm: GraphModule, *, version: str = GML_VERSION,
+                 phase_source=None) -> GmlArtifact:
     """把一张已导出的 FX 图转成 GML。
 
     融合在这里做，不要求调用方先做：GML 没有独立激活节点的表达方式，所以这一步
     不是可选的。
 
-    三个 pass 顺序固定：
-    1. `fuse_for_pim` —— llama2 特有的固定模式（RMSNorm 六合一、Gemm+SiLU、
-       attention 定标吸收）。它要在通用 pass 之前跑，因为 RMSNorm 那条链
-       一旦被通用 pass 拆动就匹配不上了。
-    2. `fuse_graph` —— 通用的「主算子 + 尾部激活」，服务 ResNet 那条路径。
-    3. `split_attention_heads` —— 把批量 attention 拆成逐头链。**必须最后跑**：
-       它产出的逐头节点带角色标记，若先跑，前两个 pass 会把那些
-       `add` / `mul` 当成普通逐元素算子去折。
+    `phase_source` 是 `opcompiler_bridge.phase_source.PhaseSource`：多相算子发
+    几套 `*_phase_N` 字段由**算子编译器**决定。没给则退回静态表
+    `contracts.gml_quant.PHASE_COUNTS`。两条路径当前产出相同的 GML，因为算子
+    编译器算出的相位数与静态表一致——这是 `cross_check()` 保证的，也是验收
+    判据（接入前后逐字节相同）。但依赖是真的：pass 改了相位结构，字段套数变。
+
+    **不幂等**：对同一个 `gm` 调两次会得到不同的图（实测第二次 206 节点而非
+    200）。要在融合与序列化之间插一步（比如跑算子编译器），用
+    `fuse_for_gml` + `serialize_gml` 这对函数，不要调两次本函数。
     """
-    # RoPE 要在逐头展开**之前**折：展开会把 Q/K 切成每头一份，
-    # 切完这条链的判据仍成立但节点翻 32 倍，白做 31 次匹配。
-    rope_report = fuse_rope(gm)
+    report = fuse_for_gml(gm)
+    return serialize_gml(gm, report, version=version, phase_source=phase_source)
+
+
+@dataclass
+class FusionReport:
+    """`fuse_for_gml` 的产出，喂给 `serialize_gml`。"""
+
+    fusions: int
+    heads: int
+    dq_nodes: int
+
+
+def fuse_for_gml(gm: GraphModule) -> FusionReport:
+    """原地跑完 GML 需要的六个 pass。**只能对一个 `gm` 调一次。**
+
+    拆出来是为了让调用方能在融合与序列化之间插一步——算子编译器要吃融合后的
+    图，而 GML 的相位字段又要等算子编译器的结果，两者必须串在中间。
+
+    pass 顺序固定：
+    1. `fuse_rope` —— 要在逐头展开**之前**折：展开会把 Q/K 切成每头一份，
+       切完判据仍成立但节点翻 32 倍，白做 31 次匹配。
+    2. `fuse_for_pim` —— llama2 特有的固定模式（RMSNorm 六合一、Gemm+SiLU、
+       attention 定标吸收）。要在通用 pass 之前跑，因为 RMSNorm 那条链
+       一旦被通用 pass 拆动就匹配不上了。
+    3. `fuse_graph` —— 通用的「主算子 + 尾部激活」，服务 ResNet 那条路径。
+    4. `split_attention_heads` —— 把批量 attention 拆成逐头链。**必须在前三个
+       之后**：它产出的逐头节点带角色标记，若先跑，前面的 pass 会把那些
+       `add` / `mul` 当成普通逐元素算子去折。
+    5. `insert_kv_dma_and_split` / `insert_dynamic_scaling` —— 最后跑：
+       插 DQ 的规则依赖逐头角色（matmul1 不插、matmul2 插），KV 写回的位置
+       判据依赖拆头留下的头下标标记。
+    """
+    fuse_rope(gm)
     pim_report = fuse_for_pim(gm)
     fusions = fuse_graph(gm) + pim_report.total
     heads = split_attention_heads(gm)
-    # 量化 pass 最后跑：插 DQ 的规则依赖逐头角色（matmul1 不插、matmul2 插）。
-    # KV 写回与拆头要在逐头展开**之后**：位置判据依赖它留下的头下标标记。
-    kv_report = insert_kv_dma_and_split(gm)
+    insert_kv_dma_and_split(gm)
     quantized = insert_dynamic_scaling(gm)
-    nodes, edges, weight_params = convert(gm, version=version)
+    return FusionReport(fusions=fusions, heads=heads.heads,
+                        dq_nodes=quantized.inserted)
+
+
+def serialize_gml(gm: GraphModule, report: FusionReport, *,
+                  version: str = GML_VERSION,
+                  phase_source=None) -> GmlArtifact:
+    """把已融合的图序列化成 GML。**纯函数**：可重复调用，不改图。"""
+    nodes, edges, weight_params, extra_dq = convert(
+        gm, version=version, phase_source=phase_source)
     text = write_gml(nodes, edges, version=version)
     return GmlArtifact(
         text=text,
@@ -111,15 +151,19 @@ def export_graph(gm: GraphModule, *, version: str = GML_VERSION) -> GmlArtifact:
         edges=edges,
         weight_params=weight_params,
         buffer_names=_referenced_buffers(nodes),
-        fusions=fusions,
-        heads=heads.heads,
-        dq_nodes=quantized.inserted,
-        dq_specs=_dq_specs(gm, nodes),
+        fusions=report.fusions,
+        heads=report.heads,
+        dq_nodes=report.dq_nodes,
+        dq_specs=_dq_specs(gm, nodes, extra_dq),
     )
 
 
-def _dq_specs(gm: GraphModule, nodes: list[Node]) -> dict:
-    """按 node_id 收集 DQ 规格。GML 的 `label` 就是 FX 节点名，按它反查。"""
+def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None) -> dict:
+    """按 node_id 收集 DQ 规格。GML 的 `label` 就是 FX 节点名，按它反查。
+
+    `extra` 是 `convert()` 额外认出来的（K 路 RoPE 那个节点也要走 DQ 写盘，
+    但它的规格不在 `node.meta` 里——`convert` 不再写图，改成返回值传出来）。
+    """
     by_label = {
         node.fields.get("label"): node.node_id for node in nodes}
     specs = {}
@@ -127,6 +171,8 @@ def _dq_specs(gm: GraphModule, nodes: list[Node]) -> dict:
         spec = fx_node.meta.get(DQ_META_KEY)
         if spec is not None and fx_node.name in by_label:
             specs[by_label[fx_node.name]] = spec
+    if extra:
+        specs.update(extra)
     return specs
 
 

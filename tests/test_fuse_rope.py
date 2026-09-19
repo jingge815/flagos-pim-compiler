@@ -99,7 +99,7 @@ def test_gml_op_types_match_reference_ratio(graph) -> None:
     split_attention_heads(clone)
     insert_kv_dma_and_split(clone)
     insert_dynamic_scaling(clone)
-    nodes, edges, _ = convert(clone)
+    nodes, edges, _, _ = convert(clone)
     text = write_gml(nodes, edges, version="26.2.1")
     counts = collections.Counter(re.findall(r'op_type "([^"]+)"', text))
     assert counts["Llama2Activation"] == 1
