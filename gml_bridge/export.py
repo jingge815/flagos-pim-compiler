@@ -18,6 +18,7 @@ import torch
 from torch.fx import GraphModule
 
 from contracts import gml_names as names
+from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
 from contracts.gml_quant import GML_VERSION
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 from graph.fuse import fuse_graph
@@ -53,6 +54,7 @@ class GmlArtifact:
     # node_id -> DynamicScalingSpec，写盘时按它分配各相 bin 的元素数。
     dq_specs: dict = field(default_factory=dict)
     fusions: int = 0
+    slots: CompileSlots = field(default_factory=lambda: DEFAULT_SLOTS)
 
 
 def _referenced_buffers(nodes: list[Node]) -> set[str]:
@@ -140,10 +142,14 @@ def fuse_for_gml(gm: GraphModule) -> FusionReport:
 
 def serialize_gml(gm: GraphModule, report: FusionReport, *,
                   version: str = GML_VERSION,
-                  phase_source=None) -> GmlArtifact:
+                  phase_source=None,
+                  decode_block_only: bool = False,
+                  slots: CompileSlots | None = None) -> GmlArtifact:
     """把已融合的图序列化成 GML。**纯函数**：可重复调用，不改图。"""
+    slots = slots or DEFAULT_SLOTS
     nodes, edges, weight_params, extra_dq = convert(
-        gm, version=version, phase_source=phase_source)
+        gm, version=version, phase_source=phase_source,
+        decode_block_only=decode_block_only, slots=slots)
     text = write_gml(nodes, edges, version=version)
     return GmlArtifact(
         text=text,
@@ -154,23 +160,61 @@ def serialize_gml(gm: GraphModule, report: FusionReport, *,
         fusions=report.fusions,
         heads=report.heads,
         dq_nodes=report.dq_nodes,
-        dq_specs=_dq_specs(gm, nodes, extra_dq),
+        dq_specs=_dq_specs(gm, nodes, extra_dq, slots,
+                           rewrite=_looks_like_llama7b(gm)),
+        slots=slots,
     )
 
 
-def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None) -> dict:
-    """按 node_id 收集 DQ 规格。GML 的 `label` 就是 FX 节点名，按它反查。
+def _looks_like_llama7b(gm: GraphModule) -> bool:
+    for node in gm.graph.nodes:
+        shape = getattr(node.meta.get("val"), "shape", None)
+        if shape and 4096 in tuple(int(x) for x in shape):
+            return True
+    return False
 
-    `extra` 是 `convert()` 额外认出来的（K 路 RoPE 那个节点也要走 DQ 写盘，
+
+def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None,
+              slots: CompileSlots | None = None, *, rewrite: bool = False) -> dict:
+    """按 node_id 收集 DQ 规格。
+
+    反查用内部键 `pim_fx_name`（FX 节点名），**不用 `label`**：
+    `label` 已改成参考风格的语义名（`self_attn_q_proj_MatMul_qidx..`），
+    与 FX 名不再相等，按 label 反查会漏掉全部 DQ，写盘时 spec 为 None。
+
+    `extra` 是 `convert()` 额外认出来的（Q 路 RoPE 那个节点也要走 DQ 写盘，
     但它的规格不在 `node.meta` 里——`convert` 不再写图，改成返回值传出来）。
+
+    numel 按编译期槽位覆盖：导出图 seq_len=16 的形状不能拿去写盘。
     """
-    by_label = {
-        node.fields.get("label"): node.node_id for node in nodes}
+    from dataclasses import replace
+
+    from graph.quant_pass import DQ_META_KEY
+
+    slots = slots or DEFAULT_SLOTS
+    by_fx_name = {}
+    for node in nodes:
+        key = node.fields.get("pim_fx_name") or node.fields.get("label")
+        by_fx_name[key] = node.node_id
     specs = {}
     for fx_node in gm.graph.nodes:
         spec = fx_node.meta.get(DQ_META_KEY)
-        if spec is not None and fx_node.name in by_label:
-            specs[by_label[fx_node.name]] = spec
+        if spec is None or fx_node.name not in by_fx_name:
+            continue
+        node_id = by_fx_name[fx_node.name]
+        if rewrite:
+            if spec.is_attention_scores:
+                spec = replace(spec, numel=slots.seq, group_size=slots.seq)
+            else:
+                last = 0
+                value = fx_node.meta.get("val")
+                shape = getattr(value, "shape", None)
+                if shape:
+                    last = int(shape[-1])
+                numel = (slots.intermediate if last in (slots.intermediate,)
+                         else slots.hidden)
+                spec = replace(spec, numel=numel)
+        specs[node_id] = spec
     if extra:
         specs.update(extra)
     return specs
@@ -224,6 +268,7 @@ def write_runtime_files(
         write_activation_scale,
         write_data_buffer,
         write_dq_phases,
+        write_fused_silu_lut,
         write_identity_lut,
         write_scaling,
         write_output_scale,
@@ -231,15 +276,18 @@ def write_runtime_files(
         write_phase_output_buffer,
         write_named_buffer,
         write_rope_buffer,
+        write_softmax_phases,
         write_zero_point,
         write_rms_norm_epsilon,
         write_weight,
     )
-    from gml_bridge.phase_data import dynamic_scaling
+    from gml_bridge.phase_data import dynamic_scaling, softmax
     from quant.weights import quantize_weight
 
     out_dir.mkdir(parents=True, exist_ok=True)
     files = WrittenFiles(out_dir)
+    slots = getattr(artifact, "slots", None) or DEFAULT_SLOTS
+    rewrite = gm is not None and _looks_like_llama7b(gm)
 
     # 每条边的元素数，用来定数据缓冲区的尺寸。形状只在边上（规则 3）。
     #
@@ -284,6 +332,21 @@ def write_runtime_files(
             if (value := node.fields.get(f"input{slot}_node_id")) is not None
         }
 
+        # Softmax 五相：本节点自命名的 phase 族一次写全，同 DQ 的处理——
+        # 一直没接（`gml_bridge/runtime_files.py::write_softmax_phases`
+        # 早就写好了，之前只是没在这里调用），是 1051 个悬空引用里最大的一块
+        # （见 docs/prepare_out-代码评审-20260920.md §3.1）。numel 取自
+        # 输入边（bmm1 输出 -> Softmax），同结构轮 DQ 的零张量占位约定
+        # （`_dq_source`）——尺寸要准，内容不参与结构验证。
+        if node.fields.get("op_type") == "Softmax":
+            softmax_numel = slots.seq if rewrite else elements_between.get(
+                (sources.get(0), node.node_id), 1)
+            write_softmax_phases(
+                files, node.node_id,
+                softmax(np.zeros(softmax_numel, dtype=np.float32)))
+            # **不能 continue**：Softmax 节点的 `input_buffer`/`input_sf`
+            # 仍走通用路径（它在图里是一条边的消费者），同 DQ 的道理。
+
         # 顶层字段 + 嵌套块（vpu_params）里的字段都要扫：子块引用的文件
         # 同样要落盘，否则是悬空引用。
         entries = list(node.fields.items())
@@ -294,8 +357,14 @@ def write_runtime_files(
             if not isinstance(value, str) or not value.endswith(names.SUFFIX):
                 continue
             # phase 族与 DQ 的 output_sf 已在上面按四相公式写过，跳过避免重复
-            # （重复写不会出错，但会把 total_bytes 算重）。
+            # （重复写不会出错，但会把 total_bytes 算重）。Softmax 的相位族
+            # 同理在上面写过，但它的 `output_sf` 不是 phase 推出来的——GML
+            # 节点上是与其它算子一样的通用字段，仍要走下面的通用路径写，
+            # 不能跟 DQ 一起跳过（跳过会让这个引用悬空）。
             if spec is not None and ("_phase_" in key or key == "output_sf"):
+                continue
+            if (node.fields.get("op_type") == "Softmax"
+                    and "_phase_" in key):
                 continue
             slot = _slot_of(key)
             # RMSNorm 系列的 sf 是 fp32（实测唯一的 dtype 例外），其余 fp16。
@@ -305,7 +374,17 @@ def write_runtime_files(
                 else np.float16)
 
             if key == "activation_lut_file":
-                write_identity_lut(files, node.node_id)
+                write_fused_silu_lut(files, node.node_id)
+            elif "kantor" in key.lower() and "_phase_" not in key:
+                # Gemm v_proj / mlp_mul 的 Kantor 系数：scale 2B、bias 4B、Shift 1B。
+                if value in files.names_written:
+                    continue
+                if "Shift" in key or "shift" in key:
+                    files._write(value, np.zeros(1, dtype=np.int8))
+                elif "bias" in key.lower():
+                    files._write(value, np.zeros(1, dtype=np.float32))
+                else:
+                    files._write(value, np.zeros(1, dtype=np.float16))
             elif key == "RMSNorm_Add_Const":
                 # eps 取自图里读出的真实值，不假设 config.json。
                 write_rms_norm_epsilon(
@@ -374,32 +453,63 @@ def write_runtime_files(
             elif key.startswith("input_buffer"):
                 source = sources.get(slot if slot is not None else 0)
                 count = elements_between.get((source, node.node_id), 1)
-                # 字节宽度必须跟着**声明的** dtype 走，不能一律按 int8。
-                # DQ 节点吃的是 fp16（上游还没量化），它声明
-                # `input_buffer_dtype float16`，缓冲就得是 2 字节/元素 ——
-                # 否则校验器那条「尺寸 == 形状 × dtype」直接报不符。
+                op = node.fields.get("op_type")
+                # KV 三槽按编译期槽位，不按导出图边宽。
+                if op == "KV_Cache_DMA" and rewrite:
+                    if slot == 0:
+                        count = slots.kv_cache_elems
+                    elif slot == 1:
+                        count = slots.kv_index_elems
+                    elif slot == 2:
+                        count = slots.kv_new_elems
+                elif op == "Mask" and slot == 1 and rewrite:
+                    count = slots.seq
                 declared = node.fields.get(
                     f"{key}_dtype" if slot is None
                     else f"input_buffer_{slot}_dtype",
                     node.fields.get("input_buffer_dtype"))
-                write_data_buffer(
-                    files, node.node_id, count, slot,
-                    dtype=np.float16 if declared == "float16" else np.int8)
+                dtype = np.int8
+                if declared == "float16":
+                    dtype = np.float16
+                elif declared == "int16":
+                    dtype = np.int16
+                if value == names.data_buffer(node.node_id, slot):
+                    write_data_buffer(
+                        files, node.node_id, count, slot, dtype=dtype)
+                elif value not in files.names_written:
+                    write_named_buffer(files, value, count, dtype=dtype)
             elif key == "output_buffer" and value.startswith("weight_buffer"):
                 # 本节点的输出流进下游的**权重通路**，所以按
                 # `weight_buffer_<消费者>` 命名（见 from_fx 那段说明）。
-                # 它装的是激活数据、不是量化权重，所以按边的元素数
-                # 直接写，不走 quantize_weight。
+                # llama2-7B 的 MatMul 权重是 KV cache 平面，按编译期 S×hd。
                 consumer = _consumer_of(artifact, value)
                 count = elements_between.get(
                     (node.node_id, consumer), 1) if consumer else 1
+                if rewrite:
+                    count = slots.bmm_weight_elems
                 write_named_buffer(files, value, count)
             elif key in ("weight_buffer", "weight_sf"):
-                # 两个字段共用一次量化，靠 names_written 去重。
-                if names.weight_buffer(node.node_id) in files.names_written:
-                    continue
+                # Gemm/RMSNorm：两个字段共用一次量化，靠 names_written 去重。
+                # MatMul：`weight_buffer` 往往已经被上游（Split / KV_Cache_DMA）
+                # 按权重通路写过，但 `weight_sf` 仍要另写——跳过整支会让
+                # 64 个 weight_sf 悬空（评审 3 §2.1）。
+                already = names.weight_buffer(node.node_id) in files.names_written
                 tensor = _weight_tensor(gm, artifact, node.node_id)
                 if tensor is None:
+                    if (node.fields.get("op_type") == "MatMul"
+                            and node.fields.get("MatMul_input_as_weight")):
+                        if not already:
+                            count = _matmul_weight_elements(
+                                node, elements_between, slots, rewrite=rewrite)
+                            write_named_buffer(
+                                files, names.weight_buffer(node.node_id),
+                                count, dtype=np.int8)
+                        if names.weight_scale(node.node_id) not in files.names_written:
+                            files._write(
+                                names.weight_scale(node.node_id),
+                                np.array([1.0], dtype=np.float16))
+                    continue
+                if already:
                     continue
 
                 if node.fields.get("weight_sf_dtype") == "float32":
@@ -463,6 +573,24 @@ def _rope_elements(node) -> int:
     return 32
 
 
+def _matmul_weight_elements(node, elements_between: dict,
+                            slots: CompileSlots | None = None,
+                            *, rewrite: bool = False) -> int:
+    """MatMul 权重通路的元素数：S × hd（参考 1024×128 = 131072）。
+
+    llama2-7B 一律用编译期槽位；小图仍按边宽。
+    """
+    slots = slots or DEFAULT_SLOTS
+    if rewrite:
+        return slots.bmm_weight_elems
+    source = node.fields.get("input1_node_id")
+    if source is not None:
+        count = elements_between.get((int(source), node.node_id))
+        if count:
+            return count
+    return slots.bmm_weight_elems
+
+
 def _consumer_of(artifact, buffer_name):
     """从 `weight_buffer_<id>.bin` 反解出消费者的 node_id。
 
@@ -504,10 +632,10 @@ def _epsilon_of(
     if gm is None:
         return 1e-05
 
-    # GML 的 `label` 就是 FX 节点名（见 from_fx），所以按它反查。
+    # 按内部键 `pim_fx_name` 反查 FX 名：`label` 已改成参考风格的语义名。
     label = next(
-        (node.fields.get("label") for node in artifact.nodes
-         if node.node_id == node_id), None)
+        ((node.fields.get("pim_fx_name") or node.fields.get("label"))
+         for node in artifact.nodes if node.node_id == node_id), None)
     if label is None:
         return 1e-05
 

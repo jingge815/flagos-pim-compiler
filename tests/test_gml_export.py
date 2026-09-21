@@ -118,6 +118,12 @@ def test_buffer_names_follow_the_naming_rules(artifact) -> None:
             names.zero_point(node_id),
             names.fpsu_bias(node_id),
             names.phase_output_buffer_self(node_id),
+            names.kantor_scale(node_id),
+            names.kantor_bias(node_id),
+            names.kantor_shift(node_id),
+            names.kantor_scale(node_id, "B"),
+            names.kantor_bias(node_id, "B"),
+            names.kantor_shift(node_id, "B"),
         }
         # FPSU 三族与量化零点在逐元素算子上按槽出现。
         for slot in range(4):

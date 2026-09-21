@@ -118,6 +118,20 @@ def synth_silu() -> bytes:
     return synth_decaying(lambda x: x / (1.0 + math.exp(-x)), -4.0, 4.0)
 
 
+def synth_exp() -> bytes:
+    """exp 表，供 Softmax phase1（`e[i] = exp(x[i] - max)`）走的 LUT 通路用。
+
+    **占位表，不是逼近参考产物的真实段**：硬件走 31 段 PWL，段索引规则未能
+    反推出（见 `docs/gml-parser-output-plan-20260917.md` §7 问题 1），本模块
+    的 Softmax 数值路径（`gml_bridge/phase_data.py::softmax`）本来就用精确
+    `exp` 计算，不经过这张表——那份 docstring 已经说明这是有意为之的已知
+    差异。这张表只是为了让 `LUT_phase_1_<id>.bin` 这个引用不再悬空（实测
+    参考产物确实有这个文件，之前完全没写，是 P0 的一部分），不追求数值
+    精度。定域参照 softmax 里 `x - max <= 0` 这条约束，取 `[-8, 0)`。
+    """
+    return synth_decaying(math.exp, -8.0, 0.0)
+
+
 def decode_reciprocal(value: float, table: bytes) -> float:
     """解码侧参考实现：用一张倒数表求 `1/value`，用来对拍合成结果。
 

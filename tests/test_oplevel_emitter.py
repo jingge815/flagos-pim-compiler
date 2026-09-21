@@ -137,16 +137,10 @@ def test_rope_keeps_rank4_for_broadcast() -> None:
     assert "numHeads = 32" in report.text
 
 
-def test_second_rope_also_emits_dq() -> None:
-    """K 路（第二条）RoPE 尾部带量化：那个节点要发 **两个** 算子。
+def test_first_rope_also_emits_dq() -> None:
+    """Q 路（第一条）RoPE 尾部带量化：那个节点要发 **两个** 算子。
 
-    对应 GML 的 `Llama2ActivationDQ` —— 实测参考产物里那个节点同时有
-    `_phase_0..3` 四个相位号和 `Llama2Activation_*` 子块，是「3 连 + 4 相」
-    而不是二选一。
-
-    K 路身份按 `_is_second_rope`（图里第二条 RoPE 链）判，**不看
-    `DQ_META_KEY`**：那个标记是 `from_fx.convert()` 的副作用，依赖它会让
-    emitter 的产出取决于序列化跑过没有。所以这里要造**两条** RoPE。
+    对应 GML 的 `Llama2ActivationDQ` —— 参考产物里 Q 的 RoPE 后面跟 4 相 DQ。
     """
     def build(g):
         cos = _add_node(g, "cos", (1, 1, 16, 128))
@@ -163,15 +157,15 @@ def test_second_rope_also_emits_dq() -> None:
     for op in report.ops:
         by_node.setdefault(op.fx_name, set()).add(op.kind)
 
-    # Q 路只发 RoPE，K 路发 RoPE + DQ。
-    assert by_node["rope_q"] == {"rope"}
-    assert by_node["rope_k"] == {"rope", "dq"}
+    # Q 路发 RoPE + DQ，K 路只发 RoPE（add 写 cache）。
+    assert by_node["rope_q"] == {"rope", "dq"}
+    assert by_node["rope_k"] == {"rope"}
     # 函数名靠后缀区分，否则同名的第二个会被去重吃掉。
     assert len({op.func for op in report.ops}) == len(report.ops)
 
 
-def test_first_rope_emits_no_dq() -> None:
-    """只有一条 RoPE 时不发 DQ —— 单条就是 Q 路，不进 cache。"""
+def test_first_rope_emits_dq() -> None:
+    """只有一条 RoPE 时按 Q 路发 DQ。"""
     def build(g):
         src = _add_node(g, "q", (1, 32, 16, 128))
         cos = _add_node(g, "cos", (1, 1, 16, 128))
@@ -180,7 +174,7 @@ def test_first_rope_emits_no_dq() -> None:
         node.meta[ROPE_META_KEY] = RopeMatch(source=src, cos=cos, sin=sin)
 
     report = emit_oplevel_mlir(_graph_with(build))
-    assert sorted(op.kind for op in report.ops) == ["rope"]
+    assert sorted(op.kind for op in report.ops) == ["dq", "rope"]
 
 
 def test_dynamic_shape_is_skipped_not_guessed() -> None:

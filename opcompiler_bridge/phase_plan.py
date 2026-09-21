@@ -41,6 +41,9 @@ _FUNC_RE = re.compile(r"tt\.func\s+@(\w+)")
 # `pim.force-consecutive` 是 unit attr，无值。
 _FORCE_CONSECUTIVE = "pim.force-consecutive"
 _ROTATE_HALF = "pim.rotate-half"
+_I64_ATTR = re.compile(
+    r'"pim\.(flp-min-exp|flp-max-exp|flp-mantisa|kantor-mode|'
+    r'fpsu-mode|transpose-type|activation-mode)"\s*=\s*(-?\d+)\s*:\s*i64')
 
 
 @dataclass(frozen=True)
@@ -54,18 +57,41 @@ class Phase:
     kind: str | None = None  # `absmax` / `exp` / `reciprocal` / `mul` ...
     force_consecutive: bool = False
     rotate_half: bool = False
+    flp_min: int | None = None
+    flp_max: int | None = None
+    flp_mantisa: int | None = None
+    kantor_mode: int | None = None
+    fpsu_mode: int | None = None
+    transpose_type: int | None = None
+    activation_mode: int | None = None
 
 
 @dataclass
 class PhasePlan:
-    """一个被展开算子的相位序列。"""
+    """一个被展开算子的相位序列。
+
+    `op_attrs` 收**单相算子**（矩阵乘这类不展开的）身上的硬件域。它们没有
+    `pim.phase`，所以不进 `phases`——否则 `count` 会把它们算成相位，
+    `cross_check` 的相位数就对不上。但那些域仍然是算子编译器的产出，
+    txt 要用（gemm_gate 的 Flp / Fpsu mode 就在这里）。
+    """
 
     func: str
     phases: list[Phase] = field(default_factory=list)
+    op_attrs: dict[str, int] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
         return len(self.phases)
+
+    @property
+    def flp(self) -> tuple[int, int, int] | None:
+        """单相算子的 FLP 窗口，取不到返回 None。"""
+        if "flp-min-exp" not in self.op_attrs:
+            return None
+        return (self.op_attrs["flp-min-exp"],
+                self.op_attrs.get("flp-max-exp", 0),
+                self.op_attrs.get("flp-mantisa", 0))
 
     def units(self) -> list[str]:
         return [p.unit for p in self.phases]
@@ -97,6 +123,14 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
 
         phase_match = _PHASE_RE.search(line)
         if not phase_match:
+            # 单相算子（`pim.matmul` 这类不展开的）没有 `pim.phase`，但 pass
+            # 仍在它身上盖了硬件域。收进 `op_attrs` 而**不是** `phases`：
+            # 进 phases 会让 `count` 把它当成一相，`cross_check` 的相位数
+            # 立刻对不上（矩阵乘是单相，期望值 0）。
+            if _OP_RE.search(line):
+                current.op_attrs.update(
+                    {m.group(1): int(m.group(2))
+                     for m in _I64_ATTR.finditer(line)})
             continue
 
         index = int(phase_match.group(1))
@@ -108,6 +142,11 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
         bytes_match = _PHASE_BYTES_RE.search(line)
         kind_match = _KIND_RE.search(line)
 
+        attrs = {m.group(1): int(m.group(2)) for m in _I64_ATTR.finditer(line)}
+        flp = None
+        if "flp-min-exp" in attrs and "flp-max-exp" in attrs:
+            flp = (attrs["flp-min-exp"], attrs["flp-max-exp"],
+                   attrs.get("flp-mantisa", 0))
         current.phases.append(Phase(
             index=index,
             op=op_match.group(1) if op_match else "",
@@ -116,6 +155,13 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
             kind=kind_match.group(1) if kind_match else None,
             force_consecutive=_FORCE_CONSECUTIVE in line,
             rotate_half=_ROTATE_HALF in line,
+            flp_min=attrs.get("flp-min-exp"),
+            flp_max=attrs.get("flp-max-exp"),
+            flp_mantisa=attrs.get("flp-mantisa"),
+            kantor_mode=attrs.get("kantor-mode"),
+            fpsu_mode=attrs.get("fpsu-mode"),
+            transpose_type=attrs.get("transpose-type"),
+            activation_mode=attrs.get("activation-mode"),
         ))
 
     for plan in plans.values():

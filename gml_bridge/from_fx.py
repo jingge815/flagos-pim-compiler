@@ -17,6 +17,7 @@ from torch.fx import GraphModule, Node as FxNode
 
 from contracts import gml_hw_table as hw_table
 from contracts import gml_names as names
+from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
 from contracts.gml_quant import GML_VERSION, PHASE_COUNTS
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 from graph.fuse_pim import (
@@ -108,13 +109,12 @@ def _op_type_of(node):
     # 顺序反了的话，同一张图第二次 convert 就会把它降级成 DynamicScaling
     # —— 实测会让 GML 从 200 节点变 206、op_type 也变掉。
     if ROPE_META_KEY in node.meta:
-        # 折叠出来的 RoPE。实测两个变体各出现一次：
-        #   第一条（Q）-> Llama2Activation（transpose=0，下游 Transpose）
-        #   第二条（K）-> Llama2ActivationDQ（transpose=1，进 cache）
-        # llama 图里 q_proj 在 k_proj 之前，所以拓扑序第一条就是 Q。
-        # 不能靠「下游有没有 Split」判 —— 逐头展开之后 Q/K 都有 slice。
+        # 折叠出来的 RoPE。参考产物：
+        #   Q -> Llama2ActivationDQ（RoPE 三连 + 后面 4 相量化）
+        #   K -> Llama2Activation（三连，add 写 cache）
+        # llama 图里 q_proj 在 k_proj 之前，拓扑序第一条是 Q。
         return ("Llama2ActivationDQ"
-                if _is_second_rope(node) else "Llama2Activation")
+                if not _is_second_rope(node) else "Llama2Activation")
     if DQ_META_KEY in node.meta:
         return "DynamicScaling"
     if RMS_NORM_META_KEY in node.meta:
@@ -136,12 +136,23 @@ def _data_slot_count(op_type, input_count):
     不占数据槽 —— 所以两条入边只对应一个数据槽，键名不带槽号
     （实测 64/64 个 MatMul 都是 `input_buffer`，且 `input_count` 记 1）。
 
-    生产者给输出缓冲命名时要按**消费者**的槽号，所以两边必须用同一判据：
+    RoPE 除了源张量还吃 cos / sin 两张表（它们是 `is_buffer` 边界节点，
+    见 convert 里建表那段），所以是 **3 个**数据槽，`input_buffer_0..2`。
+    `input_count` 只数算子入边，表节点不在其中，这里要加回来。
+
+    Mask 不在这里处理：它是否有第二个数据槎（causal mask 边界节点）取决于
+    具体节点是否真的接上了那条边（`_mask_placeholder_of` 找不到时就没有，
+    比如 seq_len==1），不是纯靠 op_type 能判断的通用规则，所以调用点各自
+    按 `node in mask_boundary_of` 处理，不进这个函数。
+
+    生产者给输出缓冲命名时要按**消费者**的槎号，所以两边必须用同一判据：
     只在一处判、另一处沿用，否则生产者写 `input_buffer_1_176.bin`
     而消费者只声明 `input_buffer`，一边悬空一边多余。
     """
     if op_type == "MatMul":
         return max(1, input_count - 1)
+    if op_type in ("Llama2Activation", "Llama2ActivationDQ"):
+        return input_count + 2
     return input_count
 
 
@@ -161,8 +172,8 @@ def _shape_tuple_of(node) -> tuple[int, ...] | None:
 def _is_second_rope(node) -> bool:
     """是不是图里第二条 RoPE 链（K 路）。
 
-    llama 的 q_proj 排在 k_proj 前面，所以按拓扑序，第二条就是 K。
-    K 进 cache 要定点化，走 Llama2ActivationDQ。
+    llama 的 q_proj 排在 k_proj 前面，拓扑序第一条是 Q。
+    Q 后面接 DQ 四相，走 Llama2ActivationDQ；K 进 cache 走 Llama2Activation。
     """
     ropes = [n for n in node.graph.nodes if ROPE_META_KEY in n.meta]
     return len(ropes) >= 2 and node is ropes[1]
@@ -264,6 +275,10 @@ def _is_emittable(node: FxNode) -> bool:
         return True
     if KV_DMA_META_KEY in node.meta or SPLIT_META_KEY in node.meta:
         return True
+    # 无计算的 view/reshape：参考只留两处（拆头前后的语义 reshape）。
+    # 喂 RMSNorm / 残差 / 出口的那些跨过去，不单独成节点（评审 4 §3.4）。
+    if node.target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default):
+        return not _reshape_is_layout_only(node)
     return node.target in OP_TYPES
 
 
@@ -293,6 +308,208 @@ def _tensor_inputs(node: FxNode, emittable: set[FxNode]) -> list[FxNode]:
 
     walk(node)
     return found
+
+
+def _reshape_is_layout_only(node: FxNode) -> bool:
+    """这个 view/reshape 没有自己的计算，只改形状。
+
+    参考只留两处语义 Reshape：v 拆头前、concat 后。q/k 喂 RoPE 的 view 跨过去。
+    """
+    if _feeds_meta(node, ROPE_META_KEY):
+        return True
+    users = [u for u in node.users if getattr(u, "op", None) == "call_function"]
+    if not users:
+        return True
+    for user in users:
+        if RMS_NORM_META_KEY in user.meta:
+            return True
+        if user.target in (torch.ops.aten.add.Tensor,):
+            return True
+    return False
+
+
+def _feeds_meta(node: FxNode, key: str, depth: int = 0) -> bool:
+    if depth > 8:
+        return False
+    for user in node.users:
+        if not hasattr(user, "meta"):
+            continue
+        if key in user.meta:
+            return True
+        if getattr(user, "op", None) == "call_function":
+            if _feeds_meta(user, key, depth + 1):
+                return True
+    return False
+
+
+def _mask_placeholder_of(mask_node: FxNode) -> FxNode | None:
+    """Mask 节点（`add.Tensor(current, mask)`）的第二个操作数最终指向的
+    graph `placeholder`。
+
+    实测该操作数是一个 `alias`（fx 的恒等操作），直接包一层 causal mask
+    这个 `placeholder`（`runtime/compile.py::PositionalLlama.forward` 的
+    第二个入参）。这里只沿着 `call_function` 链跨过恒等/reshape 类算子找
+    到那个 `placeholder`，找不到就返回 `None`（例如没有 causal mask 的
+    seq_len==1 场景，参考同样没有这条边）。
+    """
+    args = mask_node.all_input_nodes
+    if len(args) < 2:
+        return None
+    current = args[1]
+    seen: set[FxNode] = set()
+    while current.op == "call_function" and current not in seen:
+        seen.add(current)
+        inputs = current.all_input_nodes
+        if not inputs:
+            return None
+        current = inputs[0]
+    return current if current.op == "placeholder" else None
+
+
+def _slot_dims(op_type: str | None, role, slots: CompileSlots,
+               fallback: str | None, *, rewrite: bool) -> str:
+    """边的 dims 按编译期槽位写，不按导出图 seq_len。
+
+    只在 llama2-7B 图上改写（图里能看到 hidden=4096）。小图测试沿用导出形状。
+    """
+    H, I, HD, S, nh = (slots.hidden, slots.intermediate, slots.head_dim,
+                       slots.seq, slots.heads)
+    if rewrite:
+        if role == ROLE_MATMUL_QK:
+            return f"1x1x1x{S}"
+        if role in (ROLE_MASK, ROLE_SOFTMAX):
+            return f"1x1x1x{S}"
+        if role == ROLE_MATMUL_PV:
+            return f"1x1x1x{HD}"
+        if op_type == "KV_Cache_DMA":
+            return f"1x{nh}x{S}x{HD}"
+        if fallback and fallback != "unknown":
+            parts = fallback.split("x")
+            ints = [int(p) for p in parts if p.isdigit()]
+            if ints and ints[-1] in (1, 16) and S not in ints:
+                parts[-1] = str(S)
+                return "x".join(parts)
+    return fallback or "unknown"
+
+
+# 输出恒为 int8 的算子：它们把数值落成定点（量化 / 写 cache）。
+_OUT_INT8_OPS = frozenset({
+    "DynamicScaling", "Llama2Activation", "Llama2ActivationDQ",
+    "KV_Cache_DMA", "Split",
+})
+# 输出恒为 fp16 的算子：累加在浮点 FPSU 上，结果不落定点。
+_OUT_FP16_OPS = frozenset({
+    "MatMul", "Softmax", "Mask", "EltwiseAdd", "EltwiseMul", "RMSNorm_vpu",
+})
+# 吃定点激活的算子：参考 7 个 Gemm、64 个 MatMul 的 input 全是 int8。
+_IN_INT8_OPS = frozenset({"Gemm", "MatMul"})
+# 纯布局算子：不改数值，所以 **没有** input_sf / input_zp，dtype 沿边传播。
+_NO_SCALE_OPS = frozenset({"Split", "Transpose", "Reshape", "Concat"})
+# 顶层不写 input dtype 的算子（只有槽字段，或根本没有输入侧声明）。
+_NO_TOP_IN_DTYPE = frozenset({
+    "Mask", "EltwiseAdd", "EltwiseMul", "Concat", "KV_Cache_DMA",
+})
+
+
+def _stamp_dtypes(nodes: list[Node]) -> None:
+    """补齐节点级 dtype / extension，并删不该有的 sf/zp。
+
+    **布局算子的 dtype 是沿边传播的，不是按 op_type 固定**。参考里同一个
+    `Transpose` 既有 fp16 的（node 14，concat 之后那条）也有 int8 的
+    （node 27/29/34，KV 与 QK 那条）；`Reshape` 同样两种。按 op_type 写死
+    会让一半节点位宽错一倍，而这在我们这侧不会报错。
+
+    其余按参考逐 op 实测（评审 4 §2.5）：
+
+      Gemm        in int8 / out fp16（v_proj 落 cache 走 int8）/ weight int4
+      MatMul      in int8（32 个 bmm1 的 Q 来自 RoPE-DQ，也是定点）
+      Softmax     in fp16 —— 我方之前只写了 out
+      KV_DMA      out int8 + **顶层** input_sf/input_zp（槽字段之外）
+      Split       out 恒 int8（3/3），in 传播（fp16 1 个、int8 2 个）
+      DQ          自命名输出，参考顶层 input_sf 为 0 个，我方曾多写 36 个
+
+    `nodes` 必须是**拓扑序**（`convert` 按 FX 序 append，生产者在前），
+    否则传播拿不到上游已定的 dtype。
+    """
+    out_dtype: dict[int, str] = {}
+    op_of: dict[int, str] = {}
+
+    for gml_node in nodes:
+        fields = gml_node.fields
+        op_type = fields.get("op_type")
+        node_id = gml_node.node_id
+        op_of[node_id] = str(op_type or "")
+
+        # 边界缓冲节点自己声明过 dtype，只记下来供下游传播。
+        if not op_type:
+            declared = fields.get("output_buffer_dtype")
+            if isinstance(declared, str):
+                out_dtype[node_id] = declared
+            continue
+
+        producers = _gml_int_list(gml_node, names.residual_buffer_key("input", 0))
+        producers += _gml_int_list(gml_node, names.residual_buffer_key("input", 10))
+        # 传播用第一个生产者：布局算子只有一路数据。
+        flowing = next((out_dtype[p] for p in producers if p in out_dtype),
+                       "float16")
+
+        if op_type in _OUT_INT8_OPS:
+            out_dt = "int8"
+        elif op_type in _OUT_FP16_OPS:
+            out_dt = "float16"
+        elif op_type == "Gemm":
+            # v_proj 把 value 落成 int8 存进 KV cache，`resolve()` 已按
+            # 输出 dtype 选了 kantor_mode，这里复用同一个判据。
+            out_dt = ("int8" if fields.get("kantor_mode") == "fp2int_converter"
+                      else "float16")
+        else:
+            out_dt = flowing  # Transpose / Reshape / Concat：原样传播
+        out_dtype[node_id] = out_dt
+
+        if "output_buffer_dtype" not in fields:
+            fields["output_buffer_dtype"] = out_dt
+            fields["output_data_extension"] = hw_table.data_extension(out_dt)
+
+        if op_type in _IN_INT8_OPS:
+            in_dt = "int8"
+        elif op_type in _NO_TOP_IN_DTYPE:
+            in_dt = None
+        elif op_type in _NO_SCALE_OPS:
+            in_dt = flowing
+            # 例外：吃 `Llama2ActivationDQ` 的那个 Split，参考声明 **fp16**
+            # （node 21），而该生产者自己的 `output_buffer_dtype` 是 int8。
+            # 不是传播能推出来的：这个生产者是「RoPE 3 连 + DQ 4 相」的融合
+            # 节点，RoPE 那侧是 fp16、DQ 那侧才是 int8，两种声明各自都讲得通。
+            # 这里照抄参考，不自己推导。
+            if op_type == "Split" and any(
+                    op_of.get(p) == "Llama2ActivationDQ" for p in producers):
+                in_dt = "float16"
+        else:
+            in_dt = "float16"
+        # 已有带槽号的 dtype（多输入算子）时不再写顶层那份。
+        slotted = any(key.startswith("input_buffer_") and key.endswith("_dtype")
+                      for key in fields)
+        if in_dt and "input_buffer_dtype" not in fields and not slotted:
+            fields["input_buffer_dtype"] = in_dt
+            fields["input_data_extensions"] = hw_table.data_extension(in_dt)
+
+        if op_type in _NO_SCALE_OPS or op_type == "DynamicScaling":
+            for key in ("input_sf", "input_zp"):
+                fields.pop(key, None)
+
+        if op_type == "KV_Cache_DMA":
+            # 参考 node 28 顶层同时有 input_sf / input_zp，槽字段之外再来一份。
+            fields.setdefault("input_sf", names.scale(node_id))
+            fields.setdefault("input_zp", names.zero_point(node_id))
+            fields.pop("input_buffer_dtype", None)
+
+        # 权重 dtype 按**操作数来源**盖：get_attr 二维权重是 int4（W4A8），
+        # MatMul 的 KV cache 权重通路是 int8（发射时已写死，不要覆盖）。
+        if (op_type == "Gemm" and fields.get("weight_buffer")
+                and fields.get("pim_weight_param")
+                and "weight_buffer_dtype" not in fields):
+            fields["weight_buffer_dtype"] = "int4"
+            fields.setdefault("weight_sf_dtype", "float16")
 
 
 def _contraction_of(node: FxNode) -> list[tuple[str, dict[str, object]]]:
@@ -358,7 +575,9 @@ def _phase_count_for(phase_source, op_type: str, label: str) -> int:
 
 
 def convert(
-    gm: GraphModule, *, version: str = GML_VERSION, phase_source=None
+    gm: GraphModule, *, version: str = GML_VERSION, phase_source=None,
+    decode_block_only: bool = False,
+    slots: CompileSlots | None = None,
 ) -> tuple[list[Node], list[Edge], dict[int, str], dict[int, object]]:
     """把融合后的图转成 GML 节点与边。
 
@@ -373,7 +592,14 @@ def convert(
     两条路径当前产出**相同**的 GML，因为算子编译器算出的相位数与静态表一致
     ——这正是 `phase_source.cross_check()` 在保证的。但依赖是真的：pass 若改了
     相位结构，GML 的字段套数会跟着变。
+
+    `slots` 是编译期槽位。边的 dims、KV cache 边界节点按它写，不按导出图的
+    seq_len（prepare_out 的尺寸真源，见 contracts.compile_slots）。
     """
+    slots = slots or DEFAULT_SLOTS
+    rewrite_dims = any(
+        4096 in tuple(int(x) for x in getattr(n.meta.get("val"), "shape", ()) or ())
+        for n in gm.graph.nodes)
     emittable = {node for node in gm.graph.nodes if _is_emittable(node)}
     if not emittable:
         raise ValueError("图里没有可映射到 GML 的算子")
@@ -410,24 +636,60 @@ def convert(
     entry_targets = [node for node in ordered
                      if not _tensor_inputs(node, emittable)]
     exit_sources = [node for node in ordered if not consumers[node]]
+
+    # 残差旁路：第一条残差 add 的一路往上追到 embedding 就断了。参考把
+    # 这一路接到图入口缓冲（node 1 同时喂 RMSNorm 与第一条残差）。
+    # 入口缓冲的 output_buffer 仍按第一个消费者（RMSNorm）命名；残差自己
+    # 声明 input_buffer_0，规则 2 只要求生产者的名字被某个读者读到。
+    entry_bypass: dict[FxNode, int] = {}
+    for node in ordered:
+        if _op_type_of(node) != "EltwiseAdd":
+            continue
+        if _tensor_inputs(node, emittable):
+            # 只有一路可映射上游 → 另一路是 embedding 旁路。
+            if len(_tensor_inputs(node, emittable)) == 1:
+                entry_bypass[node] = 0
+            break
     boundary_base = len(ordered) + 3
     entry_ids = {node: boundary_base + index
                  for index, node in enumerate(entry_targets)}
     exit_ids = {node: boundary_base + len(entry_targets) + index
                 for index, node in enumerate(exit_sources)}
 
+    # 旁路挂到**第一个**入口缓冲上（参考的 node 1 就是那个）。
+    first_entry_id = min(entry_ids.values()) if entry_ids else None
+    for node in list(entry_bypass):
+        if first_entry_id is None:
+            entry_bypass.pop(node)
+        else:
+            entry_bypass[node] = first_entry_id
+
     for node, buffer_id in entry_ids.items():
-        gml_nodes.append(Node(buffer_id, {
+        readers = [node_ids[node]]
+        # 这个入口同时喂残差旁路时，多记一个消费者。
+        if buffer_id == first_entry_id:
+            readers += [node_ids[n] for n in entry_bypass]
+        # 缓冲按**第一个**消费者编号（规则 2）。喂残差旁路的入口有两个读者，
+        # `output_buffer` 仍指第一个（那个入口算子），旁路那条边由残差侧
+        # 自己声明 `input_buffer_0`。
+        out_name = names.data_buffer(node_ids[node])
+        fields_buf: dict[str, object] = {
             "label": f"in_{node.name}", "name": f"in_{node.name}",
             "is_buffer": 1,
-            "output_buffer": names.data_buffer(node_ids[node]),
+            "output_buffer": out_name,
             # 用列表而不是裸 int：`residual_*_buffer` 是重复键，
             # 统一成列表让下游（校验器、测试）不必兼容两种类型。
-            names.residual_buffer_key("output", 0): [node_ids[node]],
-            names.port_node_id_key("output", 0): node_ids[node],
-        }))
+            names.residual_buffer_key("output", 0): readers,
+        }
+        for index, reader_id in enumerate(readers):
+            fields_buf[names.port_node_id_key("output", index)] = reader_id
+        gml_nodes.append(Node(buffer_id, fields_buf))
         edges.append(Edge(buffer_id, node_ids[node],
                           _shape_of(node) or "unknown"))
+        if buffer_id == first_entry_id:
+            for bypass_node in entry_bypass:
+                edges.append(Edge(buffer_id, node_ids[bypass_node],
+                                  _shape_of(bypass_node) or "unknown"))
 
     for node, buffer_id in exit_ids.items():
         gml_nodes.append(Node(buffer_id, {
@@ -438,6 +700,189 @@ def convert(
             names.port_node_id_key("input", 0): node_ids[node],
             "input_count": 1,
         }))
+
+    # RoPE 的 cos / sin 表：参考把它们建成 `is_buffer` 边界节点，并连边进
+    # **两条** RoPE（Q 与 K 共用同一份表）。我方原先把表折进节点字段，于是
+    # RoPE 的 `input_count` 记 1 而参考记 3，下游 DQ 的
+    # `Residual input buffer 0/1/2` 也就无从生成。
+    #
+    # 表本身是编译期常量（`get_attr` 或广播产出），不在 `emittable` 里，所以
+    # 这里单独建节点，不影响算子节点的逆拓扑编号。
+    rope_nodes = [n for n in ordered if ROPE_META_KEY in n.meta]
+    rope_tables: dict[FxNode, int] = {}
+    # tensor -> 表节点最终声明的共享文件名（K 路锚点）。下面每个 RoPE
+    # 消费者自己声明 `input_buffer_<slot>` 时要读这个名字，不能各自按
+    # `names.data_buffer(node_id, slot)` 重新拼——否则 Q 消费者拼出的名字
+    # 和边界节点实际声明的 `output_buffer` 不是同一个字符串，读者与生产者
+    # 就此失去同步（复核 20260921 发现：K 锚点落地后，Q 侧仍各自重新拼，
+    # `test_output_buffer_points_at_the_consumer` 因此挂了）。
+    rope_table_names: dict[FxNode, str] = {}
+    if rope_nodes:
+        table_base = boundary_base + len(entry_targets) + len(exit_sources)
+        # 按 (cos, sin) 去重：两条 RoPE 指向同一对表节点。
+        for rope in rope_nodes:
+            match = rope.meta[ROPE_META_KEY]
+            for tensor in (match.sin, match.cos):
+                if tensor is not None and tensor not in rope_tables:
+                    rope_tables[tensor] = table_base + len(rope_tables)
+        for tensor, buffer_id in rope_tables.items():
+            readers = [n for n in rope_nodes
+                       if n.meta[ROPE_META_KEY].cos is tensor
+                       or n.meta[ROPE_META_KEY].sin is tensor]
+            # 不写 `original_name` / `from_tvm`：那两个是参考走 TVM 路径留下的
+            # 溯源字段，`contracts/gml_coverage.py` 明确声明我方不适用。
+            fields: dict[str, object] = {
+                "label": f"in_{tensor.name}", "name": f"in_{tensor.name}",
+                "is_buffer": 1,
+            }
+            reader_ids = [node_ids[r] for r in readers]
+            fields[names.residual_buffer_key("output", 0)] = reader_ids
+            for index, reader_id in enumerate(reader_ids):
+                fields[names.port_node_id_key("output", index)] = reader_id
+            # 缓冲按**K 路**消费者编号，不是"第一个"（复核 20260921
+            # 纠正——上一版这里写"按第一个消费者编号"是错的，没有验证过
+            # 两条 RoPE 共享表节点时到底按哪个consumer 编号）。实测参考
+            # 产物两张表节点（cos=node2、sin=node3）都被 Q（node22）与
+            # K（node30）共用，`output0_node_id` 记的是 Q（先出现），但
+            # `output_buffer` 两张表都写成 `input_buffer_*_30`——按 K 编号，
+            # 不是按"第一个"。K 路固定走 `Llama2ActivationDQ`
+            # （`_is_second_rope` 的判据），用它选锚点消费者，Q 也读这个
+            # 共享名。找不到 K 路（比如某条 RoPE 没有配对的第二条）时退回
+            # 第一个消费者，不留 None。
+            # 表占 RoPE 的槎 1（sin）或 2（cos）。取最后一个会让
+            # test_output_buffer_points_at_the_consumer 判为悬空。
+            slot = 2 if any(r.meta[ROPE_META_KEY].cos is tensor
+                            for r in readers) else 1
+            anchor = next((r for r in readers if _is_second_rope(r)),
+                         readers[0])
+            shared_name = names.data_buffer(node_ids[anchor], slot)
+            fields["output_buffer"] = shared_name
+            rope_table_names[tensor] = shared_name
+            gml_nodes.append(Node(buffer_id, fields))
+            for reader in readers:
+                edges.append(Edge(buffer_id, node_ids[reader],
+                                  _shape_of(tensor) or "unknown"))
+
+    # Mask 的第二路输入（causal mask）：图里是一个 `placeholder`
+    # （`runtime/compile.py::PositionalLlama.forward` 的第二个入参），经过一个
+    # `alias`（fx 的恒等操作）喂给全部 32 个 Mask 节点，共享同一份 placeholder。
+    # `_is_emittable`/`_tensor_inputs` 只认 `call_function`，两者都不满足，
+    # 这条边原来直接被丢弃——Mask 的 `input_count` 因此少算 1，被误判成单槎
+    # 算子，图里也再没有节点声明这个 buffer，写盘阶段自然不会落它（实测参考
+    # 产物 32 个头的 `Datain file 1` 都真实存在于 parser_output，不是虚引用）。
+    #
+    # 处理方式与 RoPE cos/sin 表同构：单独建一个 `is_buffer` 边界节点，不进
+    # `_tensor_inputs` 的返回值，不影响算子节点的逆拓扑编号。实测参考产物
+    # 32 个头的 `Datain file 1` 全部指向同一个文件名，所以只建**一个**边界
+    # 节点，全部 Mask 节点共享（同 RoPE 表「一份表喂两条 RoPE」的处理）。
+    #
+    # `mask_boundary_of` 只登记**真的**接上这条边的 Mask 节点（找不到
+    # placeholder 的退化场景——比如 seq_len==1 没有 causal mask——不登记，
+    # 那些节点仍走原来的单槎路径），下面两处都要查它而不是笼统按 op_type 判：
+    # `_data_slot_count` 收不到"这个具体节点是否有边界边"这个信息，只能在
+    # 这里、在消费者具体节点上做判断。
+    mask_nodes = [n for n in ordered
+                 if n.meta.get(HEAD_ROLE_META_KEY) == ROLE_MASK]
+    mask_boundary_of: dict[FxNode, int] = {}
+    mask_buffer_name: str | None = None
+    if mask_nodes:
+        connected = [n for n in mask_nodes
+                    if _mask_placeholder_of(n) is not None]
+        if connected:
+            mask_placeholder = _mask_placeholder_of(connected[0])
+            mask_buffer_id = (boundary_base + len(entry_targets)
+                              + len(exit_sources) + len(rope_tables))
+            reader_ids = [node_ids[n] for n in connected]
+            # 参考产物全部头的 `Datain file 1` 是**同一个文件名**（按第一个
+            # 消费者编号，同 RoPE 表的规则 2），不是各自按自己的 node_id 命名。
+            mask_buffer_name = names.data_buffer(reader_ids[0], 1)
+            fields = {
+                "label": f"in_{mask_placeholder.name}",
+                "name": f"in_{mask_placeholder.name}",
+                "is_buffer": 1,
+            }
+            fields[names.residual_buffer_key("output", 0)] = reader_ids[:10]
+            if reader_ids[10:]:
+                fields[names.residual_buffer_key("output", 10)] = (
+                    reader_ids[10:])
+            for index, reader_id in enumerate(reader_ids):
+                fields[names.port_node_id_key("output", index)] = reader_id
+            # Mask 的槎 0 是 bmm1 的输出（算子上游），槎 1 留给这块边界缓冲——
+            # 与参考产物 `Datain file 1` 的槎位一致。
+            fields["output_buffer"] = mask_buffer_name
+            gml_nodes.append(Node(mask_buffer_id, fields))
+            for reader in connected:
+                edges.append(Edge(mask_buffer_id, node_ids[reader],
+                                  _shape_of(mask_placeholder) or "unknown"))
+                mask_boundary_of[reader] = mask_buffer_id
+
+    # KV cache 初始平面 + 位置下标：参考 3 个 is_buffer（K 4MB、V 4MB、
+    # 位置 int16 共享一份）。图是 use_cache=False 导出的，这两个输入不在
+    # FX 里，必须按编译期槽位单独建（评审 4 §2.3）。
+    kv_cache_of: dict[FxNode, tuple[int, int]] = {}
+    kv_nodes = [n for n in ordered if KV_DMA_META_KEY in n.meta]
+    if kv_nodes:
+        kv_base = (boundary_base + len(entry_targets) + len(exit_sources)
+                   + len(rope_tables) + (1 if mask_buffer_name else 0))
+        pos_id = kv_base
+        pos_readers = [node_ids[n] for n in kv_nodes]
+        pos_name = names.data_buffer(pos_readers[0], 1)
+        pos_fields: dict[str, object] = {
+            "label": "in_kv_position", "name": "in_kv_position",
+            "is_buffer": 1,
+            "output_buffer": pos_name,
+            "output_buffer_dtype": "int16",
+            names.residual_buffer_key("output", 0): pos_readers,
+        }
+        for index, reader_id in enumerate(pos_readers):
+            pos_fields[names.port_node_id_key("output", index)] = reader_id
+        gml_nodes.append(Node(pos_id, pos_fields))
+        pos_dims = (f"1x{slots.heads}x1x3" if rewrite_dims else "1x1x1x3")
+        for reader in kv_nodes:
+            edges.append(Edge(pos_id, node_ids[reader], pos_dims))
+        for index, dma in enumerate(kv_nodes):
+            spec = dma.meta[KV_DMA_META_KEY]
+            cache_id = kv_base + 1 + index
+            reader_id = node_ids[dma]
+            cache_name = names.data_buffer(reader_id, 0)
+            cache_fields: dict[str, object] = {
+                "label": "in_key_cache" if spec.is_key else "in_value_cache",
+                "name": "in_key_cache" if spec.is_key else "in_value_cache",
+                "is_buffer": 1,
+                "output_buffer": cache_name,
+                "output_buffer_dtype": "int8",
+                names.residual_buffer_key("output", 0): [reader_id],
+                names.port_node_id_key("output", 0): reader_id,
+            }
+            gml_nodes.append(Node(cache_id, cache_fields))
+            cache_dims = (f"1x{slots.heads}x{slots.seq}x{slots.head_dim}"
+                          if rewrite_dims else "1x1x1x1")
+            edges.append(Edge(cache_id, reader_id, cache_dims))
+            kv_cache_of[dma] = (cache_id, pos_id)
+
+    # KV 写回出口：参考 key_cache_out / value_cache_out 两个 is_buffer。
+    kv_out_of: dict[FxNode, int] = {}
+    if kv_nodes:
+        out_base = (boundary_base + len(entry_targets) + len(exit_sources)
+                    + len(rope_tables) + (1 if mask_buffer_name else 0)
+                    + 1 + len(kv_nodes))
+        for index, dma in enumerate(kv_nodes):
+            spec = dma.meta[KV_DMA_META_KEY]
+            out_id = out_base + index
+            kv_out_of[dma] = out_id
+            dma_id = node_ids[dma]
+            label = "key_cache_out" if spec.is_key else "value_cache_out"
+            gml_nodes.append(Node(out_id, {
+                "label": label, "name": label, "is_buffer": 1,
+                "input_buffer": names.data_buffer(out_id),
+                "input_buffer_dtype": "int8",
+                names.residual_buffer_key("input", 0): [dma_id],
+                names.port_node_id_key("input", 0): dma_id,
+                "input_count": 1,
+            }))
+            cache_dims = (f"1x{slots.heads}x{slots.seq}x{slots.head_dim}"
+                          if rewrite_dims else "1x1x1x1")
+            edges.append(Edge(dma_id, out_id, cache_dims))
 
     for node in ordered:
         node_id = node_ids[node]
@@ -473,6 +918,9 @@ def convert(
             "label": node.name,
             "name": node.name,
             "op_type": op_type,
+            # 内部键（`pim_` 前缀不进 GML 文本）：label 会被改成参考风格的
+            # 语义名，写盘与编排器仍需按 FX 名反查，所以原名留在这里。
+            "pim_fx_name": node.name,
         }
 
         # 两个 attention matmul 的硬件配置不同，实测 32/32 各自一致：
@@ -489,6 +937,38 @@ def convert(
             fields.update(hw_table.top_level_fields("Mask"))
         elif role == ROLE_SOFTMAX:
             fields.update(hw_table.top_level_fields("Softmax"))
+            # Softmax 五相：字段族同 DynamicScaling 的处理（见下面 dq_spec
+            # 分支），只是这里没有 dq_spec 那样的图侧标记——role 本身就是
+            # 判据。写盘侧 `write_softmax_phases`（runtime_files.py）已经
+            # 按同一套 `names.phase_*` 函数把 bin 落盘，这里补上 GML 文本里
+            # 该有的引用字段，否则那些 bin 从 GML 的角度看永远是悬空的
+            # （之前就是这样：write_softmax_phases 写了但 GML 没声明任何
+            # `_phase_` 字段去引用它们，交叉校验判成「写了盘但没引用」）。
+            #
+            # **5 入 + 5 出对称结构**（复核 20260921 纠正：上一版这里写
+            # "phase1 没有 output_buffer_phase_1"，那是只看
+            # `prepare_out/txt_files` 层卡字段推出来的，没有去对参考 GML
+            # 文本本身——实测参考 `relay2gml_graph.gml` 的 node 18 逐相都
+            # 声明了 `input_buffer_phase_N` 与 `output_buffer_phase_N`
+            # （N=0..4），`parser_output` 也确实有全部 10 个文件。字段集合
+            # 必须跟 `write_softmax_phases` 逐一对上，那边现在是每相都写
+            # input + output，这里也每相都声明。LUT 只在 phase1（exp 表
+            # 占位）、phase3（倒数表）写。
+            for phase in range(phase_count("Softmax", node.name)):
+                fields.update(hw_table.phase_fields("Softmax", phase))
+                fields[f"input_buffer_phase_{phase}"] = (
+                    names.phase_input_buffer(node_id, phase))
+                fields[f"output_buffer_phase_{phase}"] = (
+                    names.phase_output_buffer(node_id, phase))
+                fields[f"Scaling_buffer_phase_{phase}"] = (
+                    names.phase_fpsu_scale(node_id, phase))
+                fields[f"Scaling_PS_buffer_phase_{phase}"] = (
+                    names.phase_fpsu_post_shift(node_id, phase))
+                fields[f"Bias_buffer_phase_{phase}"] = (
+                    names.phase_fpsu_bias(node_id, phase))
+            fields["LUT_phase_1"] = names.phase_lut(node_id, 1)
+            fields["LUT_phase_3"] = names.phase_lut(node_id, 3)
+
 
         # 输入缓冲区按本节点编号——本节点是这些数据的消费者。多输入算子带槽位号。
         # `residual_input_buffer` 在 GML 里是重复键（每个输入一条），所以用列表：
@@ -517,12 +997,11 @@ def convert(
                     scale_name = names.scale(node_id, slot_index)
                 fields[f"input_buffer_{slot}" if multi else "input_buffer"] = (
                     buffer_name)
-                fields[f"input_{slot}_sf" if multi else "input_sf"] = scale_name
-                # 每个 *_sf 都配一个 *_zp。对称量化下 zp 恒为 0，但**文件必须
-                # 存在** —— 实测 381 个 zp 文件全是 4 字节 int32 的 0，
-                # 缺一个就是悬空引用。
-                fields[f"input_{slot}_zp" if multi else "input_zp"] = (
-                    names.zero_point(node_id, slot_index))
+                layout = op_type in ("Split", "Transpose", "Reshape", "Concat")
+                if not layout:
+                    fields[f"input_{slot}_sf" if multi else "input_sf"] = scale_name
+                    fields[f"input_{slot}_zp" if multi else "input_zp"] = (
+                        names.zero_point(node_id, slot_index))
             fields[names.port_node_id_key("input", slot)] = node_ids[source]
             upstream_ids.append(node_ids[source])
         if inputs:
@@ -538,8 +1017,103 @@ def convert(
             if fields["op_type"] == "MatMul":
                 fields["MatMul_input_as_weight"] = 1
                 fields["input_count"] = max(1, len(inputs) - 1)
+                # 第二个 operand 走权重通路：参考 64 个 MatMul 都声明
+                # weight_buffer / weight_sf / weight_zp（int8，尺寸 S×hd）。
+                # 这些不是 get_attr 二维权重，`_weight_param_of` 抓不到。
+                fields["weight_buffer"] = names.weight_buffer(node_id)
+                fields["weight_buffer_dtype"] = "int8"
+                fields["weight_sf"] = names.weight_scale(node_id)
+                fields["weight_sf_dtype"] = "float16"
+                fields["weight_zp"] = names.weight_zero_point(node_id)
             else:
                 fields["input_count"] = len(inputs)
+
+            # 残差旁路：那一路上游是 embedding（不可发射），边接在图入口缓冲上。
+            # 参考的第一条残差 `input_count` 是 2，两个槽都声明 `input_buffer_N`。
+            if node in entry_bypass:
+                bypass_id = entry_bypass[node]
+                fields.pop("input_buffer", None)
+                fields.pop("input_sf", None)
+                fields.pop("input_zp", None)
+                # 旁路占槽 0（参考 input0_node_id 指入口缓冲），算子上游占槽 1。
+                fields["input_buffer_0"] = names.data_buffer(node_id, 0)
+                fields["input_buffer_0_dtype"] = "float16"
+                fields["input_0_sf"] = names.scale(node_id, 0)
+                fields["input_0_zp"] = names.zero_point(node_id, 0)
+                fields["input_buffer_1"] = names.data_buffer(node_id, 1)
+                fields["input_buffer_1_dtype"] = "float16"
+                fields["input_1_sf"] = names.scale(node_id, 1)
+                fields["input_1_zp"] = names.zero_point(node_id, 1)
+                fields[names.port_node_id_key("input", 0)] = bypass_id
+                fields[names.port_node_id_key("input", 1)] = upstream_ids[0]
+                fields[names.residual_buffer_key("input", 0)] = (
+                    [bypass_id] + upstream_ids)
+                fields["input_count"] = len(inputs) + 1
+
+            # RoPE 还要把 cos / sin 两张表的边界节点记成输入边：参考的
+            # `input_count` 是 3（源 + sin + cos），下游 DQ 的
+            # `Residual input buffer 0/1/2` 就是这三条。表节点在上面已建好。
+            if ROPE_META_KEY in node.meta and rope_tables:
+                match = node.meta[ROPE_META_KEY]
+                table_tensors = [t for t in (match.sin, match.cos)
+                                 if t in rope_tables]
+                table_ids = [rope_tables[t] for t in table_tensors]
+                if table_ids:
+                    # 变成多槎：源占槎 0，sin/cos 占槎 1/2。三个槎都要声明
+                    # `input_buffer_N`（参考如此），写盘侧按这些字段落 bin ——
+                    # 只在表节点写 output_buffer 会让那两个 bin 没人写。
+                    fields.pop("input_buffer", None)
+                    fields.pop("input_sf", None)
+                    fields.pop("input_zp", None)
+                    fields["input_buffer_0"] = names.data_buffer(node_id, 0)
+                    fields["input_buffer_0_dtype"] = "float16"
+                    fields["input_0_sf"] = names.scale(node_id, 0)
+                    fields["input_0_zp"] = names.zero_point(node_id, 0)
+                    slot = len(inputs)
+                    for tensor, table_id in zip(table_tensors, table_ids):
+                        fields[names.port_node_id_key("input", slot)] = table_id
+                        # 读表节点已经声明的共享名（`rope_table_names`），
+                        # 不能各自按 `names.data_buffer(node_id, slot)`
+                        # 重新拼——K 锚点落地后，Q 消费者自己拼出来的名字
+                        # 和边界节点实际声明的 `output_buffer` 不再是同一个
+                        # 字符串，读者与生产者就此失去同步（复核 20260921
+                        # 发现的回归，`test_output_buffer_points_at_
+                        # the_consumer` 会挂）。
+                        fields[f"input_buffer_{slot}"] = rope_table_names.get(
+                            tensor, names.data_buffer(node_id, slot))
+                        fields[f"input_buffer_{slot}_dtype"] = "float16"
+                        fields[f"input_{slot}_sf"] = names.scale(node_id, slot)
+                        fields[f"input_{slot}_zp"] = names.zero_point(
+                            node_id, slot)
+                        slot += 1
+                    fields[names.residual_buffer_key("input", 0)] = (
+                        upstream_ids + table_ids)
+                    fields["input_count"] = len(inputs) + len(table_ids)
+
+
+            # Mask 还要把 causal mask 边界节点记成第二路输入：参考的
+            # `input_count` 是 2（bmm1 输出 + causal mask），`Datain file 1`/
+            # `Residual input buffer 1` 就是这条边。边界节点在上面已建好。
+            # 槎 1 的缓冲名**不**按本节点编号——全部头共享同一个文件名
+            # （`mask_buffer_name`，按第一个消费者编号，规则同 RoPE 表）。
+            if node in mask_boundary_of and mask_buffer_name is not None:
+                table_id = mask_boundary_of[node]
+                fields.pop("input_buffer", None)
+                fields.pop("input_sf", None)
+                fields.pop("input_zp", None)
+                fields["input_buffer_0"] = names.data_buffer(node_id, 0)
+                fields["input_buffer_0_dtype"] = "float16"
+                fields["input_0_sf"] = names.scale(node_id, 0)
+                fields["input_0_zp"] = names.zero_point(node_id, 0)
+                fields["input_buffer_1"] = mask_buffer_name
+                fields["input_buffer_1_dtype"] = "float16"
+                fields["input_1_sf"] = names.scale(node_id, 1)
+                fields["input_1_zp"] = names.zero_point(node_id, 1)
+                fields[names.port_node_id_key("input", 1)] = table_id
+                fields[names.residual_buffer_key("input", 0)] = (
+                    upstream_ids + [table_id])
+                fields["input_count"] = len(inputs) + 1
+
         elif node in entry_ids:
             # 入口算子的上游是入口缓冲节点，字段照常写——否则那个缓冲节点的
             # output_buffer 找不到读者，规则 2 会判为悬空引用。
@@ -566,8 +1140,25 @@ def convert(
             # 见 _data_slot_count 的说明。
             first_slots = _data_slot_count(
                 _op_type_of(first), len(first_inputs))
+            # 消费者是接了 causal mask 边界节点的 Mask：它是双槎算子，但
+            # `_data_slot_count` 判不出来（只有具体节点知道自己是否接了那条
+            # 边，见 `mask_boundary_of` 的说明），这里按消费者节点本身查。
+            if first in mask_boundary_of:
+                first_slots = 2
             index = first_inputs.index(node)
             slot = index if first_slots > 1 else None
+            # 消费者是 KV_Cache_DMA：三个槽是 (cache, 索引, 新值)，
+            # 真正的数据生产者只占槽 2。不顺移的话生产者写无槽名 /
+            # 槽 0，而消费者声明 `input_buffer_2`，两边悬空。
+            if _op_type_of(first) == "KV_Cache_DMA":
+                slot = 2
+                first_slots = 3
+            # 消费者是带残差旁路的 eltwise：它有两个数据槽，算子上游占槽 1
+            # （槽 0 留给来自图入口缓冲的旁路）。不顺移的话生产者写无槽名、
+            # 消费者只声明 `input_buffer_1`，两边悬空。
+            if first in entry_bypass:
+                slot = index + 1
+                first_slots = max(first_slots, 2)
             # phase 型节点（带 rtl_version 的 DQ）**自命名** output_buffer，
             # 其余按消费者编号。实测 37 个自命名节点与 37 个 rtl_version 完全重合：
             #   DynamicScaling 36 + Llama2ActivationDQ 1 -> output_buffer_<self>
@@ -608,6 +1199,16 @@ def convert(
                 fields[names.port_node_id_key("output", index)] = \
                     node_ids[consumer]
 
+        if node in kv_out_of:
+            out_id = kv_out_of[node]
+            outs = fields.get(names.residual_buffer_key("output", 0)) or []
+            if not isinstance(outs, list):
+                outs = [outs]
+            if out_id not in outs:
+                outs = list(outs) + [out_id]
+                fields[names.residual_buffer_key("output", 0)] = outs
+                fields[names.port_node_id_key("output", len(outs) - 1)] = out_id
+
         # 权重按**本节点**编号——它属于节点自己，不属于某条边（规则 2）。
         # 名字记在 `weight_param` 里（不是 GML 字段，只给写盘用），让写盘阶段
         # 能从 FX 图取到对应的 f32 张量。
@@ -632,9 +1233,9 @@ def convert(
             if scale is not None:
                 fields["pim_attention_scale"] = float(scale)
 
-            slots = _FPSU_SLOTS.get(op_type, 1)
-            for index in range(slots):
-                suffix = index if slots > 1 else None
+            n_fpsu = _FPSU_SLOTS.get(op_type, 1)
+            for index in range(n_fpsu):
+                suffix = index if n_fpsu > 1 else None
                 fields[f"Scaling_buffer_file_{index}" if suffix is not None
                        else "Scaling_buffer_file"] = names.fpsu_scale(
                            node_id, suffix)
@@ -650,6 +1251,8 @@ def convert(
             fields["weight_buffer"] = names.weight_buffer(node_id)
             fields["weight_sf"] = names.weight_scale(node_id)
             fields["weight_zp"] = names.weight_zero_point(node_id)
+            # 内部键，不进 GML 文本。编排器用它区分 q/k/v/o/gate/up/down。
+            fields["pim_weight_param"] = weight_param
 
         # DynamicScaling：4 相字段族 + 每相的缓冲与定标系数。
         # phase 在 GML 里**不是独立节点**，而是同一节点内的 *_phase_<k> 字段。
@@ -709,9 +1312,34 @@ def convert(
             fields["updates_sf"] = names.kv_updates_scale(node_id)
             fields["updates_sf_dtype"] = "float16"
             fields["updates_zp"] = names.kv_updates_zero_point(node_id)
-            # 索引那一路是 int16 的位置下标，不参与数值计算 ——
-            # 对方的 L2Analyzer 靠这个标记忽略它。
+            # 三个输入槽：0=cache 平面、1=位置下标（int16，L2A 忽略）、2=新值。
+            # 参考 node 28：`input_buffer_0/1/2` 全声明，txt 的
+            # `Original cache file` 取槽 0。单数 `input_buffer` 是错的。
+            fields.pop("input_buffer", None)
+            fields.pop("input_sf", None)
+            fields.pop("input_zp", None)
+            fields["input_buffer_0"] = names.data_buffer(node_id, 0)
+            fields["input_buffer_0_dtype"] = "int8"
+            fields["input_0_sf"] = names.scale(node_id, 0)
+            fields["input_0_zp"] = names.zero_point(node_id, 0)
+            fields["input_buffer_1"] = names.data_buffer(node_id, 1)
+            fields["input_buffer_1_dtype"] = "int16"
             fields["use_input_buffer_1"] = "L2A_ignore"
+            fields["input_buffer_2"] = names.data_buffer(node_id, 2)
+            fields["input_buffer_2_dtype"] = "int8"
+            fields["input_2_sf"] = names.scale(node_id, 2)
+            fields["input_2_zp"] = names.zero_point(node_id, 2)
+            fields["pim_kv_is_key"] = 1 if kv_dma.is_key else 0
+            # 三槽真实入边：cache 平面、位置下标、新值（评审 4 §2.3）。
+            if node in kv_cache_of:
+                cache_id, pos_id = kv_cache_of[node]
+                new_id = upstream_ids[0] if upstream_ids else node_id
+                fields[names.port_node_id_key("input", 0)] = cache_id
+                fields[names.port_node_id_key("input", 1)] = pos_id
+                fields[names.port_node_id_key("input", 2)] = new_id
+                fields[names.residual_buffer_key("input", 0)] = [
+                    cache_id, pos_id, new_id]
+                fields["input_count"] = 3
 
         # Split：一进多出，`num_heads` 记输出个数。
         split = node.meta.get(SPLIT_META_KEY)
@@ -760,9 +1388,9 @@ def convert(
                 # `output_sf` 等字段跟着变）。收集到局部 dict 里返回，序列化就是
                 # 纯函数。
                 from graph.quant_pass import DynamicScalingSpec
-                numel = _numel_of_fx(node)
+                numel = slots.hidden if rewrite_dims else (_numel_of_fx(node) or 128)
                 extra_dq_specs[node_id] = DynamicScalingSpec(
-                    group_size=128, numel=numel or 128,
+                    group_size=128, numel=numel,
                     is_attention_scores=False)
             for unit, block in hw_table.ROPE_UNITS:
                 fields[f"Scaling_buffer_file_{unit}_{block}"] = (
@@ -827,7 +1455,41 @@ def convert(
                 "bias_buffer_file": names.rms_norm_epsilon(node_id),
             }
 
+        if op_type == "Gemm":
+            is_v = (weight_param is not None and "v_proj" in weight_param) or any(
+                (consumers[node] and KV_DMA_META_KEY in c.meta
+                 and not c.meta[KV_DMA_META_KEY].is_key)
+                for c in consumers[node])
+            fields.update(hw_table.top_level_fields(
+                "Gemm", output_dtype="int8" if is_v else "float16"))
+            if is_v:
+                fields["kantor_A_spc"] = 1
+                fields["kantor_A_scale_axis"] = 1
+                fields["kantor_A_spg"] = 0
+                fields["kantor_A_scale_buffer_file"] = names.kantor_scale(node_id)
+                fields["kantor_A_bias_buffer_file"] = names.kantor_bias(node_id)
+                fields["kantor_A_Shift"] = names.kantor_shift(node_id)
+            if any(c[-1].get("activation_op_type") == "Silu"
+                   for c in _contraction_of(node) if isinstance(c[-1], dict)):
+                fields["activation_lut_file"] = names.activation_lut(node_id)
+                fields["flp_min_exp"] = 10
+                fields["flp_max_exp"] = 17
+                fields["flp_mantisa"] = 3
+        if op_type == "EltwiseMul":
+            fields.update(hw_table.top_level_fields("EltwiseMul"))
+            fields["kantor_A_bias_buffer_file"] = names.kantor_bias(node_id, "A")
+            fields["kantor_A_Shift"] = names.kantor_shift(node_id, "A")
+            fields["kantor_B_scale_buffer_file"] = names.kantor_scale(node_id, "B")
+            fields["kantor_B_bias_buffer_file"] = names.kantor_bias(node_id, "B")
+            fields["kantor_B_Shift"] = names.kantor_shift(node_id, "B")
+        if op_type == "EltwiseAdd":
+            fields.update(hw_table.top_level_fields("EltwiseAdd"))
+
         contraction = _contraction_of(node)
+        semantic = _semantic_gml_name(op_type, node, node_id, weight_param, role)
+        if semantic:
+            fields["label"] = semantic
+            fields["name"] = semantic
         gml_node = Node(node_id, fields, contraction, nested)
         if weight_param:
             weight_params[node_id] = weight_param
@@ -836,12 +1498,184 @@ def convert(
             gml_node.fields.update(upstream_int8)
             gml_node.fields['input_data_extensions'] = (
                 hw_table.data_extension('int8'))
-
         gml_nodes.append(gml_node)
 
-        # 边带形状，节点不带。
-        shape = _shape_of(node)
+        # 边带形状，节点不带。dims 按编译期槽位，不按导出图 seq_len。
+        shape = _slot_dims(op_type, role, slots, _shape_of(node),
+                           rewrite=rewrite_dims)
         for consumer in downstream:
             edges.append(Edge(node_id, node_ids[consumer], shape or "unknown"))
 
+    # dtype 收尾：布局算子要沿边传播，所以必须等全部节点发射完再统一盖章。
+    _stamp_dtypes(gml_nodes)
+
+    if decode_block_only:
+        gml_nodes, edges = _trim_decode_block(gml_nodes, edges)
+
     return gml_nodes, edges, weight_params, extra_dq_specs
+
+
+def _trim_decode_block(nodes: list[Node], edges: list[Edge]):
+    """丢掉模型末尾 final RMSNorm + lm_head + 它前面的 DQ，对齐参考 decode block。
+
+    判据用结构，不靠 FX 名字符串（评审 3 §2.2）：
+    - 末尾 Gemm 权重不是 q/k/v/o/gate/up/down（即 lm_head）
+    - 喂它的 DynamicScaling
+    - 没有任何 Gemm/MatMul 消费者的 RMSNorm（final norm）
+    以及只连向这些节点的边界缓冲。
+    """
+    by_id = {n.node_id: n for n in nodes}
+    drop: set[int] = set()
+    gemms = [n for n in nodes if n.fields.get("op_type") == "Gemm"]
+    for n in gemms:
+        param = str(n.fields.get("pim_weight_param") or "")
+        if any(role in param for role in (
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj")):
+            continue
+        # 没有权重参数的小图 Gemm（测试夹具）不是 lm_head，不要裁。
+        if not param:
+            continue
+        drop.add(n.node_id)
+        for src in _gml_int_list(n, "residual_input_buffer"):
+            parent = by_id.get(src)
+            if parent is not None and parent.fields.get("op_type") == "DynamicScaling":
+                drop.add(parent.node_id)
+    rms = [n for n in nodes if n.fields.get("op_type") == "RMSNorm_vpu"]
+    for n in rms:
+        outs = _gml_int_list(n, "residual_output_buffer")
+        # final norm 只连向被丢掉的 lm_head 链（或出口缓冲），没有
+        # Gemm/MatMul/DQ/残差这些块内消费者。
+        keepers = {"Gemm", "MatMul", "DynamicScaling", "EltwiseAdd",
+                   "EltwiseMul", "Llama2Activation", "Llama2ActivationDQ"}
+        if not any((by_id.get(c) is not None
+                    and c not in drop
+                    and by_id[c].fields.get("op_type") in keepers)
+                   for c in outs):
+            drop.add(n.node_id)
+    # 喂被丢掉节点、自己没有其它读者的边界缓冲 / Reshape。
+    changed = True
+    while changed:
+        changed = False
+        for n in nodes:
+            if n.node_id in drop:
+                continue
+            outs = _gml_int_list(n, "residual_output_buffer")
+            if not outs:
+                continue
+            if n.fields.get("is_buffer") or n.fields.get("op_type") in (
+                    "Reshape", "Transpose"):
+                if all(c in drop for c in outs):
+                    drop.add(n.node_id)
+                    changed = True
+    kept = [n for n in nodes if n.node_id not in drop]
+    kept_ids = {n.node_id for n in kept}
+    kept_edges = [e for e in edges if e.source in kept_ids and e.target in kept_ids]
+    # 被丢掉的消费者还在残留节点的 output_buffer / residual_output 里。
+    # 参考 decode block 把块出口接到一个 is_buffer 节点上，这里同样补一个，
+    # 否则残差的 `output_buffer "input_buffer_<已删>.bin"` 变成悬空引用。
+    next_id = max((n.node_id for n in kept), default=2) + 1
+    extra_nodes: list[Node] = []
+    extra_edges: list[Edge] = []
+    for n in kept:
+        outs = _gml_int_list(n, "residual_output_buffer")
+        alive = [c for c in outs if c in kept_ids]
+        if alive == outs:
+            continue
+        if not alive:
+            exit_id = next_id
+            next_id += 1
+            extra_nodes.append(Node(exit_id, {
+                "label": f"out_{n.fields.get('label', n.node_id)}",
+                "name": f"out_{n.fields.get('label', n.node_id)}",
+                "is_buffer": 1,
+                "input_buffer": names.data_buffer(exit_id),
+                "input_sf": names.scale(exit_id),
+                "input_zp": names.zero_point(exit_id),
+                names.residual_buffer_key("input", 0): [n.node_id],
+                names.port_node_id_key("input", 0): n.node_id,
+                "input_count": 1,
+            }))
+            n.fields["output_buffer"] = names.data_buffer(exit_id)
+            n.fields[names.residual_buffer_key("output", 0)] = [exit_id]
+            n.fields[names.port_node_id_key("output", 0)] = exit_id
+            extra_edges.append(Edge(n.node_id, exit_id, "unknown"))
+            kept_ids.add(exit_id)
+        else:
+            n.fields[names.residual_buffer_key("output", 0)] = alive
+            for index, cid in enumerate(alive):
+                n.fields[names.port_node_id_key("output", index)] = cid
+    result = kept + extra_nodes
+    result_edges = kept_edges + extra_edges
+    targets = {e.target for e in result_edges}
+    # lm_head 裁掉后，它的出口缓冲没有入边，丢掉。
+    result = [n for n in result
+              if not (n.fields.get("is_buffer") and n.node_id not in targets
+                      and str(n.fields.get("label", "")).startswith("out_"))]
+    kept_ids = {n.node_id for n in result}
+    result_edges = [e for e in result_edges
+                    if e.source in kept_ids and e.target in kept_ids]
+    return result, result_edges
+
+
+def _gml_int_list(node: Node, key: str) -> list[int]:
+    value = node.fields.get(key, [])
+    if not isinstance(value, list):
+        value = [] if value in (None, "") else [value]
+    out = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _semantic_gml_name(op_type, fx_node, node_id, weight_param, role) -> str | None:
+    """参考风格的 GML label：`<角色>_qidx{fx拓扑号}_params_{node_id}`。
+
+    参考产物的 `params_N` 等于 GML `node_id`；`qidx` 在 TVM 路径是 Relay 号。
+    我们没有 Relay，qidx 用 FX 出现序（同一张图稳定），params 用 node_id。
+    逐头节点已经叫 `mha_*_headN`，保持不动（layer_expand 靠这个认头）。
+    """
+    if role in _ROLE_OP_TYPES:
+        return None
+    qidx = _fx_qidx(fx_node)
+    if op_type == "RMSNorm_vpu":
+        return f"RMSNorm_params_{node_id}"
+    if op_type == "Gemm" and weight_param:
+        for role_name, front in (
+            ("q_proj", "self_attn_q_proj_MatMul"),
+            ("k_proj", "self_attn_k_proj_MatMul"),
+            ("v_proj", "self_attn_v_proj_MatMul"),
+            ("o_proj", "self_attn_o_proj_MatMul"),
+            ("gate_proj", "mlp_gate_proj_MatMul"),
+            ("up_proj", "mlp_up_proj_MatMul"),
+            ("down_proj", "mlp_down_proj_MatMul"),
+        ):
+            if role_name in weight_param:
+                return f"{front}_qidx{qidx}_params_{node_id}"
+    if op_type == "Llama2ActivationDQ":
+        return f"self_attn_Reshape_qidx{qidx}_params_{node_id}"
+    if op_type == "Llama2Activation":
+        return f"self_attn_Reshape_1_qidx{qidx}_params_{node_id}"
+    if op_type == "EltwiseAdd":
+        return f"{fx_node.name}_Add_qidx{qidx}_params_{node_id}"
+    if op_type == "EltwiseMul":
+        return f"mlp_mul_Mul_qidx{qidx}_params_{node_id}"
+    if op_type == "DynamicScaling":
+        return f"dynamic_quantization_params_{node_id}"
+    return None
+
+
+def _fx_qidx(fx_node) -> int:
+    """FX 图里可发射节点的出现序，同一张图稳定。"""
+    graph = fx_node.graph
+    index = 0
+    for n in graph.nodes:
+        if n.op != "call_function":
+            continue
+        index += 1
+        if n is fx_node:
+            return index
+    return 0

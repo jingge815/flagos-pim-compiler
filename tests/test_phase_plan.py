@@ -31,9 +31,9 @@ module {
     %0 = pim.reshape %arg0 : tensor<1x4096xf16> -> tensor<1x32x128xf16>
     %1 = pim.reduce_axis %0 {axis = 2 : i64, kind = #pim.eltwise<absmax>, pim.phase = 0 : i64, "pim.phase-bytes" = 64 : i64, unit = #pim.unit<vpu>} : tensor<1x32x128xf16> -> tensor<1x32x1xf16>
     %2 = pim.reshape %1 {"pim.phase-bytes" = 64 : i64} : tensor<1x32x1xf16> -> tensor<1x32xf16>
-    %3 = pim.lut %2 {activation_mode = 1 : i64, kind = #pim.activation<relu>, pim.phase = 1 : i64, "pim.phase-bytes" = 64 : i64, unit = #pim.unit<cstl>} : tensor<1x32xf16> -> tensor<1x32xf16>
+    %3 = pim.lut %2 {"pim.activation-mode" = 1 : i64, kind = #pim.activation<relu>, pim.phase = 1 : i64, "pim.phase-bytes" = 64 : i64, "pim.flp-min-exp" = 10 : i64, "pim.flp-max-exp" = 17 : i64, "pim.flp-mantisa" = 3 : i64, "pim.fpsu-mode" = 1 : i64, unit = #pim.unit<cstl>} : tensor<1x32xf16> -> tensor<1x32xf16>
     %4 = pim.lut %2 {kind = #pim.activation<reciprocal>, pim.phase = 2 : i64, "pim.phase-bytes" = 64 : i64, unit = #pim.unit<cstl>} : tensor<1x32xf16> -> tensor<1x32xf16>
-    %5 = pim.quantize %arg0, %4 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = fp2int_converter>]>, pim.phase = 3 : i64, "pim.phase-bytes" = 4096 : i64, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128>, unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x32xf16> -> tensor<1x4096xi8>
+    %5 = pim.quantize %arg0, %4 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = fp2int_converter>]>, pim.phase = 3 : i64, "pim.phase-bytes" = 4096 : i64, "pim.kantor-mode" = 3 : i64, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128>, unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x32xf16> -> tensor<1x4096xi8>
     tt.store %arg2, %5 : tensor<1x4096x!tt.ptr<i8>>
     tt.return
   }
@@ -145,6 +145,15 @@ def test_reduction_phases_run_on_vector_unit() -> None:
     assert dq.phases[0].unit == "vpu"
     assert dq.phases[1].unit == dq.phases[2].unit == "cstl"
 
+
+def test_dq_p1_parses_flp_and_activation_mode() -> None:
+    """txt 的 Flp / Activation mode 从 IR attr 来，不是只靠静态表。"""
+    plan = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
+    p1 = plan.phases[1]
+    assert p1.activation_mode == 1
+    assert p1.flp_min == 10 and p1.flp_max == 17 and p1.flp_mantisa == 3
+    assert plan.phases[3].kantor_mode == 3
+
     sm = parse_phase_plans(_EXPANDED_SOFTMAX)["softmax_five_phases"]
     assert sm.units() == ["vpu", "cstl", "vpu", "cstl", "cstl"]
 
@@ -217,3 +226,25 @@ module {
 """
     plan = parse_phase_plans(text)["single_phase"]
     assert plan.count == 0
+
+
+def test_single_phase_operator_still_carries_hardware_fields() -> None:
+    """单相算子的硬件域进 `op_attrs`，**不进** `phases`。
+
+    矩阵乘不展开，但 pass 仍在它身上盖 FPSU / FLP / 激活模式（FlagTree
+    `stampMatmul`）。混进 `phases` 会让相位数把单相算子算成一相，
+    `cross_check` 立刻判不符；而丢掉它们又会让 txt 的 `Flp *` 退回查表。
+    """
+    text = """
+module {
+  tt.func @gate_matmul(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
+    %m = pim.matmul %a, %b {activation = #pim.act_spec<kind = silu>, datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, "pim.fpsu-mode" = 2 : i64, "pim.flp-min-exp" = 10 : i64, "pim.flp-max-exp" = 17 : i64, "pim.flp-mantisa" = 3 : i64, "pim.activation-mode" = 0 : i64} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
+    tt.return
+  }
+}
+"""
+    plan = parse_phase_plans(text)["gate_matmul"]
+    assert plan.count == 0, "单相算子不能被算成相位"
+    assert plan.flp == (10, 17, 3)
+    assert plan.op_attrs["fpsu-mode"] == 2
+    assert plan.op_attrs["activation-mode"] == 0

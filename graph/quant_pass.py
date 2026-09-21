@@ -136,7 +136,9 @@ def _needs_dq(node: Node) -> bool:
     return node.meta.get(HEAD_ROLE_META_KEY) != ROLE_MATMUL_QK
 
 
-def _insert_one(gm: GraphModule, consumer: Node, report: QuantReport) -> bool:
+def _insert_one(
+    gm: GraphModule, consumer: Node, consumers: list[Node], report: QuantReport
+) -> bool:
     """在 `consumer` 的激活输入边上插一个 DQ 节点。"""
     source = _activation_input(consumer)
     if source is None:
@@ -174,8 +176,14 @@ def _insert_one(gm: GraphModule, consumer: Node, report: QuantReport) -> bool:
         head_index=consumer.meta.get(HEAD_INDEX_META_KEY),
     )
 
-    # 只把**这个消费者**的那一路改接到 DQ 上。其他消费者仍读原节点
-    # —— 实测 hidden 被多个 Gemm 共享，但每个 Gemm 各有自己的 DQ。
+    # 同一源张量的所有矩阵乘共用这一条 DQ。参考产物：q/k/v 共用节点 24，
+    # gate/up 共用一条；不是每个 Gemm 各插一条（那会多出 12 层）。
+    # 逐头的分数 DQ 源各不相同，仍是一对一。
+    for other in consumers:
+        if other is consumer:
+            continue
+        if _activation_input(other) is source:
+            other.replace_input_with(source, dq)
     consumer.replace_input_with(source, dq)
 
     report.inserted += 1
@@ -196,7 +204,7 @@ def insert_dynamic_scaling(gm: GraphModule) -> QuantReport:
     consumers = [node for node in gm.graph.nodes if _needs_dq(node)]
 
     for consumer in consumers:
-        _insert_one(gm, consumer, report)
+        _insert_one(gm, consumer, consumers, report)
 
     gm.graph.lint()
     gm.recompile()

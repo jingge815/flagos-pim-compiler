@@ -130,7 +130,13 @@ def test_both_paths_produce_identical_gml() -> None:
     from_pim = serialize_gml(gm_b, fusion_b, phase_source=source)
 
     assert static.text == from_pim.text
-    assert len(static.nodes) == len(from_pim.nodes) == 200
+    # 197 算子 + cos/sin 表 2 + mask 1 + KV cache 2 + 位置下标 1 = 203。
+    # 参考 decode block 是 200（编号体系不同，边界节点集合对齐）。
+    assert len(static.nodes) == len(from_pim.nodes)
+    assert len(static.nodes) >= 200
+    n_buf = sum(1 for n in static.nodes if n.fields.get("is_buffer"))
+    # 参考 decode block 10 个；未裁尾时入口/出口/表/mask/KV 至少 6。
+    assert n_buf >= 6
 
 
 @requires_live
@@ -187,11 +193,10 @@ def test_serialize_is_a_pure_function() -> None:
 
 @requires_live
 def test_kv_cache_dma_input_sf_uses_own_node_id() -> None:
-    """`KV_Cache_DMA` 的 `input_sf` 用自己的 node_id，且不带 dtype 字段。
+    """`KV_Cache_DMA` 声明三个槽：0=cache、1=索引、2=新值。
 
-    参考产物实测：`input_sf "input_sf_28.bin"`（自己的 id）、无
-    `input_buffer_dtype`。早先被 `convert()` 的副作用污染成引用上游 RoPE 的
-    `output_buffer_phase_1_*.bin` 并多出 `input_buffer_dtype "int8"`。
+    参考产物：`input_buffer_0 "input_buffer_0_28.bin"`，txt 的
+    `Original cache file` 取它。单数 `input_buffer` / `input_sf` 是错的。
     """
     from gml_bridge.export import serialize_gml
 
@@ -201,5 +206,17 @@ def test_kv_cache_dma_input_sf_uses_own_node_id() -> None:
            if n.fields.get("op_type") == "KV_Cache_DMA"]
     assert dma, "图里应有 KV_Cache_DMA 节点"
     for node in dma:
-        assert node.fields["input_sf"] == f"input_sf_{node.node_id}.bin"
+        assert node.fields["input_buffer_0"] == (
+            f"input_buffer_0_{node.node_id}.bin")
+        assert node.fields.get("input_buffer_1_dtype") == "int16"
+        assert node.fields.get("use_input_buffer_1") == "L2A_ignore"
         assert "input_buffer_dtype" not in node.fields
+        assert node.fields.get("input_count") == 3
+        residual = node.fields.get("residual_input_buffer") or []
+        assert len(residual) == 3
+    n_buf = sum(1 for n in artifact.nodes if n.fields.get("is_buffer"))
+    labels = {n.fields.get("label") for n in artifact.nodes
+              if n.fields.get("is_buffer")}
+    assert "in_kv_position" in labels
+    assert "in_key_cache" in labels or "in_value_cache" in labels
+    assert n_buf >= 6

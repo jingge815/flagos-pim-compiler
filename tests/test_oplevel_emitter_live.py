@@ -99,16 +99,16 @@ def test_nothing_is_skipped(expanded) -> None:
 
 
 def test_operator_counts_match_real_graph(expanded) -> None:
-    """算子个数：DQ 41、Softmax 32、RoPE 2。
+    """算子个数：DQ 38、Softmax 32、RoPE 2。
 
     Softmax 与逐头 score-DQ 各 32 个（每头一个）；RoPE 两条（Q 路与 K 路）。
-    RoPE 若只有 1 个，说明 K 路那个同时带 DQ 的锚点被分派逻辑吃掉了。
+    线性 DQ：q/k/v 共用、gate/up 共用，再加 o/down/lm_head 与 Q 路，共 6 条非逐头。
     """
     report, _ = expanded
     assert len(report.by_kind("softmax")) == NUM_HEADS
     assert len(report.by_kind("rope")) == 2
-    # 41 = 32 个逐头 score DQ + 9 条非逐头（含 Q 路与 K 路）
-    assert len(report.by_kind("dq")) == 41
+    # 38 = 32 个逐头 score DQ + 6 条非逐头
+    assert len(report.by_kind("dq")) == 38
 
 
 def test_every_op_expands_to_expected_phase_count(expanded) -> None:

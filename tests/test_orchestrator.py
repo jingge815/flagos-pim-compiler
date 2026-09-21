@@ -154,13 +154,26 @@ def test_last_phase_reuses_node_id() -> None:
 def test_task_chain_links_only_within_operator() -> None:
     """Task ID = 相位号，Prev/Next 只连本链内部。
 
+    Softmax 不是线性链：p2 扇出到 p3 和 p5，p5 等 p2 和 p4。
     跨算子依赖走 Datain/Dataout 文件名，不写 Prev/Next。
     """
     report = assign_ids(expand_layers([_node(42, "sm0", "Softmax")]).layers)
     tasks = [(i.task_id, i.prev_tasks, i.next_tasks) for i in report.identities]
     assert tasks[0] == (0, (), (1,))
+    assert tasks[1] == (1, (0,), (2, 4))
     assert tasks[2] == (2, (1,), (3,))
-    assert tasks[4] == (4, (3,), ())
+    assert tasks[3] == (3, (2,), (4,))
+    assert tasks[4] == (4, (1, 3), ())
+
+
+def test_dq_task_chain_fans_out_from_phase1() -> None:
+    """DQ 的 p1 扇出到 p2 和 p3；p3 读 p1，不读 p2。"""
+    report = assign_ids(expand_layers([_node(24, "dq0", "DynamicScaling")]).layers)
+    tasks = [(i.task_id, i.prev_tasks, i.next_tasks) for i in report.identities]
+    assert tasks[0] == (0, (), (1, 2))
+    assert tasks[1] == (1, (0,), ())
+    assert tasks[2] == (2, (0,), (3,))
+    assert tasks[3] == (3, (2,), ())
 
 
 def test_single_layer_op_has_empty_task_links() -> None:
@@ -282,20 +295,112 @@ def test_net_ini_lists_layers_in_execution_order() -> None:
     text = net_ini.render_layers_section(identities)
     lines = text.splitlines()
     assert lines[0] == "[layers]"
-    assert lines[1:] == [identity.filename for identity in identities]
+    assert lines[1:] == [
+        f"layer = {identity.filename.removesuffix('.txt')}"
+        for identity in identities]
 
 
-def test_net_ini_general_section_has_layer_count() -> None:
-    text = net_ini.render_general_section(num_layers=422, gml_version="26.2.1")
-    assert "layers_count=422" in text
-    assert "gml_version=26.2.1" in text
+def test_single_phase_op_attrs_really_drive_txt() -> None:
+    """单相算子（矩阵乘）的 txt 硬件域来自 IR，不是查表巧合。
+
+    这条是**反证**：`gemm_gate` 的查表值恰好也是 `Flp (10,17,3)`、`Fpsu 2`，
+    所以「导出后 txt 是 10/17/3」并不能说明 IR 接上了 —— 假依赖（完全无视
+    `op_attrs`）同样满足。这里把 IR 的值改成一组不可能来自查表的数，
+    txt 必须跟着变；不变就是 `_attach_op_attrs` 没接上。
+    """
+    from dataclasses import replace as dc_replace
+
+    from opcompiler_bridge.oplevel_emitter import EmittedOp
+    from opcompiler_bridge.phase_plan import PhasePlan
+    from opcompiler_bridge.phase_source import PhaseSource
+    from orchestrator.layer_expand import Layer
+    from orchestrator.plan import _attach_op_attrs
+
+    layer = Layer(gml_node_id=11, label="linear_4", op_type="Gemm")
+    plan = PhasePlan(func="linear_4__matmul", op_attrs={
+        # 查表是 (10, 17, 3) / fpsu 2；这里故意全不一样。
+        "flp-min-exp": 1, "flp-max-exp": 2, "flp-mantisa": 0,
+        "fpsu-mode": 7, "activation-mode": 9,
+    })
+    source = PhaseSource(
+        by_node={"linear_4": {"fused_matmul": plan}},
+        ops=[EmittedOp(func="linear_4__matmul", kind="fused_matmul",
+                       fx_name="linear_4", expected_phases=0)])
+
+    filled = _attach_op_attrs(layer, source)
+    assert filled.flp == (1, 2, 0), "IR 的 FLP 没填进 Layer"
+    assert filled.fpsu_mode == 7
+    assert filled.activation_mode == 9
+
+    # 再确认这些值真的写进了 txt 字段，而不是停在 Layer 上。
+    from orchestrator.layer_fields import build_layer_fields
+    from orchestrator.layer_id import LayerIdentity
+
+    ident = LayerIdentity(layer=filled, layer_id=11, task_id=0)
+    node = Node(11, {"label": "linear_4", "op_type": "Gemm",
+                     "input_buffer": "x.bin", "output_buffer": "y.bin",
+                     "input0_node_id": 13},
+                contraction=[("fused", {"activation_op_type": "Silu"})])
+    fields = build_layer_fields(ident, node, widths={11: 11008, 13: 4096},
+                                l2_offsets={})
+    assert fields["Flp min exp"] == 1, "txt 的 Flp 仍来自静态表"
+    assert fields["Flp max exp"] == 2
+    assert fields["Fpsu mode"] == 7
+
+
+def test_net_ini_general_section_has_strides() -> None:
+    text = net_ini.render_general_section()
+    assert "is_seq_test = 0" in text
+    assert "input_line_stride = 8" in text
+    assert "dumps_txt_path" in text
+
+
+def test_net_ini_line_endings_match_reference() -> None:
+    """参考产物的 net.ini 是 CRLF，**只有两条 dumps 路径**是 LF。
+
+    对方解析器按行切分时若把 `\\r` 当值的一部分，行尾写错会让每个值末尾多
+    一个字符。这条钉住那个混合写法。
+    """
+    text = net_ini.render_general_section()
+    assert "[general]\r\n" in text
+    assert "is_seq_test = 0\r\n" in text
+    # 这两行参考是 LF，不带 \r。
+    assert "dumps_bin_path = llama2_w4a8_decode_block_0/parser_output\n" in text
+    assert "dumps_bin_path = llama2_w4a8_decode_block_0/parser_output\r\n" not in text
+
+
+def test_net_ini_last_layer_has_no_trailing_newline() -> None:
+    """参考 net.ini 末字节是层名最后一个字符，没有 LF。"""
+    from orchestrator.layer_id import LayerIdentity
+    from orchestrator.layer_expand import Layer
+    identities = [
+        LayerIdentity(layer=Layer(gml_node_id=1, label="a", op_type="Gemm"),
+                      layer_id=1, task_id=0),
+        LayerIdentity(layer=Layer(gml_node_id=2, label="b", op_type="Gemm"),
+                      layer_id=2, task_id=0),
+    ]
+    text = net_ini.render_layers_section(identities, stems=["first", "last"])
+    assert not text.endswith("\n")
+    assert text.endswith("layer = last")
+
+
+def test_layer_txt_uses_crlf() -> None:
+    """422 个层文件参考全是 CRLF。"""
+    from collections import OrderedDict
+
+    from orchestrator.layer_render import render_layer_txt
+
+    text = render_layer_txt(OrderedDict([("Number of frames", 1),
+                                         ("Layer ID", 7)]))
+    assert text == "Number of frames: 1\r\nLayer ID: 7\r\n"
 
 
 def test_net_ini_constants_match_manual() -> None:
     """全层恒定的硬件口，来自手册 Table 7-11。"""
-    assert net_ini.CONSTANTS["Bytes in cycle internal memory read"] == 64
-    assert net_ini.CONSTANTS["Number of frames"] == 1
-    assert net_ini.CONSTANTS["L2 qman buffer size"] == 65536
+    from orchestrator.layer_hw_table import CONSTANTS
+    assert CONSTANTS["Bytes in cycle internal memory read"] == 64
+    assert CONSTANTS["Number of frames"] == 1
+    assert CONSTANTS["L2 qman buffer size"] == 65536
 
 
 # --- 端到端 ----------------------------------------------------------------

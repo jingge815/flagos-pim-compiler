@@ -311,8 +311,11 @@ def test_normalisation_check_catches_an_unnormalised_output(tmp_path: Path) -> N
     """phase4 之和偏离 1 要被抓到（比如漏了乘 phase3）。"""
     out_dir, nodes, _ = _artifact(tmp_path)
 
+    # phase1 的逐元素输出（exp 数组）按下一相的输入命名——
+    # `input_buffer_phase_2`，不是 `output_buffer_phase_1`（参考产物没有
+    # 这个名字，phase1 没有独立的标量输出，见 write_softmax_phases 的说明）。
     phase1 = np.fromfile(
-        out_dir / "output_buffer_phase_1_18.bin", dtype=np.float16)
+        out_dir / "input_buffer_phase_2_18.bin", dtype=np.float16)
     phase1.tofile(out_dir / "output_buffer_phase_4_18.bin")
 
     report = verify.Report()

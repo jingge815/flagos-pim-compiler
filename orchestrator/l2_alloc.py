@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from orchestrator.layer_id import LayerIdentity
+from contracts.compile_slots import DEFAULT_SLOTS
 
 # L2 窗口常量。来自 docs/prepare_out-域确认表-20260918.md 步骤 C：
 #   QMAN offset = 0x1FFF0000，size = 65536，本样例全层相同
@@ -40,6 +41,62 @@ L2_OUTPUT_PAD = 16
 
 def align_up(value: int, align: int) -> int:
     return (value + align - 1) // align * align
+
+
+def _is_dual_input(op_type: str, phase: int | None, node=None) -> bool:
+    """这一层是不是双输入层（两个真实数据槎，不是权重/表节点那种旁路）。
+
+    判据抄自 `orchestrator/layer_fields.py::build_layer_fields` 的 `dual`
+    变量（`kind in ("residual", "mask", "mlp_mul") or
+    kind.startswith("rope_")`），但只用 `Layer.op_type`/`phase` 这两个字段
+    重新表达一遍——不能直接 import `layer_fields.classify`，那边已经
+    import 了本模块（`from orchestrator import l2_alloc`），双向 import
+    会循环。两处判据必须保持同步：改一处忘改另一处，`L2 input buffer
+    offset 0/1` 就会退回同一个地址（这正是之前的 bug）。
+
+    Mask 是例外——它是否真的双输入取决于 GML 图里有没有接上 causal mask
+    边界节点，不是纯靠 op_type 能判断的通用规则（复核 20260921 §2.6）：
+    `gml_bridge/from_fx.py` 只在真的找到 causal mask placeholder 时才把
+    Mask 的 `input_count` 记成 2，seq_len==1 这类退化场景仍是单槎。传入
+    `node`（GML 节点，读它的 `input_count` 字段）时按边判；不传时保持旧的
+    纯 op_type 判（向后兼容，同 `layer_fields.py` 里同名判据没读到
+    `node.fields` 时的退回路径一致）。
+    """
+    if op_type == "Mask":
+        if node is not None:
+            return int(getattr(node, "fields", {}).get("input_count") or 1) >= 2
+        return True
+    if op_type in ("EltwiseAdd", "EltwiseMul"):
+        return True
+    if op_type in ("Llama2Activation", "Llama2ActivationDQ"):
+        # phase 0/1 是 mul_cos/mul_sin，phase 2 是 rope_add_k/rope_add_q——
+        # 三者在 layer_fields 里的 kind 都以 "rope_" 开头，全部算双输入。
+        # phase >= 3（Llama2ActivationDQ 尾部借用的 DQ 四相）不是。
+        return phase is not None and phase < 3
+    return False
+
+
+# RoPE 表宽（元素数）。mul_cos/mul_sin 的两个输入槎宽度不同（数据槎 H、
+# 表槎 HD）。常量从编译期槽位取，不能 import layer_fields（循环 import）。
+_ROPE_H = DEFAULT_SLOTS.hidden
+_ROPE_HD = DEFAULT_SLOTS.head_dim
+
+
+def _dual_slot1_size(op_type: str, phase: int | None, slot0_size: int,
+                     *, bcast: int | None = None, slots=None) -> int:
+    """槎 1 该分配多大。
+
+    多数双输入层两个槎同宽。RoPE mul 是例外：表槎 HD×2、数据槎 H×2。
+    `bcast` 是 `Eltwise broadcast input index`：1 表示表在槎 1（K 路），
+    0 表示表在槎 0、槎 1 是数据（Q 路 mul_cos）。不传时按旧约定（表在槎 1）。
+    """
+    slots = slots or DEFAULT_SLOTS
+    if (op_type in ("Llama2Activation", "Llama2ActivationDQ")
+            and phase is not None and phase < 2):
+        if bcast == 0:
+            return slots.hidden * 2
+        return slots.head_dim * 2
+    return slot0_size
 
 
 def l2_output_bytes(width: int, elem_bytes: int) -> int:
@@ -66,6 +123,7 @@ class L2Plan:
     """分配结果。"""
 
     offsets: dict[str, int] = field(default_factory=dict)
+    slot_sizes: dict[int, int] = field(default_factory=dict)
     top: int = 0
     slots: int = 0
     buffers: int = 0
@@ -127,8 +185,11 @@ def allocate(buffers: list[L2Buffer], *, base: int = 0,
             offsets[buffer.name] = offset
             top = offset + buffer.size
 
-    return L2Plan(offsets=offsets, top=align_up(top, align),
-                  slots=len(slots), buffers=len(buffers))
+    return L2Plan(
+        offsets=offsets,
+        slot_sizes={slot["offset"]: slot["size"] for slot in slots},
+        top=align_up(top, align),
+        slots=len(slots), buffers=len(buffers))
 
 
 def output_width_by_node(edges) -> dict[int, int]:
@@ -170,7 +231,9 @@ def consumers_by_node(edges) -> dict[int, set[int]]:
 def buffers_from_layers(identities: list[LayerIdentity],
                         *, output_width: dict[int, int] | None = None,
                         consumers: dict[int, set[int]] | None = None,
-                        elem_bytes: int = 2) -> list[L2Buffer]:
+                        elem_bytes: int = 2,
+                        nodes_by_id: dict[int, object] | None = None,
+                        slots=None) -> list[L2Buffer]:
     """从层列表推出待分配的输出缓冲。
 
     只分配**输出**段：实测参考产物里 `L2 input buffer offset` 出现 0 次，
@@ -178,6 +241,12 @@ def buffers_from_layers(identities: list[LayerIdentity],
 
     生命周期：本层写入，被下一个引用它的层读完为止。同一算子的相位链内部相邻
     相位互为生产/消费，所以链内缓冲寿命很短——这正是 96.4% 折叠率的来源。
+
+    `nodes_by_id` 供 Mask 的双输入判定用（见 `_is_dual_input` 的调用点）：
+    Mask 是否真的有 causal mask 边界节点这条边，只有 GML 节点自己的
+    `input_count` 知道，不给这个参数时退回纯按 op_type 判（复核 20260921
+    §2.6，seq_len==1 这类没有 causal mask 的退化场景需要它才能不多分配
+    出一个没有对应边的 `#1` 槎）。
     """
     buffers: list[L2Buffer] = []
     # 层序号 -> 该层所属算子（label）。
@@ -211,29 +280,91 @@ def buffers_from_layers(identities: list[LayerIdentity],
             read_until[node_id] = max(starts)
 
     widths = output_width or {}
+    slots = slots or DEFAULT_SLOTS
 
     for index, identity in enumerate(identities):
         layer = identity.layer
-        size = layer.phase_bytes or 0
+        node = (nodes_by_id.get(layer.gml_node_id)
+               if nodes_by_id is not None else None)
+        # 尺寸与 txt 声明同源：按编译期槽位，不按导出图边宽 / phase_bytes。
+        kind = _kind_hint(layer, node)
+        declared = _declared_l2_size(kind, layer, widths, slots)
+        size = declared or layer.phase_bytes or 0
         if size <= 0:
-            # 单层算子没有相位字节数，按闭合公式从输出宽度算
-            # （文档步骤 C：L2 output size = (align16(Width)+16) * elem_bytes）。
             width = widths.get(layer.gml_node_id)
+            if kind == "mask":
+                width = slots.seq
             if width:
                 size = l2_output_bytes(width, elem_bytes)
         if size <= 0:
             continue
 
         if layer.phase is not None and index < last_layer_of[layer.label]:
-            # 相位链内部：下一相立刻读，寿命一步。这是高折叠率的来源。
             end = index + 1
         else:
-            # 算子的末层（含单层算子）：按边活到最后一个下游算子读完为止。
-            # 查不到下游（图的出口）就只活本层。
             end = read_until.get(layer.gml_node_id, index)
 
         buffers.append(L2Buffer(
             name=identity.stem, size=size,
             produced_at=index, last_read_at=max(end, index),
         ))
+
+        if _is_dual_input(layer.op_type, layer.phase, node):
+            bcast = None
+            if (layer.op_type in ("Llama2Activation", "Llama2ActivationDQ")
+                    and layer.phase is not None and layer.phase < 2):
+                # Q 路 mul_cos：表在槎 0，槎 1 是数据。
+                if layer.op_type == "Llama2ActivationDQ" and layer.phase == 0:
+                    bcast = 0
+                else:
+                    bcast = 1
+            slot1_size = _dual_slot1_size(
+                layer.op_type, layer.phase, size, bcast=bcast, slots=slots)
+            buffers.append(L2Buffer(
+                name=f"{identity.stem}#1", size=slot1_size,
+                produced_at=index, last_read_at=max(end, index),
+            ))
     return buffers
+
+
+def _kind_hint(layer, node) -> str:
+    op = layer.op_type
+    phase = layer.phase
+    if op == "Mask":
+        return "mask"
+    if op == "EltwiseAdd":
+        return "residual"
+    if op == "EltwiseMul":
+        return "mlp_mul"
+    if op == "Llama2Activation" and phase is not None:
+        return ("rope_mul_cos", "rope_mul_sin", "rope_add_k")[phase]
+    if op == "Llama2ActivationDQ" and phase is not None and phase < 3:
+        return ("rope_mul_cos", "rope_mul_sin", "rope_add_q")[phase]
+    if op == "MatMul":
+        fields = getattr(node, "fields", {}) or {}
+        if fields.get("weight_format") == "weights_transpose":
+            return "bmm1"
+        return "bmm2"
+    if op == "Softmax" and phase is not None:
+        return f"sm_p{phase + 1}"
+    if op == "DynamicScaling" and phase is not None:
+        return f"dq_p{phase + 1}"
+    return ""
+
+
+def _declared_l2_size(kind: str, layer, widths: dict[int, int],
+                      slots) -> int:
+    """与 txt 的 L2 声明同源的字节数（输出段，闭合公式）。"""
+    if kind == "mask":
+        return l2_output_bytes(slots.seq, 2)
+    if kind == "mlp_mul":
+        return l2_output_bytes(slots.intermediate, 2)
+    if kind.startswith("rope_") or kind == "residual":
+        return l2_output_bytes(slots.hidden, 2)
+    if kind == "bmm1":
+        return l2_output_bytes(slots.seq, 2)
+    if kind == "bmm2":
+        return l2_output_bytes(slots.hidden, 2)
+    if kind.startswith("sm_"):
+        return l2_output_bytes(slots.seq, 2)
+    return 0

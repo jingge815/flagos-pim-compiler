@@ -233,6 +233,10 @@ def test_matmul_under_reports_input_count_by_one() -> None:
             1 for index in range(32) if f"input{index}_node_id" in node.fields)
         assert node.fields["input_count"] == max(1, slots - 1)
         assert node.fields["MatMul_input_as_weight"] == 1
+        assert node.fields.get("weight_buffer") == names.weight_buffer(node.node_id)
+        assert node.fields.get("weight_sf") == names.weight_scale(node.node_id)
+        assert node.fields.get("weight_zp") == names.weight_zero_point(node.node_id)
+        assert node.fields.get("weight_buffer_dtype") == "int8"
 
 
 def test_input_count_identity_holds() -> None:
@@ -266,3 +270,56 @@ def test_port_keys_use_the_naming_helpers() -> None:
                 assert key in (
                     names.residual_buffer_key("input", 0),
                     names.residual_buffer_key("input", 10))
+
+
+def test_every_computing_op_declares_node_dtypes() -> None:
+    """做计算的算子必须声明节点级 dtype。
+
+    少一个 dtype 就是底层编译器少一项位宽配置，而那不会在我们这侧报错 ——
+    要到对方解析器才炸（评审 4 §2.5）。
+    """
+    nodes, _, _, _ = convert(_llama_like_graph())
+
+    computing = {"Gemm", "MatMul", "Softmax", "Mask", "EltwiseAdd",
+                 "EltwiseMul", "RMSNorm_vpu", "DynamicScaling"}
+    checked = 0
+    for node in nodes:
+        op = node.fields.get("op_type")
+        if op not in computing:
+            continue
+        checked += 1
+        assert "output_buffer_dtype" in node.fields, f"{op} 缺 output dtype"
+        assert "output_data_extension" in node.fields, f"{op} 缺 output extension"
+    assert checked, "小图里应当有做计算的算子"
+
+
+def test_layout_ops_propagate_dtype_and_carry_no_scale() -> None:
+    """布局算子的 dtype 沿边传播，且不带 sf/zp。
+
+    **不能按 op_type 写死**：参考里同一个 `Transpose` 既有 fp16 的
+    （concat 之后那条）也有 int8 的（KV 与 QK 那条），`Reshape` 同样两种。
+    写死会让一半节点位宽错一倍。sf/zp 则是压根不该有 —— 换轴改形状不改
+    动态范围，下游沿用上游的 scale。
+    """
+    nodes, _, _, _ = convert(_llama_like_graph())
+    by_id = {n.node_id: n for n in nodes}
+
+    layout = [n for n in nodes
+              if n.fields.get("op_type") in ("Transpose", "Reshape", "Split")]
+    assert layout, "小图里应当有布局算子"
+    for node in layout:
+        op = node.fields["op_type"]
+        assert "input_sf" not in node.fields, f"{op} 不该带 input_sf"
+        assert "input_zp" not in node.fields, f"{op} 不该带 input_zp"
+        # 输出 dtype 要么来自上游（传播），要么是该类的固定值（Split 落定点）。
+        assert "output_buffer_dtype" in node.fields
+        if op == "Split":
+            assert node.fields["output_buffer_dtype"] == "int8"
+            continue
+        producers = [int(p) for p in
+                     (node.fields.get(names.residual_buffer_key("input", 0)) or [])]
+        upstream = next((by_id[p] for p in producers if p in by_id), None)
+        if upstream is not None and "output_buffer_dtype" in upstream.fields:
+            assert (node.fields["output_buffer_dtype"]
+                    == upstream.fields["output_buffer_dtype"]), (
+                f"{op} 的 dtype 没有沿边传播")

@@ -69,8 +69,8 @@ def _specs(gm) -> list:
 def test_every_matmul_gets_a_dq_on_its_activation_input(quantized) -> None:
     """每个吃激活的矩阵乘都要有一个 DQ 上游。
 
-    实测参考产物：7 个 Gemm 各 1 个、32 个 matmul2 各 1 个，
-    32 个 matmul1 **零个**（它吃的是已量化的 Q 与 KV cache）。
+    实测参考产物：q/k/v 共用 1 条、o/down 各 1、gate/up 共用 1，
+    再加逐头 matmul2；matmul1 **零个**。
     """
     clone, report = quantized
     assert report.inserted > 0
@@ -112,27 +112,27 @@ def test_group_count_is_numel_over_group_size(quantized) -> None:
         assert spec.groups == spec.numel // spec.group_size
 
 
-def test_shared_activation_gets_one_dq_per_consumer(quantized) -> None:
-    """被多个矩阵乘共享的激活，每个消费者各有自己的 DQ。
+def test_shared_activation_shares_one_dq(quantized) -> None:
+    """同一源张量的多个矩阵乘共用一条 DQ。
 
-    实测参考产物：hidden 被 q/k/v_proj 三个 Gemm 读，
-    但节点 24 / 12 / 196 是三个**独立**的 DQ，不是一个共享的。
-    这是因为每个 DQ 的输出 scale 要给它自己那个消费者用。
+    参考产物：q/k/v 共用节点 24，gate/up 共用一条。
+    逐头分数 DQ 源各不相同，仍是一对一。
     """
     clone, _ = quantized
 
-    consumers_per_dq = collections.Counter()
+    gemm_dqs = []
     for node in clone.graph.nodes:
         if DQ_META_KEY not in node.meta:
             continue
-        consumers_per_dq[node.name] = len([
-            u for u in node.users
-            if u.target is not torch.ops.aten._assert_tensor_metadata.default
-        ])
-
-    assert consumers_per_dq
-    for name, count in consumers_per_dq.items():
-        assert count == 1, f"{name} 有 {count} 个消费者，应当一对一"
+        if node.meta[DQ_META_KEY].is_attention_scores:
+            continue
+        gemm_dqs.append(node)
+    # 一层：attn 前、o_proj 前、mlp 前、down 前、lm_head 前。
+    assert 1 <= len(gemm_dqs) <= 5
+    for dq in gemm_dqs:
+        users = [u for u in dq.users
+                 if u.target is not torch.ops.aten._assert_tensor_metadata.default]
+        assert users, dq.name
 
 
 def test_dq_preserves_numerics(base_graph, quantized) -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
+from contracts.compile_slots import DEFAULT_SLOTS
 from orchestrator import l2_alloc, net_ini
 from orchestrator.layer_expand import ExpandReport, expand_layers
 from orchestrator.layer_id import IdentityReport, assign_ids
@@ -29,6 +30,7 @@ class OrchestrationPlan:
     identity: IdentityReport
     l2: l2_alloc.L2Plan
     net_ini_text: str
+    layer_texts: dict[str, str] = field(default_factory=dict)
 
     @property
     def total_layers(self) -> int:
@@ -60,7 +62,9 @@ def _attach_phase_data(expand: ExpandReport, phase_source) -> ExpandReport:
         if layer.op_type == "Llama2ActivationDQ" and layer.phase is not None:
             kind = "rope" if layer.phase < 3 else "dq"
         if kind is None or layer.phase is None:
-            filled.append(layer)
+            # 单相算子（带尾部激活的矩阵乘）也有算子编译器盖的硬件域，只是
+            # 不在 `phases` 里而在 `op_attrs`（见 PhasePlan 的说明）。
+            filled.append(_attach_op_attrs(layer, phase_source))
             continue
 
         plan = phase_source.plan(layer.label, kind)
@@ -81,32 +85,175 @@ def _attach_phase_data(expand: ExpandReport, phase_source) -> ExpandReport:
             phase_bytes=phase.bytes,
             unit=phase.unit,
             force_consecutive=phase.force_consecutive,
+            flp=((phase.flp_min, phase.flp_max, phase.flp_mantisa)
+                 if phase.flp_min is not None and phase.flp_max is not None
+                 else None),
+            kantor_mode=phase.kantor_mode,
+            fpsu_mode=phase.fpsu_mode,
+            transpose_type=phase.transpose_type,
+            activation_mode=phase.activation_mode,
         ))
 
     return ExpandReport(layers=filled, folded=expand.folded,
                         unknown=expand.unknown)
 
 
+def _attach_op_attrs(layer, phase_source):
+    """把单相算子的硬件域填进层。
+
+    矩阵乘不展开相位，但算子编译器仍在 `pim.matmul` 上盖了 FPSU / FLP /
+    激活模式（见 FlagTree `stampMatmul`）。那些域在 `PhasePlan.op_attrs`
+    里，不在 `phases` 里——放进 phases 会让相位数把单相算子算进去。
+
+    取不到就原样返回：`layer_fields` 会回退查表，不会写出空值。
+    """
+    plan = phase_source.plan(layer.label, "fused_matmul")
+    if plan is None or not plan.op_attrs:
+        return layer
+    return replace(
+        layer,
+        flp=plan.flp,
+        fpsu_mode=plan.op_attrs.get("fpsu-mode"),
+        activation_mode=plan.op_attrs.get("activation-mode"),
+        kantor_mode=plan.op_attrs.get("kantor-mode"),
+    )
+
+
 def orchestrate(artifact, *, phase_source=None,
-                gml_version: str = "26.2.1") -> OrchestrationPlan:
-    """跑完编排四步。
+                gml_version: str = "26.2.1",
+                decode_block_only: bool = False) -> OrchestrationPlan:
+    """跑完编排：展开、发号、L2、逐层 txt、net.ini。
 
     `artifact` 是 `gml_bridge.export.GmlArtifact`。
+    `decode_block_only` 丢掉模型末尾 RMSNorm + lm_head + 它们的 DQ，
+    层数与参考纯 decode block 的 422 对齐。
     """
+    from orchestrator.layer_fields import build_layer_fields, classify, semantic_stem
+    from orchestrator.layer_render import render_layer_txt
+
+    # 几何真源跟着产物走：GML 侧已按模型 config 定好编译期槽位。
+    slots = getattr(artifact, "slots", None) or DEFAULT_SLOTS
     lookup = None if phase_source is None else phase_source.plan
     expand = expand_layers(artifact.nodes, phase_lookup=lookup)
     expand = _attach_phase_data(expand, phase_source)
 
     identity = assign_ids(expand.layers)
-    # 单层算子的输出宽度从 GML 边上取——它们拿不到 `pim.phase-bytes`，
-    # 漏掉会让复用率虚高（实测 99.1% vs 参考 96.4%）。
     widths = l2_alloc.output_width_by_node(artifact.edges)
-    # 消费者关系按边算，不用拓扑序近似（近似会让寿命恒为 1）。
     consumers = l2_alloc.consumers_by_node(artifact.edges)
+    # `nodes_by_id` 要在分配 L2 之前建好：Mask 是否真的双输入（有没有接上
+    # causal mask 边界节点）只有 GML 节点自己的 `input_count` 知道，`Layer`
+    # 上没有这个信息（复核 20260921 §2.6）。
+    nodes_by_id = {node.node_id: node for node in artifact.nodes}
     buffers = l2_alloc.buffers_from_layers(
-        identity.identities, output_width=widths, consumers=consumers)
+        identity.identities, output_width=widths, consumers=consumers,
+        nodes_by_id=nodes_by_id, slots=slots)
     l2 = l2_alloc.allocate(buffers)
-    text = net_ini.render(identity.identities, gml_version=gml_version)
 
+    identities = identity.identities
+    # decode-block 已在 GML `_trim_decode_block` 裁过，这里不再用另一套判据。
+    identities = _order_like_reference(identities, nodes_by_id, widths)
+
+    layer_texts: dict[str, str] = {}
+    stems: list[str] = []
+    residual_index = 0
+    for item in identities:
+        node = nodes_by_id.get(item.layer.gml_node_id)
+        if node is None:
+            continue
+        kind = classify(item, node, widths, nodes_by_id=nodes_by_id,
+                        weight_params=getattr(artifact, "weight_params", None),
+                        slots=slots)
+        extra_residual = 0
+        if kind == "residual":
+            residual_index += 1
+            extra_residual = residual_index
+        stem = semantic_stem(item, node, kind, residual_index=extra_residual)
+        fields = build_layer_fields(
+            item, node, widths=widths, l2_offsets=l2.offsets,
+            nodes_by_id=nodes_by_id, stem=stem,
+            terminal=item is identities[-1], slots=slots)
+        layer_texts[stem + ".txt"] = render_layer_txt(fields)
+        stems.append(stem)
+
+    text = net_ini.render(identities, gml_version=gml_version, stems=stems)
     return OrchestrationPlan(expand=expand, identity=identity, l2=l2,
-                             net_ini_text=text)
+                             net_ini_text=text, layer_texts=layer_texts)
+
+
+def _order_like_reference(identities, nodes_by_id, widths):
+    """按参考骨架排：RMSNorm → DQ → v → k → RoPE_K → q → RoPE_Q/DQ_Q → 32 头。
+
+    FX 拓扑是 q 再 k 再 v，参考 L2A 把写 cache 的 v/k 提前。RoPE 三连必须连续。
+    """
+    from orchestrator.layer_fields import classify
+
+    tagged = []
+    for item in identities:
+        node = nodes_by_id.get(item.layer.gml_node_id)
+        kind = "other"
+        if node is not None:
+            kind = classify(item, node, widths, nodes_by_id=nodes_by_id)
+        tagged.append((kind, item))
+
+    # gemm_qko 里 v 已分走。k 在 q 前：用权重名区分。
+    def gemm_sub(node):
+        param = str((node.fields if node else {}).get("pim_weight_param", ""))
+        if "k_proj" in param:
+            return 0
+        if "q_proj" in param:
+            return 2
+        if "o_proj" in param:
+            return 9
+        return 1
+
+    def rope_sub(kind, item):
+        # K 三连（Llama2Activation）在 Q 三连+DQ（Llama2ActivationDQ）之前。
+        if item.layer.op_type == "Llama2Activation":
+            return {"rope_mul_cos": 0, "rope_mul_sin": 1, "rope_add_k": 2}.get(kind, 3)
+        # Q
+        if kind.startswith("rope_"):
+            return {"rope_mul_cos": 3, "rope_mul_sin": 4, "rope_add_q": 5}.get(kind, 6)
+        if kind.startswith("dq_"):
+            return 6 + int(kind[-1])
+        return 8
+
+    prefix, heads, tail = [], [], []
+    seen_head = False
+    for kind, item in tagged:
+        is_head = item.layer.head_index is not None or kind.startswith("bmm") or kind == "mask"
+        if is_head:
+            seen_head = True
+            heads.append((kind, item))
+            continue
+        if seen_head:
+            tail.append((kind, item))
+            continue
+        prefix.append((kind, item))
+
+    def prefix_key(pair):
+        kind, item = pair
+        node = nodes_by_id.get(item.layer.gml_node_id)
+        # 参考：RMSNorm → DQ → v → k → RoPE_K → q → RoPE_Q+DQ_Q
+        if kind == "rmsnorm":
+            return (0, 0, item.layer.gml_node_id)
+        if kind.startswith("dq_") and item.layer.op_type != "Llama2ActivationDQ":
+            return (1, item.layer.phase or 0, item.layer.gml_node_id)
+        if kind == "gemm_v":
+            return (2, 0, item.layer.gml_node_id)
+        if kind == "gemm_qko":
+            sub = gemm_sub(node)
+            if sub == 0:  # k
+                return (3, 0, item.layer.gml_node_id)
+            if sub == 2:  # q
+                return (5, 0, item.layer.gml_node_id)
+            return (8, sub, item.layer.gml_node_id)
+        if item.layer.op_type == "Llama2Activation":
+            return (4, rope_sub(kind, item), item.layer.gml_node_id)
+        if kind.startswith("rope_") or (kind.startswith("dq_") and item.layer.op_type == "Llama2ActivationDQ"):
+            return (6, rope_sub(kind, item), item.layer.gml_node_id)
+        return (7, 0, item.layer.gml_node_id)
+
+    prefix.sort(key=prefix_key)
+    # 32 头内部保持原序（bmm1, mask, sm, dq, bmm2）。
+    ordered = [item for _, item in prefix + heads + tail]
+    return ordered

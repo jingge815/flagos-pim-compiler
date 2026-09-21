@@ -260,9 +260,14 @@ def _emit_rope(node: FxNode) -> tuple[str, EmittedOp] | None:
     func = f"{_sanitize(node.name)}__rope"
     src_ty = _tensor(src_shape, _F16)
     tab_ty = _tensor(cos_shape, _F16)
+    # 两条 RoPE 链的**末相**配置不同，而这件事只有图编译器知道（谁是 K）：
+    # K 路的 add 要在写进 cache 前重定标（层卡 Kantor mode 3），Q 路留 fp16
+    # 交给紧随的 DQ（层卡 0）。把它标在 `pim.rope` 上，展开 pass 照抄，
+    # 不必自己猜在展开哪条链 —— 猜的话两条链只能同值，`rope_add_q` 就错。
+    kantor = ' "pim.kantor-mode" = 3 : i64,' if _is_second_rope(node) else ""
     body = f"""  tt.func @{func}(%x: {src_ty}, %c: {tab_ty}, %s: {tab_ty}) {{
     %y = pim.rope %x, %c, %s
-       {{numHeads = {num_heads} : i64, unit = #pim.unit<cstl>}}
+       {{{kantor} numHeads = {num_heads} : i64, unit = #pim.unit<cstl>}}
        : {src_ty}, {tab_ty}, {tab_ty} -> {src_ty}
     tt.return
   }}"""
@@ -359,7 +364,7 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
         candidates: list[tuple[str, EmittedOp] | None] = []
         if ROPE_META_KEY in node.meta:
             candidates.append(_emit_rope(node))
-            if _is_second_rope(node):
+            if not _is_second_rope(node):
                 candidates.append(_emit_dq_for_rope(node))
         elif DQ_META_KEY in node.meta:
             candidates.append(_emit_dq(node))

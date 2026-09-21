@@ -69,6 +69,12 @@ class Layer:
     unit: str = ""
     # RoPE 三连不能被打散。
     force_consecutive: bool = False
+    # 算子编译器给的硬件域；没有则 layer_fields 回退查表。
+    flp: tuple[int, int, int] | None = None
+    kantor_mode: int | None = None
+    fpsu_mode: int | None = None
+    transpose_type: int | None = None
+    activation_mode: int | None = None
 
     @property
     def is_per_head(self) -> bool:
@@ -117,7 +123,9 @@ def _head_index_of(fields: dict) -> int | None:
     Softmax 32 + DynamicScaling 32，正是逐头的四类；剩下 38 个非逐头。
     这与文档步骤 A 的「循环内每头 12 层 × 32」对得上。
     """
-    label = str(fields.get("label", ""))
+    # 用 FX 名（内部键）：`label` 已改成参考风格的语义名，逐头那批的
+    # `headN` 只在 FX 名里。
+    label = str(fields.get("pim_fx_name") or fields.get("label", ""))
     marker = "head"
     at = label.rfind(marker)
     if at < 0:
@@ -176,7 +184,9 @@ def expand_layers(nodes, *, phase_lookup=None) -> ExpandReport:
             continue
 
         op_type = str(fields.get("op_type", ""))
-        label = str(fields.get("label", ""))
+        # 相位模板按 **FX 名** 查（算子编译器是按 FX 名索引的）。
+        # `label` 已改成参考风格的语义名，内部键 `pim_fx_name` 才是 FX 名。
+        label = str(fields.get("pim_fx_name") or fields.get("label", ""))
         head_index = _head_index_of(fields)
 
         if op_type in FOLDED_OPS:

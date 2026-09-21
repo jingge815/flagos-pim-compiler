@@ -15,7 +15,12 @@ from pathlib import Path
 import numpy as np
 
 from contracts import gml_names as names
-from contracts.gml_lut import synth_identity, synth_reciprocal, synth_silu
+from contracts.gml_lut import (
+    synth_exp,
+    synth_identity,
+    synth_reciprocal,
+    synth_silu,
+)
 from contracts.gml_quant import INT8_MAX, INT8_MIN, lut_identity
 from gml_bridge.phase_data import (
     DQ_PHASE0_BIAS,
@@ -298,15 +303,50 @@ def write_softmax_phases(
 
     另外两处是**运行时落点**而非常量：`Bias_buffer_phase_1` 等于 phase0 的输出、
     `Scaling_buffer_phase_4` 等于 phase3 的输出。不要硬编码 -30.75。
+
+    **相位模型是 5 入 + 5 出对称结构**（复核 20260921 纠正：上一版这里的
+    docstring 说"phase1 没有 output_buffer_phase_1"是错的——那是只看
+    `prepare_out/txt_files` 的层卡字段推出来的，没有去对参考 GML 文本本身。
+    实测参考 `relay2gml_graph.gml` 的 node 18 逐相都声明了
+    `input_buffer_phase_N` 与 `output_buffer_phase_N`（N=0..4），
+    `parser_output` 也确实有全部 10 个文件。逐相数据流（实测逐字节验证）：
+
+        phase0  in=原始分数(1024fp16)         out=[0,-max]（高2字节编码）
+        phase1  in=原始分数(1024fp16，同p0)    out=exp 数组(1024fp16)
+        phase2  in=exp 数组(读 p1 的输出)       out=Σexp（真 fp32，4B）
+        phase3  in=Σexp（fp32，读 p2 的输出）   out=1/Σexp（fp16，2B）
+        phase4  in=exp 数组(再读一次 p1 的输出)  out=exp×(1/Σexp)（1024fp16）
+
+    即 phase1/phase4 的 `input_buffer_phase_*` 都是「重复读 phase1 的
+    output_buffer」，不是开一条新数据；phase2/phase3 的 `input_buffer_phase_*`
+    是「读上一相的 output_buffer」。这里按此写，不再发明
+    `input_buffer_phase_3` 是 2 元素的猜测（复核前那版是错的，参考实测是
+    1 个 fp32）。
     """
     files._write(names.phase_input_buffer(node_id, 0), phases.source)
-
     files._write(names.phase_output_buffer(node_id, 0), phases.phase0_bytes)
+
+    # phase1：源数据再读一次（结构上与 phase0 相同的输入），输出是真正的
+    # exp 数组。
+    files._write(names.phase_input_buffer(node_id, 1), phases.source)
     files._write(names.phase_output_buffer(node_id, 1), phases.phase1)
+
+    # phase2：输入是 phase1 的输出（exp 数组），输出是 fp32 归约和。
+    files._write(names.phase_input_buffer(node_id, 2), phases.phase1)
     files._write(names.phase_output_buffer(node_id, 2), phases.phase2_bytes)
+
+    # phase3：输入是 phase2 的输出（fp32 标量，1 个元素，不是 2 个——上一版
+    # 猜错了），输出是倒数。
+    files._write(
+        names.phase_input_buffer(node_id, 3),
+        np.full(1, phases.phase2, dtype=np.float32))
     files._write(
         names.phase_output_buffer(node_id, 3),
         np.full(1, phases.phase3, dtype=np.float16))
+
+    # phase4：输入再读一次 phase1 的输出（exp 数组），输出是归一化后的
+    # softmax 结果。
+    files._write(names.phase_input_buffer(node_id, 4), phases.phase1)
     files._write(names.phase_output_buffer(node_id, 4), phases.phase4)
 
     for phase in range(5):
@@ -330,7 +370,9 @@ def write_softmax_phases(
             names.phase_fpsu_post_shift(node_id, phase),
             np.zeros(1, dtype=np.uint8))
 
-    # p1 过 exp 表、p3 过倒数表。exp 表尚需拷贝（段索引未反推出）。
+    # p1 过 exp 表（占位，见 synth_exp 的说明——数值路径本来就不经过它）、
+    # p3 过倒数表。
+    files._write(names.phase_lut(node_id, 1), synth_exp())
     files._write(names.phase_lut(node_id, 3), synth_reciprocal())
 
 

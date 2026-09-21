@@ -69,6 +69,15 @@ EMITTED = frozenset({
     "input_data_extensions", "output_data_extension",
     # 被量化张量的形状，以及按 group_size 拆开后的形状。
     "original_shape", "output_shape_by_group",
+    # Gemm v_proj / mlp_mul 的 Kantor，gate 的 SiLU LUT，双输入 FPSU 分槽。
+    "activation_lut_file",
+    "fpsu_mode_0", "fpsu_mode_1",
+    "fpsu_0_spc", "fpsu_0_spg", "fpsu_1_spc", "fpsu_1_spg",
+    "pooling_dtype_0", "pooling_dtype_1",
+    "kantor_A_spc", "kantor_A_spg", "kantor_A_scale_axis",
+    "kantor_A_scale_buffer_file", "kantor_A_bias_buffer_file",
+    "kantor_A_Shift",
+    "activation_mode", "activation_special_operators",
 })
 
 # 第 4 轮（静态量化）要补的字段族。量化参数、定标系数、LUT 都依赖校准数据，
@@ -78,16 +87,6 @@ PENDING_QUANTIZATION = frozenset({
     "input_0_sf_dtype", "input_1_sf_dtype",
     "bias_buffer", "bias_buffer_dtype", "bias_sf",
     "bias_sf_dtype", "bias_zp",
-    # 累加与定标
-    "fpsu_mode_0", "fpsu_mode_1",
-    "fpsu_0_spc", "fpsu_0_spg", "fpsu_1_spc", "fpsu_1_spg",
-    "pooling_dtype_0", "pooling_dtype_1",
-    # kantor 重定标
-    "kantor_A_spc", "kantor_A_spg", "kantor_A_scale_axis",
-    "kantor_A_scale_buffer_file", "kantor_A_bias_buffer_file",
-    "kantor_A_Shift",
-    # LUT 激活
-    "activation_lut_file", "activation_mode", "activation_special_operators",
     # 激活前中间态（只多输入算子有）
     "Relu_input", "Relu_input_dtype", "Relu_input_sf", "Relu_input_sf_dtype",
     "Relu_input_zp",
