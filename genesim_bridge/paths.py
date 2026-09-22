@@ -23,9 +23,6 @@ _ENV_VARS = {
     "gml_llama2_reference_dir": "GML_LLAMA2_REFERENCE_DIR",
 }
 
-# Triton NVIDIA 后端目录。
-_NVIDIA_BACKEND_SUBPATH = "python/lib/python3.10/site-packages/triton/backends/nvidia"
-
 # PIM 编译 pass 使用的默认硬件参数。
 _PIM_DEFAULTS = {
     "pim_target": "pim:v1",
@@ -120,9 +117,21 @@ def flagtree_prefix() -> Path:
     return _resolve("flagtree_prefix")
 
 
+def _flagtree_site_packages() -> Path:
+    """flagTree 安装里 Python 的 site-packages 目录（python3.X 版本号动态探测）。"""
+    lib_dir = flagtree_prefix() / "python" / "lib"
+    matches = sorted(lib_dir.glob("python3.*"))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"{lib_dir} 下应有且只有一个 python3.* 目录，实际找到 {len(matches)} 个：{matches}\n"
+            f"当前生效路径：\n{describe()}"
+        )
+    return matches[0] / "site-packages"
+
+
 def flagtree_nvidia_backend() -> Path:
     """flagTree 里 triton 的 nvidia backend 目录（含 include/cuda.h 与 bin/ptxas）。"""
-    return flagtree_prefix() / _NVIDIA_BACKEND_SUBPATH
+    return _flagtree_site_packages() / "triton" / "backends" / "nvidia"
 
 
 def pim_options() -> dict:

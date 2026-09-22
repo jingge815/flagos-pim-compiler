@@ -63,3 +63,31 @@ def test_describe_marks_missing_paths_as_unconfigured(monkeypatch, tmp_path) -> 
 
     assert "flagtree_prefix = <未配置>" in paths.describe()
     assert "pim_target = pim:v1  (内置默认值 _PIM_DEFAULTS)" in paths.describe()
+
+
+def test_flagtree_nvidia_backend_finds_dynamic_python_version(monkeypatch, tmp_path) -> None:
+    flagtree_prefix = tmp_path / "flagTree"
+    nvidia_backend = flagtree_prefix / "python" / "lib" / "python3.11" / "site-packages" / "triton" / "backends" / "nvidia"
+    nvidia_backend.mkdir(parents=True)
+    _use_config(monkeypatch, tmp_path, {"flagtree_prefix": str(flagtree_prefix)})
+
+    assert paths.flagtree_nvidia_backend() == nvidia_backend
+
+
+def test_flagtree_nvidia_backend_rejects_missing_python_dir(monkeypatch, tmp_path) -> None:
+    flagtree_prefix = tmp_path / "flagTree"
+    (flagtree_prefix / "python" / "lib").mkdir(parents=True)
+    _use_config(monkeypatch, tmp_path, {"flagtree_prefix": str(flagtree_prefix)})
+
+    with pytest.raises(RuntimeError, match="python3.\\*"):
+        paths.flagtree_nvidia_backend()
+
+
+def test_flagtree_nvidia_backend_rejects_ambiguous_python_dirs(monkeypatch, tmp_path) -> None:
+    flagtree_prefix = tmp_path / "flagTree"
+    (flagtree_prefix / "python" / "lib" / "python3.10").mkdir(parents=True)
+    (flagtree_prefix / "python" / "lib" / "python3.11").mkdir(parents=True)
+    _use_config(monkeypatch, tmp_path, {"flagtree_prefix": str(flagtree_prefix)})
+
+    with pytest.raises(RuntimeError, match="python3.\\*"):
+        paths.flagtree_nvidia_backend()

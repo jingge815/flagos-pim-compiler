@@ -18,9 +18,22 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts.export_gml import _check_structure
+import genesim_bridge.paths as paths
+from scripts.export_gml import (
+    CheckLog,
+    _check_dtype_coverage,
+    _check_parser_families,
+    _check_structure,
+)
 
 _SEQ_LEN = 16
+
+
+def _unconfigure_reference(monkeypatch, tmp_path: Path) -> None:
+    """把参考产物配成"没配"：既没有环境变量，配置文件也不存在。"""
+    monkeypatch.delenv("GML_REFERENCE_DIR", raising=False)
+    monkeypatch.delenv("GML_LLAMA2_REFERENCE_DIR", raising=False)
+    monkeypatch.setattr(paths, "_CONFIG_FILE", tmp_path / "no-such-paths.json")
 
 
 def _small_model() -> LlamaForCausalLM:
@@ -118,3 +131,47 @@ def test_skipping_weights_is_caught_by_cross_validation(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="GML 引用了但没写盘"):
         write_runtime_files(artifact, tmp_path / "out", gm=None)
+
+
+def test_parser_families_reads_the_configured_reference(tmp_path, monkeypatch) -> None:
+    """参考目录必须来自配置，不能是写死的开发机路径。
+
+    写死路径在别的机器上恒为"目录不存在"，这项检查会静默跳过——等于没有守卫。
+    """
+    ref = tmp_path / "parser_output"
+    ref.mkdir()
+    (ref / "activation_lut_file_195.bin").write_bytes(b"x")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "Bias_buffer_file_0.bin").write_bytes(b"x")
+    monkeypatch.setenv("GML_LLAMA2_REFERENCE_DIR", str(ref))
+
+    log = CheckLog()
+    _check_parser_families(out_dir, log)
+
+    check = log.checks[0]
+    assert check.name == "参考独有文件族都已产出"
+    assert "无参考目录" not in check.detail, "配了参考目录却走了跳过分支"
+    assert not check.passed, "参考独有的 activation_lut 族没产出，应当判失败"
+
+
+def test_parser_families_skips_without_reference(tmp_path, monkeypatch) -> None:
+    """没配参考产物时跳过，不算失败——参考产物是独立交付物，可能不随包提供。"""
+    _unconfigure_reference(monkeypatch, tmp_path)
+
+    log = CheckLog()
+    _check_parser_families(tmp_path / "out", log)
+
+    assert log.checks[0].passed
+    assert "无参考目录，跳过" == log.checks[0].detail
+
+
+def test_dtype_coverage_skips_without_reference(tmp_path, monkeypatch) -> None:
+    """同上：没配参考产物时 dtype 覆盖检查跳过，且不读图内容。"""
+    _unconfigure_reference(monkeypatch, tmp_path)
+
+    log = CheckLog()
+    _check_dtype_coverage("", log)
+
+    assert log.checks[0].passed
+    assert "无参考产物，跳过" == log.checks[0].detail

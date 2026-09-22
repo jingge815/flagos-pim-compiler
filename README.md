@@ -43,7 +43,7 @@
 ### 站点相关路径
 
 本仓以根目录的 `paths.json` 作为随代码交付的站点配置。甲方拿到代码后，先把
-四个 `/path/to/...` 占位路径改为自己的实际路径：
+`/path/to/...` 占位路径改为自己的实际路径：
 
 ```bash
 vim paths.json
@@ -54,7 +54,9 @@ vim paths.json
   "pytorch_env_script": "/path/to/env-pytorch.sh",
   "llama2_7b_model_dir": "/path/to/Llama-2-7b-hf",
   "flagtree_prefix": "/path/to/flagTree",
-  "genesim_root": "/path/to/genesim"
+  "genesim_root": "/path/to/genesim",
+  "gml_reference_dir": "/path/to/gml-reference",
+  "gml_llama2_reference_dir": "/path/to/gml-reference/llama2_w4a8_decode_block_0/parser_output"
 }
 ```
 
@@ -68,6 +70,17 @@ python -m pytest tests/ -x -q
 `llama2_7b_model_dir` 只供真实 7B 端到端测试使用；未配置时这些测试会跳过，常规
 单元测试仍可运行。`flagtree_prefix` 供算子编译器与 Triton 环境使用，`genesim_root`
 供 GeneSim 产物读写使用。
+
+后两个 `gml_*` 是 **GML 参考产物**（GML 结构参考与 llama2 W4A8 decode block 的
+parser 输出），它不在四个安装脚本的产物里，需要单独放置。它们影响两类结构校验：
+
+| 未配置时的现象 | 影响的检查 |
+| --- | --- |
+| `RuntimeError: 未配置站点路径 gml_llama2_reference_dir` | `tests/test_gml_hw_table.py`、`tests/test_runtime_files_phases.py` 等一组结构校验 |
+| 打印「无参考产物，跳过」或「无参考目录，跳过」，校验静默通过 | `scripts/export_gml.py` 的 dtype 覆盖检查、`--orchestrate` 的文件族检查 |
+
+也就是说，**不配这两个键，测试会报错，而导出脚本会悄悄少做两项校验**——后者更隐蔽，
+建议一并配好。
 
 需要临时覆盖时，可设置同名环境变量：`PYTORCH_ENV_SCRIPT`、
 `LLAMA2_7B_MODEL_DIR`、`FLAGTREE_PREFIX`、`GENESIM_ROOT`。优先级为环境变量

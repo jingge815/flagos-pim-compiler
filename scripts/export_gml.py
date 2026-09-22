@@ -36,7 +36,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from genesim_bridge.paths import llama2_7b_model_dir
+from genesim_bridge.paths import gml_llama2_reference_dir, llama2_7b_model_dir
 from gml_bridge.export import (
     format_summary,
     fuse_for_gml,
@@ -510,9 +510,8 @@ def _family(name: str) -> str:
 
 def _check_parser_families(out_dir: Path, log: CheckLog) -> None:
     """parser_output 分族：参考独有的族必须出现。"""
-    ref = Path("/media/disk/fengjingge/src/xinfangzhou-resource/"
-               "llama2_w4a8_decode_block_0/parser_output")
-    if not ref.is_dir():
+    ref = gml_llama2_reference_dir(required=False)
+    if ref is None or not ref.is_dir():
         log.add("parser_output 文件族", True, "无参考目录，跳过")
         return
     mine = {_family(p.name) for p in out_dir.glob("*.bin")}
@@ -546,9 +545,9 @@ def _check_dtype_coverage(gml_text: str, log: CheckLog) -> None:
     只比**字段在不在**，不比编号：两边 node_id 体系不同。缺一个 dtype 就是
     底层编译器少一项位宽配置，而那不会在我们这侧报错。
     """
-    ref = Path("/media/disk/fengjingge/src/xinfangzhou-resource/"
-               "llama2_w4a8_decode_block_0/parser_output/relay2gml_graph.gml")
-    if not ref.is_file():
+    ref_dir = gml_llama2_reference_dir(required=False)
+    ref = None if ref_dir is None else ref_dir / "relay2gml_graph.gml"
+    if ref is None or not ref.is_file():
         log.add("GML dtype 覆盖", True, "无参考产物，跳过")
         return
     theirs = _dtype_coverage(ref.read_text(errors="replace"))

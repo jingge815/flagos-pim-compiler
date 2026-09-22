@@ -319,7 +319,7 @@ wheel。离线环境需先在有网机器上准备 `downloads/` 目录再整体�
 
 #### 第一步：装系统包（唯一需要 root 的一步）
 
-纯净的 Ubuntu 22.04 缺 7 个必需命令（`git`、`make`、`cc`、`c++`、`ar`、`ld`、`curl`），
+纯净的 Ubuntu 缺 7 个必需命令（`git`、`make`、`cc`、`c++`、`ar`、`ld`、`curl`），
 必须先补：
 
 ```bash
@@ -331,9 +331,24 @@ sudo apt-get install -y build-essential git curl tar gzip python3
 不做会在第一个脚本就报 `缺少命令 git`；漏掉 `python3` 则第三个脚本报
 `缺少命令 python3`（脚本 0/1/2 用的是自带的独立 Python，只有脚本 3 需要系统 python3）。
 
-这个清单是在纯净 `ubuntu:22.04` 容器里逐个试出来的，四个脚本 `require_command` 的完整
-并集：`git`、`tar`、`gzip`、`dpkg-deb`、`apt-get`、`awk`、`sed`、`find`、`make`、`cc`、
-`c++`、`ar`、`ld`、`curl`（或 `wget`）、`python3`。上面一条 apt 命令覆盖全部。
+这个清单在纯净 `ubuntu:22.04` 和 `ubuntu:24.04` 容器里都逐个试过，覆盖四个脚本
+`require_command` 的完整并集：`git`、`tar`、`gzip`、`dpkg-deb`、`apt-get`、`awk`、
+`sed`、`find`、`make`、`cc`、`c++`、`ar`、`ld`、`curl`（或 `wget`）、`python3`。
+上面一条 apt 命令覆盖全部。
+
+**Ubuntu 24.04 的两点差异**（22.04 不受影响）：
+
+- 系统 `python3` 是 3.12，22.04 是 3.10。四个安装脚本都用自带的独立 Python 3.10.20，
+  只有上面这条存在性检查会碰到系统 `python3`，版本差异不影响安装。
+- 24.04 的系统 Python **默认没有 pip，且带 PEP 668 的 `EXTERNALLY-MANAGED` 标记**，
+  直接 `python3 -m pip install` 会被拒绝（`error: externally-managed-environment`）。
+  下载 HF 模型要用 `hf` 命令时，装到独立 venv 里：
+
+  ```bash
+  sudo apt-get install -y python3-venv
+  python3 -m venv ~/.hf-cli
+  ~/.hf-cli/bin/pip install -U "huggingface_hub[cli]"
+  ```
 
 #### 第二步：网络设置（跨境网络建议）
 
@@ -372,6 +387,9 @@ torch wheel 只能从 `download.pytorch.org` 拉，CPU 版 184 MB、CUDA 版约 
 
 #### 第三步：四个安装脚本
 
+四个脚本都支持 **Ubuntu 22.04 和 24.04**（x86_64），按 `/etc/os-release` 判断，非
+Ubuntu 或非 x86_64 会直接报错退出。下面这套在 24.04 上实测跑通全流程。
+
 ```bash
 git clone https://github.com/jingge815/flagOS-installers.git
 cd flagOS-installers
@@ -385,6 +403,19 @@ bash 3-install-model-inference.sh \
   --model-path /path/to/Llama-2-7b-hf
 ```
 
+四个脚本各自跑完应该看到的关键行：
+
+| 脚本 | 关键输出 |
+| --- | --- |
+| 0 | `未检测到 NVIDIA GPU，按纯 CPU 模式安装` → `FlagTree 已安装。`；无卡下验证打印 `no GPU: 跳过 kernel 执行验证` 与 `PIM passes: OK` |
+| 1 | `未检测到 NVIDIA GPU，按纯 CPU 模式安装。` → `FlagGems 已安装。` |
+| 2 | `未检测到 NVIDIA GPU（或指定了 --torch-cpu）：装 CPU 版 torch。` → `PIM Triton passes: OK`、`max error: 0.0`、`No broken requirements found.` |
+| 3 | `运行时模式：compiled` → `flag_gems_preflight: ok` → `inference_status: ok` |
+
+脚本 2 在纯 CPU 上会比有卡时多打一行
+`PyTorch 侧没有 triton（CPU 版 wheel 不带），整体安装 FlagTree 的 PIM Triton`——
+这是正常路径，说明命中了 CPU 分支（原因见 5.1 节）。
+
 四个脚本都会自动探测 GPU；**装 torch 的那两个**（`2-install-pytorch.sh`、
 `3-install-model-inference.sh`）额外接受 `--torch-cpu` / `--torch-cuda` 强制指定：
 
@@ -393,8 +424,11 @@ bash 2-install-pytorch.sh --torch-cpu     # 强制 CPU 版
 bash 2-install-pytorch.sh --torch-cuda    # 强制 CUDA 版
 ```
 
-脚本 0 和 1 不装 torch，所以没有这两个开关——它们只是把原来的"没有 nvidia-smi 就退出"
-改成了可选检测。
+脚本 0 和 1 没有这两个开关——它们只是把原来的"没有 nvidia-smi 就退出"改成了可选检测。
+注意脚本 0 确实会给自己那份独立 Python 装一个 `torch==2.7.1+cu128`（供安装后验证和
+FlagGems smoke test 使用），**这一份目前不区分有没有 GPU**，纯 CPU 机器上同样会拉十几个
+`nvidia-*`/`cuda-*` 包（约 2.5 GB）。不影响正确性，只是占流量和磁盘；FlagTree 的构建
+过程本身不依赖 torch。脚本 2 装的 `torch==2.9.1+cpu`/`+cu128` 是独立的另一份。
 
 #### 第四步：图编译器与 GeneSim
 
@@ -425,9 +459,17 @@ export LLAMA2_7B_MODEL_DIR=/path/flagOS-installed/model-inference/models/Llama-2
 export FLAGTREE_PREFIX=/path/flagOS-installed/flagTree
 export GENESIM_ROOT=/path/genesim
 
+# GML 参考产物：随交付物单独提供，不在四个安装脚本的产物里
+export GML_REFERENCE_DIR=/path/gml-reference
+export GML_LLAMA2_REFERENCE_DIR=/path/gml-reference/llama2_w4a8_decode_block_0/parser_output
+
 # 确认路径都解析正确
 python -c 'from genesim_bridge.paths import describe; print(describe())'
 ```
+
+也可以把上面六个键写进仓库根目录的 `paths.json`（不设环境变量时按文件取值，环境变量
+优先级更高）。**后两个 GML 键不配会让一组结构校验测试直接报
+`RuntimeError: 未配置站点路径 gml_llama2_reference_dir`**，见第五步的说明。
 
 `genesim/scripts/refine_ir_with_flagtree.py` 里的 `DEFAULT_BRIDGE_ROOT` 写的是开发机的
 绝对路径，**不要改源码**——用环境变量覆盖：
@@ -438,18 +480,19 @@ export PIM_COMPILER_ROOT=/path/flagos-pim-compiler
 
 #### 第五步：跑测试确认装成功
 
-装完之后按这个顺序验证。每一条都在纯 CPU 环境实测过，预期结果写在右边。
+装完之后按这个顺序验证。每一条都在纯 CPU 的 Ubuntu 24.04 容器里实测过，预期结果写在
+右边。**任何一条对不上都说明前面的安装有问题**，先回头查对应脚本的输出，不要往下走。
 
 ```bash
 cd /path/flagos-pim-compiler
 source /path/flagOS-installed/pytorch/env-pytorch.sh
 # 第四步的那几个 export 也要在当前 shell 里生效
 
-# 1. 快速回归（约 20 秒）
+# 1. 快速回归（约 2 分钟）
 python -m pytest tests/ -q -k "not llama2_7b"
-#    预期: 247 passed, 42 deselected
+#    预期: 714 passed, 42 deselected
 
-# 2. 算子编译单元测试（约 3 秒）——这一组在改动前的无卡机器上会全部 skip
+# 2. 算子编译单元测试（约 5 秒）——这一组在改动前的无卡机器上会全部 skip
 python -m pytest tests/test_opcompiler_linear.py -q
 #    预期: 19 passed
 
@@ -457,12 +500,16 @@ python -m pytest tests/test_opcompiler_linear.py -q
 python -m pytest tests/ -q -k "llama2_7b"
 #    预期: 42 passed
 
-# 4. GeneSim 全套
-cd /path/genesim && ./run.sh --test
-#    预期: All test suites passed
+# 4. 导出验证（约 1 分钟）
+python scripts/export_gml.py --layers 1 --seq-len 16 --out-dir /tmp/gml_out
+#    预期尾部: 验证全部通过（3 项）
+
+# 5. GeneSim 全套
+cd /path/genesim && ./run.sh --test sim
+#    预期: All simulator tests passed (37/37 test files)
 #    注: tests/predictor/ 需要可选依赖，见下面「可选：GNN 性能预测器」
 
-# 5. 全流程闭环（约 10 分钟）——这是"链路通没通"的唯一判据
+# 6. 全流程闭环（约 10 分钟）——这是"链路通没通"的唯一判据
 cd /path/flagos-pim-compiler
 python scripts/run_full_pipeline.py --num-stages 4
 #    预期尾部:
@@ -472,8 +519,39 @@ python scripts/run_full_pipeline.py --num-stages 4
 #      全流程验证通过：模型加载 → 图编译切分 → 算子编译 → GeneSim 代价
 ```
 
-第 5 条的 `{'pimir': 448}` 是最关键的一行：448 = 224 个 GEMM × 2 个分片，全部照算子
+第 6 条的 `{'pimir': 448}` 是最关键的一行：448 = 224 个 GEMM × 2 个分片，全部照算子
 编译器产出的 pim mlir 生成 trace。如果这里出现 `template`，说明算子编译产物没进代价链。
+
+第 1 条如果出现成片的 `ERROR ... RuntimeError: 未配置站点路径 gml_*`，是第四步的
+`paths.json` 没配全（见下），不是代码问题。
+
+##### 关于 GML 参考产物（需要单独取得，不在安装脚本产物里）
+
+图编译器有一组测试要对照 **GML 参考产物**，对应 `paths.json` 里的 `gml_reference_dir`
+和 `gml_llama2_reference_dir` 两个键。它们是芯方舟底层编译器的**标准输出样例**，
+由甲方提供、不属于 flagOS 软件栈，所以四个安装脚本都不会产出它们，需要单独放到某个
+目录并把这两个键指过去。
+
+需要的文件（按当前代码实际读取的内容）：
+
+| `paths.json` 键 | 目录内容 | 体积 |
+| --- | --- | --- |
+| `gml_reference_dir` | `relay2gml_graph.gml`（ResNet50 的 GML 样例，只用于确定格式）+ `runtime_files/` | 约 68 MB |
+| `gml_llama2_reference_dir` | `llama2_w4a8_decode_block_0/parser_output/`（GML + 3231 个 `.bin`） | 约 246 MB |
+
+实测这约 314 MB 就是跑通全部快速回归所需的最小集合。
+
+没配的后果分两种，**都要避免**：
+
+```
+RuntimeError: 未配置站点路径 gml_llama2_reference_dir。
+请在 paths.json 设置 gml_llama2_reference_dir，或设置环境变量 GML_LLAMA2_REFERENCE_DIR。
+```
+
+上面这条会直接打断 `tests/test_gml_hw_table.py`、`tests/test_runtime_files_phases.py`
+等一组结构校验。而 `export_gml.py` 更隐蔽——它在缺参考产物时**跳过** dtype 覆盖检查
+（打印「无参考产物，跳过」）和 `--orchestrate` 的文件族检查，**校验照样显示"全部通过"**，
+但实际少做了两项。所以这两个键建议一并配好，不要让它落到跳过分支。
 
 ##### 可选：GNN 性能预测器
 
@@ -535,7 +613,7 @@ v0.0.3 的 2.1 节要求"必须安装可用的 NVIDIA 驱动并能执行 `nvidia
 | --- | --- | --- |
 | `0-install-flagtree.sh` | `nvidia-smi` 改为可选检测 | 编译流程（本来就全在 CPU 上） |
 | `1-install-flaggems.sh` | 同上；smoke test 无卡时只验 import | 装包流程 |
-| `2-install-pytorch.sh` | wheel 索引按机器选；驱动 570+ 检查只在装 CUDA 版时做；smoke test 双路径 | **Triton 同步整段** |
+| `2-install-pytorch.sh` | wheel 索引按机器选；驱动 570+ 检查只在装 CUDA 版时做；smoke test 双路径 | 有卡时的 Triton 覆盖逻辑 |
 | `3-install-model-inference.sh` | 五处 `cuda.is_available()` 硬退出改条件分支；preflight 注入 driver | 模型下载与推理对拍流程 |
 
 新增两个开关（四个脚本口径一致）：
@@ -546,10 +624,13 @@ v0.0.3 的 2.1 节要求"必须安装可用的 NVIDIA 驱动并能执行 `nvidia
 # 都不给 = 按机器实际情况自动判断
 ```
 
-#### 关于 `2-install-pytorch.sh` 的 Triton 同步（一行都不用改）
+#### 关于 `2-install-pytorch.sh` 的 Triton 来源
 
 这个脚本**本来就不编译 PyTorch**，只下载官方 wheel + 配置环境。它的
-`sync_triton_to_pytorch()`（`2-install-pytorch.sh:194` 起）是纯文件拷贝：
+`sync_triton_to_pytorch()` 是纯文件操作，分两条路：
+
+**有卡（CUDA 版 wheel）**——wheel 自带上游 `triton==3.3.1`，脚本把 FlagTree 的 PIM 文件
+覆盖进去：
 
 ```
 FlagTree 的 triton  →  PyTorch 环境的 triton
@@ -559,13 +640,23 @@ FlagTree 的 triton  →  PyTorch 环境的 triton
   backends/nvidia/{bin,include,lib/cupti}   ← ptxas / cuda.h
 ```
 
-**那三个 `backends/nvidia/` 目录在纯 CPU 上也必须同步**，不能当作"GPU 相关"删掉：
-图编译器的 `genesim_bridge/env.py` 需要其中的 `cuda.h` 和 `ptxas`。它们是随 pip 包
-分发的**文件**，不是驱动——实测无卡下 `prepare_triton_env()` 与
-`assert_pim_passes_available()` 都正常通过。
+**纯 CPU（CPU 版 wheel）**——wheel **不带** triton（它的依赖只有 filelock、fsspec、
+jinja2、networkx、sympy、typing-extensions，没有 triton），没有可覆盖的目标。脚本把
+FlagTree 那份 triton 连同 `triton-*.dist-info` 整体装进 PyTorch 的 site-packages。
+这个分支是 v0.0.4 之后补的：老写法假定 PyTorch 侧总有 triton，纯 CPU 上会直接报
+`PyTorch wheel 未安装 Triton` 退出。
+
+两条路都保留 `backends/nvidia/{bin,include,lib/cupti}`。**那三个目录在纯 CPU 上也必须
+有**，不能当作"GPU 相关"删掉：图编译器的 `genesim_bridge/env.py` 需要其中的 `cuda.h`
+和 `ptxas`。它们是随 pip 包分发的**文件**，不是驱动——实测无卡下
+`prepare_triton_env()` 与 `assert_pim_passes_available()` 都正常通过。
 
 这也回答了"能不能把不必要的 GPU 东西删掉"：**不建议删**。这些文件是算子编译链的组成
 部分，删了纯 CPU 环境反而跑不起来。真正该动的只是"硬性要求有 GPU 硬件"那些门禁。
+
+顺带一提，v0.0.4 之后 `sync_triton_to_pytorch()` 里的 site-packages 路径也改成了动态
+推导（glob `lib/python3.*`），不再把 `python-3.10.20`/`python3.10` 当字符串写死，
+理由见 `docs/ubuntu2404-cpu-20260921.md`。
 
 ### 5.2 GeneSim 的 install.sh 默认改用 CPU-only torch
 
