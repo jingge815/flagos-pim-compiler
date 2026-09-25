@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from gml_bridge import phase_data
 from quant.activations import (
     INT8_MAX,
     INT8_MIN,
@@ -132,16 +133,40 @@ def test_all_zero_activation_does_not_produce_nan() -> None:
     assert quantization_error(activation, quantized) == 0.0
 
 
-def test_tiny_values_do_not_collapse_the_scale() -> None:
-    """幅度极小时 fp16 的 scale 可能舍入成 0，那样反量化会全零。
+def test_matches_the_phase_data_truth_source() -> None:
+    """本模块必须与 `phase_data.dynamic_scaling` 逐字节一致。
 
-    实现里兜了这一手，用 fp16 的最小正规数代替。
+    这正是它成为**第二份公式**时出的事：原先它走 `scale = absmax/128` 再取商，
+    真源走 `fp16(1/(2·absmax))` 再乘 256，两次 fp16 截断的位置不同，同一输入
+    实测 23/4096 处差 1。两份并存时改了真源、这里会冒充真值，对拍就白做。
+    """
+    activation = _activation((1, 4096))
+    quantized = quantize_activation(activation)
+    phases = phase_data.dynamic_scaling(
+        activation.ravel().astype(np.float32), group_size=128)
+
+    assert quantized.values.tobytes() == phases.phase3.tobytes()
+    assert quantized.scales.tobytes() == phases.phase1.tobytes()
+
+
+def test_tiny_values_quantize_away_without_producing_garbage() -> None:
+    """幅度低到 fp16 表示不了时，这组就量化成零——但不能出 nan / inf。
+
+    曾经这里断言 `scale > 0`，靠一个「scale 舍入成 0 就换成 fp16 最小数」的
+    兜底撑着。那个兜底**没有**达成它声称的目的：换完之后 `rint(1e-8/6.1e-5)`
+    仍是 0，反量化出来照样是全零，它只是让这条断言成立。
+    真源 `phase_data` 对退化组的选择是把倒数置 0（见其 docstring：该组本就是
+    零，而 inf/nan 会污染落盘字节），这里改断言其真实成立的几条。
     """
     activation = np.full((8, 8), 1e-8, dtype=np.float32)
     quantized = quantize_activation(activation, group_size=None)
+    dequantized = quantized.dequantize()
 
-    assert float(quantized.scale) > 0.0
-    assert not np.isnan(quantized.dequantize()).any()
+    assert not np.isnan(dequantized).any()
+    assert not np.isinf(dequantized).any()
+    assert (quantized.values == 0).all()
+    # 误差不超过输入自身的幅度——量化把这段信号丢了，但没有放大它。
+    assert np.abs(dequantized).max() <= np.abs(activation).max()
 
 
 def test_outlier_is_contained_within_its_own_group() -> None:
@@ -184,3 +209,25 @@ def test_quantize_is_deterministic() -> None:
 
     assert first.values.tobytes() == second.values.tobytes()
     assert first.scales.tobytes() == second.scales.tobytes()
+
+
+def test_silu_numpy_mirror_reads_the_lut_table() -> None:
+    """SiLU 的 numpy 镜像必须读 288 B 表，不能用闭式公式现算。
+
+    闭式与查表在多数点上差得很小，但对拍的是「编译内核与镜像一致」，
+    两边都用闭式就都绿、却都不等于参考产物实际执行的那张表。
+    """
+    import numpy as np
+
+    from contracts.gml_lut import synth_silu
+    from runtime.kernels_pim import _apply_activation
+
+    table = synth_silu()
+    xs = np.array([-2.0, -0.5, 0.0, 0.5, 2.0], dtype=np.float32)
+    got = _apply_activation(xs, "silu")
+    # 闭式的特征：在 x=2 处 silu(2) = 2/(1+e^-2) ≈ 1.7616。
+    # 查表是分段线性，不会精确落到这个值。镜像若给出闭式值，就是没读表。
+    closed = float(xs[4] / (1.0 + np.exp(-xs[4])))
+    assert abs(float(got[4]) - closed) > 1e-4, (
+        f"镜像给出了闭式值 {float(got[4]):.6f}，没有读 288 B 表")
+    assert len(table) == 288

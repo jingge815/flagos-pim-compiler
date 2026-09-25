@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
@@ -107,6 +108,151 @@ def _measure_kernel_tile_n(
         )
     cache[key] = (tile_n, str(result.pimir_path))
     return cache[key]
+
+
+def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
+    """给一个算子级 mnemonic 编一份 B 路 pimir，返回落盘路径。
+
+    与 `_measure_kernel_tile_n` 对称：那条只服务 GEMM（A 路），这条服务其余
+    算子。路径进 sidecar 的 `pimir_path` 后，GeneSim 的 `_operator_pimir`
+    才能把相位链与视图类的真实 IR 喂给 trace 编译，而不是永远拿到 A 路的
+    `tt.dot`。
+
+    形状里的符号维（`Tq`/`Tp`/`Tp+Tq`）按代表值 128 代入：trace 的外层循环
+    次数由运行时绑定，IR 只需要一个具体的静态形状才能过 verifier，但折成
+    字面 1 会让搬运量比真实 prefill（序列长度几百到几千）小几个数量级，
+    128 只是一个不退化的占位，不是真实形状。
+    """
+    from opcompiler_bridge.driver import compile_op
+    from opcompiler_bridge.oplevel_kernel import (
+        concat_kernel, dynamic_quant_kernel, eltwise_kernel, gather_kernel, kv_cache_kernel,
+        lut_kernel, mask_kernel, matmul_kernel, normalize_kernel,
+        reshape_kernel, rope_kernel, softmax_kernel, split_heads_kernel,
+        transpose_kernel,
+    )
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from genesim_bridge.op_classify import _attention_matmul_body, _module
+
+    # 符号维的代表值：只要不是 1 这种极端退化值即可，128 和
+    # `op_classify.mnemonic_of` 探测配方时用的占位维度同一量级。
+    _SYMBOLIC_DIM = 128
+
+    def n(dim):
+        return _SYMBOLIC_DIM if isinstance(dim, str) else int(dim)
+
+    ins = [tuple(n(d) for d in shape) for shape in input_shapes]
+    outs = [tuple(n(d) for d in shape) for shape in output_shapes]
+
+    builders = {
+        "rope": lambda: rope_kernel(
+            "op",
+            ins[0][-3] if len(ins[0]) >= 3 else 1,
+            ins[0][-2], ins[0][-1]),
+        "softmax": lambda: softmax_kernel("op", *ins[0]),
+        "reshape": lambda: reshape_kernel("op", ins[0], outs[0]),
+        "transpose": lambda: transpose_kernel("op", ins[0], (1, 0, 2)),
+        "concat": lambda: concat_kernel("op", ins, len(ins[0]) - 1),
+        "split_heads": lambda: split_heads_kernel("op", ins[0], 1, len(outs)),
+        "gather": lambda: gather_kernel("op", ins[0][0], outs[0][-1], ins[1][-1] if len(ins) > 1 else 1),
+        "mask": lambda: mask_kernel("op", ins[0], ins[1] if len(ins) > 1 else ins[0]),
+        "lut": lambda: lut_kernel("op", ins[0], "silu"),
+        "eltwise": lambda: eltwise_kernel("op", ins[0], "add"),
+        "normalize": lambda: normalize_kernel("op", *ins[0], ins[0][-1]),
+        "dynamic_quant": lambda: dynamic_quant_kernel(
+            "op", ins[0][-1], max(ins[0][-1] // 128, 1), 128),
+        # 第三个参数是**缓存元素数**，校验器要求它不小于一次写入的元素数。
+        # 这里传整块写入的元素总数，不是末维：`[Tq, 4096]` 的末维是 4096，
+        # 而一次搬的是 128x4096。这条路径直接发 IR 文本给 triton-opt，
+        # 绕开了 `driver._make_oplevel_mlir` 里同名的守卫。
+        "kv_cache": lambda: kv_cache_kernel("op", ins[0], prod(ins[0]), False),
+        # 注意力那两次矩阵乘走 `_attention_matmul_body`，不直接调
+        # `matmul_kernel`：后者只打 `stationarity = weight`（投影那条），
+        # 照抄会把 KV 缓存说成模型权值。
+        "matmul": lambda: _attention_matmul_body(
+            "op", ins[0][0], ins[0][1], outs[0][-1]),
+    }
+    body = builders[mnemonic]()
+    if body is None:
+        raise ValueError(f"{mnemonic} 需要单独的参数，不走这条通用入口")
+    if mnemonic == "matmul" and "stationarity" not in body:
+        raise RuntimeError(
+            f"{mnemonic} 的 B 路 IR 缺 stationarity 标记，KV 缓存会被当成模型权值"
+        )
+    from opcompiler_bridge.driver import _run_oplevel_triton_opt, _CACHE_DIR
+    import hashlib, os
+    text = _module(body)
+    key = hashlib.sha256(text.encode()).hexdigest()[:16]
+    out = _CACHE_DIR / f"bpath-{key}.pimir.mlir"
+    if not out.is_file():
+        expanded, _ = _run_oplevel_triton_opt(text)
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(expanded)
+        os.replace(tmp, out)
+    return str(out)
+
+
+
+# 算子类型到 mnemonic 的映射与成本抽取共用同一份（`op_classify.MNEMONIC_OF`）。
+# GEMM 走 A 路的分块编译，不在这里。
+from genesim_bridge.op_classify import MNEMONIC_OF
+
+_BPATH_MNEMONIC = {op: mn for op, mn in MNEMONIC_OF.items() if op != "GEMM"}
+
+
+def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
+    """给每个算子级节点编一份 B 路 pimir 并写进 sidecar。
+
+    同一 (mnemonic, 形状) 只编一次。编不出来直接抛：静默跳过的那条条目会缺
+    `pimir_path`，仿真侧退回手写模板，而现场只看到「缺路径」这个结果，看不到
+    是谁、为什么编不出。契约不满足就让原因立刻暴露。
+    """
+    cache: dict = {}
+    for op_id, op in operators_by_id.items():
+        mnemonic = _BPATH_MNEMONIC.get(op["op_type"])
+        if mnemonic is None:
+            continue
+        key = (mnemonic, json.dumps(op["input_shapes"]),
+               json.dumps(op["output_shapes"]))
+        if key not in cache:
+            try:
+                cache[key] = _bpath_pimir(
+                    mnemonic, op["input_shapes"], op["output_shapes"])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"op{op_id}（{op['op_type']} -> {mnemonic}，形状 "
+                    f"{op['input_shapes']} -> {op['output_shapes']}）没编出 "
+                    f"pim mlir：{exc}。缺了它 GeneSim 会静默退回手写模板，"
+                    "这个算子的原语等于没进仿真。"
+                ) from exc
+        # `shards` 必须在：消费方逐条取 `entry["shards"]` 统计分片数，缺了就抛。
+        # B 路节点不切分，所以是空列表，而不是不写这个键。
+        entry = sidecar["operators"].setdefault(str(op_id), {
+            "op_type": op["op_type"], "device_hint": "pim", "shards": [],
+        })
+        entry["pimir_path"] = cache[key]
+        entry["pimir_sha256"] = _file_sha256(cache[key])
+
+
+def count_sidecar_classes(sidecar) -> tuple[int, int, dict]:
+    """数一份 sidecar 里两类条目各有几条，以及每台 DPU 承担多少 GEMM 分片。
+
+    两类条目不能混着数：GEMM 走过图切分、有 `shards`；算子级节点不切分、
+    `shards` 是空列表。把总数报成「GEMM 算子数」会让 llama2-7B 的 224 个 GEMM
+    显示成 6850 个——数字看着对，含义已经错了。
+    """
+    gemm_count = 0
+    bpath_count = 0
+    by_dpu: dict = {}
+    for entry in sidecar["operators"].values():
+        shards = entry.get("shards") or []
+        if shards:
+            gemm_count += 1
+            # 一个 GEMM 可能切在多台 DPU 上，每台参与的都记一次。
+            for shard in shards:
+                by_dpu[shard["dpu_id"]] = by_dpu.get(shard["dpu_id"], 0) + 1
+        else:
+            bpath_count += 1
+    return gemm_count, bpath_count, by_dpu
 
 
 def _file_sha256(path: str) -> str:
@@ -296,6 +442,11 @@ def export_placement_to_genesim(
                 # num-dpus/num-tasklets/dma-align 不同）。也便于换机器后核对
                 # 找回来的文件是不是同一份。
                 entry["pimir_sha256"] = _file_sha256(pimir_path)
+
+    # 非 GEMM 的算子级节点也写 pimir_path：相位链与视图类的真实 IR 才能进
+    # GeneSim 的 trace 编译。之前只有 GEMM 写，相位链那一支在生产里没人喂。
+    if measure_kernel_tiles:
+        _attach_bpath_pimir(operators_by_id, sidecar)
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))

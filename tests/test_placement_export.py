@@ -242,6 +242,67 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
         assert str(op_id) not in sidecar["operators"], op_id
 
 
+def test_bpath_entries_keep_the_sidecar_shape() -> None:
+    """B 路条目并进 sidecar 后，每条都必须带 `shards`。
+
+    `export_pp_placement.py` 逐条遍历 `entry["shards"]` 统计每台 DPU 的分片数。
+    B 路回填（`_attach_bpath_pimir`）给非 GEMM 节点新建的条目若缺 `shards`，
+    那次遍历直接抛 KeyError，全链路导出中断。
+    """
+    from genesim_bridge.placement_export import _attach_bpath_pimir
+
+    operators = {
+        0: {"op_id": 0, "op_type": "GEMM", "input_shapes": [["Tq", 64]],
+            "output_shapes": [["Tq", 64]]},
+        1: {"op_id": 1, "op_type": "SOFTMAX", "input_shapes": [["Tq", 64]],
+            "output_shapes": [["Tq", 64]]},
+        2: {"op_id": 2, "op_type": "ROPE", "input_shapes": [["Tq", 64]],
+            "output_shapes": [["Tq", 64]]},
+    }
+    sidecar = {"operators": {
+        "0": {"op_type": "GEMM", "shards": [{"dpu_id": 0}]},
+    }}
+
+    _attach_bpath_pimir(operators, sidecar)
+
+    # 非 GEMM 的算子级节点也要进 sidecar，且带上 B 路产物。
+    for op_id, op_type in (("1", "SOFTMAX"), ("2", "ROPE")):
+        entry = sidecar["operators"].get(op_id)
+        assert entry is not None, f"{op_type} 没进 sidecar"
+        assert entry["op_type"] == op_type
+        assert "pimir_path" in entry, f"{op_type} 没有 pimir_path"
+        # 关键：缺了它，消费方 `entry["shards"]` 会抛 KeyError。
+        assert "shards" in entry, f"{op_type} 的条目没有 shards"
+
+    # 消费方的遍历口径：每条都要能取到 shards，GEMM 的分片不能被冲掉。
+    for entry in sidecar["operators"].values():
+        assert isinstance(entry["shards"], list), entry["op_type"]
+    assert sidecar["operators"]["0"]["shards"] == [{"dpu_id": 0}]
+
+
+def test_bpath_kv_cache_declares_a_cache_big_enough_for_one_write() -> None:
+    """KV 缓存的容量要盖得住一次写入，否则整条 B 路导出被 verifier 拦下。
+
+    `pim.kv_cache` 的 memdesc 必须装得下一次写的元素数。写成末维（`[Tq, 4096]`
+    取 4096）看着像「一行」，但一次搬的是整块 128x4096，verifier 直接报
+    `cache holds 4096 elements, fewer than the 524288 being moved`，而这条路径
+    是直接发 IR 文本给 `triton-opt`，绕开了 `driver` 里同名的守卫。
+
+    形状取自真实 decode 块的 MEM_COPY 节点（`[Tq, 4096]`，Tq 代入 128）。
+    """
+    import re
+
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    text = Path(_bpath_pimir("kv_cache", [("Tq", 4096)], [("Tq", 4096)])).read_text()
+    assert "pim.kv_cache" in text, "B 路产物里没有 kv_cache"
+    match = re.search(r"!pim\.memdesc<(\d+)xi8", text)
+    assert match, f"没找到缓存 memdesc：\n{text}"
+    assert int(match.group(1)) >= 128 * 4096, (
+        f"缓存只声明了 {match.group(1)} 个元素，装不下一次写的 {128 * 4096} 个"
+    )
+
+
 def test_local_shard_widths_follow_each_projection(
     annotated_tiny_llama, tmp_path
 ) -> None:
@@ -450,3 +511,155 @@ def test_unknown_semantic_role_raises(annotated_tiny_llama, tmp_path) -> None:
         export_placement_to_genesim(
             annotated_tiny_llama, ir_path, tmp_path / "out.ir", tmp_path / "out_sidecar.json"
         )
+
+
+# --- 全链路 sidecar 校验的分流口径 -------------------------------------
+#
+# sidecar 里有两类条目，契约不同：
+#
+#   GEMM（A 路）  按图切分归属到各台 DPU，有 shards / semantic_role /
+#                 kernel_tile_n，pim mlir 是分块 GEMM
+#   算子级（B 路） 不做张量并行切分，shards 是空列表，没有投影身份，pim mlir
+#                 是整算子级的相位链或单相 op
+#
+# `run_full_pipeline.py` 的校验若把 GEMM 那套字段要求套到全部条目，B 路的
+# 6626 条会全部判失败，全链路验收命令跑不通——而它们本身是完好的。
+
+def test_sidecar_checks_split_by_entry_class() -> None:
+    """GEMM 条目查五项，B 路条目查自己那套，都要通过。"""
+    from scripts.run_full_pipeline import check_sidecar_entries
+
+    ops = {
+        "0": {
+            "op_type": "GEMM", "semantic_role": "q_proj",
+            "shards": [{"dpu_id": 0, "local_in_features": 4096,
+                        "local_out_features": 2048}],
+            "kernel_tile_n": 512, "pimir_path": "/tmp/a.mlir",
+        },
+        "1": {
+            "op_type": "SOFTMAX", "device_hint": "pim", "shards": [],
+            "pimir_path": "/tmp/b.mlir",
+        },
+    }
+    # 不抛错即通过，并报出两类各有几条。
+    gemm_count, bpath_count = check_sidecar_entries(ops)
+    assert (gemm_count, bpath_count) == (1, 1)
+
+
+def test_gemm_entry_still_needs_all_of_its_fields() -> None:
+    """分流不是放松：GEMM 条目缺 kernel_tile_n 仍要失败。"""
+    from scripts.run_full_pipeline import StepFailed, check_sidecar_entries
+
+    ops = {
+        "0": {
+            "op_type": "GEMM", "semantic_role": "q_proj",
+            "shards": [{"dpu_id": 0, "local_in_features": 4096,
+                        "local_out_features": 2048}],
+            "pimir_path": "/tmp/a.mlir",
+        },
+    }
+    with pytest.raises(StepFailed, match="kernel_tile_n"):
+        check_sidecar_entries(ops)
+
+
+def test_bpath_entry_without_pimir_path_fails() -> None:
+    """B 路条目的判据是 pim mlir 落盘路径，缺了要失败。
+
+    缺路径意味着这个算子的原语没进 GeneSim，仿真会静默退回手写模板——正是
+    全链路脚本要防的那种静默退化。
+    """
+    from scripts.run_full_pipeline import StepFailed, check_sidecar_entries
+
+    ops = {"1": {"op_type": "SOFTMAX", "device_hint": "pim", "shards": []}}
+    with pytest.raises(StepFailed, match="pimir_path"):
+        check_sidecar_entries(ops)
+
+
+def test_bpath_entry_with_unknown_op_type_fails() -> None:
+    """B 路条目的 op_type 必须是 mnemonic 单表认得的名字。
+
+    认不出来就说明上游新增了算子而映射表没跟上，此时它在 GeneSim 侧没有原语
+    落点，必须报错而不是当成一条普通条目放过。
+    """
+    from scripts.run_full_pipeline import StepFailed, check_sidecar_entries
+
+    ops = {
+        "1": {"op_type": "BRAND_NEW_OP", "device_hint": "pim", "shards": [],
+              "pimir_path": "/tmp/b.mlir"},
+    }
+    with pytest.raises(StepFailed, match="op_type"):
+        check_sidecar_entries(ops)
+
+
+def test_sidecar_counts_report_the_two_classes_apart() -> None:
+    """统计口径要把 GEMM 与算子级条目分开数。
+
+    `export_pp_placement.py` 打印「放置的 GEMM 算子数」时若取 sidecar 条目总数，
+    B 路的算子级节点会被算成 GEMM——llama2-7B 的 tp2_pp4 下是 224 个 GEMM 被报成
+    6850 个，数字看着对、含义已经错了。
+    """
+    from genesim_bridge.placement_export import count_sidecar_classes
+
+    sidecar = {"operators": {
+        "0": {"op_type": "GEMM", "shards": [{"dpu_id": 0}, {"dpu_id": 1}]},
+        "1": {"op_type": "GEMM", "shards": [{"dpu_id": 0}]},
+        "2": {"op_type": "SOFTMAX", "shards": []},
+        "3": {"op_type": "ROPE", "shards": []},
+    }}
+
+    gemm_count, bpath_count, by_dpu = count_sidecar_classes(sidecar)
+
+    assert (gemm_count, bpath_count) == (2, 2)
+    # 分片数按每台参与的 DPU 各记一次：dpu0 拿到 op0 与 op1，dpu1 只有 op0。
+    assert by_dpu == {0: 2, 1: 1}
+
+
+def test_bpath_compile_failure_is_reported_not_swallowed() -> None:
+    """编不出 pim mlir 的算子级节点必须报错，不能静默跳过。
+
+    静默跳过的后果是这条条目没有 `pimir_path`，仿真侧退回手写模板，而现场看不到
+    是谁、为什么编不出——全链路校验只会报一句「缺 pimir_path」，信息量不足以定位。
+    契约不满足就直接抛，让原因立刻暴露。
+    """
+    import genesim_bridge.placement_export as pe
+
+    operators = {
+        7: {"op_id": 7, "op_type": "SOFTMAX", "input_shapes": [[1, 64]],
+            "output_shapes": [[1, 64]]},
+    }
+    sidecar = {"operators": {}}
+
+    def boom(mnemonic, input_shapes, output_shapes):
+        raise RuntimeError("triton-opt 挂了")
+
+    original = pe._bpath_pimir
+    pe._bpath_pimir = boom
+    try:
+        with pytest.raises(RuntimeError, match="op7"):
+            pe._attach_bpath_pimir(operators, sidecar)
+    finally:
+        pe._bpath_pimir = original
+
+
+def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) -> None:
+    """GEMV_SCORE/GEMV_CONTEXT 走 B 路 matmul 时，IR 必须带 stationarity 标记，
+    符号维也不能退化成字面 1。
+
+    这两类 op_type 映射到 matmul mnemonic，但不属于 `_BPATH_MNEMONIC` 排除的
+    GEMM，所以真实会走到 `_bpath_pimir` 的 matmul builder。那条 builder 若直接
+    调 `matmul_kernel` 而不走 `_attention_matmul_body`，产出的 IR 就缺
+    `stationarity = #pim.stationarity<kv>`——搬运量算得一样，但 KV 缓存被说成
+    模型权值，校验器要求三者一致时对不上。符号维折成 1 同理：trace 外层循环
+    次数按真实序列长度绑定，IR 里写死 1 会让搬运量比真实 prefill 小几个数量级。
+    """
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    path = _bpath_pimir(
+        "matmul",
+        [["Tq", 64], [64, "Tp+Tq"]],
+        [["Tq", "Tp+Tq"]],
+    )
+    text = Path(path).read_text()
+    assert "stationarity = #pim.stationarity<kv>" in text, text
+    # 符号维不能退化成字面 1（`<1x` 是 tensor 形状里"第一维是 1"的写法）。
+    assert "<1x" not in text, text

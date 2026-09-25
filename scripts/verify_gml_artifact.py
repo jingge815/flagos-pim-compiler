@@ -25,6 +25,7 @@ C 层能抓到 B 层抓不到的错：结构校验只看图，不看二进制内
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -386,6 +387,66 @@ def check_weight_layout(
         not bad_group,
         f"{len(bad_group)} 处不符，如 {bad_group[:2]}" if bad_group else "")
     return found
+
+
+def check_weight_hashes(out_dir: Path, nodes: list[str], report: Report) -> None:
+    """每个带 `weight_buffer` 的节点都要有指纹，且与我方写出的 bin 字节对得上。
+
+    这是**写盘自洽**检查，不是与参考对齐的判据：参考的 `contentHash` 取值
+    口径不同，指向参考目录时 73 个都会报不符。我方约定是
+    `sha256(盘上字节)`，由 `WrittenFiles._write` 在字节成形处算出。
+    """
+    missing: list[str] = []
+    mismatched: list[str] = []
+    zeroed: list[str] = []
+    checked = 0
+    hash_of: dict[str, str] = {}
+
+    for block in nodes:
+        name = field(block, "weight_buffer")
+        if not isinstance(name, str):
+            continue
+        digest = field(block, "weight_buffer_hash")
+        if not isinstance(digest, str):
+            missing.append(name)
+            continue
+        path = out_dir / name
+        if not path.is_file():
+            missing.append(name)
+            continue
+        data = path.read_bytes()
+        actual = hashlib.sha256(data).hexdigest()
+        checked += 1
+        hash_of[name] = digest
+        if actual != digest:
+            mismatched.append(name)
+        # 全零的权值缓冲与「真的算出 0」在盘上无法区分，指纹对它永远是绿的。
+        # 单独计一类：内容全零不是「校验通过」，是「这个文件没内容」。
+        if not data.strip(b"\x00"):
+            zeroed.append(name)
+
+    # 反过来也查一遍：指纹不能挂在没有 weight_buffer 的节点上。
+    orphan = [field(b, "weight_buffer_hash") for b in nodes
+              if isinstance(field(b, "weight_buffer_hash"), str)
+              and not isinstance(field(b, "weight_buffer"), str)]
+
+    ok = not missing and not mismatched and not orphan and not zeroed
+    detail = ""
+    if not ok:
+        parts = []
+        if missing:
+            parts.append(f"{len(missing)} 个缺指纹，如 {missing[:2]}")
+        if mismatched:
+            parts.append(f"{len(mismatched)} 个与 bin 字节不符，如 {mismatched[:2]}")
+        if orphan:
+            parts.append(f"{len(orphan)} 个指纹挂在没有 weight_buffer 的节点上")
+        if zeroed:
+            parts.append(
+                f"{len(zeroed)} 个内容全零（指纹自洽但等于没内容），"
+                f"如 {zeroed[:2]}")
+        detail = "；".join(parts)
+    report.check("权值指纹与 bin 字节互证", ok,
+                 detail or f"{checked} 个逐字节一致，且无一全零")
 
 
 def check_scales_are_finite(
@@ -896,6 +957,7 @@ def main() -> int:
     check_scales_are_finite(weights, report)
     check_luts(args.out_dir, nodes, report)
     check_zero_points_are_zero(args.out_dir, report)
+    check_weight_hashes(args.out_dir, nodes, report)
 
     # 第四层：量化数学自洽（不需要模型）
     check_group_saturation(args.out_dir, nodes, report)

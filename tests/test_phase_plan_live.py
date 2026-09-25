@@ -45,7 +45,7 @@ module {
   tt.func @dq(%x: tensor<1x4096xf16>, %s: tensor<32xf16>,
               %o: tensor<1x4096x!tt.ptr<i8>>) {
     %q = pim.quantize %x, %s
-       {dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128>}
+       {dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128, spg = true, spgAxis = 3, spgGroupSize = 128>}
        : tensor<1x4096xf16>, tensor<32xf16> -> tensor<1x4096xi8>
     tt.store %o, %q : tensor<1x4096x!tt.ptr<i8>>
     tt.return
@@ -72,7 +72,7 @@ _DQ_MLP_INPUT = """
 module {
   tt.func @dq_mlp(%x: tensor<1x11008xf16>, %s: tensor<86xf16>) {
     %q = pim.quantize %x, %s
-       {dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128>}
+       {dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128, spg = true, spgAxis = 3, spgGroupSize = 128>}
        : tensor<1x11008xf16>, tensor<86xf16> -> tensor<1x11008xi8>
     tt.return
   }
@@ -100,8 +100,12 @@ def _expand(text: str) -> str:
 def test_live_dq_expands_to_four_phases() -> None:
     plan = parse_phase_plans(_expand(_DQ_INPUT))["dq"]
     assert plan.count == PHASE_COUNTS["DynamicScaling"] == 4
-    assert plan.kinds() == ["absmax", "relu", "reciprocal", None]
-    assert plan.units() == ["vpu", "cstl", "cstl", "cstl"]
+    # 相 1 是恒等表（÷256 在 FPSU 定标里），不是 relu。
+    assert plan.kinds() == ["absmax", "identity", "reciprocal", None]
+    # 分组归约在池化单元，两次查表在激活块，浮点转定点在 kantor 块。
+    assert plan.units() == ["pooling", "activation", "activation", "kantor"]
+    # 相 0 现在是池化单元的分组归约，不再用 reduce_axis 冒充分组。
+    assert plan.phases[0].op == "pim.global_pool"
 
 
 def test_live_softmax_expands_to_five_phases() -> None:

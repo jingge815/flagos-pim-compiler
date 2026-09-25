@@ -110,6 +110,8 @@ class NumpyBackend:
         self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
         # 每个并发执行的 launch 使用独立的冲突检测器。
         self._tracker_local = threading.local()
+        self._bound_values: dict[str, object] = {}
+        self._bound_pos: int | None = None
 
     def reset_events(self) -> None:
         """清空本次执行的命令事件表，保留各 DPU 的执行顺序。"""

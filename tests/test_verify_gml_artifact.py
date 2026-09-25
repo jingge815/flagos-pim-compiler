@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from contracts import gml_names as names
 from contracts.gml_quant import WEIGHT_GROUP_SIZE
 from quant.weights import quantize_weight
-from scripts.gml_structure_check import parse_blocks
+from scripts.gml_structure_check import field, parse_blocks
 from scripts.verify_gml_artifact import (
     Report,
     check_attributes_survive_parsing,
@@ -292,3 +292,83 @@ def test_output_buffer_points_at_the_consumer(artifact_dir) -> None:
         checked += 1
 
     assert checked > 0, "应当有可核对的生产者-消费者对"
+
+
+@pytest.fixture(scope="module")
+def slot_layout_dir(tmp_path_factory) -> Path:
+    """`hidden=4096` 的小模型产出的产物：走**编译期槽位**口径。
+
+    槽位口径的开关是 `_looks_like_llama7b`（判据只认「图里出现 4096」），
+    所以 4096 宽、一层、词表 256 的小模型就能把这条路径跑出来——秒级完成，
+    不必加载 7B 权重。落盘尺寸取 `CompileSlots`（seq=1024、nh=32、hd=128），
+    不是导出图的 seq_len=16。
+    """
+    from gml_bridge.export import (
+        export_graph,
+        write_artifact,
+        write_runtime_files,
+    )
+    from runtime.compile import export_annotated_graph
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=256, hidden_size=4096, intermediate_size=512,
+            num_hidden_layers=1, num_attention_heads=32, num_key_value_heads=32,
+            max_position_embeddings=_SEQ_LEN, bos_token_id=1, eos_token_id=2,
+            pad_token_id=0,
+        )
+    ).eval()
+    position_ids = torch.arange(_SEQ_LEN, dtype=torch.long).unsqueeze(0)
+    graph = export_annotated_graph(
+        model, _SEQ_LEN, position_ids, dtype=torch.float32)
+
+    out_dir = tmp_path_factory.mktemp("slot-layout")
+    artifact = export_graph(graph)
+    write_artifact(artifact, out_dir)
+    write_runtime_files(artifact, out_dir, gm=graph)
+    return out_dir
+
+
+@pytest.fixture(scope="module")
+def slot_blocks(slot_layout_dir: Path) -> tuple[list[str], list[str]]:
+    text = (slot_layout_dir / "relay2gml_graph.gml").read_text()
+    return parse_blocks(text, "node"), parse_blocks(text, "edge")
+
+
+def test_slot_layout_artifact_keeps_declarations_and_files_in_step(
+    slot_layout_dir: Path, slot_blocks,
+) -> None:
+    """槽位口径下，声明与落盘必须同源——这一档曾经有 73 处不符。
+
+    DQ 的输出、掩码、KV 新值这三族落盘的是**一个 token** 的量（4096 / 2048 /
+    4096 字节），而它们的边 dims 和 DQ 的 `original_shape` 一度还是导出图的
+    16 个 token，于是校验器报「文件 4096B、声明 65536B（65536 × int8）」。
+    三族的尺寸规则在写盘侧（`export.write_runtime_files` 的槽位分支与
+    `_dq_specs`），这里钉住「写盘那一份口径 == GML 里声明的那一份」。
+    """
+    nodes, edges = slot_blocks
+    report = Report()
+    check_data_buffer_sizes(slot_layout_dir, nodes, edges, report)
+    assert report.failed == [], report.failed
+
+    # DQ 自己的两个形状字段也要与它落盘的两份一致：output_buffer 装 numel 个
+    # int8，output_sf 装 numel/group_size 个 fp16（参考 node 12 的 4096B/64B）。
+    checked = 0
+    for block in nodes:
+        original = field(block, "original_shape")
+        # Q 路的 RoPE-DQ 不带形状字段（与参考一致），跳过。
+        if field(block, "op_type") != "DynamicScaling" or original is None:
+            continue
+        numel = 1
+        for part in original.strip("[]").split(","):
+            numel *= int(part)
+        group_size = int(
+            field(block, "output_shape_by_group").strip("[]").rsplit(",", 1)[-1])
+        checked += 1
+        output = slot_layout_dir / field(block, "output_buffer")
+        scale = slot_layout_dir / field(block, "output_sf")
+        assert output.stat().st_size == numel, f"节点 {block} 的 output_buffer"
+        assert scale.stat().st_size == numel // group_size * 2, (
+            f"节点 {field(block, 'node_id')} 的 output_sf")
+    assert checked

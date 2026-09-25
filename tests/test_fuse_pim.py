@@ -119,7 +119,7 @@ def test_silu_is_folded_into_its_gemm(fused) -> None:
 
     hosts = [n for n in clone.graph.nodes if FUSED_TAIL_META_KEY in n.meta]
     assert len(hosts) == 1
-    assert hosts[0].meta[FUSED_TAIL_META_KEY].activation == "Silu"
+    assert hosts[0].meta[FUSED_TAIL_META_KEY].activation == "silu"
 
     # silu 仍留在图里（保持可执行），但被标记为「已吸收」，
     # GML 侧不会把它发射成独立节点。

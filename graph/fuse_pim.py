@@ -11,11 +11,10 @@
 | `linear -> silu` | 1 个 `Gemm` + `contraction[fused_Silu_act]` | 实物节点 195 |
 | `div(√d) -> add(mask)` | 1 个 `Mask`，`1/√d` 折进上游 matmul 的定标 | 实物 32 个（逐头） |
 
-**为什么不复用 `fuse.py`**：那里的 `ACTIVATIONS` 有意排除了 `silu` 与 `rsqrt`
-（当时判断它们在实物里是独立节点）。实测 **SiLU 折在 Gemm 195 的
-`contraction[fused_Silu_act]` 里**，`op_type "Silu"` 与 `"Lut"` 各 1 次都出现在
-那个嵌套块内、不是顶层节点。所以这里改判，但不动 `fuse.py` 的既有语义
-——它还服务 ResNet 那条路径。
+**为什么用门控表**：实测 **SiLU 折在 Gemm 195 的 `contraction[fused_Silu_act]`
+里**，`op_type "Silu"` 与 `"Lut"` 各 1 次都出现在那个嵌套块内、不是顶层节点。
+所以 `silu` 列在 `GATE_ACTIVATIONS` 里、只折 gate 投影，通用表 `ACTIVATIONS`
+（`fuse.py` 用）不含它。
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from dataclasses import dataclass, field
 import torch
 from torch.fx import GraphModule, Node
 
+from contracts.fusion_contract import GATE_ACTIVATIONS, GATE_TARGETS
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 
 # RMSNorm 在 aten 里的算子链。顺序固定，中间可能夹 `to` 与 `_assert_tensor_metadata`
@@ -44,19 +44,8 @@ TRANSPARENT = (
     torch.ops.aten.alias.default,
 )
 
-# 可以折进主算子的激活。与 fuse.py 的 ACTIVATIONS 不同，这里**包含 silu**。
-FUSABLE_ACTIVATIONS = {
-    torch.ops.aten.silu.default: "Silu",
-    torch.ops.aten.relu.default: "Relu",
-    torch.ops.aten.gelu.default: "Gelu",
-}
-
-# 能吃激活的主算子。
-ACTIVATION_HOSTS = (
-    torch.ops.aten.linear.default,
-    torch.ops.aten.addmm.default,
-    torch.ops.aten.mm.default,
-)
+# 条件表在 `contracts/fusion_contract.py`：门控激活（含 silu）与能吃它们的
+# gate 投影主算子。`rsqrt` 不在表里 —— RMSNorm 折成自己的独立节点。
 
 # 本模块自己的 meta 键。
 RMS_NORM_META_KEY = "pim_rms_norm"
@@ -242,7 +231,7 @@ def _fuse_activations(gm: GraphModule) -> int:
 
     fused = 0
     hosts = [n for n in gm.graph.nodes
-             if n.op == "call_function" and n.target in ACTIVATION_HOSTS]
+             if n.op == "call_function" and n.target in GATE_TARGETS]
 
     for host in hosts:
         if FUSED_TAIL_META_KEY in host.meta:
@@ -253,11 +242,11 @@ def _fuse_activations(gm: GraphModule) -> int:
             continue
         activation = users[0]
         if (activation.op != "call_function"
-                or activation.target not in FUSABLE_ACTIVATIONS):
+                or activation.target not in GATE_ACTIVATIONS):
             continue
 
         host.meta[FUSED_TAIL_META_KEY] = FusedTail(
-            activation=FUSABLE_ACTIVATIONS[activation.target],
+            activation=GATE_ACTIVATIONS[activation.target],
             pool=None,
             nodes=[activation],
         )

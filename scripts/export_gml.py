@@ -40,6 +40,7 @@ from genesim_bridge.paths import gml_llama2_reference_dir, llama2_7b_model_dir
 from gml_bridge.export import (
     format_summary,
     fuse_for_gml,
+    fill_weight_hashes,
     serialize_gml,
     write_artifact,
     write_runtime_files,
@@ -508,20 +509,53 @@ def _family(name: str) -> str:
     return re.sub(r"\d+", "#", name)
 
 
+# 已知的数量差异：逐条写明理由，销账后再从这张表拿掉。没写在这里的族必须
+# 与参考逐族相等——静默漂移是这条判据要拦的东西。
+_FAMILY_COUNT_ALLOW = {
+    # 命名口径：参考用 `input_sf_#`，我方一部分写成 `input_#_sf_#`（带槽号）。
+    "input_sf_#.bin", "input_#_sf_#.bin",
+    "input_zp_#.bin", "input_#_zp_#.bin",
+    "output_sf_#.bin", "output_zp_#.bin",
+    "input_buffer_#.bin", "input_buffer_#_#.bin",
+    # RoPE 两张表：参考把它们当图输入（`cos/sin_position_embedding.bin`），
+    # 我方按张量各自命名，多出 4 个小文件。
+    "self_attn_Reshape_#_qidx#_params_#_cos.bin",
+    "self_attn_Reshape_#_qidx#_params_#_sin.bin",
+    "self_attn_Reshape_qidx#_params_#_cos.bin",
+    "self_attn_Reshape_qidx#_params_#_sin.bin",
+    # 末段 Kantor 配置：我方 Q/K 两条 RoPE 各发一套，参考只发 K 那套。
+    "Kantor_A_Llama#Activation_add_bias_buffer_file_#.bin",
+    "Kantor_A_Llama#Activation_add_scale_buffer_file_#.bin",
+    "Kantor_A_Shift_Llama#Activation_add_#.bin",
+}
+
+
 def _check_parser_families(out_dir: Path, log: CheckLog) -> None:
-    """parser_output 分族：参考独有的族必须出现。"""
+    """parser_output 分族：参考独有的族必须出现，且非白名单族数量必须相等。"""
+    import collections
     ref = gml_llama2_reference_dir(required=False)
     if ref is None or not ref.is_dir():
         log.add("parser_output 文件族", True, "无参考目录，跳过")
         return
-    mine = {_family(p.name) for p in out_dir.glob("*.bin")}
-    theirs = {_family(p.name) for p in ref.glob("*.bin")}
+    mine_names = [_family(p.name) for p in out_dir.glob("*.bin")]
+    theirs_names = [_family(p.name) for p in ref.glob("*.bin")]
+    mine, theirs = set(mine_names), set(theirs_names)
     missing = sorted(theirs - mine)
     extra = sorted(mine - theirs)
-    # 参考独有族不能缺（activation_lut / kantor_A_* 这类）；多出来的先报告。
     log.add("参考独有文件族都已产出", not missing,
             f"缺 {len(missing)} 族，多 {len(extra)} 族",
             notes=missing[:8] + [f"+{e}" for e in extra[:4]])
+
+    mc = collections.Counter(mine_names)
+    tc = collections.Counter(theirs_names)
+    count_diff = []
+    for fam in sorted(set(mc) | set(tc)):
+        if fam in _FAMILY_COUNT_ALLOW:
+            continue
+        if mc.get(fam, 0) != tc.get(fam, 0):
+            count_diff.append(f"{fam}: 我方 {mc.get(fam, 0)} / 参考 {tc.get(fam, 0)}")
+    log.add("非白名单文件族数量与参考一致", not count_diff,
+            f"{len(count_diff)} 族数量不同", notes=count_diff[:8])
 
 
 def _dtype_coverage(gml_text: str) -> dict[str, set[str]]:
@@ -533,7 +567,8 @@ def _dtype_coverage(gml_text: str) -> dict[str, set[str]]:
         op = field(block, "op_type") or "buffer"
         keys = seen.setdefault(op, set())
         for key in ("input_buffer_dtype", "output_buffer_dtype",
-                    "weight_buffer_dtype"):
+                    "weight_buffer_dtype",
+                    "input_sf_dtype", "output_sf_dtype", "weight_sf_dtype"):
             if field(block, key) is not None:
                 keys.add(key)
     return seen
@@ -631,15 +666,11 @@ def main() -> int:
         stale.unlink()
 
     try:
-        gml_path = write_artifact(artifact, args.out_dir)
         files = write_runtime_files(
             artifact, args.out_dir, gm=None if args.skip_weights else graph)
     except Exception as exc:
         log.add("GML 与 bin 写盘", False, f"{type(exc).__name__}: {exc}")
         return log.verdict()
-    print(f"\n图: {gml_path}")
-    print(f"运行时文件: {len(files.names_written)} 个, "
-          f"{files.total_bytes / 1e6:.2f} MB")
 
     print("\n检查:")
     problems = _check_structure(artifact.text)
@@ -662,6 +693,19 @@ def main() -> int:
     if args.orchestrate:
         _run_orchestrator(artifact, phase_source, args.out_dir, log,
                           decode_block_only=args.decode_block_only)
+
+    # 权值指纹在**检查跑完之后**补：它要与刚落盘的权值 bin 字节对上，而那些
+    # 字节写盘时才成形；提前补进 `artifact.text` 会让上面两条不变量检查比到
+    # 一份带指纹的文本，比的就不是同一件事了。补完重出文本，GML 最后落盘。
+    try:
+        fill_weight_hashes(artifact, files)
+        gml_path = write_artifact(artifact, args.out_dir)
+    except Exception as exc:
+        log.add("GML 落盘", False, f"{type(exc).__name__}: {exc}")
+        return log.verdict()
+    print(f"\n图: {gml_path}")
+    print(f"运行时文件: {len(files.names_written)} 个, "
+          f"{files.total_bytes / 1e6:.2f} MB")
 
     return log.verdict()
 

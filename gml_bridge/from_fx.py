@@ -18,7 +18,7 @@ from torch.fx import GraphModule, Node as FxNode
 from contracts import gml_hw_table as hw_table
 from contracts import gml_names as names
 from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
-from contracts.gml_quant import GML_VERSION, PHASE_COUNTS
+from contracts.gml_quant import ACTIVATION_LAYOUT, GML_VERSION, PHASE_COUNTS, QuantLayout
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 from graph.fuse_pim import (
     ABSORBED_META_KEY,
@@ -74,6 +74,14 @@ OP_TYPES = {
     torch.ops.aten.max_pool2d.default: "MaxPool",
     torch.ops.aten.avg_pool2d.default: "AveragePool",
     torch.ops.aten.convolution.default: "Conv",
+    # 类型转换是一次真实的数据运动：输入输出位宽不同，必须有节点承载
+    # `input_data_extensions` / `output_data_extension`，不能被跨过。
+    torch.ops.aten.to.dtype: "Convert",
+    torch.ops.aten.to.dtype_layout: "Convert",
+    # 词嵌入查表。全模型导出的图入口是 input_ids，嵌入在块内，必须发这个节点；
+    # decode 块以隐藏态为入口、嵌入在块外，那条导出在 `convert` 里按
+    # `decode_block_only` 裁掉（见那里的说明），所以同一个算子两种导出各发各的。
+    torch.ops.aten.embedding.default: "Gather",
     # attention 在 GML 里是真实节点（scores/context 两个 MatMul 加一个 Softmax）。
     # 本仓的 NumPy 路径把它放在主机侧执行，但那是执行策略，不是图结构——
     # 如果这里跨过它，它的 q/k/v 三个上游会被下游节点误当成自己的输入。
@@ -249,6 +257,15 @@ def _shape_of(node: FxNode) -> str | None:
     return "x".join(str(int(dim)) for dim in shape)
 
 
+def _cast_dtypes(node: FxNode) -> tuple[torch.dtype, torch.dtype] | None:
+    """`to.dtype` 两侧的元素类型（源, 目标）；任何一侧读不到就返回 None。"""
+    src = node.args[0].meta.get("val") if node.args else None
+    dst = node.meta.get("val")
+    if src is None or dst is None:
+        return None
+    return src.dtype, dst.dtype
+
+
 def _is_emittable(node: FxNode) -> bool:
     """这个 FX 节点是否对应一个 GML 硬件节点。
 
@@ -279,15 +296,33 @@ def _is_emittable(node: FxNode) -> bool:
     # 喂 RMSNorm / 残差 / 出口的那些跨过去，不单独成节点（评审 4 §3.4）。
     if node.target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default):
         return not _reshape_is_layout_only(node)
+    # 类型转换只在位宽真的变了时才成节点；同 dtype 的 `to` 是恒等，跨过。
+    if node.target in (torch.ops.aten.to.dtype,
+                       torch.ops.aten.to.dtype_layout):
+        pair = _cast_dtypes(node)
+        if pair is None or pair[0] == pair[1]:
+            return False
     return node.target in OP_TYPES
+
+
+# 明确不发 GML 节点、但有据可查的算子。这不是守卫，是记账：谁被跨过、
+# 为什么，下一个人能查到，不必从 `OP_TYPES` 的缺失里反推。
+# 词嵌入**不在**这里：它在全模型导出里是要发的节点，只有 decode 块那条导出
+# 不发（图入口是隐藏态，嵌入在块外），那个条件写在 `convert` 里。
+_WALK_THROUGH = frozenset({
+    # 同 dtype 的类型转换是恒等，`_is_emittable` 判为不发射；位宽真变了才成
+    # `Convert` 节点。两个重载是同一件事。
+    torch.ops.aten.to.dtype,
+    torch.ops.aten.to.dtype_layout,
+})
 
 
 def _tensor_inputs(node: FxNode, emittable: set[FxNode]) -> list[FxNode]:
     """节点上游最近的那些 GML 节点。
 
-    不可映射的算子（`to`、`slice`、`pow`、`embedding` 之类）要**跨过**而不是丢弃：
-    它们夹在可映射节点之间，直接断开会把图切成互不相连的碎片，入口/出口就不再唯一。
-    所以顺着它们继续往上找，直到碰到可映射节点为止。
+    `_WALK_THROUGH` 里的算子要**跨过**而不是丢弃：它们夹在可映射节点之间，
+    直接断开会把图切成互不相连的碎片。顺着它们继续往上找，直到可映射节点。
+    名单之外的不可映射算子直接报错。
 
     权重、常量、标量不在此列——它们在 GML 里是节点属性或编译期数据，不是边。
     """
@@ -366,14 +401,80 @@ def _mask_placeholder_of(mask_node: FxNode) -> FxNode | None:
     return current if current.op == "placeholder" else None
 
 
+def _boundary_dims(node: FxNode, slots: CompileSlots, rewrite: bool,
+                   export_seq: int | None) -> str:
+    """边界缓冲节点出边的形状，与算子边同一套槽位口径。
+
+    这些边喂的是同一批消费者，所以入口侧写导出图的 seq_len、算子侧写编译期槽位
+    就成了同一条数据通路上两个不一致的声明——下游按哪一个分配缓冲都是错的。
+    """
+    dims = _require_shape(node)
+    return _decode_dims(dims, export_seq, slots) if rewrite else dims
+
+
+def _require_shape(node: FxNode) -> str:
+    """节点输出形状，取不到就抛。
+
+    边的形状是可知的（FX 节点带 `meta["val"]`）。写 `"unknown"` 兜底会让写盘侧
+    按 1 个元素分配缓冲，而声明与文件仍然自洽——校验器比的就是这两者，
+    于是这个错永远不会被发现。
+    """
+    shape = _shape_of(node)
+    if not shape:
+        raise ValueError(
+            f"FX 节点 {node.name} 没有 meta['val'].shape，算不出边的 dims。"
+            f"上游没标注形状就是上游的错，这里不替它编一个")
+    return shape
+
+
+def _export_seq_len(gm: GraphModule) -> int | None:
+    """导出图那次用的 seq_len，取自 `input_ids` 占位符的末维。
+
+    它是判断「哪一维是序列轴」的真源。拿不到就返回 None，`_slot_dims`
+    随之不改写——宁可留着导出形状让参考对比发现，也不按位置猜一维。
+    """
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        shape = tuple(getattr(node.meta.get("val"), "shape", ()) or ())
+        if len(shape) == 2:
+            return int(shape[-1])
+    return None
+
+
+
+def _split_out_dims(producer: FxNode, consumer: FxNode, emittable: set,
+                    slots: CompileSlots) -> str:
+    """Split 一条出边的形状：看它喂的是 Q、Kᵀ 还是 V。
+
+    三个 Split（Q/K/V）在 GML 里都叫 Split，只能靠消费者的角色和槽位区分。
+    Q 是 QKᵀ 的左操作数，K 是右操作数（走权重通路，形状是转置后的），
+    V 是 PV 的右操作数。
+    """
+    HD, S = slots.head_dim, slots.seq
+    role = consumer.meta.get(HEAD_ROLE_META_KEY)
+    inputs = _tensor_inputs(consumer, emittable)
+    left = bool(inputs) and inputs[0] is producer
+    if role == ROLE_MATMUL_QK:
+        return f"1x1x1x{HD}" if left else f"1x1x{HD}x{S}"
+    if role == ROLE_MATMUL_PV:
+        return f"1x1x1x{HD}" if left else f"1x1x{S}x{HD}"
+    return f"1x1x1x{HD}"
+
+
 def _slot_dims(op_type: str | None, role, slots: CompileSlots,
-               fallback: str | None, *, rewrite: bool) -> str:
-    """边的 dims 按编译期槽位写，不按导出图 seq_len。
+               fallback: str | None, *, rewrite: bool,
+               export_seq: int | None = None) -> str:
+    """边的 dims 按 decode 参考口径写，不按导出图 seq_len。
 
     只在 llama2-7B 图上改写（图里能看到 hidden=4096）。小图测试沿用导出形状。
+
+    decode 参考里 **token 轴恒为 1**，1024 只属于 KV 长度轴：hidden 是
+    `1x1x1x4096`，单头 Q 是 `1x1x1x128`，K/V cache 才是 `1x32x1024x128`。
+    把导出 seq_len 换成 `slots.seq` 会让激活边按 1024 个 token 分配缓冲
+    （实测 `input_buffer_*` 一族 270MB vs 参考 21.6MB）。
     """
-    H, I, HD, S, nh = (slots.hidden, slots.intermediate, slots.head_dim,
-                       slots.seq, slots.heads)
+    HD, S, nh = slots.head_dim, slots.seq, slots.heads
     if rewrite:
         if role == ROLE_MATMUL_QK:
             return f"1x1x1x{S}"
@@ -383,15 +484,55 @@ def _slot_dims(op_type: str | None, role, slots: CompileSlots,
             return f"1x1x1x{HD}"
         if op_type == "KV_Cache_DMA":
             return f"1x{nh}x{S}x{HD}"
-        if fallback and fallback != "unknown":
-            parts = fallback.split("x")
-            ints = [int(p) for p in parts if p.isdigit()]
-            if ints and ints[-1] in (1, 16) and S not in ints:
-                parts[-1] = str(S)
-                return "x".join(parts)
-    return fallback or "unknown"
+        # K 路 RoPE 参考是 `1x1x32x128`（头轴在倒数第二），不是 `1x32x1x128`。
+        if op_type == "Llama2Activation":
+            return f"1x1x{nh}x{HD}"
+        if fallback:
+            return _decode_dims(fallback, export_seq, slots)
+    if not fallback:
+        raise ValueError(
+            f"边的 dims 算不出来（op_type={op_type!r} role={role!r}）。"
+            f"形状是可知的，写 unknown 只会让下游按 1 个元素分配缓冲")
+    return fallback
 
 
+def _decode_dims(dims: str, export_seq: int | None,
+                 slots: CompileSlots) -> str:
+    """把导出图的 token 轴换成 1，再左补 1 到四维。
+
+    候选是「值等于导出 seq_len」的那些维。光靠这个值有时分不出来：
+    `1x32x128x128` 在 seq_len=128 时末维也是 128，而末维是 head_dim。
+    所以先按**已知轴**排除——末维若等于 head_dim / hidden / intermediate 就不是
+    token 轴，下标 1 若等于 heads 也不是。排除后仍剩多于一处就只做补维：
+    换错一维得到的是形状对、语义错的声明，不如留着让参考对比发现。
+
+    补四维是参考口径：`1x4096` / `1x1x4096` 都写成 `1x1x1x4096`。
+    """
+    parts = [int(p) for p in dims.split("x")]
+    if export_seq is not None:
+        known_last = {slots.head_dim, slots.hidden, slots.intermediate}
+        hits = [
+            i for i, value in enumerate(parts)
+            if value == export_seq
+            and not (i == len(parts) - 1 and value in known_last)
+            and not (i == 1 and len(parts) == 4 and value == slots.heads)
+        ]
+        if len(hits) == 1:
+            parts[hits[0]] = 1
+    while len(parts) < 4:
+        parts.insert(0, 1)
+    return "x".join(str(p) for p in parts)
+
+
+def _rewrite_seq_axis(dims: str, export_seq: int | None,
+                      slots: CompileSlots) -> str:
+    """兼容旧名字：decode 参考把 token 轴写成 1，不是 `slots.seq`。"""
+    return _decode_dims(dims, export_seq, slots)
+
+
+# 动态量化算子：输入 fp16、输出定点，四种量化参数由它们自己算。
+#   DynamicScaling 36 个（attn 分数 32 + hidden/MLP）+ Q 路 RoPE 那一个。
+_DQ_OPS = frozenset({"DynamicScaling", "Llama2ActivationDQ"})
 # 输出恒为 int8 的算子：它们把数值落成定点（量化 / 写 cache）。
 _OUT_INT8_OPS = frozenset({
     "DynamicScaling", "Llama2Activation", "Llama2ActivationDQ",
@@ -405,10 +546,85 @@ _OUT_FP16_OPS = frozenset({
 _IN_INT8_OPS = frozenset({"Gemm", "MatMul"})
 # 纯布局算子：不改数值，所以 **没有** input_sf / input_zp，dtype 沿边传播。
 _NO_SCALE_OPS = frozenset({"Split", "Transpose", "Reshape", "Concat"})
+# 顶层不带输入定标的算子——只有纯布局的两个。参考实测：Transpose 4/4、
+# Reshape 2/2 都不带 `input_sf`；而 Split 吃 DQ 的那一路带、
+# Concat 的 32 槽逐槽带，所以它们不能整族豁免。
+_NO_TOP_IN_SCALE = frozenset({"Transpose", "Reshape"})
 # 顶层不写 input dtype 的算子（只有槽字段，或根本没有输入侧声明）。
 _NO_TOP_IN_DTYPE = frozenset({
     "Mask", "EltwiseAdd", "EltwiseMul", "Concat", "KV_Cache_DMA",
 })
+
+# 产物能落盘的缓冲元素类型。`int64` 这类索引/主机侧类型不在其中——声明了
+# 没有宽度可核文件大小（`verify_gml_artifact` 的宽度表只认这四种）。
+_BUFFER_DTYPES = frozenset({"int8", "int16", "float16", "float32"})
+
+# 不逐槽声明输入定标的算子。参考实测：Mask / KV_Cache_DMA / 两个 RoPE 锚点
+# 都**没有** `input_<槽>_sf` / `_zp` / `_sf_dtype`——Mask 读的是浮点分数与
+# 掩码、自己产出量化结果，KV 与 RoPE 的入槽是 fp16 直通。**多输入不等于
+# 逐槽量化**：槽位字段的判据是「这一路的输入是不是量化张量」，不是输入个数。
+_NO_INPUT_SLOT_SCALE = frozenset({
+    "Mask", "KV_Cache_DMA", "Llama2Activation", "Llama2ActivationDQ",
+})
+
+# 参考只写定标文件名、不带 dtype 兄弟字段的算子。实测：
+#   Split 3/3、Mask 32/32、EltwiseAdd 2/2 的 input_sf / output_sf 都没有
+#   `*_sf_dtype`；DynamicScaling 反过来——`output_sf_dtype` 有、
+#   `input_sf_dtype` 没有。多写一个 dtype 不是「更完整」，是两份产物对不上。
+_NO_INPUT_SF_DTYPE = frozenset({
+    "DynamicScaling", "EltwiseAdd", "Mask", "Split",
+})
+_NO_OUTPUT_SF_DTYPE = frozenset({"EltwiseAdd", "Mask", "Split"})
+
+# 带 `kantor_mode` 的算子。参考实测：Split / Concat / Reshape / Transpose
+# 这四个布局类算子也带，值恒为 "off"——它们落到 Kantor 单元上做直通，
+# 字段是给下游看「这一路不做定点转换」。
+_LAYOUT_KANTOR_OPS = frozenset({"Split", "Concat", "Reshape", "Transpose"})
+
+
+def _transpose_axes_of(node: FxNode) -> tuple[int, ...] | None:
+    """从 FX 节点读出 Transpose / permute 的轴序。
+
+    `aten.transpose.int` 是两维对换，展开成完整排列；`aten.permute` 直接给轴序。
+    取不到就不发，宁缺勿猜。
+    """
+    target = node.target
+    args = node.args
+    if target == torch.ops.aten.permute.default and len(args) >= 2:
+        perm = args[1]
+        if isinstance(perm, (list, tuple)) and all(isinstance(i, int) for i in perm):
+            return tuple(perm)
+        return None
+    if target == torch.ops.aten.transpose.int and len(args) >= 3:
+        dim0, dim1 = args[1], args[2]
+        rank_src = _shape_tuple_of(args[0]) if args else None
+        rank = len(rank_src) if rank_src is not None else 4
+        if not isinstance(dim0, int) or not isinstance(dim1, int):
+            return None
+        axes = list(range(rank))
+        axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+        return tuple(axes)
+    return None
+
+
+def _stamp_idx(nodes: list[Node]) -> None:
+    """给每个有输出的节点补 `idx`：它的输出挂在消费者的第几个输入端口。
+
+    参考产物里 197 个节点各带且仅带一个 `idx`，规则是
+    `consumer.input<idx>_node_id == self.node_id`（197/197 成立）。它不是
+    「第几个输入」——每个节点只有一个，取值 0..31 是 head 序号，
+    `input{i}_node_id` 不编码任何 head 信息。
+    """
+    port_of: dict[int, int] = {}
+    for node in nodes:
+        for index in range(64):
+            producer = node.fields.get(f"input{index}_node_id")
+            if isinstance(producer, int):
+                port_of.setdefault(producer, index)
+
+    for node in nodes:
+        if node.node_id in port_of:
+            node.fields["idx"] = port_of[node.node_id]
 
 
 def _stamp_dtypes(nodes: list[Node]) -> None:
@@ -453,6 +669,13 @@ def _stamp_dtypes(nodes: list[Node]) -> None:
         flowing = next((out_dtype[p] for p in producers if p in out_dtype),
                        "float16")
 
+        # 转换节点的两侧位宽由图侧元素类型定，发射时已经写好（见 `convert` 里
+        # `op_type == "Convert"` 那段）。这里只把目标位宽记进传播表供下游用，
+        # 其余推导全部跳过——它是**唯一**按自己改位宽的算子，传播会抹平它。
+        if op_type == "Convert":
+            out_dtype[node_id] = str(fields.get("output_buffer_dtype") or flowing)
+            continue
+
         if op_type in _OUT_INT8_OPS:
             out_dt = "int8"
         elif op_type in _OUT_FP16_OPS:
@@ -491,16 +714,27 @@ def _stamp_dtypes(nodes: list[Node]) -> None:
                       for key in fields)
         if in_dt and "input_buffer_dtype" not in fields and not slotted:
             fields["input_buffer_dtype"] = in_dt
-            fields["input_data_extensions"] = hw_table.data_extension(in_dt)
+        # 数据扩展位与 input_buffer_dtype 独立：Mask / Concat / Eltwise /
+        # KV_Cache_DMA 顶层不写 input dtype，但仍声明扩展位。
+        ext_dt = in_dt
+        if op_type in _NO_TOP_IN_DTYPE:
+            ext_dt = "int8" if op_type == "KV_Cache_DMA" else (flowing or "float16")
+        if ext_dt and "input_data_extensions" not in fields:
+            fields["input_data_extensions"] = hw_table.data_extension(ext_dt)
 
-        if op_type in _NO_SCALE_OPS or op_type == "DynamicScaling":
-            for key in ("input_sf", "input_zp"):
+        # 顶层不写 `input_sf` / `input_zp` 的算子。**不含 Split / Concat**：
+        # 参考给 Split 写了那一路的输入定标、给 Concat 逐槽写了 32 组，
+        # 整族豁免会把它们一起抹掉（`_NO_SCALE_OPS` 管的是 dtype 沿边传播，
+        # 是另一件事，不要混用）。
+        if op_type in _NO_TOP_IN_SCALE or op_type == "DynamicScaling":
+            for key in ("input_sf", "input_zp", "input_sf_dtype"):
                 fields.pop(key, None)
 
         if op_type == "KV_Cache_DMA":
             # 参考 node 28 顶层同时有 input_sf / input_zp，槽字段之外再来一份。
             fields.setdefault("input_sf", names.scale(node_id))
             fields.setdefault("input_zp", names.zero_point(node_id))
+            fields.setdefault("input_sf_dtype", "float16")
             fields.pop("input_buffer_dtype", None)
 
         # 权重 dtype 按**操作数来源**盖：get_attr 二维权重是 int4（W4A8），
@@ -512,19 +746,32 @@ def _stamp_dtypes(nodes: list[Node]) -> None:
             fields.setdefault("weight_sf_dtype", "float16")
 
 
-def _contraction_of(node: FxNode) -> list[tuple[str, dict[str, object]]]:
-    """折进本节点的激活与池化，写成 contraction 块的内容。"""
+def _contraction_of(
+    node: FxNode, node_id: int | None = None
+) -> list[tuple[str, dict[str, object]]]:
+    """折进本节点的激活与池化，写成 contraction 块的内容。
+
+    `node_id` 用来填 `residual_input_buffer`——**本节点自己的编号**（实测参考
+    产物节点 195 的块里就是 195）。折进来的激活读的是主算子的累加结果，那块缓冲
+    属于主算子，所以指回自己。取不到编号时不发这一项，宁缺勿错。
+    """
     tail = node.meta.get(FUSED_TAIL_META_KEY)
     if tail is None:
         return []
 
     entries: list[tuple[str, dict[str, object]]] = []
     activation = _ACTIVATION_NAMES.get(tail.activation, tail.activation)
-    entries.append((
-        f"fused_{node.name}_activation",
-        {"name": f"{node.name}_activation", "op_type": "Lut",
-         "activation_op_type": activation},
-    ))
+    # 块名与 `name` 都按**激活**命名，不按 FX 节点名。实测参考产物是
+    # `fused_Silu_act` / `name "Silu_act"`（节点 195），而按节点名会写成
+    # `fused_linear_4_activation`——同一个融合，对方解析器按块名找不到。
+    # FlagTree 侧 `#pim.contraction<form = named, blockName = ...>` 是同一份口径。
+    block: dict[str, object] = {
+        "name": f"{activation}_act", "op_type": "Lut",
+        "activation_op_type": activation,
+    }
+    if node_id is not None:
+        block["residual_input_buffer"] = node_id
+    entries.append((f"fused_{activation}_act", block))
     if tail.pool:
         entries.append((
             f"fused_{node.name}_pool",
@@ -532,6 +779,7 @@ def _contraction_of(node: FxNode) -> list[tuple[str, dict[str, object]]]:
              "op_type": _POOL_NAMES.get(tail.pool, tail.pool)},
         ))
     return entries
+
 
 
 def _weight_param_of(node: FxNode) -> str | None:
@@ -548,6 +796,86 @@ def _weight_param_of(node: FxNode) -> str | None:
         if shape is not None and len(shape) >= 2:
             return str(arg.target)
     return None
+
+
+# 相位上的硬件域：ODS 属性名 -> GML 字段的词干。
+# 值优先取算子编译器给的（`#pim.phase_spec` 之外的那些 spec 属性），取不到才
+# 用常量表——表的定位是缺省值，不是真源。
+_PHASE_ODS_FIELDS = (
+    ("flp_min", "flp_min_exp"),
+    ("flp_max", "flp_max_exp"),
+    ("flp_mantisa", "flp_mantisa"),
+    ("activation_mode", "activation_mode"),
+    ("kantor_mode", "kantor_mode"),
+    ("fpsu_mode", "fpsu_mode"),
+    ("transpose_type", "transpose_type"),
+)
+
+# 卡值 -> GML 文本里的模式名。`phase_plan` 存的是**卡值**（编排器的 txt 用
+# 卡值），而 GML 文本写模式名，所以这里映射回去。值与
+# `phase_plan._FPSU_CARD`、FlagTree 的 `TTPIM_FpsuMode` / `TTPIM_KantorMode`
+# 枚举逐项对应，改一处必须改三处。
+_FPSU_MODE_NAME = {1: "floating_point", 2: "floating_point_32"}
+_KANTOR_MODE_NAME = {
+    0: "off",
+    1: "elementwise_mul_fp16",
+    2: "float_elt_wise_and_scale",
+    3: "fp2int_converter",
+    4: "elementwise_mul_fixed_point",
+    5: "scalar",
+}
+# 存卡值、要映回名字的两个域；其余域两边都是整数，直接用。
+_CARD_FIELDS = {
+    "fpsu_mode": _FPSU_MODE_NAME,
+    "kantor_mode": _KANTOR_MODE_NAME,
+}
+
+# GML op_type -> 算子编译器那边的 kind。
+_PHASE_KIND = {
+    "DynamicScaling": "dq",
+    "Llama2ActivationDQ": "dq",
+    "Softmax": "softmax",
+    "Llama2Activation": "rope",
+}
+
+
+def _resolve_rtl_version(declared: str | None) -> str:
+    """定版 `rtl_version`：接了算子编译器就以 IR 的模块属性为真源。
+
+    两处各写一份版本号、谁都不核对，改一边另一边不会报错——所以这里要么
+    用 IR 声明的值，要么在两者不一致时直接抛。
+    """
+    if declared is None:
+        return hw_table.RTL_VERSION
+    if declared != hw_table.RTL_VERSION:
+        raise ValueError(
+            f"rtl_version 两侧不一致：IR 模块属性是 {declared!r}，"
+            f"本仓常量是 {hw_table.RTL_VERSION!r}")
+    return declared
+
+
+def _overlay_phase_source(fields: dict, phase_source, op_type: str,
+                          label: str, phase: int) -> None:
+    """把算子编译器给的相位域值盖到常量表算出来的字段上。
+
+    `phase_source` 为空、或那一相没给某个域时保持表值不变——所以没接算子
+    编译器时产物逐字节不变。
+    """
+    kind = _PHASE_KIND.get(op_type)
+    if phase_source is None or kind is None:
+        return
+    for ods_name, stem in _PHASE_ODS_FIELDS:
+        value = phase_source.phase_value(label, kind, phase, ods_name)
+        if value is None:
+            continue
+        names = _CARD_FIELDS.get(ods_name)
+        if names is not None:
+            value = names.get(value)
+            if value is None:
+                continue
+        key = f"{stem}_phase_{phase}"
+        if key in fields:
+            fields[key] = value
 
 
 def _phase_count_for(phase_source, op_type: str, label: str) -> int:
@@ -600,9 +928,21 @@ def convert(
     rewrite_dims = any(
         4096 in tuple(int(x) for x in getattr(n.meta.get("val"), "shape", ()) or ())
         for n in gm.graph.nodes)
+    export_seq = _export_seq_len(gm)
     emittable = {node for node in gm.graph.nodes if _is_emittable(node)}
+    if decode_block_only:
+        # decode 块以隐藏态为图入口、词嵌入在块外，那条导出不发 `Gather`
+        # ——参考产物里没有这个节点。**必须在这里裁**，不能留到收尾：
+        # 节点编号按 `len(ordered)` 逆拓扑算，少一个节点全图编号都会平移。
+        emittable = {
+            node for node in emittable
+            if node.target is not torch.ops.aten.embedding.default}
     if not emittable:
         raise ValueError("图里没有可映射到 GML 的算子")
+
+    # 版本号定版一次：接了算子编译器就以 IR 的模块属性为真源。
+    rtl_version = _resolve_rtl_version(
+        getattr(phase_source, "rtl_version", None))
 
     def phase_count(op_type: str, label: str) -> int:
         """这个算子发几套 `*_phase_N` 字段。
@@ -621,6 +961,53 @@ def convert(
     for node in ordered:
         for source in _tensor_inputs(node, emittable):
             consumers[source].append(node)
+
+    # RoPE 与它前面那个转置**可交换**：旋转只作用在末维（head_dim），把
+    # heads 轴与 seq 轴对调的转置移到 RoPE 前面还是后面都是同一个数。
+    # 参考产物把转置放在 RoPE **之后**（RoPE 直接吃主算子的输出），所以这里
+    # 把两者的入边、出边对调，节点本身与编号都不动。
+    rope_transpose_of: dict[FxNode, FxNode] = {}
+    transpose_rope_of: dict[FxNode, FxNode] = {}
+    for node in ordered:
+        if ROPE_META_KEY not in node.meta:
+            continue
+        source = node.meta[ROPE_META_KEY].source
+        if not (source in emittable and source.target in (
+                torch.ops.aten.transpose.int, torch.ops.aten.permute.default)):
+            continue
+        # 只对**写回 KV cache 的那条**（K 路）交换。参考产物里 Q 路的 RoPE
+        # 直接喂 Split、中间没有转置，K 路才是「RoPE → 转置 → 写 cache」。
+        if not any(KV_DMA_META_KEY in user.meta for user in node.users):
+            continue
+        rope_transpose_of[node] = source
+        transpose_rope_of[source] = node
+
+    # 发射口径的入边与出边表：先把 RoPE 与转置对调，再逐处引用。
+    # 入边：RoPE 吃转置的输入，转置吃 RoPE。
+    # 出边：转置原来的上游改由 RoPE 承接，RoPE 原来的消费者改由转置承接。
+    emitted_in: dict[FxNode, list[FxNode]] = {node: None for node in ordered}
+    for node in ordered:
+        emitted_in[node] = _tensor_inputs(node, emittable)
+    emitted_out: dict[FxNode, list[FxNode]] = {
+        node: list(consumers[node]) for node in ordered
+    }
+    for rope_node, trans_node in rope_transpose_of.items():
+        emitted_in[trans_node] = [rope_node]
+        emitted_in[rope_node] = _tensor_inputs(trans_node, emittable)
+        for producer in _tensor_inputs(trans_node, emittable):
+            emitted_out[producer] = [
+                rope_node if consumer is trans_node else consumer
+                for consumer in emitted_out[producer]
+            ]
+        # RoPE 原来的消费者改吃转置——它们的 FX 上游仍是 RoPE 那个锚点，
+        # 出边对调后必须同步改，否则消费者按 FX 入边找槽号会找不到。
+        for consumer in consumers[rope_node]:
+            emitted_in[consumer] = [
+                trans_node if item is rope_node else item
+                for item in emitted_in[consumer]
+            ]
+        emitted_out[rope_node] = [trans_node]
+        emitted_out[trans_node] = list(consumers[rope_node])
 
     gml_nodes: list[Node] = []
     edges: list[Edge] = []
@@ -685,11 +1072,12 @@ def convert(
             fields_buf[names.port_node_id_key("output", index)] = reader_id
         gml_nodes.append(Node(buffer_id, fields_buf))
         edges.append(Edge(buffer_id, node_ids[node],
-                          _shape_of(node) or "unknown"))
+                          _boundary_dims(node, slots, rewrite_dims, export_seq)))
         if buffer_id == first_entry_id:
             for bypass_node in entry_bypass:
                 edges.append(Edge(buffer_id, node_ids[bypass_node],
-                                  _shape_of(bypass_node) or "unknown"))
+                                  _boundary_dims(bypass_node, slots,
+                                                 rewrite_dims, export_seq)))
 
     for node, buffer_id in exit_ids.items():
         gml_nodes.append(Node(buffer_id, {
@@ -761,7 +1149,8 @@ def convert(
             gml_nodes.append(Node(buffer_id, fields))
             for reader in readers:
                 edges.append(Edge(buffer_id, node_ids[reader],
-                                  _shape_of(tensor) or "unknown"))
+                                  _boundary_dims(tensor, slots,
+                                                 rewrite_dims, export_seq)))
 
     # Mask 的第二路输入（causal mask）：图里是一个 `placeholder`
     # （`runtime/compile.py::PositionalLlama.forward` 的第二个入参），经过一个
@@ -800,6 +1189,11 @@ def convert(
                 "label": f"in_{mask_placeholder.name}",
                 "name": f"in_{mask_placeholder.name}",
                 "is_buffer": 1,
+                # `is_mask` 挂在**缓冲节点**上，不挂在 32 个 Mask 算子上：
+                # 实测参考产物里该标志只有 1 处，就在这个共享边界节点
+                # （与 `is_buffer 1` 同节点），扇出给全部 32 个头。它描述的
+                # 是「这块缓冲是掩码张量」这个来源事实，不是某个算子的配置。
+                "is_mask": 1,
             }
             fields[names.residual_buffer_key("output", 0)] = reader_ids[:10]
             if reader_ids[10:]:
@@ -811,9 +1205,13 @@ def convert(
             # 与参考产物 `Datain file 1` 的槎位一致。
             fields["output_buffer"] = mask_buffer_name
             gml_nodes.append(Node(mask_buffer_id, fields))
+            # 掩码按编译期槽位：落盘的是 1 个 token 的 seq 个 fp16
+            # （参考的掩码边也是 `1x1x1x1024`），导出图的 16x16 不能拿去写。
+            mask_dims = _slot_dims("Mask", ROLE_MASK, slots,
+                                   _shape_of(mask_placeholder),
+                                   rewrite=rewrite_dims, export_seq=export_seq)
             for reader in connected:
-                edges.append(Edge(mask_buffer_id, node_ids[reader],
-                                  _shape_of(mask_placeholder) or "unknown"))
+                edges.append(Edge(mask_buffer_id, node_ids[reader], mask_dims))
                 mask_boundary_of[reader] = mask_buffer_id
 
     # KV cache 初始平面 + 位置下标：参考 3 个 is_buffer（K 4MB、V 4MB、
@@ -837,7 +1235,7 @@ def convert(
         for index, reader_id in enumerate(pos_readers):
             pos_fields[names.port_node_id_key("output", index)] = reader_id
         gml_nodes.append(Node(pos_id, pos_fields))
-        pos_dims = (f"1x{slots.heads}x1x3" if rewrite_dims else "1x1x1x3")
+        pos_dims = (f"3x1x{slots.heads}x1" if rewrite_dims else "1x1x1x3")
         for reader in kv_nodes:
             edges.append(Edge(pos_id, node_ids[reader], pos_dims))
         for index, dma in enumerate(kv_nodes):
@@ -886,7 +1284,7 @@ def convert(
 
     for node in ordered:
         node_id = node_ids[node]
-        inputs = _tensor_inputs(node, emittable)
+        inputs = emitted_in[node]
 
         rms_norm = node.meta.get(RMS_NORM_META_KEY)
         role = node.meta.get(HEAD_ROLE_META_KEY)
@@ -923,13 +1321,21 @@ def convert(
             "pim_fx_name": node.name,
         }
 
+        # `use_dynamic_quantization 1` 挂在**吃定点激活的矩阵乘**上（`_IN_INT8_OPS`，
+        # 正是「输入走动态量化」这层意思）。参考产物实测 72 处 = Gemm 7 +
+        # MatMul 64 + 被 DQ 喂的那个 Split 1；DQ 节点自己**没有**这个字段
+        # ——它的输入是 fp16、量化是它算的，不是它读的。
+        if op_type in _IN_INT8_OPS:
+            fields["use_dynamic_quantization"] = 1
+
         # 两个 attention matmul 的硬件配置不同，实测 32/32 各自一致：
         #   matmul1 (QKᵀ) 吃 K 的转置 -> weights_transpose，定标 1/√head_dim
         #   matmul2 (PV)  直接吃 V    -> weight，定标 1.0
         # 这是**数学决定的**（哪个是 QKᵀ 图编译器完全知道），不是排布优化。
         if role in (ROLE_MATMUL_QK, ROLE_MATMUL_PV):
             fields.update(hw_table.top_level_fields(
-                "MatMul", transposed=role == ROLE_MATMUL_QK))
+                "MatMul", transposed=role == ROLE_MATMUL_QK,
+                spec=ACTIVATION_LAYOUT))
             head = node.meta.get(HEAD_INDEX_META_KEY)
             if role == ROLE_MATMUL_QK and head is not None:
                 fields["split_channel_number"] = head
@@ -937,6 +1343,8 @@ def convert(
             fields.update(hw_table.top_level_fields("Mask"))
         elif role == ROLE_SOFTMAX:
             fields.update(hw_table.top_level_fields("Softmax"))
+            # 参考把 Softmax 写成 4 维 `[1,1,1,S]`，归约轴是最后一维。
+            fields["axis"] = 3
             # Softmax 五相：字段族同 DynamicScaling 的处理（见下面 dq_spec
             # 分支），只是这里没有 dq_spec 那样的图侧标记——role 本身就是
             # 判据。写盘侧 `write_softmax_phases`（runtime_files.py）已经
@@ -955,7 +1363,10 @@ def convert(
             # input + output，这里也每相都声明。LUT 只在 phase1（exp 表
             # 占位）、phase3（倒数表）写。
             for phase in range(phase_count("Softmax", node.name)):
-                fields.update(hw_table.phase_fields("Softmax", phase))
+                fields.update(hw_table.phase_fields(
+                    "Softmax", phase, spec=ACTIVATION_LAYOUT))
+                _overlay_phase_source(
+                    fields, phase_source, "Softmax", node.name, phase)
                 fields[f"input_buffer_phase_{phase}"] = (
                     names.phase_input_buffer(node_id, phase))
                 fields[f"output_buffer_phase_{phase}"] = (
@@ -997,11 +1408,29 @@ def convert(
                     scale_name = names.scale(node_id, slot_index)
                 fields[f"input_buffer_{slot}" if multi else "input_buffer"] = (
                     buffer_name)
-                layout = op_type in ("Split", "Transpose", "Reshape", "Concat")
-                if not layout:
-                    fields[f"input_{slot}_sf" if multi else "input_sf"] = scale_name
+                if multi and op_type in _NO_TOP_IN_DTYPE:
+                    # 这些算子顶层不写 input dtype，改按槽声明。吃 DQ 输出的
+                    # 槽稍后会被 `upstream_int8` 的收集结果覆盖成 int8。
+                    fields.setdefault(f"input_buffer_{slot}_dtype", "float16")
+                # 纯布局算子（换轴、改形状）不改数值的动态范围，既不带输入
+                # 定标也不带输出定标。Split / Concat 不在其列：参考给它们
+                # 声明了逐槽定标（Split 是那唯一一路），见各自分支。
+                layout = op_type in ("Transpose", "Reshape")
+                if not layout and op_type not in _NO_INPUT_SLOT_SCALE:
+                    sf_key = f"input_{slot}_sf" if multi else "input_sf"
+                    fields[sf_key] = scale_name
                     fields[f"input_{slot}_zp" if multi else "input_zp"] = (
                         names.zero_point(node_id, slot_index))
+                    # 参考的 EltwiseAdd 逐槽带 `_sf_dtype`（2/2）。decode 块那条
+                    # 产物是与参考对齐的冻结基线、本次不改它（带入口旁路的那个
+                    # 由旁路分支手写这两份）；全模型这条路的 add 走通用分支，
+                    # 按参考补齐。
+                    if (op_type not in _NO_INPUT_SF_DTYPE
+                            or (op_type == "EltwiseAdd"
+                                and not decode_block_only)):
+                        fields.setdefault(
+                            f"input_{slot}_sf_dtype" if multi
+                            else "input_sf_dtype", "float16")
             fields[names.port_node_id_key("input", slot)] = node_ids[source]
             upstream_ids.append(node_ids[source])
         if inputs:
@@ -1039,10 +1468,12 @@ def convert(
                 fields["input_buffer_0"] = names.data_buffer(node_id, 0)
                 fields["input_buffer_0_dtype"] = "float16"
                 fields["input_0_sf"] = names.scale(node_id, 0)
+                fields.setdefault("input_0_sf_dtype", "float16")
                 fields["input_0_zp"] = names.zero_point(node_id, 0)
                 fields["input_buffer_1"] = names.data_buffer(node_id, 1)
                 fields["input_buffer_1_dtype"] = "float16"
                 fields["input_1_sf"] = names.scale(node_id, 1)
+                fields.setdefault("input_1_sf_dtype", "float16")
                 fields["input_1_zp"] = names.zero_point(node_id, 1)
                 fields[names.port_node_id_key("input", 0)] = bypass_id
                 fields[names.port_node_id_key("input", 1)] = upstream_ids[0]
@@ -1067,8 +1498,6 @@ def convert(
                     fields.pop("input_zp", None)
                     fields["input_buffer_0"] = names.data_buffer(node_id, 0)
                     fields["input_buffer_0_dtype"] = "float16"
-                    fields["input_0_sf"] = names.scale(node_id, 0)
-                    fields["input_0_zp"] = names.zero_point(node_id, 0)
                     slot = len(inputs)
                     for tensor, table_id in zip(table_tensors, table_ids):
                         fields[names.port_node_id_key("input", slot)] = table_id
@@ -1082,9 +1511,6 @@ def convert(
                         fields[f"input_buffer_{slot}"] = rope_table_names.get(
                             tensor, names.data_buffer(node_id, slot))
                         fields[f"input_buffer_{slot}_dtype"] = "float16"
-                        fields[f"input_{slot}_sf"] = names.scale(node_id, slot)
-                        fields[f"input_{slot}_zp"] = names.zero_point(
-                            node_id, slot)
                         slot += 1
                     fields[names.residual_buffer_key("input", 0)] = (
                         upstream_ids + table_ids)
@@ -1103,12 +1529,8 @@ def convert(
                 fields.pop("input_zp", None)
                 fields["input_buffer_0"] = names.data_buffer(node_id, 0)
                 fields["input_buffer_0_dtype"] = "float16"
-                fields["input_0_sf"] = names.scale(node_id, 0)
-                fields["input_0_zp"] = names.zero_point(node_id, 0)
                 fields["input_buffer_1"] = mask_buffer_name
                 fields["input_buffer_1_dtype"] = "float16"
-                fields["input_1_sf"] = names.scale(node_id, 1)
-                fields["input_1_zp"] = names.zero_point(node_id, 1)
                 fields[names.port_node_id_key("input", 1)] = table_id
                 fields[names.residual_buffer_key("input", 0)] = (
                     upstream_ids + [table_id])
@@ -1119,23 +1541,52 @@ def convert(
             # output_buffer 找不到读者，规则 2 会判为悬空引用。
             fields["input_buffer"] = names.data_buffer(node_id)
             fields["input_sf"] = names.scale(node_id)
+            fields.setdefault("input_sf_dtype", "float16")
             fields[names.residual_buffer_key("input", 0)] = [entry_ids[node]]
             fields[names.port_node_id_key("input", 0)] = entry_ids[node]
             fields["input_count"] = 1
 
+        # 词嵌入查表。**参考产物无此节点，字段名待求证**——这里按方言
+        # （`pim.gather`）的两个操作数名发，缓冲名沿用参考的命名规则：表是
+        # 编译期常量、走权重通路（与上面通用权重分支写的 `weight_buffer`
+        # 是同一个文件），索引就是图入口那一路（token id）。
+        if op_type == "Gather":
+            fields["table"] = names.weight_buffer(node_id)
+            fields["indices"] = fields["input_buffer"]
+
+        # 类型转换：两侧位宽由图侧的元素类型定，**不能按 `_stamp_dtypes` 的
+        # 沿边传播写**——它自己就是改位宽的那一步，传播会把两侧写成同一个值。
+        # 名字取 FX 的类型原名（`torch.float32` 去掉前缀）。只声明产物认识的
+        # 缓冲元素类型（见 `_BUFFER_DTYPES`）；扩展位只覆盖 fp16 与 int8
+        # （实测编码表），其余没有编码可写，那一份就不写：宁缺勿猜。
+        if op_type == "Convert":
+            src, dst = _cast_dtypes(node)
+            for key, ext_key, dtype in (
+                    ("input_buffer_dtype", "input_data_extensions", src),
+                    ("output_buffer_dtype", "output_data_extension", dst)):
+                dt_name = str(dtype).removeprefix("torch.")
+                if dt_name not in _BUFFER_DTYPES:
+                    continue
+                fields[key] = dt_name
+                if dt_name in hw_table.DATA_EXTENSION:
+                    fields[ext_key] = hw_table.data_extension(dt_name)
+
         # 输出缓冲区按**消费者**编号。多个消费者时记第一个，其余靠
         # residual_output_buffer 列出——参考产物就是这样。
-        downstream = consumers[node]
+        downstream = emitted_out[node]
         if not downstream and node in exit_ids:
             # 末端算子的输出流向出口缓冲节点，按消费者（即该缓冲节点）编号。
             fields["output_buffer"] = names.data_buffer(exit_ids[node])
             fields[names.residual_buffer_key("output", 0)] = [exit_ids[node]]
             fields[names.port_node_id_key("output", 0)] = exit_ids[node]
+            # 出口边与算子边同一套槽位口径：它就是这个末端算子的输出，
+            # 写导出图的 seq_len 会让出口缓冲按 16 个 token 分配。
             edges.append(Edge(node_id, exit_ids[node],
-                              _shape_of(node) or "unknown"))
+                              _boundary_dims(node, slots, rewrite_dims,
+                                             export_seq)))
         if downstream:
             first = downstream[0]
-            first_inputs = _tensor_inputs(first, emittable)
+            first_inputs = emitted_in[first]
             # 槽号按**消费者**的数据槽规则算，不是它的入边数 ——
             # 见 _data_slot_count 的说明。
             first_slots = _data_slot_count(
@@ -1164,8 +1615,7 @@ def convert(
             #   DynamicScaling 36 + Llama2ActivationDQ 1 -> output_buffer_<self>
             #   其余 152 个算子节点 -> input_buffer_<消费者>
             # 判据就是「有没有 rtl_version」，不需要额外规则。
-            if (dq_spec is not None
-                    or op_type in ("DynamicScaling", "Llama2ActivationDQ")):
+            if dq_spec is not None or op_type in _DQ_OPS:
                 # phase 型节点自命名（见 phase_output_buffer_self）。
                 # 不能只看 dq_spec：Llama2ActivationDQ 的标记是在字段
                 # 发射时才打上的，那时 output_buffer 已经写过了。
@@ -1217,7 +1667,8 @@ def convert(
         if (op_type in _OUTPUT_SCALE_OPS
                 and dq_spec is None and rms_norm is None):
             fields["output_sf"] = names.output_scale(node_id)
-            fields["output_sf_dtype"] = "float16"
+            if op_type not in _NO_OUTPUT_SF_DTYPE:
+                fields["output_sf_dtype"] = "float16"
             fields["output_zp"] = names.output_zero_point(node_id)
 
         # FPSU 定标三族。实测哪些算子带它：
@@ -1253,33 +1704,69 @@ def convert(
             fields["weight_zp"] = names.weight_zero_point(node_id)
             # 内部键，不进 GML 文本。编排器用它区分 q/k/v/o/gate/up/down。
             fields["pim_weight_param"] = weight_param
-
+            # 次正规保护：参考只在 q_proj（×2）与 v_proj（×4）两处发。
+            # 这是参考产物的约定，不是从权重算出来的——实测这两个权重的逐组
+            # 缩放都在正规区（最小约 5.7e-4），按数值判定会一个都不发。
+            if "q_proj" in weight_param:
+                fields["weight_sf_multiplier"] = 2
+            elif "v_proj" in weight_param:
+                fields["weight_sf_multiplier"] = 4
         # DynamicScaling：4 相字段族 + 每相的缓冲与定标系数。
         # phase 在 GML 里**不是独立节点**，而是同一节点内的 *_phase_<k> 字段。
+        # DynamicScaling 节点的输出宽 = 落盘的那一行，按这个口径给出边形状。
+        dq_out_shape: str | None = None
         if dq_spec is not None:
             fields.update(hw_table.top_level_fields("DynamicScaling"))
-            fields["use_dynamic_quantization"] = 1
             # 节点级字段（不带 _phase_ 后缀）。dtype 说的是**整个节点**的
             # 输入输出：吃 fp16、吐 int8，与 p3 那一相一致。
             fields["input_buffer_dtype"] = "float16"
             fields["input_data_extensions"] = hw_table.data_extension("float16")
             fields["output_buffer_dtype"] = "int8"
             fields["output_data_extension"] = hw_table.data_extension("int8")
-            fields["rtl_version"] = hw_table.RTL_VERSION
+            fields["rtl_version"] = rtl_version
             fields["transpose"] = 1
             # 两个形状字段。`original_shape` 是被量化张量的形状，
             # `output_shape_by_group` 把最后一维按 group_size 拆成
             # `[..., groups, group_size]` —— 硬件按这个分组求 absmax。
-            # 必须按真实张量算，不能写死（实测 4096 与 11008 两种）。
-            shape = _shape_tuple_of(node.args[0]) if node.args else None
-            if shape is not None:
-                fields["original_shape"] = _shape_literal(shape)
+            #
+            # 两者按**落盘口径**写：DQ 落盘的是**一行**（一个 token），
+            # `output_buffer_<self>.bin` 装 numel 个 int8、`output_sf_<self>.bin`
+            # 装 numel/group_size 个 fp16。拿导出图的 [1,16,4096] 去写会声明出
+            # 512 组，而盘上只有 32 组（16 倍错位）。参考 node 12 就是
+            # `[1, 1, 1, 4096]` + `[1, 1, 1, 32, 128]`、output_sf 64 字节；
+            # 注意力分数的组宽也要换成整行的 1024（参考 node 17 是
+            # `[1, 1, 1, 1, 1024]`，不是导出图那一行的 256）。
+            # 小图（hidden != 4096）不改写，两个字段与落盘都用导出形状。
+            dq_group = dq_spec.group_size
+            if rewrite_dims:
+                shape = _shape_tuple_of(node.args[0]) if node.args else None
+                if not shape:
+                    raise ValueError(
+                        f"DQ 节点 {node.name} 取不到被量化张量的形状，"
+                        f"dq_layout 不能拿 0 去猜 hidden")
+                last = int(shape[-1])
+                dq_numel, dq_group = slots.dq_layout(
+                    last, is_attention_scores=dq_spec.is_attention_scores,
+                    group_size=dq_spec.group_size)
+                fields["original_shape"] = _shape_literal((1, 1, 1, dq_numel))
                 fields["output_shape_by_group"] = _shape_literal(
-                    tuple(shape[:-1]) + (dq_spec.groups, dq_spec.group_size))
+                    (1, 1, 1, dq_numel // dq_group, dq_group))
+                dq_out_shape = f"1x1x1x{dq_numel}"
+            else:
+                shape = _shape_tuple_of(node.args[0]) if node.args else None
+                if shape is not None:
+                    fields["original_shape"] = _shape_literal(shape)
+                    fields["output_shape_by_group"] = _shape_literal(
+                        tuple(shape[:-1]) + (dq_spec.groups, dq_spec.group_size))
+            # 这一路的量化规格：沿最后一维分组，组宽随张量变（attention scores
+            # 整条一组）。三族 spc/spg 由它派生，与组宽同源。
+            dq_layout = QuantLayout("per_group", group_size=dq_group, axis=-1)
             # 相位数由算子编译器给出（没接上时退回静态表）。
             for phase in range(phase_count("DynamicScaling", node.name)):
                 fields.update(hw_table.phase_fields(
-                    "DynamicScaling", phase, group_size=dq_spec.group_size))
+                    "DynamicScaling", phase, spec=dq_layout))
+                _overlay_phase_source(
+                    fields, phase_source, "DynamicScaling", node.name, phase)
                 fields[f"input_buffer_phase_{phase}"] = (
                     names.phase_input_buffer(node_id, phase))
                 fields[f"output_buffer_phase_{phase}"] = (
@@ -1308,7 +1795,8 @@ def convert(
         # KV_Cache_DMA：定点通路 + updates 那一路的量化参数。
         kv_dma = node.meta.get(KV_DMA_META_KEY)
         if kv_dma is not None:
-            fields.update(hw_table.top_level_fields("KV_Cache_DMA"))
+            fields.update(hw_table.top_level_fields(
+                "KV_Cache_DMA", spec=ACTIVATION_LAYOUT))
             fields["updates_sf"] = names.kv_updates_scale(node_id)
             fields["updates_sf_dtype"] = "float16"
             fields["updates_zp"] = names.kv_updates_zero_point(node_id)
@@ -1320,15 +1808,11 @@ def convert(
             fields.pop("input_zp", None)
             fields["input_buffer_0"] = names.data_buffer(node_id, 0)
             fields["input_buffer_0_dtype"] = "int8"
-            fields["input_0_sf"] = names.scale(node_id, 0)
-            fields["input_0_zp"] = names.zero_point(node_id, 0)
             fields["input_buffer_1"] = names.data_buffer(node_id, 1)
             fields["input_buffer_1_dtype"] = "int16"
             fields["use_input_buffer_1"] = "L2A_ignore"
             fields["input_buffer_2"] = names.data_buffer(node_id, 2)
             fields["input_buffer_2_dtype"] = "int8"
-            fields["input_2_sf"] = names.scale(node_id, 2)
-            fields["input_2_zp"] = names.zero_point(node_id, 2)
             fields["pim_kv_is_key"] = 1 if kv_dma.is_key else 0
             # 三槽真实入边：cache 平面、位置下标、新值（评审 4 §2.3）。
             if node in kv_cache_of:
@@ -1341,13 +1825,44 @@ def convert(
                     cache_id, pos_id, new_id]
                 fields["input_count"] = 3
 
+        if op_type == "Concat":
+            # 32 头沿 heads 维拼接，参考写 axis 1。
+            fields["axis"] = 1
+        if op_type == "Transpose":
+            # llama2 的 K/V 排布交换是 [0, 2, 1, 3]。
+            perm = _transpose_axes_of(node)
+            if perm is not None:
+                # 参考写成带引号的字面量，不是数组字段；序列化器会加引号。
+                fields["axes"] = "[" + ", ".join(str(i) for i in perm) + "]"
+
+        # 布局类算子也带 `kantor_mode`（参考恒为 "off"）：它们落到 Kantor
+        # 单元上直通，字段说的是「这一路不做定点转换」。Split 在下面自己有
+        # 一份，`setdefault` 不覆盖它。
+        if op_type in _LAYOUT_KANTOR_OPS:
+            fields.setdefault("kantor_mode", "off")
+
         # Split：一进多出，`num_heads` 记输出个数。
         split = node.meta.get(SPLIT_META_KEY)
         if split is not None:
             fields["num_heads"] = str(split.heads)
             fields["axis"] = 1
             fields["kantor_mode"] = "off"
-            fields["use_dynamic_quantization"] = 1
+            # 三个 Split 里只有**输入被 DQ 量化过**的那个带这个字段
+            # （参考实测 1 处：吃 Q 路 RoPE-DQ 输出的那个）。判据看直接上游
+            # 的 op_type，与 phase 型节点自命名的判据同源。
+            if any(_op_type_of(source) in _DQ_OPS for source in inputs):
+                fields["use_dynamic_quantization"] = 1
+                # 参考只留 `input_sf` 这一份，`input_zp` 不带。
+                fields.pop("input_zp", None)
+            else:
+                # 参考实测：只有吃 DQ 输出的那一个 Split 带 `input_sf`
+                # （沿用上游的 scale，槽字段之外的一份）；另外两个不带输入
+                # 定标，改为自己发 `output_sf` / `output_zp`。
+                fields.pop("input_sf", None)
+                fields.pop("input_sf_dtype", None)
+                fields.pop("input_zp", None)
+                fields["output_sf"] = names.output_scale(node_id)
+                fields["output_zp"] = names.output_zero_point(node_id)
 
         # RoPE 折叠节点：一整套子块配置 + 每个子块的定标/零点/Kantor 文件。
         rope = node.meta.get(ROPE_META_KEY)
@@ -1356,13 +1871,15 @@ def convert(
             fields.update(hw_table.rope_fields(dq=is_dq))
             fields["num_heads"] = str(_head_count_of(node))
             if is_dq:
-                fields["rtl_version"] = hw_table.RTL_VERSION
+                fields["rtl_version"] = rtl_version
                 fields["dq_contraction"] = 1
                 fields["transpose"] = 1
                 # 同样由算子编译器给相位数（查 dq：`*_phase_N` 只对应后 4 相）。
                 for phase in range(phase_count("Llama2ActivationDQ", node.name)):
                     fields.update(hw_table.phase_fields(
-                        "Llama2ActivationDQ", phase, group_size=128))
+                        "Llama2ActivationDQ", phase, spec=ACTIVATION_LAYOUT))
+                    _overlay_phase_source(
+                        fields, phase_source, "Llama2ActivationDQ", node.name, phase)
                     fields[f"input_buffer_phase_{phase}"] = (
                         names.phase_input_buffer(node_id, phase))
                     fields[f"output_buffer_phase_{phase}"] = (
@@ -1412,12 +1929,17 @@ def convert(
                 # A 侧的 scale 由 B 侧那份承担，实测只有 B 有 scale_buffer。
                 fields[f"Kantor_B_{block}_scale_buffer_file"] = (
                     names.rope_kantor_scale(node_id, block, "B"))
-            for key, fn in (("bias_buffer_file", names.rope_kantor_bias),
-                            ("scale_buffer_file", names.rope_kantor_scale)):
-                fields[f"Kantor_A_Llama2Activation_add_{key}"] = fn(
-                    node_id, "Llama2Activation_add", "A")
-            fields["Kantor_A_Shift_Llama2Activation_add"] = (
-                names.rope_kantor_shift(node_id, "Llama2Activation_add", "A"))
+            # 末段加法的 Kantor 配置只挂在 K 路那个 `Llama2Activation` 上。
+            # 参考实测：node 30（K 路）带这三项，node 22（Q 路的 DQ）不带，
+            # 只留下 `kantor_mode_Llama2Activation_add`。照抄参考。
+            if not is_dq:
+                for key, fn in (("bias_buffer_file", names.rope_kantor_bias),
+                                ("scale_buffer_file", names.rope_kantor_scale)):
+                    fields[f"Kantor_A_Llama2Activation_add_{key}"] = fn(
+                        node_id, "Llama2Activation_add", "A")
+                fields["Kantor_A_Shift_Llama2Activation_add"] = (
+                    names.rope_kantor_shift(node_id, "Llama2Activation_add",
+                                            "A"))
             # 两个中间态：x*cos 与 rotate_half(x)*sin。
             fields["cos_mul_output"] = names.rope_intermediate(node_id, "cos")
             fields["sin_mul_output"] = names.rope_intermediate(node_id, "sin")
@@ -1441,13 +1963,27 @@ def convert(
 
             fields["input_sf_dtype"] = "float32"
             fields["weight_sf_dtype"] = "float32"
+            # `output_sf` 与下面的 `output_scale_factor_buffer` 是同一个文件：
+            # 参考两个 RMSNorm_vpu 节点都写了顶层这一份，漏了会让下游按
+            # 自己的命名习惯去找一个没人声明的名字。
+            fields["output_sf"] = names.output_scale(node_id)
             fields["output_sf_dtype"] = "float32"
             fields["output_zp"] = names.output_zero_point(node_id)
             fields["RMSNorm_Add_Const"] = names.rms_norm_epsilon(node_id)
-            fields["Use_Scaling"] = 0
+            # 向量单元参数以算子编译器读回的为准，没接上时退回实测常量。
+            vpu_axis = -1
+            use_scaling = 0
+            if phase_source is not None:
+                if (got := phase_source.op_value(
+                        node.name, "normalize", "vpu-axis")) is not None:
+                    vpu_axis = got
+                if (got := phase_source.op_value(
+                        node.name, "normalize", "use-scaling")) is not None:
+                    use_scaling = got
+            fields["Use_Scaling"] = use_scaling
             nested["vpu_params"] = {
                 # -1 表示沿最后一维归约，实测如此。
-                "Vpu_Axis": -1,
+                "Vpu_Axis": vpu_axis,
                 "input_scale_factor_buffer": names.scale(node_id),
                 "output_scale_factor_buffer": names.output_scale(node_id),
                 "Weights_buffer_file": names.weight_buffer(node_id),
@@ -1455,13 +1991,20 @@ def convert(
                 "bias_buffer_file": names.rms_norm_epsilon(node_id),
             }
 
+        # 参考给矩阵单元的两类算子多写一个 `A`，值逐节点等于 `input0_node_id`
+        # （实测 71/71 相等）：同一个操作数，矩阵单元那边按 A 侧称呼。
+        # 按 `A` 取值的读者只认这个名字，所以两个名字都写。
+        if op_type in ("MatMul", "Gemm") and "input0_node_id" in fields:
+            fields["A"] = fields["input0_node_id"]
+
         if op_type == "Gemm":
             is_v = (weight_param is not None and "v_proj" in weight_param) or any(
                 (consumers[node] and KV_DMA_META_KEY in c.meta
                  and not c.meta[KV_DMA_META_KEY].is_key)
                 for c in consumers[node])
             fields.update(hw_table.top_level_fields(
-                "Gemm", output_dtype="int8" if is_v else "float16"))
+                "Gemm", output_dtype="int8" if is_v else "float16",
+                spec=ACTIVATION_LAYOUT))
             if is_v:
                 fields["kantor_A_spc"] = 1
                 fields["kantor_A_scale_axis"] = 1
@@ -1472,20 +2015,24 @@ def convert(
             if any(c[-1].get("activation_op_type") == "Silu"
                    for c in _contraction_of(node) if isinstance(c[-1], dict)):
                 fields["activation_lut_file"] = names.activation_lut(node_id)
+                fields["activation_mode"] = 0
+                fields["activation_special_operators"] = 0
                 fields["flp_min_exp"] = 10
                 fields["flp_max_exp"] = 17
                 fields["flp_mantisa"] = 3
         if op_type == "EltwiseMul":
-            fields.update(hw_table.top_level_fields("EltwiseMul"))
+            fields.update(hw_table.top_level_fields(
+                "EltwiseMul", spec=ACTIVATION_LAYOUT))
             fields["kantor_A_bias_buffer_file"] = names.kantor_bias(node_id, "A")
             fields["kantor_A_Shift"] = names.kantor_shift(node_id, "A")
             fields["kantor_B_scale_buffer_file"] = names.kantor_scale(node_id, "B")
             fields["kantor_B_bias_buffer_file"] = names.kantor_bias(node_id, "B")
             fields["kantor_B_Shift"] = names.kantor_shift(node_id, "B")
         if op_type == "EltwiseAdd":
-            fields.update(hw_table.top_level_fields("EltwiseAdd"))
+            fields.update(hw_table.top_level_fields(
+                "EltwiseAdd", spec=ACTIVATION_LAYOUT))
 
-        contraction = _contraction_of(node)
+        contraction = _contraction_of(node, node_id)
         semantic = _semantic_gml_name(op_type, node, node_id, weight_param, role)
         if semantic:
             fields["label"] = semantic
@@ -1501,13 +2048,42 @@ def convert(
         gml_nodes.append(gml_node)
 
         # 边带形状，节点不带。dims 按编译期槽位，不按导出图 seq_len。
-        shape = _slot_dims(op_type, role, slots, _shape_of(node),
-                           rewrite=rewrite_dims)
+        # DQ 的输出是它自己那一行（与 output_buffer_<self>.bin 同源），
+        # 不按导出图的 seq_len 摊开。
+        shape = dq_out_shape or _slot_dims(
+            op_type, role, slots, _shape_of(node), rewrite=rewrite_dims,
+            export_seq=export_seq)
         for consumer in downstream:
-            edges.append(Edge(node_id, node_ids[consumer], shape or "unknown"))
+            dims = shape
+            # KV 写回的**新值槽**（槽 2）落盘的是 1 个 token 的 nh×hd
+            # （参考 `input_buffer_2` 边是 `1x32x1x128`、文件 4096 字节）。
+            if rewrite_dims and KV_DMA_META_KEY in consumer.meta:
+                dims = f"1x{slots.heads}x1x{slots.head_dim}"
+            # K 路：参考在 KV DMA 与 Split 之间有一个 Transpose，把
+            # `1x32x1024x128` 转成 `1x32x128x1024` 再切。我方把转置折进了
+            # Split，入边仍是未转置的缓存平面。元素数相同，尺寸检查看不见。
+            # 把这条边改成参考的 Kᵀ 平面，让 Split 的输入与出边同一套布局。
+            elif (rewrite_dims and op_type == "KV_Cache_DMA"
+                  and consumer.meta.get(SPLIT_META_KEY) is not None
+                  and node.meta.get(KV_DMA_META_KEY) is not None
+                  and node.meta[KV_DMA_META_KEY].is_key):
+                dims = f"1x{slots.heads}x{slots.head_dim}x{slots.seq}"
+            # Split 的 32 路出边按消费者角色分三份：Q / Kᵀ / V。
+            # 三个 Split 共用一个 op_type，按生产者形状改写会把 96 条边
+            # 全写成 KV cache 全量（`1x32x1024x128`），参考是
+            # `1x1x1x128`×32 + `1x1x128x1024`×32 + `1x1x1024x128`×32。
+            elif rewrite_dims and op_type == "Split":
+                dims = _split_out_dims(node, consumer, emittable, slots)
+            if not dims:
+                raise ValueError(
+                    f"{node.name} -> {consumer.name} 这条边的 dims 算不出来。"
+                    f"形状可知，写 unknown 只会让缓冲按 1 个元素分配")
+            edges.append(Edge(node_id, node_ids[consumer], dims))
 
     # dtype 收尾：布局算子要沿边传播，所以必须等全部节点发射完再统一盖章。
     _stamp_dtypes(gml_nodes)
+    # idx 要等所有 inputN_node_id 都写完才能反查，与 dtype 同一处收尾。
+    _stamp_idx(gml_nodes)
 
     if decode_block_only:
         gml_nodes, edges = _trim_decode_block(gml_nodes, edges)
@@ -1575,6 +2151,9 @@ def _trim_decode_block(nodes: list[Node], edges: list[Edge]):
     # 参考 decode block 把块出口接到一个 is_buffer 节点上，这里同样补一个，
     # 否则残差的 `output_buffer "input_buffer_<已删>.bin"` 变成悬空引用。
     next_id = max((n.node_id for n in kept), default=2) + 1
+    # 裁剪**之前**每个节点出边的形状。出口边要用它，所以必须在这里取：
+    # 裁完之后那条边已经不在 `kept_edges` 里了。
+    out_dims = {e.source: e.dims for e in edges}
     extra_nodes: list[Node] = []
     extra_edges: list[Edge] = []
     for n in kept:
@@ -1591,6 +2170,7 @@ def _trim_decode_block(nodes: list[Node], edges: list[Edge]):
                 "is_buffer": 1,
                 "input_buffer": names.data_buffer(exit_id),
                 "input_sf": names.scale(exit_id),
+                "input_sf_dtype": "float16",
                 "input_zp": names.zero_point(exit_id),
                 names.residual_buffer_key("input", 0): [n.node_id],
                 names.port_node_id_key("input", 0): n.node_id,
@@ -1599,7 +2179,10 @@ def _trim_decode_block(nodes: list[Node], edges: list[Edge]):
             n.fields["output_buffer"] = names.data_buffer(exit_id)
             n.fields[names.residual_buffer_key("output", 0)] = [exit_id]
             n.fields[names.port_node_id_key("output", 0)] = exit_id
-            extra_edges.append(Edge(n.node_id, exit_id, "unknown"))
+            # 出口边的形状 = 这个残留节点自己的输出形状。它是可知的：
+            # 该节点原来那条出边（被裁掉的消费者那条）就带着它。写 unknown
+            # 会让写盘侧按 1 个元素分配缓冲，而声明与文件仍然自洽，谁都发现不了。
+            extra_edges.append(Edge(n.node_id, exit_id, out_dims[n.node_id]))
             kept_ids.add(exit_id)
         else:
             n.fields[names.residual_buffer_key("output", 0)] = alive

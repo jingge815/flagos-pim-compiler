@@ -115,7 +115,14 @@ def test_every_strategy_decodes_the_same_tokens_as_single_card_pytorch(
 
 
 def test_cross_stage_edge_count_grows_with_stage_count(compiled_by_strategy) -> None:
-    """验证跨 stage 的通信边数量。"""
+    """跨 stage 的通信边分两类，各自的条数都要钉住。
+
+    激活搬运：每个段边界恰好一条（残差从前一段交给后一段）。
+    只读表搬运：位置编码的 cos/sin 表由所有层共用，视图族下设备后它由**最早
+    消费它的那一段**算一次，再复制给其余段。表本身是产物而不是激活，所以单独
+    按字节量分开计——把两者混在一个总数里，就没法再区分「多搬了一份激活」和
+    「多复制了一次只读表」。
+    """
     counts = {}
     for name, compiled in compiled_by_strategy.items():
         cross = [
@@ -123,9 +130,20 @@ def test_cross_stage_edge_count_grows_with_stage_count(compiled_by_strategy) -> 
             if e.src_loc.get("device") == "dpu" and e.dst_loc.get("device") == "dpu"
             and set(e.src_loc["dpus"]) != set(e.dst_loc["dpus"])
         ]
-        counts[name] = len(cross)
-        assert len(cross) == compiled.strategy.num_stages - 1, (
-            f"{name}: 跨 stage 边 {len(cross)} 条，期望 {compiled.strategy.num_stages - 1} 条"
+        # 位置编码表很小（几百字节），激活是隐藏态（这里 512B）。按名字分更稳：
+        # 表那两条的源都是 `to_*`（位置编码的 dtype 转换），激活是残差 add。
+        tables = [e for e in cross if e.src.startswith("to_")]
+        activations = [e for e in cross if e not in tables]
+        counts[name] = len(activations)
+
+        expected_activation = compiled.strategy.num_stages - 1
+        assert len(activations) == expected_activation, (
+            f"{name}: 跨 stage 的激活搬运 {len(activations)} 条，"
+            f"期望 {expected_activation} 条：{[(e.src, e.dst) for e in activations]}"
+        )
+        assert len(tables) == 2 * expected_activation, (
+            f"{name}: 位置编码表的跨段复制 {len(tables)} 条，"
+            f"期望 {2 * expected_activation} 条（cos/sin 各一份）"
         )
     assert counts["tp4_pp1"] == 0  # 张量并行下不该有任何跨 stage 搬运
 

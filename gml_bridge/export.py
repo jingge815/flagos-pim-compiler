@@ -55,6 +55,9 @@ class GmlArtifact:
     dq_specs: dict = field(default_factory=dict)
     fusions: int = 0
     slots: CompileSlots = field(default_factory=lambda: DEFAULT_SLOTS)
+    # 图头里写的格式版本。写盘阶段要按它重出文本（见 `fill_weight_hashes`），
+    # 所以不能只留在 `text` 里。
+    version: str = GML_VERSION
 
 
 def _referenced_buffers(nodes: list[Node]) -> set[str]:
@@ -163,6 +166,7 @@ def serialize_gml(gm: GraphModule, report: FusionReport, *,
         dq_specs=_dq_specs(gm, nodes, extra_dq, slots,
                            rewrite=_looks_like_llama7b(gm)),
         slots=slots,
+        version=version,
     )
 
 
@@ -203,22 +207,93 @@ def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None,
             continue
         node_id = by_fx_name[fx_node.name]
         if rewrite:
-            if spec.is_attention_scores:
-                spec = replace(spec, numel=slots.seq, group_size=slots.seq)
-            else:
-                last = 0
-                value = fx_node.meta.get("val")
-                shape = getattr(value, "shape", None)
-                if shape:
-                    last = int(shape[-1])
-                numel = (slots.intermediate if last in (slots.intermediate,)
-                         else slots.hidden)
-                spec = replace(spec, numel=numel)
+            value = fx_node.meta.get("val")
+            shape = getattr(value, "shape", None)
+            if not shape:
+                raise ValueError(
+                    f"DQ 节点 {fx_node.name} 没有 meta['val'].shape，"
+                    f"dq_layout 不能拿 0 去猜 hidden")
+            last = int(shape[-1])
+            numel, group = slots.dq_layout(
+                last, is_attention_scores=spec.is_attention_scores,
+                group_size=spec.group_size)
+            spec = replace(spec, numel=numel, group_size=group)
         specs[node_id] = spec
     if extra:
         specs.update(extra)
     return specs
 
+
+
+def write_io_info(artifact: GmlArtifact, out_dir: Path) -> Path:
+    """按参考口径写 `IO_info.txt`：图级入口/出口的 node_id、dtype、shape、size。
+
+    形状取自边的 dims（decode 槽位口径），不是导出图的 seq_len。
+    """
+    sources = {e.source for e in artifact.edges}
+    targets = {e.target for e in artifact.edges}
+    by_id = {n.node_id: n for n in artifact.nodes}
+    dims_out = {}
+    for e in artifact.edges:
+        dims_out.setdefault(e.source, e.dims)
+        dims_out.setdefault(e.target, e.dims)
+
+    def shape_of(node_id: int) -> list[int]:
+        dims = dims_out.get(node_id)
+        if not dims:
+            raise ValueError(f"缓冲节点 {node_id} 没有边，写不出 IO_info 的 shape")
+        return [int(p) for p in dims.split("x")]
+
+    def dtype_of(node, side: str) -> str:
+        key = f"{side}_buffer_dtype" if side == "input" else "output_buffer_dtype"
+        return str(node.fields.get(key)
+                   or node.fields.get("output_buffer_dtype")
+                   or node.fields.get("input_buffer_dtype")
+                   or "float16")
+
+    entries = []
+    exits = []
+    for n in artifact.nodes:
+        if not n.fields.get("is_buffer"):
+            continue
+        if n.node_id not in targets:
+            entries.append(n)
+        if n.node_id not in sources:
+            exits.append(n)
+    entries.sort(key=lambda n: n.node_id)
+    exits.sort(key=lambda n: n.node_id)
+
+    inputs = {}
+    for idx, n in enumerate(entries):
+        shape = shape_of(n.node_id)
+        dt = dtype_of(n, "output")
+        inputs[str(n.node_id)] = {
+            "sf": 1.0,
+            "dtype": dt,
+            "node_name": n.fields.get("label", n.node_id),
+            "input_idx": idx,
+            "shape": shape,
+            "size": int(__import__("math").prod(shape)),
+        }
+        if n.fields.get("is_mask"):
+            inputs[str(n.node_id)]["mask"] = True
+    outputs = {}
+    for idx, n in enumerate(exits):
+        shape = shape_of(n.node_id)
+        dt = dtype_of(n, "input")
+        outputs[str(n.node_id)] = {
+            "sf": 1.0,
+            "dtype": dt,
+            "node_name": n.fields.get("label", n.node_id),
+            "previous_name": n.fields.get("label", n.node_id),
+            "output_idx": idx,
+            "shape": shape,
+            "size": int(__import__("math").prod(shape)),
+        }
+    text = repr({"inputs": inputs, "outputs": outputs})
+    path = out_dir / "IO_info.txt"
+    path.write_text(text)
+    return path
 
 def write_artifact(artifact: GmlArtifact, out_dir: Path) -> Path:
     """把 GML 写到 `out_dir/relay2gml_graph.gml`，返回该路径。
@@ -275,6 +350,7 @@ def write_runtime_files(
         write_per_tensor_weight,
         write_phase_output_buffer,
         write_named_buffer,
+        placeholder_weight,
         write_rope_buffer,
         write_softmax_phases,
         write_zero_point,
@@ -406,9 +482,13 @@ def write_runtime_files(
                 # 漏掉数值全错）；其余算子 1.0，KV_Cache_DMA 2.0。
                 scaling = node.fields.get(_ATTENTION_SCALE_FIELD)
                 slot = _slot_of(key)
+                if scaling is not None:
+                    scale_val = float(scaling)
+                else:
+                    multiplier = int(node.fields.get("weight_sf_multiplier") or 1)
+                    scale_val = 1.0 / multiplier
                 write_scaling(
-                    files, node.node_id,
-                    float(scaling) if scaling is not None else 1.0,
+                    files, node.node_id, scale_val,
                     post_shift=14 if node.fields.get("op_type") == "KV_Cache_DMA"
                     else 0,
                     slot=slot)
@@ -487,7 +567,11 @@ def write_runtime_files(
                     (node.node_id, consumer), 1) if consumer else 1
                 if rewrite:
                     count = slots.bmm_weight_elems
-                write_named_buffer(files, value, count)
+                # 也是 KV cache 平面走权重通路，内容同样不能是全零——见
+                # `placeholder_weight` 的说明。
+                write_named_buffer(files, value, count,
+                                   content=placeholder_weight(node.node_id,
+                                                              count))
             elif key in ("weight_buffer", "weight_sf"):
                 # Gemm/RMSNorm：两个字段共用一次量化，靠 names_written 去重。
                 # MatMul：`weight_buffer` 往往已经被上游（Split / KV_Cache_DMA）
@@ -503,7 +587,8 @@ def write_runtime_files(
                                 node, elements_between, slots, rewrite=rewrite)
                             write_named_buffer(
                                 files, names.weight_buffer(node.node_id),
-                                count, dtype=np.int8)
+                                count, dtype=np.int8,
+                                content=placeholder_weight(node.node_id, count))
                         if names.weight_scale(node.node_id) not in files.names_written:
                             files._write(
                                 names.weight_scale(node.node_id),
@@ -519,7 +604,15 @@ def write_runtime_files(
                     # 走 int4 per-group 会因 4096 % 128 的分组语义完全错位。
                     write_per_tensor_weight(files, node.node_id, tensor)
                 else:
-                    write_weight(files, node.node_id, quantize_weight(tensor))
+                    quantized = quantize_weight(tensor)
+                    multiplier = int(node.fields.get("weight_sf_multiplier") or 1)
+                    if multiplier != 1:
+                        # 幂等：只乘一次。scale 已带倍数则不再乘。
+                        scales = quantized.scales.astype(np.float32) * multiplier
+                        quantized = type(quantized)(
+                            quantized.values, scales.astype(quantized.scales.dtype),
+                            quantized.group_size)
+                    write_weight(files, node.node_id, quantized)
             elif key == "output_buffer" and value.startswith("output_buffer_"):
                 # phase 型节点自命名的输出缓冲：装本节点的完整输出
                 # （量化后的 int8），不是某条边的数据。
@@ -530,7 +623,42 @@ def write_runtime_files(
                 continue
 
     verify_against_graph(files, artifact.buffer_names)
+    write_io_info(artifact, out_dir)
     return files
+
+
+def fill_weight_hashes(artifact: GmlArtifact, files: "WrittenFiles") -> None:
+    """把权值 bin 的内容指纹回填到节点，并按新字段重出 GML 文本。
+
+    参考产物对每个带 `weight_buffer` 的节点都写 `weight_buffer_hash`，用于
+    跨节点权值去重，是按节点必填的。
+
+    指纹只能在 `WrittenFiles._write` 里算——那是字节最终成形的地方。序列化
+    阶段那些缓冲还不存在：64 个注意力节点的权值是 KV 激活，写盘时才按形状
+    补零，长度由 `_matmul_weight_elements` 定，序列化侧复制不出来。所以顺序
+    是**先写盘、再重出文本**，而不是序列化时算或写盘后扫盘。
+
+    权威在图编译器这一侧。`#pim.weight_binding` 上的 `contentHash` 留空是
+    **约定**：算子编译器不持有权值张量，算不出这份指纹。两边不要各算一次，
+    对不上时以这里落盘的字节为准。
+
+    这一步**不放在 `write_runtime_files` 里**：那两条不变量检查（接入前后
+    逐字节相同、砍相位必变）比的是 `artifact.text`，而指纹与算子编译器无关，
+    掺进去会让它们比的不是同一件事。调用方在检查跑完之后调它。
+    """
+    changed = False
+    for node in artifact.nodes:
+        name = node.fields.get("weight_buffer")
+        if not isinstance(name, str):
+            continue
+        digest = files.hashes.get(name)
+        if digest is None:
+            continue
+        node.fields["weight_buffer_hash"] = digest
+        changed = True
+    if changed:
+        artifact.text = write_gml(artifact.nodes, artifact.edges,
+                                  version=artifact.version)
 
 
 # 节点上记录 attention 定标系数的字段名（由 from_fx 写入）。
@@ -670,11 +798,18 @@ def _weight_tensor(
 
 
 def _element_count(dims: str) -> int:
-    """把 GML 的 `1x64x56x56` 形状字符串换算成元素数。"""
-    if dims == "unknown":
-        return 1
+    """把 GML 的 `1x64x56x56` 形状字符串换算成元素数。
+
+    非数字形状直接抛。原来 `"unknown"` 返回 1，于是那条边的缓冲按 1 个元素落盘，
+    而声明也是 `unknown` —— 校验器比的正是「声明 × dtype 宽度」对「文件字节数」，
+    两边一起错就永远绿。形状算不出来是上游的错，在这里补一个数只会盖住它。
+    """
     count = 1
     for part in dims.split("x"):
+        if not part.isdigit():
+            raise ValueError(
+                f"边的 dims {dims!r} 不是纯数字形状，算不出元素数。"
+                f"缓冲尺寸由它决定，猜一个会让声明与落盘一起错")
         count *= int(part)
     return count
 

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from contracts import gml_names as names
 from graph.fuse import ACTIVATIONS, fuse_graph
+from contracts import gml_hw_table as hw_table
 from gml_bridge.from_fx import OP_TYPES, convert
 from gml_bridge.writer import write_gml
 from scripts.gml_structure_check import (
@@ -124,6 +125,9 @@ def test_arrays_are_never_written_as_lists(gml_text: str) -> None:
         stripped = line.strip()
         if stripped.endswith("["):
             continue
+        # 参考把某些轴序写成带引号的字面量（`axes "[0, 2, 1, 3]"`），不是数组字段。
+        if '"' in stripped and "[" in stripped:
+            continue
         assert "[" not in stripped, f"数组未展开: {line}"
 
 
@@ -168,6 +172,103 @@ def _llama_like_graph():
     ).eval()
     position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
     return export_annotated_graph(model, 8, position_ids, dtype=torch.float32)
+
+
+def test_dtype_cast_is_not_silently_skipped() -> None:
+    """`to.dtype` 必须有 GML 落点，不能被静默跨过。
+
+    评审九轮问题 4：它不在 `OP_TYPES` 里，`_tensor_inputs` 把它当「不可映射」
+    直接跨过——一次真实的数据运动在 GML 里消失，两侧都不报错。
+    """
+    import torch
+
+    gm = _llama_like_graph()
+    casts = [n for n in gm.graph.nodes
+             if n.target is torch.ops.aten.to.dtype]
+    assert casts, "合成 Llama 图里应该有 to.dtype"
+    for node in casts:
+        assert node.target in OP_TYPES, (
+            f"{node.target} 不在 OP_TYPES 里，GML 导出会静默跨过它")
+
+
+def test_every_dtype_cast_overload_is_handled() -> None:
+    """`to` 的每个重载都要有处置，不能只覆盖 `to.dtype`。
+
+    评审九轮问题 4 的修复只认了 `to.dtype`，而 `torch.export` 也会发
+    `to.dtype_layout`——同一件事的另一个重载，漏掉它会让跨过守卫把合法图判错。
+    """
+    import torch
+
+    from gml_bridge.from_fx import _WALK_THROUGH
+
+    for overload in (torch.ops.aten.to.dtype, torch.ops.aten.to.dtype_layout):
+        assert overload in OP_TYPES or overload in _WALK_THROUGH, (
+            f"{overload} 既没有 GML 落点，也不在跨过名单里")
+
+
+def test_embedding_lookup_is_emitted_as_gather() -> None:
+    """图入口是 `input_ids`（真带词嵌入）时要发 `Gather` 节点。
+
+    参考 decode 产物以隐藏态为图入口、词嵌入在块外，所以那条导出不发；但那只该是
+    decode 块的性质，不能变成「embedding 一律跨过」——全模型导出少了这个词表节点，
+    查表这一步就在 GML 里整块消失了。
+    """
+    nodes, _, weight_params, _ = convert(_llama_like_graph())
+
+    gathers = [n for n in nodes if n.fields.get("op_type") == "Gather"]
+    assert len(gathers) == 1, "含词嵌入的图应当恰好发一个 Gather 节点"
+    gather = gathers[0]
+    # 两个操作数都要指到真实缓冲：表是编译期常量、走权重通路，索引是图入口那一路。
+    assert gather.fields["table"] == names.weight_buffer(gather.node_id)
+    assert gather.fields["indices"] == gather.fields["input_buffer"]
+    assert weight_params[gather.node_id].endswith("embed_tokens.weight")
+
+
+def test_decode_block_export_omits_gather() -> None:
+    """同一条图按 decode 块口径导出时不发 `Gather`——参考产物里没有这个节点。"""
+    nodes, _, _, _ = convert(_llama_like_graph(), decode_block_only=True)
+
+    assert not [n for n in nodes if n.fields.get("op_type") == "Gather"]
+
+
+def _cast_graph(*dtypes):
+    """最小图：输入 → 一串 `to.dtype` → 输出，用来验 `Convert` 的发射条件。"""
+    import torch
+    from torch.fx import Graph, GraphModule
+
+    graph = Graph()
+    source = graph.placeholder("x")
+    source.meta["val"] = torch.zeros(1, 4, dtype=dtypes[0])
+    current = source
+    for dtype in dtypes[1:]:
+        cast = graph.call_function(torch.ops.aten.to.dtype, (current, dtype))
+        cast.meta["val"] = torch.zeros(1, 4, dtype=dtype)
+        current = cast
+    graph.output(current)
+    return GraphModule(torch.nn.Module(), graph)
+
+
+def test_only_real_dtype_changes_become_convert_nodes() -> None:
+    """位宽真变了才发 `Convert`，恒等转换（同 dtype）不发。
+
+    图：f32 → `to(f16)`（真换）→ `to(f16)`（恒等）。恒等那一步是 `export` 自己
+    塞进来的，跨过；真换那一步是一次数据运动（两侧位宽不同），必须有节点承载
+    `input_buffer_dtype` / `output_buffer_dtype`。
+    """
+    import torch
+
+    nodes, _, _, _ = convert(
+        _cast_graph(torch.float32, torch.float16, torch.float16))
+
+    converts = [n for n in nodes if n.fields.get("op_type") == "Convert"]
+    assert len(converts) == 1, "恒等转换不该成节点"
+    cast = converts[0]
+    assert cast.fields["input_buffer_dtype"] == "float32"
+    assert cast.fields["output_buffer_dtype"] == "float16"
+    # 扩展位只覆盖 fp16 与 int8：f32 那侧没有编码可写，就不写，宁缺勿猜。
+    assert "input_data_extensions" not in cast.fields
+    assert cast.fields["output_data_extension"] == hw_table.data_extension(
+        "float16")
 
 
 def test_residual_output_buffer_is_emitted() -> None:
@@ -252,7 +353,42 @@ def test_input_count_identity_holds() -> None:
     assert total + matmuls == len(edges)
 
 
-def test_port_keys_use_the_naming_helpers() -> None:
+def test_idx_names_the_consumer_input_port() -> None:
+    """`idx` 是本节点输出挂在消费者的第几个输入端口。
+
+    参考产物 197 个节点各带且仅带一个 `idx`，推导规则是
+    `consumer.input<idx>_node_id == self.node_id`（197/197 成立）。
+    它不是「第几个输入」——每个节点只有一个，且取值 0..31 是 head 序号，
+    `input{i}_node_id` 不编码任何 head 信息。
+    """
+    nodes, _, _, _ = convert(_llama_like_graph())
+
+    inputs_of: dict[int, dict[int, int]] = {}
+    for node in nodes:
+        ports = {}
+        for index in range(64):
+            value = node.fields.get(f"input{index}_node_id")
+            if isinstance(value, int):
+                ports[index] = value
+        inputs_of[node.node_id] = ports
+
+    with_output = [
+        n for n in nodes
+        if any(key.startswith("output") and key.endswith("_node_id")
+               for key in n.fields)
+    ]
+    assert with_output, "应当有带输出端口的节点"
+
+    for node in with_output:
+        assert "idx" in node.fields, f"节点 {node.node_id} 缺 idx"
+        idx = node.fields["idx"]
+        consumers = [
+            nid for nid, ports in inputs_of.items()
+            if idx in ports and ports[idx] == node.node_id
+        ]
+        assert consumers, (
+            f"节点 {node.node_id} 的 idx={idx} 在任何消费者的"
+            f" input{idx}_node_id 里都对不上")
     """端口键名一律走 contracts.gml_names，不在这里拼字符串。
 
     钉住这条是因为端口 >= 10 时 residual 的键名多一个下划线，
@@ -323,3 +459,140 @@ def test_layout_ops_propagate_dtype_and_carry_no_scale() -> None:
             assert (node.fields["output_buffer_dtype"]
                     == upstream.fields["output_buffer_dtype"]), (
                 f"{op} 的 dtype 没有沿边传播")
+
+
+# --- 边形状的槽位口径（评审 20260923 的 P0-1 / P0-2）-------------------------
+#
+# 这两条钉的是「边的 dims 必须是编译期槽位，不是某一次导出的 seq_len」。
+# 之前的判据写成「末维是 1 或 16 就换」，两处错：序列轴不一定在末维
+# （`1x32x16x128` 的 16 在下标 2），16 又是字面量（换 128 导出一条都不改写）。
+# 实测那时 331 条边里有 121 条带 16、1 条是 `unknown`，而参考产物一条都没有。
+
+
+def _dims_of(gml_text: str) -> list[str]:
+    import re
+
+    return re.findall(r'^\s*dims "([^"]*)"', gml_text, re.M)
+
+
+def test_small_graph_keeps_its_export_shapes(gml_text: str) -> None:
+    """小图不改写：`rewrite_dims` 的判据是图里看得到 hidden=4096。
+
+    合成小图（hidden=64）没有 decode 槽位这回事，按 7B 的 seq=1024 改写它
+    只会写出一个与自己的权重形状矛盾的声明。这里钉住「不改写」，
+    真实 7B 图上「必须改写」由 `test_gml_export.py` 钉。
+    """
+    dims = _dims_of(gml_text)
+    assert dims, "这张图应当有带形状的边"
+    assert "unknown" not in dims, "形状是可知的，不允许写 unknown"
+    assert any("16" in d.split("x") for d in dims), (
+        "小图应当沿用导出形状（seq_len=16），不该被改写成 1024")
+
+
+def test_seq_axis_rewrite_finds_the_axis_by_value_not_by_position() -> None:
+    """token 轴按**值**定位，换成 1，再左补到四维——这是 decode 参考口径。
+
+    `1x32x128x128` 在 seq_len=128 时末维也是 128，但末维是 head_dim。
+    只按值匹配会有两个候选，按位置猜则会挑错一维。把 token 轴换成
+    `slots.seq=1024` 会对参考差 120 条边：hidden 参考是 `1x1x1x4096`，
+    不是 `1x1024x4096`。
+    """
+    from contracts.compile_slots import DEFAULT_SLOTS as s
+    from gml_bridge.from_fx import _rewrite_seq_axis
+
+    # 序列轴在不同下标上都要命中，换成 1 后补到四维。
+    assert _rewrite_seq_axis("1x32x16x128", 16, s) == "1x32x1x128"
+    assert _rewrite_seq_axis("1x16x4096", 16, s) == "1x1x1x4096"
+    assert _rewrite_seq_axis("1x16", 16, s) == "1x1x1x1"
+    # 换个 seq_len 导出也要命中（原来的字面量 16 在这里就失效了）。
+    assert _rewrite_seq_axis("1x32x128x128", 128, s) == "1x32x1x128"
+    assert _rewrite_seq_axis("1x128x4096", 128, s) == "1x1x1x4096"
+    # 已经是槽位口径的 KV 全量（token 轴不是 16）不动，只补维。
+    assert _rewrite_seq_axis(f"1x32x{s.seq}x128", 16, s) == f"1x32x{s.seq}x128"
+    # hidden / MLP 中间态补到四维。
+    assert _rewrite_seq_axis("1x4096", 16, s) == "1x1x1x4096"
+    assert _rewrite_seq_axis("1x11008", 16, s) == "1x1x1x11008"
+
+
+def test_shapeless_edge_and_non_numeric_dims_both_raise() -> None:
+    """算不出形状、或形状不是纯数字，都必须抛，不许补一个默认值。
+
+    原来 `_element_count("unknown")` 返回 1，于是那条边的缓冲按 1 个元素落盘；
+    声明也是 `unknown`，校验器比的正是这两者，两边一起错就永远绿。
+    """
+    from contracts.compile_slots import DEFAULT_SLOTS as s
+    from gml_bridge.export import _element_count
+    from gml_bridge.from_fx import _slot_dims
+
+    with pytest.raises(ValueError, match="unknown"):
+        _slot_dims("Gemm", None, s, None, rewrite=True, export_seq=16)
+    with pytest.raises(ValueError, match="不是纯数字形状"):
+        _element_count("unknown")
+    assert _element_count(f"1x32x{s.seq}x128") == 32 * s.seq * 128
+
+
+def test_split_out_dims_follow_the_consumer_role() -> None:
+    """Split 的三条出边按消费者角色分：Q / Kᵀ / V，不是同一份 KV 全量。"""
+    from contracts.compile_slots import DEFAULT_SLOTS as s
+    from gml_bridge.from_fx import _split_out_dims
+    from graph.split_heads import ROLE_MATMUL_PV, ROLE_MATMUL_QK
+
+    class N:
+        def __init__(self, role=None):
+            self.meta = {"pim_head_role": role} if role else {}
+
+    producer = N()
+    qk = N(ROLE_MATMUL_QK)
+    pv = N(ROLE_MATMUL_PV)
+
+    def tensor_inputs(node, _emittable):
+        # 左操作数：producer 是 inputs[0]；右操作数：producer 是 inputs[1]。
+        if node is qk or node is pv:
+            return [producer if getattr(node, "_left", False) else N(),
+                    producer if not getattr(node, "_left", False) else N()]
+        return []
+
+    import gml_bridge.from_fx as fx
+    orig = fx._tensor_inputs
+    fx._tensor_inputs = tensor_inputs
+    try:
+        qk._left = True
+        assert _split_out_dims(producer, qk, set(), s) == f"1x1x1x{s.head_dim}"
+        qk._left = False
+        assert _split_out_dims(producer, qk, set(), s) == f"1x1x{s.head_dim}x{s.seq}"
+        pv._left = True
+        assert _split_out_dims(producer, pv, set(), s) == f"1x1x1x{s.head_dim}"
+        pv._left = False
+        assert _split_out_dims(producer, pv, set(), s) == f"1x1x{s.seq}x{s.head_dim}"
+    finally:
+        fx._tensor_inputs = orig
+
+
+def test_dq_layout_rejects_unknown_last_dim() -> None:
+    """未知末维必须抛，不许静默落到 hidden。"""
+    from contracts.compile_slots import DEFAULT_SLOTS as s
+    import pytest
+
+    assert s.dq_layout(4096, is_attention_scores=False, group_size=128) == (4096, 128)
+    assert s.dq_layout(11008, is_attention_scores=False, group_size=128) == (11008, 128)
+    with pytest.raises(ValueError, match="last_dim 是 0"):
+        s.dq_layout(0, is_attention_scores=False, group_size=128)
+    # 未知宽度用张量自己的末维，不许猜成 hidden（32000 曾经静默变成 4096）。
+    assert s.dq_layout(32000, is_attention_scores=False, group_size=128) == (32000, 128)
+    assert s.dq_layout(512, is_attention_scores=False, group_size=128) == (512, 128)
+
+
+def test_rtl_version_disagreement_is_rejected() -> None:
+    """接了算子编译器时，`rtl_version` 必须与 IR 的模块属性一致。
+
+    评审九轮问题 8：GML 侧一直写本仓常量，IR 上的 `pim.rtl-version` 没人读。
+    两处版本号各写一份、谁都不核对，改一边另一边不会报错。
+    """
+    import pytest
+
+    from gml_bridge.from_fx import _resolve_rtl_version
+
+    assert _resolve_rtl_version(None) == hw_table.RTL_VERSION
+    assert _resolve_rtl_version("1.4") == "1.4"
+    with pytest.raises(ValueError, match="rtl_version"):
+        _resolve_rtl_version("9.9")

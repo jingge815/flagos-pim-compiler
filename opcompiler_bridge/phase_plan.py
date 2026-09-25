@@ -5,15 +5,19 @@ RoPE 3 连）写死在 `contracts/gml_hw_table.py` 的静态表里——那张�
 把算子编译器该算的东西抄了一份。现在真源移到 FlagTree 的
 `-pim-expand-phases`，本模块只负责读回来。
 
-读的是 pass 打在每个相位 op 上的三个属性：
+读的是 pass 打在每个相位 op 上的结构化属性：
 
-    pim.phase        0-based 硬件相位号。**只有真正占一次引擎遍历的 op 才带**
-                     ——`pim.reshape` 是布局、Softmax 的 `sub` 是折进 exp 相的
-                     FPSU 仿射，两者都不带，所以数相位就是数这个属性的去重值，
-                     不是数 op 个数。
-    pim.phase-bytes  该相的逻辑缓冲字节数（numel × elem_bytes）。不是 L2 物理
-                     段大小——物理段有对齐和跨节点折叠，归编排器。
-    unit             引擎（vpu / cstl / nmu）。
+    phases = [#pim.phase_spec<index = 0, bytes = 64, unit = vpu, reads = [0]>]
+
+`index` 是 0-based 硬件相位号，**只有真正占一次引擎遍历的 op 才带**——
+`pim.reshape` 是布局、Softmax 的 `sub` 是折进 exp 相的 FPSU 仿射，两者都不带，
+所以数相位就是数这个属性的去重值，不是数 op 个数。
+
+`bytes` 是该相的逻辑缓冲字节数（numel × elem_bytes）。不是 L2 物理段
+大小——物理段有对齐和跨节点折叠，归编排器。
+
+`unit` 是引擎（vpu / cstl / nmu）；`forceConsecutive` 标记不得重排的相
+（RoPE 三连共享中间缓冲）；`reads` 是本相读哪些前序相位。
 
 与静态表的关系：本模块产出的 `PhasePlan` 用来**交叉校验**静态表，而不是立刻
 替换它。理由是静态表里还有一批 pass 目前不产出的字段（`flp_min_exp` 这类
@@ -26,24 +30,114 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# 一个带相位号的 op 行。`pim.phase = 3 : i64` 里取 3。
-_PHASE_RE = re.compile(r"\bpim\.phase\s*=\s*(\d+)\s*:\s*i64")
-# `"pim.phase-bytes" = 4096 : i64`。注意键名带引号（MLIR 对带连字符的键加引号）。
-_PHASE_BYTES_RE = re.compile(r'"pim\.phase-bytes"\s*=\s*(\d+)\s*:\s*i64')
-# `unit = #pim.unit<cstl>`
-_UNIT_RE = re.compile(r"\bunit\s*=\s*#pim\.unit<(\w+)>")
+# `phases = [#pim.phase_spec<index = 0, bytes = 64, unit = vpu, reads = [0]>]`。
+# `[^>]*` 够用：phase_spec 的参数里没有 `>`（`reads` 是 `[0]` / `[1, 3]` 这种）。
+_PHASE_SPEC_RE = re.compile(r"#pim\.phase_spec<([^>]*)>")
+# `reads = [1, 3]`。值里带逗号，所以先从 body 里摘出去再按逗号切其余参数。
+_READS_RE = re.compile(r"reads\s*=\s*\[([^\]]*)\]")
+_PARAM_RE = re.compile(r"(\w+)\s*=\s*([^,]+)")
 # 行首的算子名：`%3 = pim.lut %2 {...}` 里取 `pim.lut`。
 _OP_RE = re.compile(r"=\s*(pim\.[a-z_]+)")
-# `kind = #pim.activation<exp>` / `kind = #pim.eltwise<absmax>`
-_KIND_RE = re.compile(r"\bkind\s*=\s*#pim\.(?:activation|eltwise)<(\w+)>")
+# `kind = #pim.activation<exp>` / `kind = #pim.eltwise<absmax>` /
+# `kind = #pim.pool_kind<absmax>`
+_KIND_RE = re.compile(
+    r"\bkind\s*=\s*#pim\.(?:activation|eltwise|pool_kind)<(\w+)>")
 # 被展开的函数名，用来把相位归到哪个算子上。
 _FUNC_RE = re.compile(r"tt\.func\s+@(\w+)")
-# `pim.force-consecutive` 是 unit attr，无值。
-_FORCE_CONSECUTIVE = "pim.force-consecutive"
-_ROTATE_HALF = "pim.rotate-half"
+# `rotateHalf` 是 UnitAttr，无值，出现即为真。已从裸字符串
+# `pim.rotate-half` 收编成 `pim.eltwise` 自己的 ODS 属性——改名会在这里
+# 立刻对不上，而不是静默读成 False。
+_ROTATE_HALF = "rotateHalf"
+# LUT 的寻址窗口与激活模式。这些是 LutOp 的 ODS 属性，键名是驼峰、不带引号。
 _I64_ATTR = re.compile(
-    r'"pim\.(flp-min-exp|flp-max-exp|flp-mantisa|kantor-mode|'
-    r'fpsu-mode|transpose-type|activation-mode)"\s*=\s*(-?\d+)\s*:\s*i64')
+    r"\b(flpMinExp|flpMaxExp|flpMantisa|activationMode)\s*=\s*(-?\d+)\s*:\s*i64")
+# 相位走的是哪张寻址卡：`#pim.transpose_purpose<purpose = layout_reorder,
+# cardValue = 1>`。原来是裸属性 `"pim.transpose-type"`，已收编进 ODS；取的是
+# `cardValue` 那一项——`purpose` 是枚举，编排器按卡值分流。
+_TRANSPOSE_TYPE_RE = re.compile(
+    r"#pim\.transpose_purpose<([^>]*)>")
+# `kantor = #pim.kantor_spec<mode = fp2int_converter, cardValue = 3>`。卡值单
+# 独存：几个不同卡值共用一个方言模式，从模式反推不出来。
+_KANTOR_RE = re.compile(r"#pim\.kantor_spec<([^>]*)>")
+_FPSU_RE = re.compile(r"#pim\.fpsu_spec<([^>]*)>")
+# `vpuParams = #pim.vpu_params<axis = -1, useScaling = false>`。RMSNorm 的
+# 向量单元参数块，单相算子身上没有相位可挂，走 `op_attrs` 读回。
+_VPU_PARAMS_RE = re.compile(r"#pim\.vpu_params<([^>]*)>")
+
+# 定点单元的卡值。参考实测只出现 1 与 2：1 是 16 位相位通路，2 是 32 位累加
+# 通路。GML 文本写模式名，编排器的 txt 写卡值，所以要映射回去。
+# `fixed_point` 没有实测卡值（唯一的用处是 KV 写入，那条链目前不展开），
+# 取不到就返回 None，让下游退回静态表。
+_FPSU_CARD = {"floating_point": 1, "floating_point_32": 2}
+
+# ODS 属性名 -> 编排器惯用的键名。
+_ATTR_ALIAS = {
+    "flpMinExp": "flp-min-exp",
+    "flpMaxExp": "flp-max-exp",
+    "flpMantisa": "flp-mantisa",
+    "activationMode": "activation-mode",
+}
+
+
+def _attr_params(body: str) -> dict[str, str]:
+    """属性体里的 `键 = 值` 对。`blocks` 这类含逗号的数组会截断，但调用方只取
+    它前面的标量参数，所以够用。"""
+    return {key: value.strip() for key, value in _PARAM_RE.findall(body)}
+
+
+def _parse_hw_fields(line: str) -> dict[str, int]:
+    """一行里的硬件域。
+
+    键名沿用编排器一直在用的**旧契约**（带连字符）：`orchestrator/plan.py`
+    与 `layer_fields` 按这些名字取值，属性换成 ODS 形态不该顺带改这层名字。
+    """
+    fields = {_ATTR_ALIAS[m.group(1)]: int(m.group(2))
+              for m in _I64_ATTR.finditer(line)}
+
+    if match := _TRANSPOSE_TYPE_RE.search(line):
+        card = _attr_params(match.group(1)).get("cardValue")
+        if card is not None:
+            fields["transpose-type"] = int(card)
+
+    if match := _KANTOR_RE.search(line):
+        card = _attr_params(match.group(1)).get("cardValue")
+        if card is not None:
+            fields["kantor-mode"] = int(card)
+
+    if match := _FPSU_RE.search(line):
+        mode = _attr_params(match.group(1)).get("mode")
+        if mode in _FPSU_CARD:
+            fields["fpsu-mode"] = _FPSU_CARD[mode]
+
+    if match := _VPU_PARAMS_RE.search(line):
+        # 空体 `#pim.vpu_params<>` 是默认值：MLIR 打印时省略等于默认的参数，
+        # 而默认值（axis=-1、useScaling=false）恰好是参考产物的实测值。
+        params = _attr_params(match.group(1))
+        fields["vpu-axis"] = int(params.get("axis", "-1"))
+        fields["use-scaling"] = 1 if params.get("useScaling") == "true" else 0
+
+    return fields
+
+
+def _parse_phase_specs(line: str) -> list[tuple[int, int, str, bool, list[int]]]:
+    """一行里出现的相位属性，按出现顺序返回 (index, bytes, unit, 连续, reads)。"""
+    specs = []
+    for body in _PHASE_SPEC_RE.findall(line):
+        reads: list[int] = []
+        match = _READS_RE.search(body)
+        if match:
+            reads = [int(x) for x in match.group(1).split(",") if x.strip()]
+            body = body[:match.start()] + body[match.end():]
+        params = {key: value.strip()
+                  for key, value in _PARAM_RE.findall(body)}
+        specs.append((
+            int(params["index"]),
+            int(params["bytes"]),
+            params.get("unit", ""),
+            params.get("forceConsecutive", "false") == "true",
+            reads,
+        ))
+    return specs
 
 
 @dataclass(frozen=True)
@@ -108,6 +202,9 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
     """
     plans: dict[str, PhasePlan] = {}
     current: PhasePlan | None = None
+    # 属性可能换行写在 op 的下一行（`pim.normalize` 的 `vpuParams` 就是这样）。
+    # 记住上一行是不是 op，续行上的硬件域才有地方收。
+    prev_was_op = False
 
     for raw in pimir_text.splitlines():
         line = raw.split(" loc(")[0]
@@ -116,53 +213,49 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
         if func:
             current = PhasePlan(func=func.group(1))
             plans[current.func] = current
+            prev_was_op = False
             continue
 
         if current is None:
             continue
 
-        phase_match = _PHASE_RE.search(line)
-        if not phase_match:
-            # 单相算子（`pim.matmul` 这类不展开的）没有 `pim.phase`，但 pass
+        specs = _parse_phase_specs(line)
+        if not specs:
+            # 单相算子（`pim.matmul` 这类不展开的）没有相位属性，但 pass
             # 仍在它身上盖了硬件域。收进 `op_attrs` 而**不是** `phases`：
             # 进 phases 会让 `count` 把它当成一相，`cross_check` 的相位数
             # 立刻对不上（矩阵乘是单相，期望值 0）。
-            if _OP_RE.search(line):
-                current.op_attrs.update(
-                    {m.group(1): int(m.group(2))
-                     for m in _I64_ATTR.finditer(line)})
+            is_op = _OP_RE.search(line) is not None
+            if is_op or prev_was_op:
+                current.op_attrs.update(_parse_hw_fields(line))
+            prev_was_op = is_op
             continue
 
-        index = int(phase_match.group(1))
-        if any(p.index == index for p in current.phases):
-            continue
+        prev_was_op = False
 
         op_match = _OP_RE.search(line)
-        unit_match = _UNIT_RE.search(line)
-        bytes_match = _PHASE_BYTES_RE.search(line)
         kind_match = _KIND_RE.search(line)
+        attrs = _parse_hw_fields(line)
 
-        attrs = {m.group(1): int(m.group(2)) for m in _I64_ATTR.finditer(line)}
-        flp = None
-        if "flp-min-exp" in attrs and "flp-max-exp" in attrs:
-            flp = (attrs["flp-min-exp"], attrs["flp-max-exp"],
-                   attrs.get("flp-mantisa", 0))
-        current.phases.append(Phase(
-            index=index,
-            op=op_match.group(1) if op_match else "",
-            unit=unit_match.group(1) if unit_match else "",
-            bytes=int(bytes_match.group(1)) if bytes_match else 0,
-            kind=kind_match.group(1) if kind_match else None,
-            force_consecutive=_FORCE_CONSECUTIVE in line,
-            rotate_half=_ROTATE_HALF in line,
-            flp_min=attrs.get("flp-min-exp"),
-            flp_max=attrs.get("flp-max-exp"),
-            flp_mantisa=attrs.get("flp-mantisa"),
-            kantor_mode=attrs.get("kantor-mode"),
-            fpsu_mode=attrs.get("fpsu-mode"),
-            transpose_type=attrs.get("transpose-type"),
-            activation_mode=attrs.get("activation-mode"),
-        ))
+        for index, phase_bytes, unit, consecutive, _reads in specs:
+            if any(p.index == index for p in current.phases):
+                continue
+            current.phases.append(Phase(
+                index=index,
+                op=op_match.group(1) if op_match else "",
+                unit=unit,
+                bytes=phase_bytes,
+                kind=kind_match.group(1) if kind_match else None,
+                force_consecutive=consecutive,
+                rotate_half=_ROTATE_HALF in line,
+                flp_min=attrs.get("flp-min-exp"),
+                flp_max=attrs.get("flp-max-exp"),
+                flp_mantisa=attrs.get("flp-mantisa"),
+                kantor_mode=attrs.get("kantor-mode"),
+                fpsu_mode=attrs.get("fpsu-mode"),
+                transpose_type=attrs.get("transpose-type"),
+                activation_mode=attrs.get("activation-mode"),
+            ))
 
     for plan in plans.values():
         plan.phases.sort(key=lambda p: p.index)

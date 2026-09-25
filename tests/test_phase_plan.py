@@ -24,17 +24,48 @@ from contracts.gml_quant import PHASE_COUNTS
 from contracts import gml_hw_table as hw_table
 from opcompiler_bridge.phase_plan import parse_phase_plans
 
-# 逐字取自 pass 的真实输出。改 pass 的属性名或相位结构，这里就对不上。
+_NORMALIZE = """
+module {
+  tt.func @rms(%x: tensor<1x128x4096xf16>, %g: tensor<4096xf16>, %e: tensor<1xf32>) {
+    %y = pim.normalize %x, %g eps %e {axis = 1 : i64, rmsNorm,
+        vpuParams = #pim.vpu_params<axis = -1, useScaling = false>}
+       : tensor<1x128x4096xf16>, tensor<4096xf16> eps tensor<1xf32> -> tensor<1x128x4096xf16>
+    tt.return
+  }
+}
+"""
+
+
+def test_vpu_params_default_to_the_measured_values_when_omitted() -> None:
+    """空体 `#pim.vpu_params<>` 也要读出默认值。
+
+    MLIR 打印时省略等于默认的参数，展开后的 IR 里就是空体。默认值
+    （axis=-1、不缩放）恰好是参考产物的实测值，读成「没有」会让 GML
+    退回图编译器写死的常量。
+    """
+    text = _NORMALIZE.replace(
+        "vpuParams = #pim.vpu_params<axis = -1, useScaling = false>",
+        "vpuParams = #pim.vpu_params<>")
+    plan = parse_phase_plans(text)["rms"]
+    assert plan.op_attrs.get("vpu-axis") == -1
+    assert plan.op_attrs.get("use-scaling") == 0
+    """`pim.normalize` 的 `vpuParams` 要能读回，不能只写不读。
+
+    它是单相算子，没有 `pim.phase`，硬件域走 `op_attrs`。读不回就意味着
+    GML 的 `Vpu_Axis` / `Use_Scaling` 只能继续由图编译器硬编码。
+    """
+    plans = parse_phase_plans(_NORMALIZE)
+    plan = plans["rms"]
+    assert plan.op_attrs.get("vpu-axis") == -1
+    assert plan.op_attrs.get("use-scaling") == 0
 _EXPANDED_DQ = """
 module {
   tt.func @dq_four_phases(%arg0: tensor<1x4096xf16>, %arg1: tensor<32xf16>, %arg2: tensor<1x4096x!tt.ptr<i8>>) {
-    %0 = pim.reshape %arg0 : tensor<1x4096xf16> -> tensor<1x32x128xf16>
-    %1 = pim.reduce_axis %0 {axis = 2 : i64, kind = #pim.eltwise<absmax>, pim.phase = 0 : i64, "pim.phase-bytes" = 64 : i64, unit = #pim.unit<vpu>} : tensor<1x32x128xf16> -> tensor<1x32x1xf16>
-    %2 = pim.reshape %1 {"pim.phase-bytes" = 64 : i64} : tensor<1x32x1xf16> -> tensor<1x32xf16>
-    %3 = pim.lut %2 {"pim.activation-mode" = 1 : i64, kind = #pim.activation<relu>, pim.phase = 1 : i64, "pim.phase-bytes" = 64 : i64, "pim.flp-min-exp" = 10 : i64, "pim.flp-max-exp" = 17 : i64, "pim.flp-mantisa" = 3 : i64, "pim.fpsu-mode" = 1 : i64, unit = #pim.unit<cstl>} : tensor<1x32xf16> -> tensor<1x32xf16>
-    %4 = pim.lut %2 {kind = #pim.activation<reciprocal>, pim.phase = 2 : i64, "pim.phase-bytes" = 64 : i64, unit = #pim.unit<cstl>} : tensor<1x32xf16> -> tensor<1x32xf16>
-    %5 = pim.quantize %arg0, %4 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = fp2int_converter>]>, pim.phase = 3 : i64, "pim.phase-bytes" = 4096 : i64, "pim.kantor-mode" = 3 : i64, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128>, unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x32xf16> -> tensor<1x4096xi8>
-    tt.store %arg2, %5 : tensor<1x4096x!tt.ptr<i8>>
+    %0 = pim.global_pool %arg0 {groupSize = 128 : i64, kind = #pim.pool_kind<absmax>, phases = [#pim.phase_spec<index = 0, bytes = 64, unit = vpu>], unit = #pim.unit<vpu>} : tensor<1x4096xf16> -> tensor<1x32xf16>
+    %1 = pim.lut %0 {activationMode = 1 : i64, flpMantisa = 3 : i64, flpMaxExp = 17 : i64, flpMinExp = 10 : i64, fpsu = #pim.fpsu_spec<mode = floating_point>, kind = #pim.activation<identity>, phases = [#pim.phase_spec<index = 1, bytes = 64, unit = activation, reads = [0]>], specialOperators = 0 : i64, unit = #pim.unit<activation>} : tensor<1x32xf16> -> tensor<1x32xf16>
+    %2 = pim.lut %0 {activationMode = 0 : i64, flpMantisa = 0 : i64, flpMaxExp = 15 : i64, flpMinExp = 15 : i64, fpsu = #pim.fpsu_spec<mode = floating_point>, kind = #pim.activation<reciprocal>, phases = [#pim.phase_spec<index = 2, bytes = 64, unit = activation, reads = [0]>], purpose = #pim.transpose_purpose<purpose = layout_reorder, cardValue = 1>, specialOperators = 4 : i64, unit = #pim.unit<activation>} : tensor<1x32xf16> -> tensor<1x32xf16>
+    %3 = pim.quantize %arg0, %2 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = fp2int_converter>]>, fpsu = #pim.fpsu_spec<mode = floating_point>, kantor = #pim.kantor_spec<mode = fp2int_converter, cardValue = 3>, phases = [#pim.phase_spec<index = 3, bytes = 4096, unit = kantor>], spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = 128, spg = true, spgAxis = 3, spgGroupSize = 128>, unit = #pim.unit<kantor>} : tensor<1x4096xf16>, tensor<1x32xf16> -> tensor<1x4096xi8>
+    tt.store %arg2, %3 : tensor<1x4096x!tt.ptr<i8>>
     tt.return
   }
 }
@@ -43,12 +74,12 @@ module {
 _EXPANDED_SOFTMAX = """
 module {
   tt.func @softmax_five_phases(%arg0: tensor<1x1024xf16>, %arg1: tensor<1x1024x!tt.ptr<f16>>) {
-    %0 = pim.reduce_axis %arg0 {axis = 1 : i64, kind = #pim.eltwise<max>, pim.phase = 0 : i64, "pim.phase-bytes" = 2 : i64, unit = #pim.unit<vpu>} : tensor<1x1024xf16> -> tensor<1x1xf16>
-    %1 = pim.eltwise %arg0, %0 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, kind = #pim.eltwise<sub>, unit = #pim.unit<cstl>} : tensor<1x1024xf16>, tensor<1x1xf16> -> tensor<1x1024xf16>
-    %2 = pim.lut %1 {kind = #pim.activation<exp>, pim.phase = 1 : i64, "pim.phase-bytes" = 2048 : i64, unit = #pim.unit<cstl>} : tensor<1x1024xf16> -> tensor<1x1024xf16>
-    %3 = pim.reduce_axis %2 {axis = 1 : i64, kind = #pim.eltwise<add>, pim.phase = 2 : i64, "pim.phase-bytes" = 2 : i64, unit = #pim.unit<vpu>} : tensor<1x1024xf16> -> tensor<1x1xf16>
-    %4 = pim.lut %3 {kind = #pim.activation<reciprocal>, pim.phase = 3 : i64, "pim.phase-bytes" = 2 : i64, unit = #pim.unit<cstl>} : tensor<1x1xf16> -> tensor<1x1xf16>
-    %5 = pim.eltwise %2, %4 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, kind = #pim.eltwise<mul>, pim.phase = 4 : i64, "pim.phase-bytes" = 2048 : i64, unit = #pim.unit<cstl>} : tensor<1x1024xf16>, tensor<1x1xf16> -> tensor<1x1024xf16>
+    %0 = pim.reduce_axis %arg0 {axis = 1 : i64, kind = #pim.eltwise<max>, phases = [#pim.phase_spec<index = 0, bytes = 2, unit = vpu>], unit = #pim.unit<vpu>} : tensor<1x1024xf16> -> tensor<1x1xf16>
+    %1 = pim.eltwise %arg0, %0 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, kind = #pim.eltwise<sub>, unit = #pim.unit<fpsu>} : tensor<1x1024xf16>, tensor<1x1xf16> -> tensor<1x1024xf16>
+    %2 = pim.lut %1 {activationMode = 0 : i64, flpMantisa = 3 : i64, flpMaxExp = 16 : i64, flpMinExp = 9 : i64, fpsu = #pim.fpsu_spec<mode = floating_point>, kind = #pim.activation<exp>, phases = [#pim.phase_spec<index = 1, bytes = 2048, unit = activation>], purpose = #pim.transpose_purpose<purpose = layout_reorder, cardValue = 1>, specialOperators = 0 : i64, unit = #pim.unit<activation>} : tensor<1x1024xf16> -> tensor<1x1024xf16>
+    %3 = pim.reduce_axis %2 {axis = 1 : i64, fpsu = #pim.fpsu_spec<mode = floating_point>, kind = #pim.eltwise<add>, phases = [#pim.phase_spec<index = 2, bytes = 4, unit = vpu>], unit = #pim.unit<vpu>} : tensor<1x1024xf16> -> tensor<1x1xf32>
+    %4 = pim.lut %3 {activationMode = 0 : i64, flpMantisa = 0 : i64, flpMaxExp = 15 : i64, flpMinExp = 15 : i64, fpsu = #pim.fpsu_spec<mode = floating_point_32>, kind = #pim.activation<reciprocal>, phases = [#pim.phase_spec<index = 3, bytes = 2, unit = activation>], purpose = #pim.transpose_purpose<purpose = layout_reorder, cardValue = 2>, specialOperators = 4 : i64, unit = #pim.unit<activation>} : tensor<1x1xf32> -> tensor<1x1xf16>
+    %5 = pim.eltwise %2, %4 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, kind = #pim.eltwise<mul>, phases = [#pim.phase_spec<index = 4, bytes = 2048, unit = combiner, reads = [1, 3]>], unit = #pim.unit<combiner>} : tensor<1x1024xf16>, tensor<1x1xf16> -> tensor<1x1024xf16>
     tt.store %arg1, %5 : tensor<1x1024x!tt.ptr<f16>>
     tt.return
   }
@@ -58,9 +89,9 @@ module {
 _EXPANDED_ROPE = """
 module {
   tt.func @rope_three_phases(%arg0: tensor<1x4096xf16>, %arg1: tensor<1x4096xf16>, %arg2: tensor<1x4096xf16>, %arg3: tensor<1x4096x!tt.ptr<f16>>) {
-    %0 = pim.eltwise %arg0, %arg1 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = elementwise_mul_fp16>]>, kind = #pim.eltwise<mul>, "pim.force-consecutive", pim.phase = 0 : i64, "pim.phase-bytes" = 8192 : i64, unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
-    %1 = pim.eltwise %arg0, %arg2 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = elementwise_mul_fp16>]>, kind = #pim.eltwise<mul>, "pim.force-consecutive", pim.phase = 1 : i64, "pim.phase-bytes" = 8192 : i64, "pim.rotate-half", unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
-    %2 = pim.eltwise %0, %1 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, kind = #pim.eltwise<add>, "pim.force-consecutive", pim.phase = 2 : i64, "pim.phase-bytes" = 8192 : i64, unit = #pim.unit<cstl>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
+    %0 = pim.eltwise %arg0, %arg1 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = elementwise_mul_fp16>]>, fpsu = #pim.fpsu_spec<mode = floating_point>, kantor = #pim.kantor_spec<mode = elementwise_mul_fp16, cardValue = 5>, kind = #pim.eltwise<mul>, phases = [#pim.phase_spec<index = 0, bytes = 8192, unit = kantor, forceConsecutive = true>], unit = #pim.unit<kantor>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
+    %1 = pim.eltwise %arg0, %arg2 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point, kantorBlocks = [#pim.kantor_block<id = "A", mode = elementwise_mul_fp16>]>, fpsu = #pim.fpsu_spec<mode = floating_point>, kantor = #pim.kantor_spec<mode = elementwise_mul_fp16, cardValue = 5>, kind = #pim.eltwise<mul>, phases = [#pim.phase_spec<index = 1, bytes = 8192, unit = kantor, forceConsecutive = true>], rotateHalf, unit = #pim.unit<kantor>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
+    %2 = pim.eltwise %0, %1 {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, fpsu = #pim.fpsu_spec<mode = floating_point>, kantor = #pim.kantor_spec<mode = off, cardValue = 0>, kind = #pim.eltwise<add>, phases = [#pim.phase_spec<index = 2, bytes = 8192, unit = kantor, forceConsecutive = true>], unit = #pim.unit<kantor>} : tensor<1x4096xf16>, tensor<1x4096xf16> -> tensor<1x4096xf16>
     tt.store %arg3, %2 : tensor<1x4096x!tt.ptr<f16>>
     tt.return
   }
@@ -111,21 +142,28 @@ def test_rope_phase_count_matches_rope_units() -> None:
     assert len(mul_blocks) + 1 == plan.count
 
 
-def test_dq_reduction_is_absmax_not_max() -> None:
-    """p0 必须是 absmax。用 max 会让负值主导的组量化错一个符号。"""
+def test_dq_reduction_is_a_grouped_absmax() -> None:
+    """p0 必须是 absmax，而且必须是**分组**归约。用 max 会让负值主导的组量化
+    错一个符号；用 tile 级的 `reduce_axis` 加两次 reshape 冒充分组归约，则是在
+    用不表达分组语义的算子（没有组大小、没有逐通道/逐组标志）发一组它说不出的
+    字段。池化单元的分组归约才是这一步的实际硬件行为。
+    """
     plan = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
     assert plan.phases[0].kind == "absmax"
-    assert plan.phases[0].op == "pim.reduce_axis"
+    assert plan.phases[0].op == "pim.global_pool"
 
 
 def test_dq_kinds_match_static_table_semantics() -> None:
     """四相语义：absmax -> 恒等 -> 倒数 -> 定点化。
 
+    相 1 是恒等表，不是 relu——它曾经被写成 `relu`，描述的是错的那个函数；
+    ÷256 落在 FPSU 定标里，所以这一相只是原样过一遍表。
+
     静态表里 p2 带 `activation_special_operators=4`（选倒数表）、
     p3 带 `kantor_mode=fp2int_converter`，与这里的 kind 一一对应。
     """
     plan = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
-    assert plan.kinds() == ["absmax", "relu", "reciprocal", None]
+    assert plan.kinds() == ["absmax", "identity", "reciprocal", None]
     assert plan.phases[3].op == "pim.quantize"
     assert hw_table.DQ_PHASES[3]["kantor_mode"] == "fp2int_converter"
     assert hw_table.DQ_PHASES[2]["activation_special_operators"] == 4
@@ -143,7 +181,9 @@ def test_reduction_phases_run_on_vector_unit() -> None:
     """归约走 VPU，非线性走 CSTL——这是引擎单功能的硬约束。"""
     dq = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
     assert dq.phases[0].unit == "vpu"
-    assert dq.phases[1].unit == dq.phases[2].unit == "cstl"
+    # 查表相落在激活块上。以前六个块共用 `cstl` 一个名字，成本抽取分不出
+    # 遍历类型；现在各自具名。
+    assert dq.phases[1].unit == dq.phases[2].unit == "activation"
 
 
 def test_dq_p1_parses_flp_and_activation_mode() -> None:
@@ -154,8 +194,15 @@ def test_dq_p1_parses_flp_and_activation_mode() -> None:
     assert p1.flp_min == 10 and p1.flp_max == 17 and p1.flp_mantisa == 3
     assert plan.phases[3].kantor_mode == 3
 
+    # 寻址卡值（`transpose_purpose` 的 cardValue）必须真的解析出来：
+    # 夹具若还停在旧的裸属性形态，这里会是 None 而测试照样绿。
+    assert plan.phases[2].transpose_type == 1
+
     sm = parse_phase_plans(_EXPANDED_SOFTMAX)["softmax_five_phases"]
-    assert sm.units() == ["vpu", "cstl", "vpu", "cstl", "cstl"]
+    # 两次归约在向量单元，两次查表在激活块，末尾的归一化乘在合成块。
+    assert sm.units() == ["vpu", "activation", "vpu", "activation", "combiner"]
+    assert sm.phases[1].transpose_type == 1
+    assert sm.phases[3].transpose_type == 2
 
 
 def test_stabilization_sub_is_not_a_phase() -> None:
@@ -191,13 +238,16 @@ def test_phase_bytes_follow_logical_shape() -> None:
     """逻辑缓冲字节数 = numel × elem_bytes。
 
     DQ：4096 个 fp16 输入分 32 组 -> 组统计量 32×2=64 字节，输出 4096 个 int8。
-    Softmax：1024 个 fp16 = 2048 字节，标量归约 1×2=2 字节。
+    Softmax：1024 个 fp16 = 2048 字节；两个标量归约相各占一个元素，但**宽度不同**
+    —— 相 0 的极值是 fp16 值（2 字节），相 2 的求和是**真 fp32**（4 字节）。
+    这不是记账口径的差异：把求和也截成 fp16，再由它取倒数，倒数就会带上求和
+    自身的舍入，约千分之一，比这套算术本身的噪声大一个量级。
     """
     dq = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
     assert [p.bytes for p in dq.phases] == [64, 64, 64, 4096]
 
     sm = parse_phase_plans(_EXPANDED_SOFTMAX)["softmax_five_phases"]
-    assert [p.bytes for p in sm.phases] == [2, 2048, 2, 2, 2048]
+    assert [p.bytes for p in sm.phases] == [2, 2048, 4, 2, 2048]
 
     rope = parse_phase_plans(_EXPANDED_ROPE)["rope_three_phases"]
     assert [p.bytes for p in rope.phases] == [8192, 8192, 8192]
@@ -238,7 +288,7 @@ def test_single_phase_operator_still_carries_hardware_fields() -> None:
     text = """
 module {
   tt.func @gate_matmul(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
-    %m = pim.matmul %a, %b {activation = #pim.act_spec<kind = silu>, datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, "pim.fpsu-mode" = 2 : i64, "pim.flp-min-exp" = 10 : i64, "pim.flp-max-exp" = 17 : i64, "pim.flp-mantisa" = 3 : i64, "pim.activation-mode" = 0 : i64} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
+    %m = pim.matmul %a, %b {activation = #pim.act_spec<kind = silu>, activationMode = 0 : i64, datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, flpMantisa = 3 : i64, flpMaxExp = 17 : i64, flpMinExp = 10 : i64, fpsu = #pim.fpsu_spec<mode = floating_point_32>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
     tt.return
   }
 }
@@ -246,5 +296,6 @@ module {
     plan = parse_phase_plans(text)["gate_matmul"]
     assert plan.count == 0, "单相算子不能被算成相位"
     assert plan.flp == (10, 17, 3)
+    # `floating_point_32` 是 32 位累加通路的模式，对应卡值 2。
     assert plan.op_attrs["fpsu-mode"] == 2
     assert plan.op_attrs["activation-mode"] == 0

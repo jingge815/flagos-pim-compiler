@@ -4,7 +4,7 @@
 
     融合后的 FX 图
       → oplevel_emitter.emit_oplevel_mlir   整算子级 PIM MLIR
-      → triton-opt -pim-fuse-activation -pim-expand-phases
+      → triton-opt -pim-fuse-activation -pim-expand-phases -pim-verify-gml-contract
       → phase_plan.parse_phase_plans        {函数名: PhasePlan}
       → 本模块按 FX 节点名重新索引          {FX 节点名: {kind: PhasePlan}}
 
@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -32,9 +33,31 @@ from genesim_bridge.paths import flagtree_prefix
 from opcompiler_bridge.oplevel_emitter import EmittedOp, emit_oplevel_mlir
 from opcompiler_bridge.phase_plan import PhasePlan, parse_phase_plans
 
-# 先融合、再展开。顺序不能反：展开后主算子已经变成相位链，
-# `-pim-fuse-activation` 认的 `pim.matmul + pim.lut` 模式就不在了。
-PASS_PIPELINE = ("-pim-fuse-activation", "-pim-expand-phases")
+# 先融合、再展开、最后校验。顺序不能反：展开后主算子已经变成相位链，
+# `-pim-fuse-activation` 认的 `pim.matmul + pim.lut` 模式就不在了；
+# 而 `-pim-verify-gml-contract` 查的是跨属性的不变量（相位数连续、
+# DQ 相 1/2 扇出读相 0），展开前那些相位链根本不存在。
+PASS_PIPELINE = ("-pim-fuse-activation", "-pim-expand-phases",
+                 "-pim-verify-gml-contract")
+
+
+# 模块级 RTL 版本属性。FlagTree 侧的名字是 `pim.rtl-version`（Dialect.h 的
+# `AttrRtlVersionName`），本仓只负责读回来当真源。
+def rtl_version_of(mlir_text: str) -> str | None:
+    """取 IR 模块属性里的 RTL 版本；没有这个属性返回 None。
+
+    返回 None 与返回空串是两件事：前者是「IR 没声明」，后者是「声明成空」。
+    调用方据此分辨「该迁移但没迁」和「迁了但值不对」。
+
+    按 module 的属性字典取，不在整篇文本里搜：属性名只在 `module attributes`
+    那一处出现才算数，正文里同名的字符串不算。
+    """
+    head = re.search(r"module\s+attributes\s*\{([^}]*)\}", mlir_text)
+    if head is None:
+        return None
+    body = head.group(1)
+    match = re.search(r'(?:\"pim\.rtl-version\"|pim\.rtl-version)\s*=\s*\"([^\"]*)\"', body)
+    return match.group(1) if match else None
 
 
 class OpCompilerUnavailable(RuntimeError):
@@ -54,12 +77,40 @@ class PhaseSource:
     mlir: str = ""
     expanded: str = ""
 
+    @property
+    def rtl_version(self) -> str | None:
+        """这次算子编译声明的 RTL 版本，取自展开后 IR 的模块属性。"""
+        return rtl_version_of(self.expanded or self.mlir)
+
     def plan(self, fx_name: str, kind: str) -> PhasePlan | None:
         return self.by_node.get(fx_name, {}).get(kind)
 
     def phase_count(self, fx_name: str, kind: str) -> int | None:
         plan = self.plan(fx_name, kind)
         return None if plan is None else plan.count
+
+    def phase_value(self, fx_name: str, kind: str, phase_index: int,
+                    field_name: str) -> int | None:
+        """某一相上某个硬件域的取值，算子编译器没给就返回 None。
+
+        GML 的值字段（`flp_min_exp` / `kantor_mode` / `activation_mode` 这类）
+        原先整族查常量表，算子宫编译器改了值 GML 也一个字节不变、两边都不报错。
+        取值时优先用这里给出的，取不到才退回常量表——表的定位是**缺省值**。
+        """
+        plan = self.plan(fx_name, kind)
+        if plan is None:
+            return None
+        for phase in plan.phases:
+            if phase.index == phase_index:
+                return getattr(phase, field_name, None)
+        return None
+
+    def op_value(self, fx_name: str, kind: str, field_name: str) -> int | None:
+        """单相算子（矩阵乘这类不展开的）身上的硬件域取值。"""
+        plan = self.plan(fx_name, kind)
+        if plan is None:
+            return None
+        return plan.op_attrs.get(field_name)
 
     def __str__(self) -> str:
         kinds: dict[str, int] = {}
@@ -149,6 +200,44 @@ class PhaseMismatch:
                 f"静态表={self.from_static_table!r}")
 
 
+
+# 相位上要比具体数字的域：Phase 字段名 -> 常量表键。
+_NUMERIC_FIELDS = (
+    ("flp_min", "flp_min_exp"),
+    ("flp_max", "flp_max_exp"),
+    ("flp_mantisa", "flp_mantisa"),
+    ("activation_mode", "activation_mode"),
+)
+
+
+def _static_phases(kind: str):
+    """这个 kind 的常量表相位行；没有表返回空。"""
+    from contracts.gml_hw_constants import DQ_PHASES, SOFTMAX_PHASES
+
+    return {"dq": DQ_PHASES, "softmax": SOFTMAX_PHASES}.get(kind, [])
+
+
+def _check_phase_numbers(fx_name, kind, plan, mismatches) -> None:
+    """相位上算子编译器给了的数字，必须与常量表一致。
+
+    只比算子编译器**给了**的域：None 表示那一相不发这个域，由「蒸发」那条
+    检查管。两边都有值却不同，说明其中一侧退化了。
+    """
+    table = _static_phases(kind)
+    for phase in plan.phases:
+        if phase.index >= len(table):
+            continue
+        row = table[phase.index]
+        for attr, key in _NUMERIC_FIELDS:
+            got = getattr(phase, attr)
+            if got is None or key not in row:
+                continue
+            want = row[key]
+            if isinstance(want, int) and got != want:
+                mismatches.append(PhaseMismatch(
+                    fx_name, kind, f"phase{phase.index}.{attr}", got, want))
+
+
 def cross_check(source: PhaseSource) -> list[PhaseMismatch]:
     """把算子编译器的相位模板与 GML 静态表对拍。
 
@@ -182,4 +271,17 @@ def cross_check(source: PhaseSource) -> list[PhaseMismatch]:
                 if got != want_kind:
                     mismatches.append(PhaseMismatch(
                         fx_name, kind, "phase0.kind", got, want_kind))
+
+            # 值字段：展开器填了的相位，既不能蒸发成 None，也不能与常量表
+            # 的数字对不上——只拦 None 会让「改了窗口但 GML 不变」溜过去。
+            _check_phase_numbers(fx_name, kind, plan, mismatches)
+            for phase in plan.phases:
+                if phase.op == "pim.lut" and phase.flp_min is None:
+                    mismatches.append(PhaseMismatch(
+                        fx_name, kind, f"phase{phase.index}.flp_min",
+                        None, "int"))
+                if phase.kantor_mode is None and phase.op == "pim.quantize":
+                    mismatches.append(PhaseMismatch(
+                        fx_name, kind, f"phase{phase.index}.kantor_mode",
+                        None, "int"))
     return mismatches

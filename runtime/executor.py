@@ -9,6 +9,7 @@ import torch
 
 from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import PIMStaticKVCache, decode_mask, prefill_mask
+from runtime.kernels import softmax
 
 
 @dataclass
@@ -35,55 +36,6 @@ def execute_plan(plan: ExecutionPlan, hal, *, values: dict[str, object] | None =
     for event in events.values():
         hal.wait(event)
     return events
-
-
-def _host_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    e = np.exp(x - np.max(x, axis=axis, keepdims=True))
-    return e / e.sum(axis=axis, keepdims=True)
-
-
-def make_sdpa_handler(layer: int, kv_specs, state: DecodeState, np_dtype: np.dtype):
-    """构造读写指定层 KV 缓存的 SDPA 主机处理函数。"""
-    # 建立当前层 KV head 到 DPU 的映射。
-    dpu_of_head: dict[int, int] = {}
-    for dpu_id, spec in kv_specs.items():
-        if layer not in spec.layers:
-            continue
-        for head in spec.kv_heads:
-            dpu_of_head[head] = dpu_id
-
-    def handler(hal, cmd, args, kwargs):
-        q, k, v, _mask = args
-        q = np.asarray(q, dtype=np_dtype)  # [1, num_heads, Tq, head_dim]
-        k = np.asarray(k, dtype=np_dtype)
-        v = np.asarray(v, dtype=np_dtype)
-        scale = kwargs.get("scale") or 1.0 / np.sqrt(q.shape[-1])
-        num_heads, tq, head_dim = q.shape[1], q.shape[2], q.shape[3]
-        cache = PIMStaticKVCache(hal, kv_specs, wram_budget_bytes=2**20)
-
-        pos = hal.bound_pos if hal.bound_pos is not None else 0
-        # 将当前序列的 K/V 逐位置写入本层缓存。
-        owners = {dpu_id: spec for dpu_id, spec in kv_specs.items() if layer in spec.layers}
-        for t in range(tq):
-            k_by_dpu = {dpu_id: {h: k[0, h, t] for h in spec.kv_heads} for dpu_id, spec in owners.items()}
-            v_by_dpu = {dpu_id: {h: v[0, h, t] for h in spec.kv_heads} for dpu_id, spec in owners.items()}
-            cache.update(layer, pos + t, k_by_dpu, v_by_dpu)
-
-        valid_len = pos + tq  # 当前步骤后的有效长度。
-        max_seq = next(iter(kv_specs.values())).max_seq
-        out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
-        for head in range(num_heads):
-            dpu_id = dpu_of_head[head]
-            K_hist, V_hist = cache.read_tile(layer, dpu_id, head, 0, max_seq)
-            for t in range(tq):
-                mask = prefill_mask(t + 1, max_seq) if tq > 1 else decode_mask(valid_len - 1, max_seq)
-                mask_row = mask[t] if tq > 1 else mask
-                scores = K_hist.astype(np.float32) @ q[0, head, t].astype(np.float32) * scale
-                weights = _host_softmax(scores + mask_row)
-                out[0, head, t] = weights @ V_hist.astype(np.float32)
-        return out.astype(np_dtype)
-
-    return handler
 
 
 def run_decode_loop(

@@ -11,9 +11,149 @@ NMU / FPSU / KANTOR / Pooling / Activation 五个单元。
 
 表是声明式的，没有逻辑。改这里之前先跑 tests/test_gml_hw_table.py，
 它拿参考产物逐格对拍。
+
+表里 `fpsu_*` / `global_pooling_*` / `kantor_A_*` 三族的 spc/spg 是**缺省值**：
+它们其实是同一个量化决策投到三个硬件块上的结果，有量化规格时由
+`derive_hardware_axes(...)` 派生（见本文件开头那张三行表），表值只在
+「手上没有规格」时兜底。
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+
+from contracts.gml_hw_constants import (
+    DQ_PHASES,
+    SOFTMAX_PHASES,
+    TOP_LEVEL,
+    PHASE_TABLE,
+    ROPE_UNITS,
+    ROPE_KANTOR_MODES,
+    ROPE_KANTOR_BLOCKS,
+    ROPE_SCALE_BLOCKS,
+)
+from contracts.gml_quant import QuantLayout
+
+# phase 型节点声明的硬件 RTL 版本。实测 37 个带 phase 的节点全是 "1.4"，
+# 其余节点不带这个字段 —— 它同时也是「是不是 phase 型节点」的判据。
+RTL_VERSION = "1.4"
+
+
+# ---------------------------------------------------------------------------
+# 量化规格 -> 硬件块的 spc/spg
+# ---------------------------------------------------------------------------
+#
+# spc（逐通道定标）与 spg（逐组定标）不是三组独立配置，是**同一个量化决策的
+# 三处投影**：定点单元拿它定标、池化单元拿它分组求 absmax、逐元素乘单元拿它
+# 分组反量化。所以它们从量化规格派生，不查表 —— 下面常量表里的那几项是
+# 「手上没有规格」时的缺省值，有规格时被这里的派生覆盖。
+#
+# 硬件块的轴编号是**块自己的口径**，与量化规格里的张量轴（Llama2 上是 -1）
+# 不是一回事，两套编号禁止混用。出处是 GML 实物的这几族：
+#
+#   | 硬件块                          | spc 轴 | spg 轴                | 出处 |
+#   | 定点单元（FPSU）                | 1      | 顶层不写 groupSize    | TOP_LEVEL |
+#   | 池化单元（Pooling）             | 2      | 3                     | DQ_PHASES[0] |
+#   | 逐元素乘单元（Kantor A，DQ p3） | 2      | 3                     | DQ_PHASES[3] |
+_BLOCK_AXES: dict[str, tuple[int, int]] = {
+    "fpsu": (1, -1),
+    "pooling": (2, 3),
+    "kantor_a": (2, 3),
+}
+
+
+@dataclass(frozen=True)
+class HardwareAxes:
+    """量化规格投影到一个硬件块上的 spc/spg 五个字段。"""
+
+    spc: bool
+    spc_axis: int
+    spg: bool
+    spg_axis: int
+    spg_group_size: int
+
+
+def derive_hardware_axes(layout: QuantLayout, block: str) -> HardwareAxes:
+    """量化规格 -> 某个硬件块该写的 spc/spg。
+
+    三条规则：
+
+    1. `spc` 看规格是否 per_tensor —— 整张量一个 scale 时单元不按通道取值。
+    2. `spg` 看规格是否 per_group，**且该块真的做分组**：定点单元只吃逐通道
+       那一位，分组归约是池化与 Kantor 的活，所以它永远不置位（实测 FPSU 的
+       `fpsu_spg` 全图 0）。
+    3. 轴取该块自己的编号；不分组时写 -1，与实物一致。
+
+    与 `lib/Dialect/TritonPIM/IR/Dialect.cpp` 的 `deriveHardwareAxes` 同一条
+    规则：算子编译器在构造相位 IR 时派生一遍，图编译器在这里派生一遍，两边
+    都以量化规格为输入。
+    """
+    if block not in _BLOCK_AXES:
+        raise ValueError(f"未知硬件块 {block!r}，只有 {sorted(_BLOCK_AXES)}")
+    spc_axis, spg_axis = _BLOCK_AXES[block]
+    spc = layout.granularity != "per_tensor"
+    spg = layout.granularity == "per_group" and block != "fpsu"
+    return HardwareAxes(
+        spc=spc,
+        spc_axis=spc_axis,
+        spg=spg,
+        spg_axis=spg_axis if spg else -1,
+        spg_group_size=layout.group_size if spg else -1,
+    )
+
+
+# 由量化规格派生的键：GML 键名（去掉 `_phase_<k>` 后缀）-> (硬件块, 派生项)。
+#
+# 只列上面那张三行表覆盖的键，出处逐行对得上：FPSU 族取 TOP_LEVEL 与各相、
+# 池化族取 DQ_PHASES[0]、Kantor A 族取 DQ_PHASES[3]。
+#
+# **不列** RoPE 子块（`fpsu_1_spc_Llama2Activation_Cos`）与顶层 EltwiseMul 的
+# 逐槽 Kantor —— 那是各块**操作数自己的定标轴**：A/B 各一套，与 DQ 的分组决策
+# 无关，数值也不同（实测 Kantor A 在 DQ 的 p3 是轴 2，在逐元素乘是轴 1）。
+_FPSU_STEMS: dict[str, tuple[str, str]] = {
+    "fpsu_spc": ("fpsu", "spc"),
+    "fpsu_spc_axis": ("fpsu", "spc_axis"),
+    "fpsu_spg": ("fpsu", "spg"),
+    "fpsu_spg_axis": ("fpsu", "spg_axis"),
+    "fpsu_spg_group_size": ("fpsu", "spg_group_size"),
+}
+
+# 顶层：三块里只有 FPSU 在顶层出面。逐槽 fpsu_0/1_* 是各块操作数自己的
+# 定标轴，与 DQ 的分组决策无关，不进派生表。
+TOP_AXIS_FIELD_STEMS: dict[str, tuple[str, str]] = dict(_FPSU_STEMS)
+
+# 相内：三族都在（池化在 p0、Kantor A 在 p3、FPSU 每相都有）。
+PHASE_AXIS_FIELD_STEMS: dict[str, tuple[str, str]] = {
+    **_FPSU_STEMS,
+    "global_pooling_spc": ("pooling", "spc"),
+    "global_pooling_spc_axis": ("pooling", "spc_axis"),
+    "global_pooling_spg": ("pooling", "spg"),
+    "global_pooling_spg_axis": ("pooling", "spg_axis"),
+    "global_pooling_group_size": ("pooling", "spg_group_size"),
+    "kantor_A_spc": ("kantor_a", "spc"),
+    "kantor_A_spg": ("kantor_a", "spg"),
+    "kantor_A_scale_axis": ("kantor_a", "spc_axis"),
+    "kantor_A_spg_axis": ("kantor_a", "spg_axis"),
+    "kantor_A_spg_group_size": ("kantor_a", "spg_group_size"),
+}
+
+
+def _apply_axes(fields: dict[str, object], spec: QuantLayout,
+                stems: dict[str, tuple[str, str]]) -> None:
+    """把 spec 派生的值盖回字段字典。
+
+    只改**已经声明**的键的值，不增不减键：实物哪一相写哪几个字段是固定的
+    （DQ 就不写 `fpsu_spg_axis`），派生负责的是值，不是字段集合。
+    """
+    derived: dict[str, HardwareAxes] = {}
+    for key in fields:
+        entry = stems.get(key.split("_phase_")[0])
+        if entry is None:
+            continue
+        block, name = entry
+        axes = derived.setdefault(block, derive_hardware_axes(spec, block))
+        fields[key] = int(getattr(axes, name))
+
 
 # ---------------------------------------------------------------------------
 # 顶层（非 phase）算子
@@ -21,260 +161,9 @@ from __future__ import annotations
 #
 # 空字典表示该算子不带任何硬件字段（实测 RMSNorm_vpu 就是这样——它绑在向量
 # 单元 VPU 上，配置走 vpu_params 嵌套块，不走这五个单元）。
-
-TOP_LEVEL: dict[str, dict[str, object]] = {
-    "Gemm": {
-        "nmu_mode": "floating_point",
-        "fpsu_mode": "floating_point_32",
-        "fpsu_spc": 1,
-        "fpsu_spc_axis": 1,
-        "fpsu_spg": 0,
-        "pooling_dtype": "floating_point",
-        # kantor_mode 见 resolve()：输出 int8 的那个节点是 fp2int_converter。
-    },
-    "MatMul": {
-        "nmu_mode": "floating_point",
-        "fpsu_mode": "floating_point_32",
-        "fpsu_spc": 1,
-        "fpsu_spc_axis": 1,
-        "fpsu_spg": 0,
-        "pooling_dtype": "floating_point",
-        "kantor_mode": "off",
-        # 第二个 operand 走权重通路，不占 input 槽——所以 input_count 少记 1。
-        "MatMul_input_as_weight": 1,
-        # 逐头展开后每个节点仍记录总头数（= num_attention_heads）。
-        "group_attention_data_num": 32,
-        "group_attention_weight_num": 32,
-        # weight_format 见 resolve()：QK^T 转置、PV 不转。
-    },
-    "KV_Cache_DMA": {
-        # 全图唯一走定点 FPSU 的算子。配 Scaling_buffer_file=2.0、Scaling_PS=14。
-        "fpsu_mode": "fixed_point",
-        "fpsu_spc": 1,
-        "fpsu_spc_axis": 1,
-        "fpsu_spg": 0,
-        "pooling_dtype": "fixed_point",
-        "kantor_mode": "off",
-    },
-    "EltwiseAdd": {
-        # 双输入算子逐槽配置，槽号后缀而非 phase。
-        "fpsu_mode_0": "floating_point",
-        "fpsu_0_spc": 1,
-        "fpsu_0_spg": 0,
-        "pooling_dtype_0": "floating_point",
-        "fpsu_mode_1": "floating_point",
-        "fpsu_1_spc": 1,
-        "fpsu_1_spg": 0,
-        "pooling_dtype_1": "floating_point",
-        "kantor_mode": "off",
-    },
-    "EltwiseMul": {
-        "fpsu_mode_0": "floating_point",
-        "fpsu_0_spc": 1,
-        "fpsu_0_spg": 0,
-        "pooling_dtype_0": "floating_point",
-        "fpsu_mode_1": "floating_point",
-        "fpsu_1_spc": 1,
-        "fpsu_1_spg": 0,
-        "pooling_dtype_1": "floating_point",
-        # 逐元素相乘由 KANTOR 做，两块系数各一套。
-        "kantor_mode": "elementwise_mul_fp16",
-        "kantor_A_spc": 1,
-        "kantor_A_spg": 0,
-        "kantor_A_scale_axis": 1,
-        "kantor_B_spc": 1,
-        "kantor_B_spg": 0,
-        "kantor_B_scale_axis": 1,
-        "transpose": 1,
-    },
-    "Mask": {
-        "kantor_mode": "off",
-        "transpose": 1,
-    },
-    # 布局类算子只声明 kantor_mode=off，其余单元不参与。
-    "Split": {"kantor_mode": "off"},
-    "Concat": {"kantor_mode": "off"},
-    "Transpose": {"kantor_mode": "off"},
-    "Reshape": {"kantor_mode": "off"},
-    # RMSNorm 走 VPU，配置在 vpu_params 块里，这里没有五单元字段。
-    "RMSNorm_vpu": {},
-    # phase 型算子的顶层部分。
-    "DynamicScaling": {
-        "rtl_version": "1.4",
-        "transpose": 1,
-    },
-    "Llama2ActivationDQ": {
-        "rtl_version": "1.4",
-        "transpose": 1,
-    },
-    "Llama2Activation": {
-        "transpose": 0,
-    },
-    "Softmax": {},
-}
-
-
-# ---------------------------------------------------------------------------
-# phase 流水线
-# ---------------------------------------------------------------------------
 #
-# phase 在 GML 里**不是独立节点**，而是同一个节点内的 `*_phase_<k>` 字段族。
-#
-# DQ 四相：p0 求组统计量 -> p1 乘 1/256 -> p2 取倒数 -> p3 Kantor 定点化
-# Softmax 五相：p0 求 max -> p1 exp -> p2 求和 -> p3 取倒数 -> p4 归一化
-
-_DQ_COMMON = {
-    "fpsu_mode": "floating_point",
-    "fpsu_spc": 1,
-    "fpsu_spc_axis": 1,
-    "fpsu_spg": 0,
-    "pooling_dtype": "floating_point",
-    "kantor_mode": "off",
-    # 每相的数据通道声明。前三相都在 fp16 域里算（求 absmax、除 256、取倒数），
-    # 只有 p3 的**输出**落到 int8 —— 那一相才是量化真正落定的地方。
-    # `*_data_extensions` 不是独立配置，是 dtype 的编码（float16→3、int8→1），
-    # 所以这里跟着 dtype 一起给，不单列。
-    "input_buffer_dtype": "float16",
-    "input_data_extensions": 3,
-    "output_buffer_dtype": "float16",
-    "output_data_extensions": 3,
-}
-
-DQ_PHASES: list[dict[str, object]] = [
-    {
-        **_DQ_COMMON,
-        # p0 用 Pooling 块求每组的对称动态范围（abs max），所以只有这一相
-        # 带 global_pooling_*。group_size 见 resolve()：随张量变化。
-        "global_pooling_spc": 1,
-        "global_pooling_spc_axis": 2,
-        "global_pooling_spg": 1,
-        "global_pooling_spg_axis": 3,
-    },
-    {
-        **_DQ_COMMON,
-        # p1 走 LUT 通路但用恒等表：activation_mode=1 表示直通，
-        # 真正的 1/256 由 Scaling_buffer_phase_1 完成。
-        "flp_min_exp": 10,
-        "flp_max_exp": 17,
-        "flp_mantisa": 3,
-        "activation_mode": 1,
-        "activation_special_operators": 0,
-    },
-    {
-        **_DQ_COMMON,
-        # p2 取倒数：special_operators=4 选倒数表。
-        "flp_min_exp": 15,
-        "flp_max_exp": 15,
-        "flp_mantisa": 0,
-        "activation_mode": 0,
-        "activation_special_operators": 4,
-    },
-    {
-        **_DQ_COMMON,
-        # p3 由 KANTOR 做浮点转定点，这是量化真正落定的一相 ——
-        # 也是唯一输出 int8 的一相（data_extensions 随之从 3 变 1）。
-        "kantor_mode": "fp2int_converter",
-        "kantor_A_spc": 1,
-        "kantor_A_spg": 1,
-        "kantor_A_scale_axis": 2,
-        "kantor_A_spg_axis": 3,
-        "output_buffer_dtype": "int8",
-        "output_data_extensions": 1,
-    },
-]
-
-_SOFTMAX_COMMON = {
-    "fpsu_mode": "floating_point",
-    "fpsu_spc": 1,
-    "fpsu_spc_axis": 1,
-    "fpsu_spg": 0,
-    # Softmax 显式写 -1 表示不分组（DQ 侧则完全不写这两个字段）。
-    "fpsu_spg_axis": -1,
-    "fpsu_spg_group_size": -1,
-    "pooling_dtype": "floating_point",
-    "kantor_mode": "off",
-    "nmu_output_type": "floating_point",
-}
-
-SOFTMAX_PHASES: list[dict[str, object]] = [
-    # p0 求 max。注意 Softmax **没有** global_pooling_*——求 max 走另一条通路。
-    {**_SOFTMAX_COMMON},
-    {
-        **_SOFTMAX_COMMON,
-        # p1 过 exp 表。注意 flp 三元组与 DQ 的 p1 不同（9/16/3 vs 10/17/3）。
-        "flp_min_exp": 9,
-        "flp_max_exp": 16,
-        "flp_mantisa": 3,
-        "activation_mode": 0,
-        "activation_special_operators": 0,
-    },
-    # p2 求和，用 fp32 累加（落盘就是真 fp32，与 p0 的编码不同）。
-    {**_SOFTMAX_COMMON},
-    {
-        **_SOFTMAX_COMMON,
-        # p3 取倒数，且 FPSU 升到 32 位——因为被除的和是 fp32。
-        "fpsu_mode": "floating_point_32",
-        "flp_min_exp": 15,
-        "flp_max_exp": 15,
-        "flp_mantisa": 0,
-        "activation_mode": 0,
-        "activation_special_operators": 4,
-    },
-    # p4 施加 1/sum。
-    {**_SOFTMAX_COMMON},
-]
-
-PHASE_TABLE: dict[str, list[dict[str, object]]] = {
-    "DynamicScaling": DQ_PHASES,
-    "Llama2ActivationDQ": DQ_PHASES,
-    "Softmax": SOFTMAX_PHASES,
-}
-
-
-# ---------------------------------------------------------------------------
-# RoPE 子块
-# ---------------------------------------------------------------------------
-#
-# Llama2Activation / Llama2ActivationDQ 内部按固定命名的子块配置，单元号 1..6
-# 与子块一一绑定。子块名进字段名后缀，例如
-# `fpsu_mode_1_Llama2Activation_Add_Cos`。
-#
-# 注意 `fpsu_<n>_scale_axis` 后面**没有下划线**就接子块名（实测 12 处），
-# 这是对方生成器的键名 bug，为兼容需照样复现。
-
-ROPE_UNITS: list[tuple[int, str]] = [
-    (1, "Llama2Activation_Add_Cos"),
-    (2, "Llama2Activation_Add_Sin"),
-    (3, "Llama2Activation_Sin"),
-    (4, "Llama2Activation_Sin"),
-    (5, "Llama2Activation_Cos"),
-    (6, "Llama2Activation_Cos"),
-]
-
-# 各子块的 kantor 模式：cos/sin 相乘用逐元素乘。
-#
-# `Llama2Activation_add` 的取值**随变体不同**，不是常量：
-#   Llama2Activation   -> "fp2int_converter"（末尾要落定点）
-#   Llama2ActivationDQ -> "off"（定点化交给它自己的 p3 那一相）
-# 原先写死成前者，DQ 变体上就错了 —— 见 rope_fields(dq=...)。
-ROPE_KANTOR_MODES: dict[str, str] = {
-    "Llama2Activation_Cos": "elementwise_mul_fp16",
-    "Llama2Activation_Sin": "elementwise_mul_fp16",
-}
-
-# 带 Kantor A/B 两组配置的子块（实测只有 cos/sin 两个，各一整套）。
-ROPE_KANTOR_BLOCKS = ("Llama2Activation_Sin", "Llama2Activation_Cos")
-
-# 声明了 fp16 定标的子块。`_Broadcast` 是 cos/sin 广播到各头的那一路。
-ROPE_SCALE_BLOCKS = (
-    "Llama2Activation_Add_Cos",
-    "Llama2Activation_Add_Sin",
-    "Llama2Activation_Sin",
-    "Llama2Activation_Sin_Broadcast",
-    "Llama2Activation_Cos",
-    "Llama2Activation_Cos_Broadcast",
-)
-
+# `fpsu_spc` / `fpsu_spc_axis` / `fpsu_spg` 与 `fpsu_<槽>_spc` / `fpsu_<槽>_spg`
+# 是**缺省值**：有量化规格时由 `derive_hardware_axes("fpsu", ...)` 覆盖。
 
 def rope_fields(*, dq: bool = False) -> dict[str, object]:
     """RoPE 子块的全部硬件字段，按单元号展开。
@@ -303,9 +192,12 @@ def rope_fields(*, dq: bool = False) -> dict[str, object]:
             fields[f"Kantor_{side}_spg_{block}"] = 0
             fields[f"Kantor_{side}_spg_axis_{block}"] = -1
             fields[f"Kantor_{side}_spg_group_size_{block}"] = -1
-    # 末段加法只有 A 侧。
-    fields["Kantor_A_spc_Llama2Activation_add"] = 1
-    fields["Kantor_A_spg_Llama2Activation_add"] = 0
+    # 末段加法只有 A 侧，而且只挂在 K 路那个节点上：参考 node 30
+    # （Llama2Activation）有这两项、node 22（DQ）没有。与
+    # `Kantor_A_Llama2Activation_add_{scale,bias}_buffer_file` 同一处判据。
+    if not dq:
+        fields["Kantor_A_spc_Llama2Activation_add"] = 1
+        fields["Kantor_A_spg_Llama2Activation_add"] = 0
 
     # 各子块的定标 dtype。
     for block in ROPE_SCALE_BLOCKS:
@@ -340,10 +232,6 @@ def rope_fields(*, dq: bool = False) -> dict[str, object]:
 # `data_extension` 不是独立配置，而是 dtype 的编码：int8 -> 1、float16 -> 3。
 # 实测全图无例外，所以按 dtype 推即可，不必进常量表。
 
-# phase 型节点声明的硬件 RTL 版本。实测 37 个带 phase 的节点全是 "1.4"，
-# 其余节点不带这个字段 —— 所以它同时也是「这是不是 phase 型节点」的判据
-# （见 contracts/gml_names.phase_output_buffer_self 那条自命名例外）。
-RTL_VERSION = "1.4"
 
 
 DATA_EXTENSION: dict[str, int] = {
@@ -396,10 +284,15 @@ def dq_group_size_fields(group_size: int) -> dict[str, object]:
     }
 
 
-def phase_fields(op_type: str, phase: int, *, group_size: int | None = None) -> dict:
+def phase_fields(op_type: str, phase: int, *, group_size: int | None = None,
+                 spec: QuantLayout | None = None) -> dict:
     """一个算子某一相的硬件字段，键名已加 `_phase_<k>` 后缀。
 
-    `group_size` 只对 DQ 有意义（p0 与 p3 各要一个 group_size 字段）。
+    `group_size` 只对 DQ 有意义（p0 与 p3 各要一个 group_size 字段）；
+    给了 `spec` 就以规格里的组宽为准（规格是量化决策的真源，组宽是它的一部分）。
+
+    `spec` 是这一相的量化规格：给了它，三族 spc/spg（FPSU / 池化 / Kantor A）
+    由 `derive_hardware_axes(...)` 派生，表里的值是没规格时的缺省。
     """
     phases = PHASE_TABLE.get(op_type)
     if phases is None:
@@ -410,17 +303,25 @@ def phase_fields(op_type: str, phase: int, *, group_size: int | None = None) -> 
     fields = {f"{key}_phase_{phase}": value
               for key, value in phases[phase].items()}
 
-    if op_type in ("DynamicScaling", "Llama2ActivationDQ") and group_size is not None:
-        for key, value in dq_group_size_fields(group_size).items():
+    size = spec.group_size if spec is not None else group_size
+    if op_type in ("DynamicScaling", "Llama2ActivationDQ") and size is not None:
+        for key, value in dq_group_size_fields(size).items():
             if key.endswith(f"_phase_{phase}"):
                 fields[key] = value
+    if spec is not None:
+        _apply_axes(fields, spec, PHASE_AXIS_FIELD_STEMS)
     return fields
 
 
 def top_level_fields(
-    op_type: str, *, output_dtype: str | None = None, transposed: bool = False
+    op_type: str, *, output_dtype: str | None = None, transposed: bool = False,
+    spec: QuantLayout | None = None,
 ) -> dict[str, object]:
-    """一个算子的顶层硬件字段，已解出那些按节点变化的项。"""
+    """一个算子的顶层硬件字段，已解出那些按节点变化的项。
+
+    `spec` 是这类算子的量化规格：给了它，FPSU 族的 spc/spg 由
+    `derive_hardware_axes("fpsu", ...)` 派生（顶层不写 groupSize）。
+    """
     if op_type not in TOP_LEVEL:
         raise ValueError(f"常量表里没有 {op_type!r}")
     fields = dict(TOP_LEVEL[op_type])
@@ -431,4 +332,6 @@ def top_level_fields(
         fields["weight_format"] = matmul_weight_format(transposed=transposed)
     elif op_type in ("Llama2Activation", "Llama2ActivationDQ"):
         fields.update(rope_fields())
+    if spec is not None:
+        _apply_axes(fields, spec, TOP_AXIS_FIELD_STEMS)
     return fields

@@ -7,10 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .flagtree_driver import run_and_capture
+from .flagtree_driver import lower_oplevel_to_pimir, run_and_capture
 from .ir_cost import analyze_ir
 from .op_classify import (
     UNCOVERED_OP_TYPES,
+    OpRecipe,
     ShapePoint,
     build_recipes,
     flash_attention_probe,
@@ -53,6 +54,9 @@ def _measure(
     `local_features` 给出该算子在一台 DPU 上的 (in_features, out_features)，
     来自图编译器的切分结果。传了就按本地分片形状编译和测量，不传则沿用 IR 里
     的模型级全局形状。
+
+    `ir_level` 决定走哪条路：`ttir` / `pimir` 是 A 路（跑 FlagGems、需要 GPU），
+    `oplevel` 是 B 路（发整算子 IR、纯 CPU），见 `_measure_oplevel`。
     """
     op_type = op_dict["op_type"]
     recipes = build_recipes(dims)
@@ -65,6 +69,15 @@ def _measure(
         recipe = recipes["GEMM"](point, in_features, out_features)
     else:
         recipe = recipes[op_type](point)
+
+    if ir_level == "oplevel":
+        return _measure_oplevel(recipe, op_dict, point, local_features)
+
+    if recipe.build is None:
+        raise ValueError(
+            f"{op_type} 没有 A 路配方（只有整算子级 B 路），"
+            "请改用 --ir-level oplevel"
+        )
 
     pimir = ir_level == "pimir"
     captured = run_and_capture(recipe.build, emit_pimir=pimir)
@@ -124,6 +137,37 @@ def _measure(
     )
 
 
+def _measure_oplevel(
+    recipe: OpRecipe,
+    op_dict: dict,
+    point: ShapePoint,
+    local_features: Optional[Tuple[int, int]],
+) -> Measurement:
+    """B 路测量：发整算子级 IR，展开成相位链，交给 `ir_cost`。
+
+    全程不发 kernel、不碰 GPU——B 路的成本来自本仓自己发的 IR，不来自
+    FlagGems 的实跑。展开后 `pim.softmax` / `pim.rope` 已经变成相位链，
+    `analyze_ir` 按 `pimir` 口径逐行计费（计算类记 flops、视图类记搬运）。
+    """
+    assert recipe.pimir is not None, f"{op_dict['op_type']} 没有 B 路配方"
+    text = lower_oplevel_to_pimir(recipe.pimir())
+    cost = analyze_ir(text, recipe.mnemonic.replace(".", "_"), (1,), {},
+                      ir_level="oplevel")
+    return Measurement(
+        point=point,
+        flops=cost.flops,
+        data_bytes=_net_data_bytes(op_dict, point, cost.element_bytes,
+                                   local_features),
+        dtype=cost.dtype,
+        element_bytes=cost.element_bytes,
+        kernel_ids=[f"{cost.kernel_name}@grid{list(cost.grid)}"],
+        notes=list(cost.notes),
+        mram_traffic_bytes=cost.mram_traffic_bytes,
+        pim_kernels=[_pim_kernel_dict(cost)],
+        local_features=local_features,
+    )
+
+
 def _pim_kernel_dict(cost) -> Dict[str, Any]:
     """将 PIM 内核的搬运、WRAM 和分块信息转为 sidecar 字典。"""
     return {
@@ -139,6 +183,9 @@ def _pim_kernel_dict(cost) -> Dict[str, Any]:
         "dma_ops": cost.dma_ops,
         # 记录带已确认布局属性的 DMA 数量。
         "dma_ops_with_proven_layout": cost.dma_ops_with_layout,
+        # 组反量化的次数（`K / groupSize` 之和）。flops 不受累加顺序影响，
+        # 这个数才对得上反量化单元被调用的趟数。
+        "group_dequant_steps": cost.group_dequant_steps,
         "loop_trip_counts": cost.loop_trip_counts,
         # 记录硬件预算和自动选择的分块。
         "mram_bytes_budget": cost.mram_bytes_budget,
@@ -308,8 +355,13 @@ def export_costs_to_genesim(
     `local_shapes` 给出 {op_id: (in_features, out_features)}，来自图编译器的
     切分结果（见 `load_local_shapes`）。命中的算子按本地分片形状编译和测量，
     未命中的沿用 IR 里的模型级全局形状。不传则全部按全局形状，与改造前一致。
+
+    `ir_level` 的三档：`ttir` / `pimir` 是 A 路（FlagGems → Triton → TTIR 或
+    pim mlir），`oplevel` 是 B 路（本仓发的整算子 IR → 相位链），见 4.9。
+    B 路把 `UNCOVERED_OP_TYPES` 里属于 14 个 mnemonic 的那几个也桥接上——它们
+    在 A 路上保留模板成本是刻意的，B 路量的不是 FlagGems，没有那个顾虑。
     """
-    assert ir_level in ("ttir", "pimir"), f"未知 ir_level: {ir_level}"
+    assert ir_level in ("ttir", "pimir", "oplevel"), f"未知 ir_level: {ir_level}"
     ir = json.loads(Path(ir_path).read_text())
     local_shapes = local_shapes or {}
     if local_shapes:
@@ -341,11 +393,14 @@ def export_costs_to_genesim(
         # 保存 sidecar 对应的 PIM pass 参数。
         sidecar["pim_options"] = pim_options()
 
+    recipe_types = set(build_recipes(dims))
     for op in ir["operators"]:
         op_type = op["op_type"]
         op_id = op["op_id"]
 
-        if op_type in UNCOVERED_OP_TYPES:
+        # B 路桥接四类逐元素/归约算子，只要它有 `pimir`；A 路一律留在模板里。
+        bridged_here = ir_level == "oplevel" and op_type in recipe_types
+        if op_type in UNCOVERED_OP_TYPES and not bridged_here:
             sidecar["coverage"]["template"].append(op_id)
             continue
 
@@ -377,7 +432,7 @@ def export_costs_to_genesim(
         sidecar["coverage"]["bridged"].append(op_id)
         sidecar["operators"][str(op_id)] = {
             "op_type": op_type,
-            "source_name": _source_name(op, dims, prefill_point),
+            "source_name": _source_name(op, dims, prefill_point, ir_level),
             "dtype": prefill.dtype,
             "kernel_ids": sorted(set(prefill.kernel_ids + decode.kernel_ids)),
             "measurements": {
@@ -424,13 +479,24 @@ def export_costs_to_genesim(
     return sidecar
 
 
-def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint) -> str:
+def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint,
+                 ir_level: str) -> str:
+    """sidecar 里记的实现名。
+
+    B 路记 mnemonic（`pim.softmax`），不记 `flag_gems.ops.softmax`：4.9 的
+    sidecar 要用这个字段区分同一笔成本是从哪条路量出来的（A 路 FlagGems linear
+    与 B 路 `pim.matmul` 是两种口径），记成一样的就分不清了。
+    """
     op_type = op["op_type"]
     recipes = build_recipes(dims)
     if op_type == "GEMM":
         in_f, out_f = gemm_features(op)
-        return recipes["GEMM"](point, in_f, out_f).source_name
-    return recipes[op_type](point).source_name
+        recipe = recipes["GEMM"](point, in_f, out_f)
+    else:
+        recipe = recipes[op_type](point)
+    if ir_level == "oplevel" and recipe.mnemonic:
+        return recipe.mnemonic
+    return recipe.source_name
 
 
 def _measurement_dict(m: Measurement) -> Dict[str, Any]:
@@ -459,7 +525,17 @@ def _cross_validate(
     decode_point: ShapePoint,
     ir_level: str,
 ) -> Dict[str, Any]:
-    """测量融合注意力内核，作为分离算子成本的交叉验证基准。"""
+    """测量融合注意力内核，作为分离算子成本的交叉验证基准。
+
+    B 路跳过：这个基准要真跑一遍 FlagGems 的融合 flash attention，而 B 路
+    的意义正在于不经 FlagGems、纯 CPU 出成本。跳过在这里写清楚，不静默——
+    sidecar 里少了 `cross_validation` 的两点数字，得能看出是为什么。
+    """
+    if ir_level == "oplevel":
+        return {
+            "skipped": "B 路不跑 FlagGems，无法测量融合注意力基准",
+            "note": "融合基准是 A 路的对照物，请用 --ir-level pimir 取",
+        }
     result: Dict[str, Any] = {
         "note": "FlagGems 实跑 attention 为融合 flash 路径；"
                 "此处记录融合 kernel 的单层全 head 成本，供与代表实现求和对照",

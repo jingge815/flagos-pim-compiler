@@ -14,37 +14,12 @@ from dataclasses import dataclass
 import torch
 from torch.fx import GraphModule, Node
 
+from contracts.fusion_contract import ACTIVATIONS, FUSION_TARGETS
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 
-
-# 可以持有折入激活的主算子。GML 里对应 Conv / Gemm / MatMul / EltwiseAdd 这些
-# 带 contraction 块的节点。
-FUSION_TARGETS = frozenset(
-    {
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.linear.default,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.mul.Tensor,
-    }
-)
-
-# 可以折进主算子 contraction 块的激活。目标平台用查表实现激活，所以这些在硬件上
-# 是同一条指令配不同的表。
-#
-# `silu` 与 `rsqrt` **不在**这里：llama2 W4A8 实物显示它们是独立节点
-# （`Silu` 自带 nmu_mode/fpsu_*/kantor_mode，`RMSNorm_vpu` 绑定在向量单元上并带
-# vpu 专属字段），归入 gml_bridge.from_fx.OP_TYPES。放进来会被融合吃掉，
-# 产出的 GML 就少了这两类节点。
-ACTIVATIONS = {
-    torch.ops.aten.relu.default: "relu",
-    torch.ops.aten.sigmoid.default: "sigmoid",
-    torch.ops.aten.tanh.default: "tanh",
-    torch.ops.aten.gelu.default: "gelu",
-    torch.ops.aten.exp.default: "exp",
-    torch.ops.aten.sqrt.default: "sqrt",
-    torch.ops.aten.reciprocal.default: "reciprocal",
-}
+# 条件表在 `contracts/fusion_contract.py`，两个 pass 共用那一份。本模块折的是
+# 通用主算子（matmul + eltwise）；`silu` 只折 gate 投影，走 `fuse_pim.py` 的
+# 门控表；`rsqrt` 两张表都没有，是独立的 `RMSNorm_vpu` 节点。
 
 # 池化算子到 GML `op_type` 的映射。
 POOLS = {

@@ -17,16 +17,25 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.gml_hw_table import (
+    PHASE_AXIS_FIELD_STEMS,
     PHASE_TABLE,
+    TOP_AXIS_FIELD_STEMS,
     TOP_LEVEL,
+    HardwareAxes,
     data_extension,
+    derive_hardware_axes,
     gemm_kantor_mode,
     matmul_weight_format,
     phase_fields,
     rope_fields,
     top_level_fields,
 )
+from contracts.gml_quant import QuantLayout
 from genesim_bridge.paths import gml_llama2_reference_dir
+
+# 参考产物这一路的量化规格：激活与权重都是逐组、组宽 128、沿最后一维。
+# 三族 spc/spg 由它派生，与 `contracts.gml_quant.ACTIVATION_LAYOUT` 同值。
+_SPEC = QuantLayout("per_group", group_size=128, axis=-1)
 
 # 归常量表的字段族。与 gml_hw_table 的覆盖范围一致。
 _HARDWARE_FIELD = re.compile(
@@ -285,14 +294,16 @@ def test_data_extension_follows_dtype() -> None:
         data_extension("float32")
 
 
-# 实物里唯一一处 dtype 与 data_extension 不一致的节点。
+# 已知例外。当前参考（v2）里**一处都没有**——v1 有一处：
 #
 # `Split_params_21` 声明 `input_buffer_dtype "float16"` 但 `input_data_extensions 1`
-# （1 对应 int8）。判定 dtype 才是真的，两条独立证据：
-#   - `input_buffer_21.bin` 是 8192 字节 = 4096 个 fp16（按 int8 读则是 8192 个元素）
-#   - 入边 dims 是 `1x32x1x128` = 4096 个元素
-# 两者都指向 fp16。所以这是对方生成器的一处笔误，不是另一条规则。
-_DATA_EXTENSION_EXCEPTIONS = {"Split_params_21"}
+# （1 对应 int8），而 `input_buffer_21.bin` 是 8192 字节 = 4096 个 fp16、入边 dims
+# 也是 `1x32x1x128` = 4096 个元素，两条独立证据都指向 fp16。所以那是对方生成器
+# 在当时那一版里的一处笔误，v2 已修掉，这也是切换参考后这条断言从 1 变 0 的原因。
+#
+# 留着这个集合而不是删掉：v1 的参考路径仍在（`llama2_w4a8_decode_block_0`），
+# 谁把它指回去，这个例外就要重新生效。
+_DATA_EXTENSION_EXCEPTIONS: frozenset[str] = frozenset()
 
 
 def test_data_extension_matches_the_reference(nodes) -> None:
@@ -314,8 +325,140 @@ def test_data_extension_matches_the_reference(nodes) -> None:
     unexpected = [
         item for item in mismatched if item[0] not in _DATA_EXTENSION_EXCEPTIONS]
     assert not unexpected, f"dtype 与 data_extension 不一致: {unexpected}"
-    # 例外只有那一处；若实物换版本后变多，这条会提醒重新审视规则。
-    assert len(mismatched) == 1
+    # 例外要恰好用完，不能多也不能少：多了说明规则没跟上实物，少了说明某个
+    # 本该报出来的不一致被顺手改成了例外。当前参考下应为 0。
+    assert len(mismatched) == len(_DATA_EXTENSION_EXCEPTIONS)
+
+
+def _derived_value(stems, key: str, spec: QuantLayout) -> int:
+    """派生表里 `key` 该取的值（键名去掉 `_phase_<k>` 后缀再查）。"""
+    block, name = stems[key.split("_phase_")[0]]
+    return int(getattr(derive_hardware_axes(spec, block), name))
+
+
+def test_derived_axes_equal_the_constants() -> None:
+    """派生出的 spc/spg 与常量表**逐格相同**。
+
+    这是迁移的等价性判据：三族从「查表」改成「从量化规格派生」，值必须一格
+    不差，否则 GML 就不再逐字节相同。表里三族的每个键都要有一个派生值与之
+    对应且相等；派生规则改了而表没跟着改（或反之），这里立刻失败。
+    """
+    cells = 0
+    for op_type in TOP_LEVEL:
+        for key, expected in top_level_fields(op_type).items():
+            if key not in TOP_AXIS_FIELD_STEMS:
+                continue
+            assert _derived_value(TOP_AXIS_FIELD_STEMS, key, _SPEC) == expected, \
+                f"{op_type}.{key}: 派生 {_derived_value(TOP_AXIS_FIELD_STEMS, key, _SPEC)}，表 {expected}"
+            cells += 1
+
+    for op_type, phases in PHASE_TABLE.items():
+        for phase in range(len(phases)):
+            # 带上组宽：它也是派生出来的一格（规格的一部分），不是常量。
+            for key, expected in phase_fields(
+                    op_type, phase, group_size=_SPEC.group_size).items():
+                if key.split("_phase_")[0] not in PHASE_AXIS_FIELD_STEMS:
+                    continue
+                derived = _derived_value(PHASE_AXIS_FIELD_STEMS, key, _SPEC)
+                assert derived == expected, \
+                    f"{op_type} p{phase} {key}: 派生 {derived}，表 {expected}"
+                cells += 1
+
+    # 逐槽 fpsu_0/1_* 不进派生表（与 DQ 分组无关），覆盖从 86 降到 78。
+    assert cells == 78, f"派生覆盖 {cells} 格，实测 78 格"
+
+
+def test_axes_follow_the_spec_not_the_table() -> None:
+    """派生跟着规格走，不是查表：规格一变，三族跟着变。
+
+    表里只有**一种**规格的值（全图只有一种量化配置），所以「查表能跑通」现在
+    成立；这条测试钉住的是升级的理由——换了组宽或换成逐通道，查表会给错值且
+    不报错，派生则会跟着变。
+    """
+    per_group = QuantLayout("per_group", group_size=1024, axis=-1)
+    assert derive_hardware_axes(per_group, "pooling") == \
+        HardwareAxes(True, 2, True, 3, 1024)
+    assert derive_hardware_axes(per_group, "kantor_a") == \
+        HardwareAxes(True, 2, True, 3, 1024)
+    # FPSU 不做分组归约：规格是逐组，它也只在逐通道那一位上置位。
+    assert derive_hardware_axes(per_group, "fpsu") == \
+        HardwareAxes(True, 1, False, -1, -1)
+
+    # 逐通道：spg 不置位，组宽与 spg 轴写 -1。
+    per_channel = QuantLayout("per_channel", axis=-1)
+    assert derive_hardware_axes(per_channel, "pooling") == \
+        HardwareAxes(True, 2, False, -1, -1)
+
+    # 逐张量：连 spc 都不置位（单元不按通道取值）。
+    assert derive_hardware_axes(QuantLayout("per_tensor"), "fpsu").spc is False
+
+    with pytest.raises(ValueError, match="未知硬件块"):
+        derive_hardware_axes(per_channel, "nmu")
+
+    # 组宽也来自规格：1024 落到池化与 Kantor A 两处，而不是表里的缺省。
+    fields = phase_fields("DynamicScaling", 0, spec=per_group)
+    assert fields["global_pooling_group_size_phase_0"] == 1024
+    fields = phase_fields("DynamicScaling", 3, spec=per_group)
+    assert fields["kantor_A_spg_group_size_phase_3"] == 1024
+
+
+@pytest.mark.parametrize("op_type", sorted(TOP_LEVEL))
+def test_top_level_axes_with_a_spec_match_the_reference(op_type, nodes) -> None:
+    """走派生路径发出来的顶层 spc/spg 也要与参考产物逐格相同。"""
+    table = _hardware_values(nodes)
+    if op_type not in table:
+        pytest.skip(f"参考产物里没有 {op_type}")
+
+    emitted = top_level_fields(op_type, spec=_SPEC)
+    derived_keys = [key for key in emitted if key in TOP_AXIS_FIELD_STEMS]
+    for key in derived_keys:
+        assert key in table[op_type], f"{op_type} 的 {key} 在参考产物里不存在"
+        assert table[op_type][key] == {str(emitted[key])}, \
+            f"{op_type}.{key}: 派生 {emitted[key]}，实物 {sorted(table[op_type][key])}"
+
+
+@pytest.mark.parametrize("op_type", sorted(PHASE_TABLE))
+def test_phase_axes_with_a_spec_match_the_reference(op_type, nodes) -> None:
+    """走派生路径发出来的相位 spc/spg 也要与参考产物逐格相同。
+
+    只比轴与标志（派生覆盖的那些键）：组宽按节点变化（128 与 1024 两种），
+    有自己的解，见 `_NODE_DEPENDENT`。
+    """
+    table = _hardware_values(nodes)
+    if op_type not in table:
+        pytest.skip(f"参考产物里没有 {op_type}")
+
+    for phase in range(len(PHASE_TABLE[op_type])):
+        emitted = phase_fields(op_type, phase, spec=_SPEC)
+        for key, value in emitted.items():
+            if key.split("_phase_")[0] not in PHASE_AXIS_FIELD_STEMS:
+                continue
+            if key.endswith("group_size_phase_%d" % phase):
+                continue
+            assert key in table[op_type], f"{op_type} 的 {key} 在参考产物里不存在"
+            assert table[op_type][key] == {str(value)}, \
+                f"{op_type}.{key}: 派生 {value}，实物 {sorted(table[op_type][key])}"
+
+
+def test_rope_and_eltwise_kantor_axes_are_not_derived() -> None:
+    """RoPE 子块与逐元素乘的 Kantor 轴**不**进派生表。
+
+    它们是各块操作数自己的定标轴（A/B 各一套、轴 1），与 DQ 的分组决策无关；
+    实测 Kantor A 在 DQ 的 p3 是轴 2、在逐元素乘是轴 1，混起来会静默发错值。
+    """
+    eltwise = top_level_fields("EltwiseMul", spec=_SPEC)
+    assert eltwise["kantor_A_scale_axis"] == 1
+    assert eltwise["kantor_A_spg"] == 0
+    assert eltwise["kantor_B_scale_axis"] == 1
+
+    rope = rope_fields()
+    assert rope["fpsu_1_spc_Llama2Activation_Add_Cos"] == 1
+    assert rope["fpsu_1_spg_axis_Llama2Activation_Add_Cos"] == -1
+    # 派生表里没有它们，所以 `_apply_axes` 一动也不动。
+    derived = [key for key in eltwise if key in TOP_AXIS_FIELD_STEMS]
+    assert not derived, f"逐槽/逐操作数轴不该进派生表: {derived}"
+    assert not [key for key in rope if key.split("_phase_")[0]
+                in PHASE_AXIS_FIELD_STEMS]
 
 
 def test_top_level_rejects_unknown_op() -> None:

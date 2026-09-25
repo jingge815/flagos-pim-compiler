@@ -33,7 +33,7 @@ from graph.spec_prop import (
     llama_shard_config,
     propagate_specs,
 )
-from graph.strategy import ShardStrategy
+from graph.strategy import ShardStrategy, llama_strategy
 from tests.test_partition import _export_random_llama
 
 REPLICATE = Placement("Replicate")
@@ -198,11 +198,19 @@ def test_keyword_operand_edges_materialize_endpoint_specs() -> None:
 
 
 def test_replicate_dpu_to_host_is_degenerate_all_gather_from_smallest_dpu() -> None:
-    """验证复制布局从编号最小的 DPU 向主机生成单次全量传输。"""
+    """验证复制布局从编号最小的 DPU 向主机生成单次全量传输。
+
+    主机侧消费者要用**真正**留主机的算子。`neg` 不行：RoPE 的旋转半区要它，
+    它是设备算子。`slice` 可以：它的实参是 (dim, start, end) 描述的子区间，
+    命令编码不了，所以它留主机（`view` 同样留主机，但换成 `slice` 更能说明
+    「留主机」的理由是实参形态，不是「布局算子都留主机」）。
+    """
     graph = Graph()
     x = graph.placeholder("x")
     dpu_tanh = graph.call_function(torch.ops.aten.tanh.default, (x,))
-    host_neg = graph.call_function(torch.ops.aten.neg.default, (dpu_tanh,))
+    # 主机断点要用**真正**留主机的算子：`slice` 已下设备，改用脚手架。
+    host_neg = graph.call_function(
+        torch.ops.aten._assert_tensor_metadata.default, (dpu_tanh,))
     graph.output(host_neg)
     gm = GraphModule(torch.nn.Module(), graph)
     for node in (x, dpu_tanh, host_neg):
@@ -384,7 +392,9 @@ def test_tiny_llama_weight_initial_sharding() -> None:
         if "layernorm" in target:
             assert spec.placement == REPLICATE and spec.device == DEVICE_DPU, target
         if "embed_tokens" in target:
-            assert spec.device == DEVICE_HOST, target
+            # 建表权重随 embedding 一起下了设备：查表是设备算子，表就得在设备上。
+            assert spec.device == DEVICE_DPU, target
+            assert spec.placement == REPLICATE, target
     # 每个 DPU 对应一个注意力头。
     q_weight = by_name["model_model_layers_0_self_attn_q_proj_weight"].meta[SPEC_META_KEY]
     assert q_weight.shard_map[0].local_shape == (16, 64)
@@ -421,7 +431,9 @@ def test_tiny_llama_propagation_structure() -> None:
 
     # 每层包含两次 all_reduce。
     assert sum(e.type == "all_reduce" for e in edges) == 2
-    assert {e.type for e in edges} <= {"all_reduce", "all_gather", "scatter"}
+    # 视图族下设备后允许 `local_slice`（Replicate → Shard 的 DPU 内切分）。
+    assert {e.type for e in edges} <= {
+        "all_reduce", "all_gather", "scatter", "local_slice"}
     # 常驻权重不参与重分布。
     for edge in edges:
         assert by_name[edge.src].op != "get_attr"
@@ -465,3 +477,45 @@ def test_linear_weight_must_be_configured() -> None:
     partition_graph(gm)
     with pytest.raises(ValueError, match="w2"):
         propagate_specs(gm, ShardStrategy(name="a", num_dpus=2, weight_rules=(("w1", "col"),)))
+
+
+def _split_head_llama() -> tuple[GraphModule, ShardStrategy]:
+    """拆头之后的 tiny llama 图 —— 注意力被展成逐头的 matmul + softmax。
+
+    这是 `runtime.compile` 真实走的形态：先 `split_attention_heads`，
+    再标注、切分。用夹具默认那套维度，与 `test_placement_export` 一致。
+    """
+    from graph.split_heads import split_attention_heads
+    from tests.test_placement_export import annotated_tiny_llama
+
+    gm = annotated_tiny_llama.__wrapped__()
+    split_attention_heads(gm)
+    partition_graph(gm)
+    strategy = llama_strategy(
+        2, num_stages=1, num_heads=4, num_kv_heads=4,
+        intermediate_size=176, vocab_size=32000, num_layers=1,
+    )
+    return gm, strategy
+
+
+def test_split_head_graph_has_rules_for_every_device_op() -> None:
+    """拆头之后每个设备侧算子都要有切分规则，不能卡在「缺少切分规则」。
+
+    拆头把注意力展成 `aten.matmul` 与 `aten._softmax`（每头一次），这两个
+    原本不在 RULE_TABLE 里。缺规则的后果不是退回主机，而是整条编译**直接失败**
+    ——规则表里没有、`HOST_ONLY` 里也没有，`propagate_specs` 当场抛。
+    """
+    gm, strategy = _split_head_llama()
+    edges = propagate_specs(gm, strategy)  # 缺规则会在这里抛
+
+    # 注意力那两个矩阵乘与 softmax 必须真的被判成设备节点并拿到布局。
+    from graph.spec_prop import SPEC_META_KEY
+
+    matmul_nodes = [n for n in gm.graph.nodes if str(n.target).endswith("matmul.default")]
+    softmax_nodes = [n for n in gm.graph.nodes if str(n.target).endswith("_softmax.default")]
+    assert matmul_nodes and softmax_nodes, "拆头图里没有 matmul/softmax，夹具变了"
+    for node in matmul_nodes + softmax_nodes:
+        spec = node.meta.get(SPEC_META_KEY)
+        assert spec is not None, f"{node.name} 没有拿到布局规格"
+        assert spec.device == "dpu", f"{node.name} 落到了 {spec.device}"
+    assert edges is not None

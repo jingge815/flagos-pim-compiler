@@ -24,9 +24,10 @@ from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import kv_specs_from_placement
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime import kernels as kernels_mod
+from runtime.kernels import sdpa_kv_info
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, execute_plan, make_sdpa_handler
+from runtime.executor import DecodeState, execute_plan
 from tests.test_partition import _FixedMaskLlama
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -88,14 +89,14 @@ def llama2_instrumented_run():
     state = DecodeState(valid_len=0)
     sdpa_layer = sdpa_layer_map(gm)
 
-    def host_handler_of(node):
-        if "scaled_dot_product_attention" in str(node.target):
-            return make_sdpa_handler(sdpa_layer[node.name], kv_specs, state, np.dtype(np.float16))
-        return None
+    def sdpa_info_of(node):
+        if "scaled_dot_product_attention" not in str(node.target):
+            return None
+        return sdpa_kv_info(node, kv_specs, sdpa_layer, np.dtype(np.float16))
 
     compiled = build_execution_plan(
         nodes, gm, entries_by_id, pending, hardware=hardware,
-        host_handler_of=host_handler_of,
+        sdpa_info_of=sdpa_info_of,
     )
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))
@@ -114,8 +115,9 @@ def llama2_instrumented_run():
                 intervals.append((cmd.id, dpu_id, t0, t1))
         return wrapped
 
-    for name, fn in kernels_mod._KERNELS.items():
-        backend.register_kernel(name, wrap(fn))
+    # `_KERNELS` 的值是 `KernelEntry`，真正的可调用体在 `.mirror` 上。
+    for name, entry in kernels_mod._KERNELS.items():
+        backend.register_kernel(name, wrap(entry.mirror))
 
     write_weight_shards(gm, plans, backend)
 

@@ -235,14 +235,20 @@ def test_scatter_to_replicate_degenerates_to_broadcast() -> None:
     assert [(s.global_range, s.dst_dpu) for s in entry.segments] == [((0, 4), 0), ((0, 4), 1)]
 
 
-def test_local_slice_keeps_empty_placeholder_entry() -> None:
+def test_local_slice_copies_each_dpu_shard_from_its_replica() -> None:
+    """Replicate → Shard：每台 DPU 从自己那份完整副本切出属于自己的那段。"""
     shape = (4,)
     src = _dpu_spec(REPLICATE, shape, (0, 1))
     dst = _dpu_spec(Placement("Shard", 0), shape, (0, 1))
     (entry,) = build_comm_plan([_edge(7, "local_slice", src, dst, shape)])
 
-    assert entry.type == "local_slice" and entry.segments == []
-    assert dma_sequence(entry) == []
+    assert entry.type == "local_slice"
+    assert [(s.src_dpu, s.global_range, s.dst_dpu, s.dst_local_offset)
+            for s in entry.segments] == [
+        (0, (0, 2), 0, 0),
+        (1, (2, 4), 1, 0),
+    ]
+    assert dma_sequence(entry) == []  # 不走主机总线
 
 
 # DMA 序列和接口成本。

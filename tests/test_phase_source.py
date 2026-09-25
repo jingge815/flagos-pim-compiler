@@ -128,7 +128,19 @@ def phase_source_of_real_graph():
 
 
 @requires_live
-def test_real_graph_cross_checks_clean(phase_source_of_real_graph) -> None:
+def test_rms_norm_vpu_params_come_from_the_opcompiler(
+        phase_source_of_real_graph) -> None:
+    """RMSNorm 的向量单元参数必须能从算子编译器读回。
+
+    读不回就说明 `Vpu_Axis` / `Use_Scaling` 仍由图编译器写死，算子编译器
+    改了值 GML 也不会变。
+    """
+    source = phase_source_of_real_graph
+    norms = [op for op in source.ops if op.kind == "normalize"]
+    assert norms, "一层里应当有 RMSNorm"
+    for op in norms:
+        assert source.op_value(op.fx_name, "normalize", "vpu-axis") == -1
+        assert source.op_value(op.fx_name, "normalize", "use-scaling") == 0
     """真实图上算子编译器与静态表一致，一处不符都没有。"""
     assert cross_check(phase_source_of_real_graph) == []
 
@@ -178,3 +190,60 @@ def test_rope_node_with_dq_carries_two_plans(phase_source_of_real_graph) -> None
     kinds = source.by_node[both[0]]
     assert kinds["rope"].count == 3
     assert kinds["dq"].count == 4
+
+
+def test_rtl_version_comes_from_the_module_attribute() -> None:
+    """`rtl_version` 的真源是 IR 的模块属性，不是本仓常量。
+
+    评审九轮问题 8：`pim.rtl-version` 在 FlagTree 侧定义了、进了白名单、有
+    正反 lit 用例，但编译器仓没有任何读者——`from_fx` 仍写 `hw_table.RTL_VERSION`。
+    属性存在却没人读，等于没有迁移。
+    """
+    from opcompiler_bridge.phase_source import rtl_version_of
+
+    text = ('module attributes {pim.target = "pim:v1", '
+            'pim.rtl-version = "1.4"} { }')
+    assert rtl_version_of(text) == "1.4"
+
+
+def test_missing_module_attribute_is_reported() -> None:
+    """模块属性缺失要能分辨，不能静默退回常量。"""
+    from opcompiler_bridge.phase_source import rtl_version_of
+
+    assert rtl_version_of('module attributes {pim.target = "pim:v1"} { }') is None
+
+
+def test_cross_check_compares_phase_numbers_against_the_static_table() -> None:
+    """相位上的具体数字也要比，不能只比相位数。
+
+    之前 `cross_check` 只拦「蒸发成 None」，不跟常量表比数值：算子编译器把
+    DQ 相 1 的 flp 窗口从 10/17/3 改成别的，GML 一个字节不变、两边都不报错。
+    """
+    from contracts.gml_hw_constants import DQ_PHASES
+
+    want = DQ_PHASES[1]
+    phases = []
+    for i in range(4):
+        kw = {"kind": "absmax"} if i == 0 else {}
+        if i == 1:
+            kw.update(flp_min=int(want["flp_min_exp"]) + 1,
+                      flp_max=int(want["flp_max_exp"]),
+                      flp_mantisa=int(want["flp_mantisa"]))
+        phases.append(Phase(index=i, op="pim.lut" if i == 1 else "",
+                            unit="", bytes=0, **kw))
+    source = PhaseSource(by_node={
+        "dq0": {"dq": PhasePlan(func="dq0__dq", phases=phases)}})
+    fields = [m.field for m in cross_check(source)]
+    assert "phase1.flp_min" in fields, f"数值偏差没被拦住：{fields}"
+
+
+def test_rtl_version_with_a_dash_in_the_name_is_still_read() -> None:
+    """属性名带引号（`pim.rtl-version` 含连字符）也要读到。
+
+    正则按空白切会在连字符处失手；结构化解析按 module 属性字典取。
+    """
+    from opcompiler_bridge.phase_source import rtl_version_of
+
+    text = ('module attributes {"pim.rtl-version" = "1.4", '
+            'pim.target = "pim:v1"} { }')
+    assert rtl_version_of(text) == "1.4"

@@ -23,8 +23,8 @@ from memory.kv_layout import kv_specs_from_placement
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, make_sdpa_handler, run_decode_loop
-from runtime.kernels import register_all
+from runtime.executor import DecodeState, run_decode_loop
+from runtime.kernels import register_all, sdpa_kv_info
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
@@ -121,22 +121,23 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     state = DecodeState(valid_len=0)
 
 
-    def make_host_handler(layer_map):
-        def host_handler_of(node):
-            if "scaled_dot_product_attention" in str(node.target):
-                return make_sdpa_handler(layer_map[node.name], kv_specs, state, np.dtype(np.float16))
-            return None
-        return host_handler_of
+    def sdpa_info_for(gm):
+        layer_map = sdpa_layer_map(gm)
+
+        def sdpa_info_of(node):
+            if "scaled_dot_product_attention" not in str(node.target):
+                return None
+            return sdpa_kv_info(node, kv_specs, layer_map, np.dtype(np.float16))
+
+        return sdpa_info_of
 
     prefill_compiled = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
-        hardware=hardware,
-        host_handler_of=make_host_handler(sdpa_layer_map(prefill_gm)),
+        hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gm),
     )
     decode_compiled = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
-        hardware=hardware,
-        host_handler_of=make_host_handler(sdpa_layer_map(decode_gm)),
+        hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
     )
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes))

@@ -90,8 +90,26 @@ def test_weight_initial_sharding_and_dpu_mapping(annotated_llama2) -> None:
             assert spec.placement == Placement("Shard", 1), target
         elif "layernorm" in target or target.endswith("norm.weight"):
             assert spec.placement == REPLICATE and spec.device == DEVICE_DPU, target
-        elif "embed_tokens" in target or "inv_freq" in target:
-            assert spec.device == DEVICE_HOST, target
+        elif "embed_tokens" in target:
+            # 建表权重随 embedding 一起下了设备：查表是设备算子，表就得在设备上。
+            assert spec.device == DEVICE_DPU, target
+            assert spec.placement == REPLICATE, target
+            continue
+        elif "inv_freq" in target:
+            # 位置编码的频率常量：落点跟着**直接消费者**走。
+            #
+            # `_weight_spec` 只看直接消费者（`dpu_users`）：消费者全是主机脚手架
+            # （导出的包装 `wrap_with_set_grad_enabled` 与 `getitem`）就留主机，
+            # 有设备消费者就下设备。这里断言**那条规则**而不是某个固定答案——
+            # 同一个模块在不同跑法下导出的图不同：前面若有算子编译用例
+            # （`compile_op` → `opcompiler_bridge.cpu_host` 会 `import flag_gems`），
+            # flag_gems 在进程级替换 aten 实现，之后 `torch.export` 追出的是另一张图，
+            # inv_freq 的直接消费者也就跟着变。钉固定值会让这条判据时绿时红。
+            dpu_users = [
+                u for u in node.users
+                if u.meta.get(DEVICE_META_KEY) == DEVICE_DPU
+            ]
+            assert spec.device == (DEVICE_DPU if dpu_users else DEVICE_HOST), target
             continue
         if spec.placement.kind != "Shard":
             continue
@@ -131,7 +149,11 @@ def test_megatron_pattern_holds_for_all_32_layers(annotated_llama2) -> None:
         assert act.meta[SPEC_META_KEY].placement == Placement("Shard", 2)
         assert all(e.src != act.name for e in down_linear.meta[REDISTRIBUTE_META_KEY])
     assert sum(e.type == "all_reduce" for e in edges) == 2 * cfg.num_hidden_layers
-    assert {e.type for e in edges} <= {"all_reduce", "all_gather", "scatter"}
+    # `local_slice` 是 Replicate → Shard 的 **DPU 内**切分（不走主机、不发
+    # DMA）：视图族与 embedding 下设备后，它们的输出是完整副本，而下游的
+    # 线性层要分片，那条边由它承担。它没有出现在主机上，正是要的东西。
+    assert {e.type for e in edges} <= {
+        "all_reduce", "all_gather", "scatter", "local_slice"}
 
 
 def test_redistribute_edges_well_formed_and_weights_never_moved(annotated_llama2) -> None:

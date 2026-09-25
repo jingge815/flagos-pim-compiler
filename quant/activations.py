@@ -1,23 +1,16 @@
 """把 f32 激活量化成 GML 要的 int8 + per-group scale。
 
-**动态量化的四相公式已完整反推并逐元素验证**（见
-docs/gml-parser-output-plan-20260917.md §1.2），所以 scale 的定法不是猜的：
+**数值公式的真源是 `gml_bridge.phase_data.dynamic_scaling`**，本模块只做包装：
+`values` 就是它的 `phase3`，`scales` 就是它的 `phase1`（即 `output_sf`）。
+方案 §9.7 要求同一套公式只留一处，本模块原先那份已删。
 
-    p0[g]  = 2 * absmax[g]            # 硬件 Pooling 块算对称 DR 后左移 1 位
-    sf[g]  = p0[g] / 256              # == output_sf，实测 32/32 组逐字节吻合
-           = absmax[g] / 128          # 等价形式：absmax 映射到 int8 满量程 128
-    q[i]   = clamp(round(x[i] / sf[g]), -128, 127)
+参考量（不参与数值生成，只用于核对参考产物）：
 
-两条关键修正（原实现两处都错）：
-
-- **分母是 128 不是 127**：实测 `output_sf == absmax/128` 在 32/32 组成立，
-  且 int8 用满 `[-128, 127]` 全域。
-- **粒度是 per-group（group_size=128）不是 per-tensor**：实测
-  `output_sf_12` 有 32 个 scale（4096/128）、`output_sf_193` 有 86 个（11008/128）。
-  按 per-tensor 只写 2 字节，而实际需要 64 / 172 字节。
-
-attention scores 那 32 个节点是整条当一组（group_size = numel），
-所以 per-tensor 是 per-group 的一个特例，用 `group_size=None` 表示。
+- 粒度是 per-group（group_size=128）不是 per-tensor：实测 `output_sf_12` 有
+  32 个 scale（4096/128）、`output_sf_193` 有 86 个（11008/128）。按 per-tensor
+  只写 2 字节，而实际需要 64 / 172 字节。
+- attention scores 那 32 个节点是整条当一组（group_size = numel），
+  所以 per-tensor 是 per-group 的一个特例，用 `group_size=None` 表示。
 """
 
 from __future__ import annotations
@@ -28,12 +21,8 @@ import numpy as np
 
 # 值域与「定 scale 用的满量程分母」不是同一个数：clamp 到 [-128, 127]，
 # 但分母取 128（absmax 映射到 128，正端那一个值会 clamp 成 127）。
-from contracts.gml_quant import (
-    INT8_MAX,
-    INT8_MIN,
-    INT8_SCALE_DIVISOR,
-    WEIGHT_GROUP_SIZE,
-)
+from contracts.gml_quant import INT8_MAX, INT8_MIN, WEIGHT_GROUP_SIZE
+from gml_bridge import phase_data
 
 
 @dataclass
@@ -78,12 +67,19 @@ def quantize_activation(
 ) -> QuantizedActivation:
     """按 per-group 对称量化一个激活张量。
 
+    **公式转调 `gml_bridge.phase_data.dynamic_scaling`**，不在本模块里另写一份。
+    本模块原先是第二份实现（`scale = absmax/128` 再取商），与真源**取整顺序
+    不同**——真源先把 `1/(2·absmax)` 截到 fp16 再乘 256，实测同一输入
+    23/4096 处差 1。两份公式并存时改了其中一份，另一份会在对拍里冒充真值，
+    所以按方案 §9.7「真源只有一处」只留 `phase_data` 这一份。
+
+    本模块保留的是**包装**：`QuantizedActivation` 的 `dequantize` /
+    `saturation_ratio` / `quantization_error` 是分析参考产物用的量，不参与
+    数值生成。
+
     `group_size=None` 表示整条当一组（attention scores 的情形）。
     元素数必须能被 `group_size` 整除——不能整除就抛，静默补零会让 scale 与
     数据错位，而这种错在结构校验里看不出来。
-
-    全零组的 scale 取 1 而不是 0——除以 0 会产出 nan，而全零激活量化后本就
-    该是全零。
     """
     flat = np.ascontiguousarray(activation, dtype=np.float32).ravel()
     width = flat.size if group_size is None else group_size
@@ -91,19 +87,9 @@ def quantize_activation(
         raise ValueError(
             f"激活有 {flat.size} 个元素，不能被 group_size {width} 整除")
 
-    grouped = flat.reshape(-1, width)
-    peak = np.abs(grouped).max(axis=1)
-    scales = np.where(
-        peak > 0, peak / INT8_SCALE_DIVISOR, 1.0).astype(np.float16)
-
-    # fp16 的 scale 可能舍入成 0（peak 极小时），那样反量化会全零。
-    scales = np.where(
-        scales.astype(np.float32) == 0.0,
-        np.float16(np.finfo(np.float16).tiny), scales).astype(np.float16)
-
-    quantized = np.rint(grouped / scales.astype(np.float32)[:, None])
-    values = np.clip(quantized, INT8_MIN, INT8_MAX).astype(np.int8)
-    return QuantizedActivation(values.ravel(), scales, width)
+    phases = phase_data.dynamic_scaling(flat, group_size=group_size)
+    return QuantizedActivation(phases.phase3.reshape(-1).copy(),
+                               phases.phase1.copy(), width)
 
 
 def quantization_error(

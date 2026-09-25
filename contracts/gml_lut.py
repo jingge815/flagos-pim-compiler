@@ -149,3 +149,23 @@ def decode_reciprocal(value: float, table: bytes) -> float:
     segment = mantissa_bits >> 5
     mantissa = 1.0 + mantissa_bits / 1024.0
     return (slopes[segment] * mantissa + intercepts[segment]) * 2.0 ** (15 - exponent)
+
+
+def eval_lut(value: float, table: bytes, lo: float, hi: float) -> float:
+    """用一张衰减型分段线性表求值：`y = A[i]*x + B[i]`。
+
+    段 0 承担「饱和到 0」，有效段均匀覆盖 `[lo, hi)`，域外饱和到两端。
+    这是 `synth_decaying` 的逆：SiLU 与 exp 都按这个定域合成，求值必须用
+    同一份定域，否则段索引对不上。
+    """
+    entries = struct.unpack("<" + "e" * LUT_ENTRY_COUNT, table)
+    slopes, intercepts = entries[0:LUT_SEGMENTS], entries[LUT_SEGMENTS:2 * LUT_SEGMENTS]
+    segments = LUT_USABLE_SEGMENTS - 1
+    if value <= lo:
+        index = 0
+    elif value >= hi:
+        index = segments
+    else:
+        index = 1 + int((value - lo) / (hi - lo) * segments)
+        index = min(index, segments)
+    return slopes[index] * value + intercepts[index]

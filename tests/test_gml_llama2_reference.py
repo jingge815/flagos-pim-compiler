@@ -208,3 +208,38 @@ def test_rope_is_a_fused_multi_stage_node(graph) -> None:
     # cos 与 sin 两路各有自己的定标。
     assert "Llama2Activation_Add_Cos" in body
     assert "Llama2Activation_Add_Sin" in body
+
+
+
+def test_reference_edge_dims_are_decode_slots(graph) -> None:
+    """参考 decode block 的边形状：token 轴恒为 1，1024 只属于 KV 长度轴。
+
+    我方导出必须对上这份分布。把导出 seq_len 换成 slots.seq 会把 hidden
+    写成 `1x1024x4096`，对参考差 120 条。
+    """
+    import collections
+    import re
+
+    _, _, edges = graph
+    dims = []
+    for block in edges:
+        m = re.search(r'dims "([^"]*)"', block)
+        assert m, block[:80]
+        dims.append(m.group(1))
+    got = collections.Counter(dims)
+    expected = {
+        "1x1x1x1024": 160,
+        "1x1x1x128": 68,
+        "1x1x128x1024": 32,
+        "1x1x1024x128": 32,
+        "1x1x1x4096": 19,
+        "1x32x1024x128": 6,
+        "1x32x1x128": 4,
+        "1x1x1x11008": 4,
+        "1x1x32x128": 3,
+        "3x1x32x1": 2,
+        "1x32x128x1024": 1,
+    }
+    assert got == expected, f"参考边 dims 变了: {dict(got)}"
+    assert all("16" not in d.split("x") for d in dims)
+    assert "unknown" not in dims

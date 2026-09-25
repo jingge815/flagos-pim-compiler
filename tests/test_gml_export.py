@@ -209,6 +209,70 @@ def test_llama2_specific_nodes_are_emitted(artifact) -> None:
     assert 'op_type "RMSNorm_vpu"' in artifact.text
     assert 'op_type "Silu"' in artifact.text
 
+
+def test_shared_mask_buffer_is_flagged(artifact) -> None:
+    """`is_mask` 挂在**缓冲节点**上，不挂在 32 个 Mask 算子上。
+
+    实测参考产物里该标志只有 1 处，就在掩码张量的图入口（与 `is_buffer 1`
+    同一节点），扇出给全部头。它描述的是这块缓冲是掩码张量这个来源事实，
+    不是某个算子的配置——挂到每个 Mask 算子上会多发 31 处参考产物里没有的
+    字段。
+    """
+    assert artifact.text.count("is_mask 1") == 1
+    flagged = [b for b in parse_blocks(artifact.text, "node") if "is_mask 1" in b]
+    assert len(flagged) == 1
+    assert "is_buffer 1" in flagged[0]
+
+
+
+def test_every_weight_buffer_carries_a_hash_of_its_bytes(graph_and_artifact, tmp_path) -> None:
+    """带 `weight_buffer` 的节点必须写指纹，且等于盘上字节的 sha256。
+
+    占位（全零）也写——字段是按节点必填的。占位内容本轮按形状补零，
+    下游不得当真实权值用；这条只钉「声明与写出一致」。
+    """
+    from gml_bridge.export import fill_weight_hashes, write_runtime_files
+    import hashlib
+
+    gm, artifact = graph_and_artifact
+    files = write_runtime_files(artifact, tmp_path, gm=gm)
+    fill_weight_hashes(artifact, files)
+
+    hashed = 0
+    for node in artifact.nodes:
+        name = node.fields.get("weight_buffer")
+        if not isinstance(name, str):
+            continue
+        path = tmp_path / name
+        payload = path.read_bytes()
+        digest = node.fields.get("weight_buffer_hash")
+        assert isinstance(digest, str), f"{name} 必须有 hash"
+        assert digest == hashlib.sha256(payload).hexdigest()
+        hashed += 1
+    assert hashed > 0, "这张图上没有权值缓冲，这条判据失去意义"
+
+
+def test_every_softmax_node_carries_the_phase_data_extensions(artifact) -> None:
+    """Softmax 五相各自声明进出的数据通道。
+
+    这一族曾经**整族缺失**：`_SOFTMAX_COMMON` 没声明这两个键，于是 32 个
+    Softmax 节点一条都没有，而参考产物每个节点有 10 条（5 进 5 出，全为 3）。
+    缺一族不会报错——dtype 自检只看节点级的三个 `*_buffer_dtype`，相位级的
+    缺席它看不见，所以只能靠这条钉住。
+
+    五相进出都在 fp16 域（exp 表、求和、取倒数、乘回），所以都是 3
+    （`data_extension` 是 dtype 的编码：float16→3、int8→1）。
+    """
+    softmax = [b for b in parse_blocks(artifact.text, "node")
+               if 'op_type "Softmax"' in b]
+    assert softmax, "这张图上没有 Softmax 节点"
+
+    for block in softmax:
+        for n in range(5):
+            for direction in ("input", "output"):
+                key = f"{direction}_data_extensions_phase_{n}"
+                assert f"{key} 3" in block, f"Softmax 节点缺 {key}"
+
 def test_gml_and_runtime_files_agree(graph_and_artifact, tmp_path) -> None:
     """端到端闭环：GML 引用的每个名字都要在磁盘上真实存在，反之亦然。
 
@@ -311,3 +375,91 @@ def test_weights_are_quantized_and_written(graph_and_artifact, tmp_path) -> None
 
         # scale 不能有 nan——全零组会踩到除零。
         assert not np.isnan(scales).any()
+
+
+def test_fused_activation_block_is_named_after_the_activation(artifact) -> None:
+    """contraction 块按**激活**命名，不按 FX 节点名，且 `residual_input_buffer`
+    自指。
+
+    实测参考产物（节点 195）：
+
+        fused_Silu_act [
+          name "Silu_act"
+          op_type "Lut"
+          activation_op_type "Silu"
+          residual_input_buffer 195      ← 本节点自己的编号
+        ]
+
+    按 FX 节点名会写成 `fused_linear_4_activation`——同一个融合，对方解析器按块名
+    找不到，是个静默失配。折进来的激活读的是主算子的累加结果，那块缓冲属于主算子，
+    所以编号指回自己。
+
+    FlagTree 侧 `#pim.contraction<form = named, blockName = ...>` 是同一份口径，
+    两侧必须一致。
+    """
+    import re
+
+    blocks = [b for b in parse_blocks(artifact.text, "node")
+              if "fused_Silu_act" in b]
+    assert blocks, "gate 投影上应当有一个折进去的 SiLU"
+
+    for block in blocks:
+        assert 'name "Silu_act"' in block
+        assert 'activation_op_type "Silu"' in block
+        # 只看嵌套块内那一条：节点顶层也有个同名字段（输入边），不是这一条。
+        inner = block[block.index("fused_Silu_act"):]
+        match = re.search(r"residual_input_buffer (\d+)", inner)
+        assert match, "嵌套块要带 residual_input_buffer"
+        node_id = re.search(r"node_id (\d+)", block).group(1)
+        assert match.group(1) == node_id, (
+            f"嵌套块的 residual_input_buffer 应当指向本节点 {node_id}，"
+            f"实际 {match.group(1)}")
+
+    # 不能再出现按 FX 节点名的旧块名。
+    assert "_activation [" not in artifact.text
+
+
+
+def test_runtime_files_include_io_info(graph_and_artifact, tmp_path) -> None:
+    """图级 I/O 清单必须落盘。参考产物有 IO_info.txt，本仓一度完全不产。"""
+    gm, artifact = graph_and_artifact
+    out_dir = tmp_path / "out"
+    write_runtime_files(artifact, out_dir, gm=gm)
+    path = out_dir / "IO_info.txt"
+    assert path.is_file(), "IO_info.txt 必须落盘"
+    payload = path.read_text()
+    assert "inputs" in payload and "outputs" in payload
+
+
+def test_k_path_split_input_is_transposed_cache_plane() -> None:
+    """K 路 Split 的输入边必须是 Kᵀ 平面 `1x32x128x1024`，不能是未转置的缓存。
+
+    参考：KV_Cache_DMA → Transpose → Split，入边 `1x32x128x1024`。
+    我方把转置折进 Split 时，入边曾是 `1x32x1024x128`。元素数相同，
+    尺寸检查看不见。这条比的是产物上那条边的 dims。
+    """
+    from genesim_bridge.paths import gml_llama2_reference_dir
+    from scripts.gml_structure_check import field
+
+    ref_dir = gml_llama2_reference_dir(required=False)
+    if ref_dir is None or not (ref_dir / "relay2gml_graph.gml").is_file():
+        pytest.skip("缺少 llama2 GML 参考产物")
+    ours_path = Path("/tmp/rev_db16/relay2gml_graph.gml")
+    if not ours_path.is_file():
+        pytest.skip("没有现成的 decode-block 导出，跳过产物对拍")
+
+    def k_split_in_dims(text: str) -> list[str]:
+        nodes = {field(b, "id"): field(b, "op_type") for b in parse_blocks(text, "node")}
+        dims = []
+        for b in parse_blocks(text, "edge"):
+            src, dst = field(b, "source"), field(b, "target")
+            if nodes.get(dst) == "Split" and nodes.get(src) in ("Transpose", "KV_Cache_DMA"):
+                dims.append(field(b, "dims"))
+        return dims
+
+    ref = k_split_in_dims((ref_dir / "relay2gml_graph.gml").read_text())
+    ours = k_split_in_dims(ours_path.read_text())
+    assert "1x32x128x1024" in ref, f"参考 K 路 Split 入边变了: {ref}"
+    assert "1x32x128x1024" in ours, (
+        f"K 路 Split 入边不是 Kᵀ 平面: {ours}。"
+        "元素数相同的 1x32x1024x128 不够——那是未转置的缓存平面")

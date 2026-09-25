@@ -33,7 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from contracts.op_contract import PIMHardwareConfig
 from contracts.partition_plan import PartitionPlan
 from genesim_bridge.paths import genesim_models_dir, llama2_7b_model_dir
-from genesim_bridge.placement_export import export_placement_to_genesim
+from genesim_bridge.placement_export import (
+    count_sidecar_classes,
+    export_placement_to_genesim,
+)
 from graph.strategy import (
     format_strategy,
     llama_strategy,
@@ -154,11 +157,9 @@ def main() -> None:
 
     # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。一个 GEMM 可能切在多台
     # DPU 上（TP 宽度 > 1），每台参与的 DPU 都记一次，而不是只数代表 DPU。
-    by_dpu: dict[int, int] = {}
-    for entry in sidecar["operators"].values():
-        for shard in entry["shards"]:
-            by_dpu[shard["dpu_id"]] = by_dpu.get(shard["dpu_id"], 0) + 1
-    print(f"\n放置的 GEMM 算子数: {len(sidecar['operators'])}")
+    gemm_count, bpath_count, by_dpu = count_sidecar_classes(sidecar)
+    print(f"\n放置的 GEMM 算子数: {gemm_count}")
+    print(f"带 pim mlir 的算子级节点数: {bpath_count}")
     print("每台 DPU 承担的 GEMM 分片数:")
     for dpu_id in sorted(by_dpu):
         print(f"  dpu{dpu_id}: {by_dpu[dpu_id]}")

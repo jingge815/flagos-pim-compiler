@@ -246,7 +246,38 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
         wait_for=wait_for,
     )
     if edge.type == "local_slice":
-        return entry  # 本地视图切换不需要 DMA。
+        # Replicate → Shard，两端在同一组 DPU 上：每台 DPU 从自己那份完整
+        # 副本里切出属于自己的那一段，写到目标分片缓冲。不走主机、不发 DMA。
+        if edge.src_spec.placement.kind != "Replicate":
+            raise ValueError(
+                f"edge {edge.edge_id} local_slice 的源必须是 Replicate，"
+                f"收到 {edge.src_spec.placement}")
+        if edge.dst_spec.placement.kind != "Shard":
+            raise ValueError(
+                f"edge {edge.edge_id} local_slice 的目标必须是 Shard，"
+                f"收到 {edge.dst_spec.placement}")
+        if set(edge.src_spec.shard_map) != set(edge.dst_spec.shard_map):
+            raise ValueError(
+                f"edge {edge.edge_id} local_slice 的源/目标 DPU 集必须相同")
+        segs = []
+        for dpu_id, d_detail, g, local, length in _spec_runs(edge.dst_spec):
+            s_detail = edge.src_spec.shard_map[dpu_id]
+            segs.append(
+                _segment(
+                    edge,
+                    dtype.itemsize,
+                    src_dpu=dpu_id,
+                    src_range=(g, g + length),
+                    src_base=s_detail.mram_offset,
+                    global_range=(g, g + length),
+                    dst_dpu=dpu_id,
+                    dst_offset=local,
+                    dst_base=d_detail.mram_offset,
+                )
+            )
+        _check_coverage(segs, False, numel, f"edge {edge.edge_id} local_slice")
+        entry.segments = segs
+        return entry
     if edge.type == "all_to_all":
         entry.segments = _all_to_all_segments(edge, dtype.itemsize)
         _check_coverage(entry.segments, False, numel, f"edge {edge.edge_id} all_to_all")
@@ -289,7 +320,12 @@ def _batch(segs: list[CommSegment], key) -> Iterator[list[CommSegment]]:
 
 
 def dma_sequence(entry: CommPlanEntry) -> list[DmaOp]:
-    """按收集、回写顺序生成 DMA 调用，并合并可批量传输的段。"""
+    """按收集、回写顺序生成 DMA 调用，并合并可批量传输的段。
+
+    `local_slice` 是 DPU 内拷贝，两端都在同一台 DPU 上，不走主机总线。
+    """
+    if entry.type == "local_slice":
+        return []
     ops: list[DmaOp] = []
     for group in _batch(entry.collect_segments, lambda s: (s.src_addr, s.nbytes)):
         ops.append(DmaOp("push_from" if len(group) > 1 else "copy_from", tuple(group)))

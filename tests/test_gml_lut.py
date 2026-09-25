@@ -143,17 +143,49 @@ def test_reciprocal_matches_the_hardware_reduction_output() -> None:
     """
     table = synth_reciprocal()
     reference = gml_llama2_reference_dir()
+    theirs_table = (reference / "LUT_phase_2_12.bin").read_bytes()
+
+    # 表把一个段留空是**硬件约定**，不是我们的缺口：参考那张表的第 31 段同样
+    # 是 `0/0`。落在空段上的输入表里根本没有答案，而参考产物的 phase2 给的是
+    # 真倒数——那是参考生成器算出来的，不是硬件表能产出的东西。拿它当判据，
+    # 量到的是参考数据的动态范围，不是我们的表准不准。
+    #
+    # 所以：只比表声明覆盖的段，并且**要求空段与参考表逐段一致**——我们的表若
+    # 在参考表有值的段上是空的，这条立刻失败。
+    empty_segments = {
+        segment for segment in range(LUT_SEGMENTS)
+        if struct.unpack("<" + "e" * LUT_ENTRY_COUNT, table)[segment] == 0.0
+    }
+    their_empty = {
+        segment for segment in range(LUT_SEGMENTS)
+        if struct.unpack("<" + "e" * LUT_ENTRY_COUNT, theirs_table)[segment] == 0.0
+    }
+    assert empty_segments == their_empty, (
+        f"空段与参考表不一致：我方 {sorted(empty_segments)}，"
+        f"参考 {sorted(their_empty)}")
 
     for node_id in (12, 193, 196):
         source = _read_fp16(reference / f"output_buffer_phase_0_{node_id}.bin")
         expected = _read_fp16(reference / f"output_buffer_phase_2_{node_id}.bin")
-        errors = [
-            abs(decode_reciprocal(a, table) - b) / b
-            for a, b in zip(source, expected) if a > 0 and b > 0
-        ]
+        errors, skipped = [], 0
+        for a, b in zip(source, expected):
+            if not (a > 0 and b > 0):
+                continue
+            if _segment_of(a) in empty_segments:
+                skipped += 1
+                continue
+            errors.append(abs(decode_reciprocal(a, table) - b) / b)
         assert errors, f"节点 {node_id} 没有可比对的组"
         mean = sum(errors) / len(errors)
-        assert mean < 0.002, f"节点 {node_id} 平均偏差 {mean:.5f}"
+        assert mean < 0.002, (
+            f"节点 {node_id} 平均偏差 {mean:.5f}"
+            f"（{len(errors)} 组入域，{skipped} 组落在空段上）")
+
+
+def _segment_of(value: float) -> int:
+    """一个 fp16 值查表时落在哪一段：尾数高 5 位。"""
+    bits = struct.unpack("<H", struct.pack("<e", value))[0]
+    return (bits & 0x3FF) >> 5
 
 
 def _read_fp16(path: Path) -> list[float]:

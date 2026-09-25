@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import prod
 
 
@@ -79,6 +79,25 @@ class OpCompileRequest:
     dtype: str = "float32"
     # 单台 DPU 使用的 tasklet 数。
     num_tasklets: int = 4
+    # 复用字段，含义随 `op` 变：dynamic_quant / matmul 的组宽、kv_cache 的
+    # 是否散写、split_heads 的头数、concat 的拼接轴。A 路 linear 不看它。
+    # concat 必须显式给，省略不再默认 0。
+    group_size: int | None = None
+    # 折进主算子的尾部激活（silu / relu / gelu）。None 表示不折。
+    activation: str | None = None
+    # RoPE 末相卡值：K 路写 cache 前重定标是 3，Q 路是 0。缺了展开 pass
+    # 把末相当成 0，K 路的 dq_contraction 一起消失。
+    tail_card_value: int = 0
+    # 权值次正规保护倍数，必须是 2 的幂。1 表示不补偿。
+    sf_multiplier: int = 1
+    # `eltwise` 的运算种类（`add` / `mul` / `sub`）。门控乘与 RoPE 乘都是
+    # `mul`，与残差加的 `add` 走同一个 mnemonic——没有这一位，降级侧只能
+    # 猜一个，而猜错的后果是数值全错、形状与接口都对。
+    kind: str | None = None
+    # `convert` 的目标元素类型（`float16` / `float32` / `int8`）。`dtype` 是
+    # **输入**的存储类型，换类型这件事只有这一位说得出来；原来把它写死在
+    # 降级侧，于是 f16→f32 也会被编成 f16→i8。
+    out_dtype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +105,11 @@ class OpCompileResult:
     so_path: str
     symbol: str
     argtypes: list[str]
+    # 与 `argtypes` 一一对应：这一位是不是**按值**传的标量。
+    # `pim.kv_cache` 的步计数器是唯一一例（其余都是裸指针）。空列表表示
+    # 「全是指针」，即旧产物。少了这一位，`load_kernel` 只能把标量也当成
+    # 指针塞进去，C 侧读到的就是那个地址的低 32 位——一个数当指针用。
+    by_value: list[bool] = field(default_factory=list)
     # 算子编译产出的 pim mlir 文本。GeneSim 的代价模型靠它拿到真实分块和 DMA
     # 结构（`genesim_bridge.ir_cost.analyze_ir` 负责解析），而不是沿用
     # `conf/sim.yaml` 里拍下的 `tile_size` 常量。

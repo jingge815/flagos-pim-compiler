@@ -142,6 +142,58 @@ def step_zero_pu_mapping(
     return plan_path
 
 
+def check_sidecar_entries(ops: Dict[str, Dict[str, Any]]) -> tuple[int, int]:
+    """按条目类别分流核对 sidecar，返回 (GEMM 条数, 算子级条数)。
+
+    sidecar 里两类条目的契约不同，用一套谓词查会把好的判成坏的：
+
+      GEMM（A 路）   按图切分归属到各台 DPU，所以有 `shards` / `semantic_role`
+                     / `kernel_tile_n`，pim mlir 是分块 GEMM
+      算子级（B 路）  不做张量并行切分，`shards` 是空列表、没有投影身份，
+                     pim mlir 是整算子级的相位链或单相 op
+
+    两类共有的判据只有一条：`pimir_path` 必须在。缺了就说明这个算子的原语没进
+    GeneSim，仿真会静默退回手写模板——正是本脚本要防的退化。
+    """
+    from genesim_bridge.op_classify import MNEMONIC_OF
+
+    # GEMM 条目：图切分那一段的四项证据，逐项都要在。
+    gemm_checks = {
+        "shards（图切分归属，每台参与 DPU 各一项）": lambda e: bool(e.get("shards")),
+        "shards[*].local_in/out_features（本地分片形状）": lambda e: all(
+            s.get("local_in_features") and s.get("local_out_features")
+            for s in e.get("shards", [])
+        ),
+        "semantic_role（投影身份）": lambda e: e.get("semantic_role") in _EXPECTED_ROLES,
+        "kernel_tile_n（算子编译器实测分块）": lambda e: (e.get("kernel_tile_n") or 0) > 0,
+    }
+    # 算子级条目：op_type 要是 mnemonic 单表认得的名字，否则它在 GeneSim 侧
+    # 没有原语落点，得报错而不是当普通条目放过。
+    bpath_checks = {
+        "op_type（mnemonic 单表认得的算子名）":
+            lambda e: e.get("op_type") in MNEMONIC_OF,
+    }
+    common_checks = {
+        "pimir_path（pim mlir 落盘路径）": lambda e: bool(e.get("pimir_path")),
+    }
+
+    # 有 shards 列表且非空 = 走过图切分的 GEMM；空列表 = 算子级节点。
+    gemm_ops = {k: e for k, e in ops.items() if e.get("shards")}
+    bpath_ops = {k: e for k, e in ops.items() if not e.get("shards")}
+
+    for label, entries in (("GEMM", gemm_ops), ("算子级", bpath_ops)):
+        checks = dict(common_checks)
+        checks.update(gemm_checks if label == "GEMM" else bpath_checks)
+        for field_label, predicate in checks.items():
+            bad = [op_id for op_id, entry in entries.items()
+                   if not predicate(entry)]
+            if bad:
+                raise StepFailed(
+                    f"{len(bad)} 个{label}算子缺 {field_label}，如 op{bad[:5]}"
+                )
+    return len(gemm_ops), len(bpath_ops)
+
+
 def step_bcd_export(
     num_stages: int, num_dpus: int, log_dir: Path,
     *, plan_path: Optional[Path] = None,
@@ -182,23 +234,8 @@ def step_bcd_export(
             "否则 GeneSim 不会自动进严格模式，pim mlir 读不到会静默退回手写模板。"
         )
 
-    # 四类字段各自对应链路上的一段，逐个核对，不能只看文件存在。
-    checks = {
-        "shards（图切分归属，每台参与 DPU 各一项）": lambda e: bool(e.get("shards")),
-        "shards[*].local_in/out_features（本地分片形状）": lambda e: all(
-            s.get("local_in_features") and s.get("local_out_features")
-            for s in e.get("shards", [])
-        ),
-        "semantic_role（投影身份）": lambda e: e.get("semantic_role") in _EXPECTED_ROLES,
-        "kernel_tile_n（算子编译器实测分块）": lambda e: (e.get("kernel_tile_n") or 0) > 0,
-        "pimir_path（pim mlir 落盘路径）": lambda e: bool(e.get("pimir_path")),
-    }
-    for label, predicate in checks.items():
-        bad = [op_id for op_id, entry in ops.items() if not predicate(entry)]
-        if bad:
-            raise StepFailed(
-                f"{len(bad)} 个算子缺 {label}，如 op{bad[:5]}"
-            )
+    gemm_count, bpath_count = check_sidecar_entries(ops)
+    print(f"    条目分两类核对：GEMM {gemm_count} 条、算子级 {bpath_count} 条")
 
     pimir_files = {entry["pimir_path"] for entry in ops.values()}
     absent = [p for p in pimir_files if not Path(p).is_file()]
@@ -236,8 +273,12 @@ def step_bcd_export(
                 "请重新导出。"
             )
 
-    tiles = sorted({int(e["kernel_tile_n"]) for e in ops.values()})
-    print(f"    放置 {len(ops)} 个 GEMM，本地形状 {len(pimir_files)} 种 pim mlir")
+    # 分块是 GEMM 才有的字段（B 路算子级节点不做分块搜索），所以只在 GEMM
+    # 条目上取；对全部条目取会在第一条 B 路条目上抛 KeyError。
+    tiles = sorted({int(e["kernel_tile_n"]) for e in ops.values()
+                    if e.get("kernel_tile_n")})
+    print(f"    放置 {gemm_count} 个 GEMM 与 {bpath_count} 个算子级节点，"
+          f"本地形状 {len(pimir_files)} 种 pim mlir")
     print(f"    算子编译器选出的分块: {tiles}（GeneSim 默认常量是 32）")
 
     # 走方案路径时，Cluster 映射必须随 sidecar 回传，否则 GeneSim 会退回取模换算。

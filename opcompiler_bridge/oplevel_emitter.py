@@ -41,10 +41,19 @@ from dataclasses import dataclass, field
 
 from torch.fx import GraphModule, Node as FxNode
 
+from contracts import gml_hw_table as hw_table
 from contracts.graph_meta import FUSED_TAIL_META_KEY
+from graph.fuse_pim import RMS_NORM_META_KEY
 from graph.fuse_rope import ROPE_META_KEY
 from graph.quant_pass import DQ_META_KEY
 from graph.split_heads import HEAD_INDEX_META_KEY, HEAD_ROLE_META_KEY, ROLE_SOFTMAX
+from opcompiler_bridge.oplevel_kernel import (
+    dynamic_quant_kernel,
+    matmul_kernel,
+    normalize_kernel,
+    rope_kernel,
+    softmax_kernel,
+)
 
 # K 路 RoPE 的判据。复用 GML 侧同一个函数，两边对「哪条是 K」必须一致 ——
 # 各自判会在 Q/K 顺序变化时静默分叉。
@@ -76,12 +85,12 @@ _I8 = "i8"
 class EmittedOp:
     """发射出的一个算子。
 
-    `func` 是 MLIR 函数名（= FX 节点名）；`kind` 是三类之一，
-    供调用方核对相位数（DQ 4 / Softmax 5 / RoPE 3）。
+    `func` 是 MLIR 函数名（= FX 节点名）；`kind` 标明算子类别，
+    供调用方核对相位数（DQ 4 / Softmax 5 / RoPE 3 / RMSNorm 0）。
     """
 
     func: str
-    kind: str                # "dq" / "softmax" / "rope"
+    kind: str                # "dq" / "softmax" / "rope" / "normalize"
     fx_name: str
     expected_phases: int
 
@@ -166,15 +175,7 @@ def _emit_dq(node: FxNode) -> tuple[str, EmittedOp] | None:
     # 后缀 `__dq`：K 路 RoPE 的锚点同时要发 RoPE 和 DQ 两个算子，
     # 不加后缀两者同名，第二个会被去重吃掉。
     func = f"{_sanitize(node.name)}__dq"
-    src_ty = _tensor((1, numel), _F16)
-    scale_ty = _tensor((groups,), _F16)
-    out_ty = _tensor((1, numel), _I8)
-    body = f"""  tt.func @{func}(%x: {src_ty}, %s: {scale_ty}) {{
-    %q = pim.quantize %x, %s
-       {{dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = {group_size}>}}
-       : {src_ty}, {scale_ty} -> {out_ty}
-    tt.return
-  }}"""
+    body = dynamic_quant_kernel(func, numel, groups, group_size)
     return body, EmittedOp(func=func, kind="dq", fx_name=node.name,
                            expected_phases=4)
 
@@ -197,15 +198,7 @@ def _emit_dq_for_rope(node: FxNode) -> tuple[str, EmittedOp] | None:
     groups = numel // group_size
 
     func = f"{_sanitize(node.name)}__dq"
-    src_ty = _tensor((1, numel), _F16)
-    scale_ty = _tensor((groups,), _F16)
-    out_ty = _tensor((1, numel), _I8)
-    body = f"""  tt.func @{func}(%x: {src_ty}, %s: {scale_ty}) {{
-    %q = pim.quantize %x, %s
-       {{dynamic, spec = #pim.quant_spec<granularity = per_group, axis = 1, groupSize = {group_size}>}}
-       : {src_ty}, {scale_ty} -> {out_ty}
-    tt.return
-  }}"""
+    body = dynamic_quant_kernel(func, numel, groups, group_size)
     return body, EmittedOp(func=func, kind="dq", fx_name=node.name,
                            expected_phases=4)
 
@@ -223,11 +216,7 @@ def _emit_softmax(node: FxNode) -> tuple[str, EmittedOp] | None:
     rows = _numel(shape) // last
 
     func = f"{_sanitize(node.name)}__softmax"
-    ty = _tensor((rows, last), _F16)
-    body = f"""  tt.func @{func}(%s: {ty}) {{
-    %p = pim.softmax %s {{axis = 1 : i64, unit = #pim.unit<cstl>}} : {ty} -> {ty}
-    tt.return
-  }}"""
+    body = softmax_kernel(func, rows, last)
     return body, EmittedOp(func=func, kind="softmax", fx_name=node.name,
                            expected_phases=5)
 
@@ -261,18 +250,39 @@ def _emit_rope(node: FxNode) -> tuple[str, EmittedOp] | None:
     src_ty = _tensor(src_shape, _F16)
     tab_ty = _tensor(cos_shape, _F16)
     # 两条 RoPE 链的**末相**配置不同，而这件事只有图编译器知道（谁是 K）：
-    # K 路的 add 要在写进 cache 前重定标（层卡 Kantor mode 3），Q 路留 fp16
-    # 交给紧随的 DQ（层卡 0）。把它标在 `pim.rope` 上，展开 pass 照抄，
-    # 不必自己猜在展开哪条链 —— 猜的话两条链只能同值，`rope_add_q` 就错。
-    kantor = ' "pim.kantor-mode" = 3 : i64,' if _is_second_rope(node) else ""
-    body = f"""  tt.func @{func}(%x: {src_ty}, %c: {tab_ty}, %s: {tab_ty}) {{
-    %y = pim.rope %x, %c, %s
-       {{{kantor} numHeads = {num_heads} : i64, unit = #pim.unit<cstl>}}
-       : {src_ty}, {tab_ty}, {tab_ty} -> {src_ty}
-    tt.return
-  }}"""
+    # K 路的 add 要在写进 cache 前重定标（层卡值 3），Q 路留 fp16 交给紧随的
+    # DQ（层卡值 0）。把它标在 `pim.rope` 上，展开 pass 照抄，不必自己猜在展开
+    # 哪条链 —— 猜的话两条链只能同值，`rope_add_q` 就错。
+    #
+    # `tailCardValue` 是 ODS 属性，不是裸字符串（评审 20260923 的 P1-1）。
+    # 原来发的是 `"pim.kantor-mode"`，靠 FlagTree 侧按**名字**查回去：任一侧
+    # 改名，那边 `getAttrOfType` 返回空、卡值落回 0，K 路写进 cache 前的重定标
+    # 与 flat `contraction` 标记一起消失，而 IR 仍合法、图仍跑完。现在它有
+    # verifier（只收 0 或 3），发错值当场报错。
+    # 文本只此一处：`rope_kernel` 是 driver 路径和本路径共用的出文本函数。
+    # 两处各写一份就会让 GML 与 C 各说各话（评审第六轮问题 11）。
+    body = rope_kernel(func, num_heads, src_shape[-2], src_shape[-1],
+                       tail_card_value=3 if _is_second_rope(node) else 0)
     return body, EmittedOp(func=func, kind="rope", fx_name=node.name,
                            expected_phases=3)
+
+
+def _emit_normalize(node: FxNode) -> tuple[str, EmittedOp] | None:
+    """RMSNorm -> `pim.normalize`，压成 `[rows, cols]`。
+
+    单相算子，不产相位，发它是为了把 `vpuParams` 交给算子编译器、再读回 GML。
+    压成二维保住归约轴：压平会让沿末轴的归约跨行。
+    """
+    shape = _shape_of(node)
+    if shape is None or len(shape) < 2:
+        return None
+    cols = shape[-1]
+    rows = _numel(shape) // cols
+
+    func = f"{_sanitize(node.name)}__normalize"
+    body = normalize_kernel(func, rows, cols, cols)
+    return body, EmittedOp(func=func, kind="normalize", fx_name=node.name,
+                           expected_phases=0)
 
 
 def _emit_fused_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
@@ -306,16 +316,8 @@ def _emit_fused_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
     k = src_shape[-1]
 
     func = f"{_sanitize(node.name)}__matmul"
-    a_ty = _tensor((m, k), _I8)
-    b_ty = _tensor((k, n), _I8)
-    out_ty = _tensor((m, n), _F16)
-    body = f"""  tt.func @{func}(%a: {a_ty}, %b: {b_ty}) {{
-    %o = pim.matmul %a, %b
-       {{activation = #pim.act_spec<kind = {kind}>,
-        datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>}}
-       : {a_ty}, {b_ty} -> {out_ty}
-    tt.return
-  }}"""
+    # 文本只此一处：转调 `matmul_kernel`，否则图路径与 driver 路径会各说各话。
+    body = matmul_kernel(func, m, k, n, activation=kind)
     return body, EmittedOp(func=func, kind="fused_matmul", fx_name=node.name,
                            expected_phases=0)
 
@@ -373,6 +375,9 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
         # 带尾部激活的矩阵乘：不产相位，发它是给 -pim-fuse-activation 校验用。
         if not candidates and FUSED_TAIL_META_KEY in node.meta:
             candidates.append(_emit_fused_matmul(node))
+        # RMSNorm：单相，发它是为了把 vpuParams 读回 GML，而不是由图编译器写死。
+        if not candidates and RMS_NORM_META_KEY in node.meta:
+            candidates.append(_emit_normalize(node))
         if not candidates:
             continue
 
@@ -391,7 +396,8 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
             report.ops.append(op)
 
     report.text = (
-        f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
+        f'module attributes {{pim.target = "{PIM_TARGET}", '
+        f'"pim.rtl-version" = "{hw_table.RTL_VERSION}"}} {{\n'
         + "\n\n".join(bodies)
         + "\n}\n"
     )

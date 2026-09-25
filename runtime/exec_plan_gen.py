@@ -21,6 +21,7 @@ _REDISTRIBUTE_OP = {
     "all_gather": "host_concat",
     "all_to_all": "host_permute",
     "scatter": "host_slice",
+    "local_slice": "dpu_slice",
 }
 _REDISTRIBUTE_FN = {"all_reduce": all_reduce, "all_gather": all_gather, "all_to_all": all_to_all}
 
@@ -72,6 +73,25 @@ def _node_access(node: Node, dpu_id: int) -> Access:
 
 def _itemsize(dtype_name: str) -> int:
     return np.dtype(dtype_name).itemsize
+
+
+def _flatten_node_args(args) -> list:
+    """把**张量列表**摊平，其余原样。
+
+    `aten.cat([a, b], dim)` 的第一个实参是张量列表，按位置逐个编码看不出列表
+    边界，所以摊平成 `a, b, dim`——内核按同一个顺序收。
+
+    只摊平元素全是 `Node` 的列表。`aten.view(x, [1, 4, 32, 128])` 的第二个实参
+    也是列表，但那是**形状字面量**：摊平会把 5 个参数喂给只收 2 个的内核。
+    """
+    flat: list = []
+    for arg in args:
+        if (isinstance(arg, (list, tuple)) and arg
+                and all(isinstance(item, Node) for item in arg)):
+            flat.extend(arg)
+        else:
+            flat.append(arg)
+    return flat
 
 
 def _edge_accesses(entry: CommPlanEntry) -> tuple[list[Access], list[Access]]:
@@ -143,6 +163,16 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
             engine = DmaEngine(hal.dpu_set)
             scatter(entry, engine, get_host_buf(hal))
             return None
+    elif edge.type == "local_slice":
+        def fn(hal, cmd):
+            engine = DmaEngine(hal.dpu_set)
+            itemsize = entry.dtype.itemsize
+            for seg in entry.segments:
+                n = seg.nbytes // itemsize
+                data = engine.copy_from_dpu(
+                    seg.src_dpu, seg.src_addr, n, entry.dtype)
+                engine.copy_to_dpu(seg.dst_dpu, seg.dst_addr, data)
+            return None
     else:
         primitive = _REDISTRIBUTE_FN[edge.type]
 
@@ -200,6 +230,7 @@ def build_execution_plan(
     hardware: PIMHardwareConfig,
     kv_access_of: KvAccessFn | None = None,
     host_handler_of: HostHandlerFn | None = None,
+    sdpa_info_of: "Callable[[Node], dict | None] | None" = None,
     num_tasklets: int = 4,
 ) -> CompiledPlan:
     """从图、通信计划和内存依赖构建按拓扑顺序执行的命令计划。"""
@@ -246,9 +277,11 @@ def build_execution_plan(
                 if e.dst_loc.get("device") == DEVICE_DPU
             }
             for dpu_id in spec.shard_map:
-                # 按节点参数顺序收集输入地址。
+                # 按节点参数顺序收集输入地址。`cat` 的第一个实参是**张量
+                # 列表**，要摊平——不摊平它整段被跳过，内核一个输入都读不到。
+                flat_args = _flatten_node_args(node.args)
                 reads: list[Access] = []
-                for arg in node.args:
+                for arg in flat_args:
                     if not isinstance(arg, Node):
                         continue
                     if arg.name in landing_by_src and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", []):
@@ -270,25 +303,42 @@ def build_execution_plan(
                 write = _node_access(node, dpu_id)
                 waits = _deps_of(reads, builder.writers)
                 waits += _war_waits(write.loc, write.offset, pending_readers, builder.reader_cmds)
-                # 按节点参数顺序记录形状和字面量参数。
+                # 按节点参数顺序记录形状、dtype 和字面量参数。
+                # `arg_dtypes` 逐参记输入 dtype，不能只有输出 dtype：
+                # `to.dtype` 的 f16→f32 会按 f32 去读 f16 的缓冲，整块读错。
                 arg_kinds = []
                 arg_shapes = []
-                for arg in node.args:
+                arg_dtypes = []
+                for arg in flat_args:
                     if not isinstance(arg, Node):
                         arg_kinds.append(arg)
                         arg_shapes.append(None)
+                        arg_dtypes.append(None)
                         continue
                     arg_kinds.append("tensor")
                     if arg.name in landing_by_src and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", []):
                         arg_shapes.append(landing_by_src[arg.name].dst_spec.shard_map[dpu_id].local_shape)
                     else:
                         arg_shapes.append(arg.meta[SPEC_META_KEY].shard_map[dpu_id].local_shape)
+                    arg_dtypes.append(str(arg.meta["val"].dtype).removeprefix("torch."))
                 out_detail = spec.shard_map[dpu_id]
+                payload = {
+                    "kernel": str(node.target), "node": node.name,
+                    "arg_kinds": arg_kinds, "arg_shapes": arg_shapes,
+                    "arg_dtypes": arg_dtypes,
+                    "dtype": str(node.meta["val"].dtype).removeprefix("torch."),
+                    "out_shape": out_detail.local_shape,
+                    "hardware": hardware.to_payload(),
+                }
+                # 注意力要读的设备侧 KV 区域，编译期才知道，在这里烘进命令——
+                # 内核自己拿不到 `kv_specs`，而用模块级全局会在多个策略之间
+                # 互相覆盖（实测三种策略连着编译时后面的把前面的盖掉）。
+                if sdpa_info_of is not None:
+                    info = sdpa_info_of(node)
+                    if info is not None:
+                        payload["sdpa"] = info
                 cmd = builder.append(
-                    "launch", dpu_id,
-                    {"kernel": str(node.target), "node": node.name, "arg_kinds": arg_kinds,
-                     "arg_shapes": arg_shapes, "dtype": str(node.meta["val"].dtype).removeprefix("torch."),
-                     "out_shape": out_detail.local_shape, "hardware": hardware.to_payload()},
+                    "launch", dpu_id, payload,
                     reads, [write] + kv_writes, waits,
                     num_tasklets=num_tasklets,
                 )

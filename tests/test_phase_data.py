@@ -65,8 +65,24 @@ def test_dq_all_four_phases_match_the_reference(node_id: int, group_size) -> Non
     # phase3 允许 ±1 —— 落在 .5 边界上的元素受 fp16 舍入方向影响。
     expected = _read(f"output_buffer_phase_3_{node_id}.bin", np.int8)
     delta = np.abs(result.phase3.astype(np.int16) - expected.astype(np.int16))
+    # 舍入方向：差恒为 1，且每一处不一致都落在 .5 平局上。判据是「能被解释」
+    # 而不是「一致率够高」——后者是个随参考版本漂移的经验数。
     assert delta.max() <= 1
-    assert (delta == 0).mean() > 0.99
+    differing = delta > 0
+    if differing.any():
+        src32 = source.astype(np.float32)
+        grouped = src32.reshape(-1, group_size)
+        amax = np.abs(grouped).max(axis=1, keepdims=True) * np.float32(2.0)
+        inv = np.where(amax == 0, np.float32(0.0),
+                       np.float32(1.0) / amax).astype(np.float16).astype(
+                           np.float32)
+        inv = np.repeat(inv, group_size, axis=1).ravel()
+        pre = src32.ravel() * inv * np.float32(256.0)
+        distance = np.abs(pre - np.rint(pre))
+        off_tie = differing & (distance < 0.4)
+        assert not off_tie.any(), (
+            f"{int(off_tie.sum())} 处不一致不在 .5 平局上，"
+            f"最小距离 {float(distance[off_tie].min()):.4f}")
 
 
 @pytest.mark.parametrize("node_id,group_size", DQ_NODES)
@@ -244,19 +260,24 @@ def test_reference_phase0_low_half_is_zero(node_id: int) -> None:
 def test_the_two_reduction_phases_use_different_encodings() -> None:
     """phase0 是「fp16 放高半」，phase2 是真 fp32。混用会静默写错。
 
-    判据：把 -2.98047 按两种方式打包，字节不同；实物的 phase0 匹配前者。
+    判据：参考的 phase0 字节按高半解出一个 fp16，再按同一种方式装回去必须
+    逐字节复现；而按真 fp32 打包同样的数得到的字节与它不同。
     """
-    value = -2.98046875
+    reference = _raw("output_buffer_phase_0_18.bin")
+    # 数值从参考里取，不写死：参考换一版，两边的数都跟着换，判据不变。
+    value = unpack_fp16_from_high_half(reference)
     high_half = pack_fp16_in_high_half(value)
     true_fp32 = struct.pack("<f", np.float32(value))
 
+    assert high_half == reference, "高半编码没能复现参考字节"
     assert high_half != true_fp32
-    assert high_half == _raw("output_buffer_phase_0_18.bin")
-    assert high_half.hex() == "0000f6c1"
-    assert true_fp32.hex() == "00c03ec0"
+    # 低半恒为 0 是这个编码的直接后果，不是巧合。
+    assert high_half[:2] == b"\x00\x00"
 
-    # 按 fp32 误读 phase0 会得到一个「看似合理」的数，这才是危险之处。
-    assert struct.unpack("<f", high_half)[0] == pytest.approx(-30.75)
+    # 按 fp32 误读 phase0 会得到一个「看似合理」的数，这才是危险之处：它有限、
+    # 不为零、量级也像那么回事，只是完全不是那个 max。
+    misread = struct.unpack("<f", high_half)[0]
+    assert np.isfinite(misread) and misread != value
 
 
 @pytest.mark.parametrize("node_id", SOFTMAX_NODES)

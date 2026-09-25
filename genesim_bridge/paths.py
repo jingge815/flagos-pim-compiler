@@ -105,6 +105,14 @@ def gml_llama2_reference_dir(*, required: bool = True) -> Path | None:
 
     比 ResNet50 那份更贴近目标模型：它是 decode block，带动态量化与 KV cache，
     所以结构规则要在两份上同时成立才算可靠。
+
+    指向 **v2**（`model_layers_0_decode_v2`，图头 `relay2gml_version "19.2.0"`）。
+    v1（`llama2_w4a8_decode_block_0`，`"26.2.1"`）留着作历史对照，把
+    `paths.json` 指回去它仍然可用——`tests/test_gml_hw_table.py` 的例外集合就是
+    为它准备的。
+
+    **版本字符串不是判据**：切换参考后按字段集合对拍，不拿版本号当失败条件。
+    我方 `GML_VERSION` 也不随参考改。
     """
     path = _configured_path("gml_llama2_reference_dir")
     if path is not None or not required:
@@ -115,6 +123,31 @@ def gml_llama2_reference_dir(*, required: bool = True) -> Path | None:
 def flagtree_prefix() -> Path:
     """flagTree 安装根目录（唯一安装，带 PIM pass 支持）。"""
     return _resolve("flagtree_prefix")
+
+
+def flagtree_source(required: bool = True) -> Path | None:
+    """FlagTree **源码树**（不是安装目录）。
+
+    从安装里的 `env-flagtree.sh` 读 `FLAGTREE_SOURCE`，而不是在 `paths.json` 里
+    再写一条：那个脚本是安装时生成的，它指向的就是这次安装用的源码。两处各写
+    一份的话，换个源码树重装之后 `paths.json` 那条会静默指向旧的。
+
+    `contracts/fusion_contract.py` 与 FlagTree 的 `FuseActivation.cpp` 必须描述
+    同一张融合表，而 C++ 读不了 Python。唯一能自动对起来的办法是读那份 C++ 源码
+    的文本，所以这里要能找到它。
+    """
+    env_file = flagtree_prefix() / "env-flagtree.sh"
+    if env_file.is_file():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("FLAGTREE_SOURCE="):
+                path = Path(line.split("=", 1)[1].strip().strip('"'))
+                if path.is_dir():
+                    return path
+    if required:
+        raise RuntimeError(
+            f"没能从 {env_file} 读出可用的 FLAGTREE_SOURCE。"
+            f"重装 FlagTree 会重新生成这个脚本。")
+    return None
 
 
 def _flagtree_site_packages() -> Path:

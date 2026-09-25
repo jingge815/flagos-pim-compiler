@@ -117,11 +117,23 @@ def test_most_files_are_byte_identical(written: WrittenFiles) -> None:
     assert not unexpected, f"这些文件本应逐字节相同: {unexpected}"
 
 
-@pytest.mark.parametrize("node_id,group_size", DQ_NODES)
-def test_dq_phase3_differs_by_at_most_one(node_id: int, group_size: int) -> None:
-    """DQ 的量化结果允许 ±1 —— 落在 .5 边界的元素受 fp16 舍入方向影响。
+# 一处不一致要能被解释成「平局舍入」才算数。判据是「离最近的整数有多远」：
+# 平局处这个距离接近 **0.5**（不是接近 0），实测不一致处最小 0.4708，而一致处
+# 只有约 19% 落在这条线以上。0.4 是个宽松的界。
+_MIN_TIE_DISTANCE = 0.4
 
-    上界钉在 ±1：若出现 ±2 以上，说明 scale 而非舍入出了问题。
+
+@pytest.mark.parametrize("node_id,group_size", DQ_NODES)
+def test_dq_phase3_disagreements_are_all_rounding_ties(node_id: int,
+                                                        group_size: int) -> None:
+    """DQ 的量化结果与参考的每一处不一致，都必须是 .5 平局造成的。
+
+    **判据不是「一致率有多高」而是「不一致处能不能被解释」**。参考产物是合成
+    数据，拿一个经验阈值去卡它，只会得到一个随参考版本漂移、又说不清在防什么
+    的数字：换 v2 参考后一致率从 99.1% 掉到 98.95%，而 43 处不一致**全部**
+    落在 0.5 平局上（|x - round(x)| > 0.4995），|差| 恒为 1 —— 两边只是把平局
+    舍向了不同方向。这比数比例更严：scale 真错了的话，偏移会摊到大量非平局
+    元素上，「每处不一致都是平局」立刻不成立。
     """
     reference = gml_llama2_reference_dir()
     source = np.fromfile(
@@ -132,8 +144,29 @@ def test_dq_phase3_differs_by_at_most_one(node_id: int, group_size: int) -> None
         reference / f"output_buffer_phase_3_{node_id}.bin", dtype=np.int8)
     delta = np.abs(phases.phase3.astype(np.int16) - theirs.astype(np.int16))
 
+    # 舍入最多差一个单位：出现 ±2 说明 scale 而不是方向出了问题。
     assert delta.max() <= 1
-    assert (delta == 0).mean() > 0.99
+
+    differing = delta > 0
+    if not differing.any():
+        return
+    # 量化前那个浮点值，离最近整数有多远。
+    src32 = source.astype(np.float32)
+    grouped = src32.reshape(-1, group_size)
+    amax = np.abs(grouped).max(axis=1, keepdims=True) * np.float32(2.0)
+    inv = np.where(amax == 0, np.float32(0.0),
+                   np.float32(1.0) / amax).astype(np.float16).astype(np.float32)
+    inv = np.repeat(inv, group_size, axis=1).ravel()
+    pre = src32.ravel() * inv * np.float32(256.0)
+    distance = np.abs(pre - np.rint(pre))
+
+    at_tie = differing & (distance >= _MIN_TIE_DISTANCE)
+    off_tie = differing & ~at_tie
+    assert not off_tie.any(), (
+        f"{int(off_tie.sum())} 处不一致不在 .5 平局上，"
+        f"最小距离 {float(distance[off_tie].min()):.4f}——"
+        f"离整数这么远的值不该被舍到另一边，这不是舍入方向，是 scale"
+    )
 
 
 def test_fpsu_triple_widths(tmp_path: Path) -> None:

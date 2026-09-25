@@ -112,8 +112,6 @@ def _redistribute_edges_landing_on(dpu_nodes: list[Node], dpu_id: int) -> dict[i
     out: dict[int, RedistributeEdge] = {}
     for node in dpu_nodes:
         for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
-            if edge.type == "local_slice":
-                continue
             if edge.dst_loc.get("device") == DEVICE_DPU and dpu_id in edge.dst_loc.get("dpus", []):
                 out[edge.edge_id] = edge
     return out
@@ -126,8 +124,6 @@ def redistribute_landing_tensors(
     tensors: list[TransientTensor] = []
     for node in dpu_nodes:
         for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
-            if edge.type == "local_slice":
-                continue  # local_slice 不产生 DMA，也不需要落地缓冲。
             if edge.dst_loc.get("device") != DEVICE_DPU or dpu_id not in edge.dst_loc.get("dpus", []):
                 continue
             detail = edge.dst_spec.shard_map[dpu_id]

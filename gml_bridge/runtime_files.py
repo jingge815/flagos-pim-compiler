@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,15 +45,27 @@ class WrittenFiles:
     directory: Path
     names_written: set[str] = field(default_factory=set)
     total_bytes: int = 0
+    # 文件名 -> 内容 sha256（小写 hex）。GML 的 `weight_buffer_hash` 要与权值
+    # bin 的字节对上，而这里是字节最终成形、也是唯一成形的地方：在序列化时算
+    # 得把量化再做一遍，在写盘之后算又得回头扫盘。
+    hashes: dict[str, str] = field(default_factory=dict)
 
     def _write(self, name: str, data: np.ndarray | bytes) -> None:
         path = self.directory / name
         if isinstance(data, bytes):
             path.write_bytes(data)
             size = len(data)
+            payload = data
         else:
             data.tofile(path)
             size = data.nbytes
+            payload = data.tobytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        # 按节点必填：参考 73 个带 weight_buffer 的节点全都写 hash。
+        # 全零占位也写——互证检查的是「写出的字节与声明一致」，不是
+        # 「内容是真实权值」。KV-as-weight 本轮按形状补零，下游不得
+        # 依赖其内容；内容是否两两不同另用测试守。
+        self.hashes[name] = digest
         self.names_written.add(name)
         self.total_bytes += size
 
@@ -109,14 +122,32 @@ def write_per_tensor_weight(
 
 
 def write_named_buffer(
-    files: WrittenFiles, name: str, element_count: int, dtype=np.int8
+    files: WrittenFiles, name: str, element_count: int, dtype=np.int8,
+    content: np.ndarray | None = None,
 ) -> None:
     """按**给定文件名**写一个数据缓冲。
 
     命名规则算不出来的那几种走这里：生产者流进下游权重通路时命名为
     `weight_buffer_<消费者>`，名字已由 GML 侧定好，这里照抄即可。
+
+    `content` 给了就写它，否则写全零。走权重通路的那 64 个 KV 缓冲**必须**
+    给内容：全零的 bin 与「真的算出 0」在盘上无法区分，读的人会把
+    「这个文件没内容」当成「这个权值就是 0」。
     """
-    files._write(name, np.zeros(element_count, dtype=dtype))
+    if content is None:
+        content = np.zeros(element_count, dtype=dtype)
+    files._write(name, content)
+
+
+def placeholder_weight(node_id: int, element_count: int) -> np.ndarray:
+    """KV 缓存走权重通路时的占位内容。
+
+    这 64 个 bin 装的是 KV cache 而不是模型权值，参考产物那一侧同样是
+    合成数据（方案 §9.6：结构是权威的，数值不是）。但**不能填全零**。
+    按节点号定种子，给一段确定、可复现、非零的 int8。
+    """
+    rng = np.random.default_rng(node_id)
+    return rng.integers(-128, 128, size=element_count, dtype=np.int8)
 
 
 def write_phase_output_buffer(

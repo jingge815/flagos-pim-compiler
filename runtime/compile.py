@@ -18,7 +18,7 @@ from graph.strategy import ShardStrategy
 from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy
 from memory.mem_planner import DPUPlan, HwBudget, plan_dpu
 from runtime.exec_plan_gen import CompiledPlan, build_execution_plan
-from runtime.executor import DecodeState, make_sdpa_handler
+from runtime.executor import DecodeState
 
 
 @dataclass
@@ -159,23 +159,29 @@ def compile_llama2(
     state = DecodeState(valid_len=0)
     np_dtype = np.dtype(np.float16 if dtype == torch.float16 else np.float32)
 
-    def host_handler_for(gm: GraphModule):
-        layer_map = sdpa_layer_map(gm)
+    # 注意力不再是主机回调：那段计算搬进了设备内核
+    # （`runtime/kernels.sdpa_kernel`）。它要读的设备侧 KV 区域编译期才知道，
+    # 所以在这里算好、烘进命令 payload——三种策略连着编译时用模块级全局
+    # 会互相覆盖，前面那些 plan 再执行就用错了别人的 KV 规格。
+    from runtime.kernels import sdpa_kv_info
 
-        def host_handler_of(node):
-            if "scaled_dot_product_attention" in str(node.target):
-                return make_sdpa_handler(layer_map[node.name], kv_specs, state, np_dtype)
-            return None
+    def sdpa_info_for(gm: GraphModule):
+        layer_of_node = sdpa_layer_map(gm)
 
-        return host_handler_of
+        def sdpa_info_of(node):
+            if "scaled_dot_product_attention" not in str(node.target):
+                return None
+            return sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype)
+
+        return sdpa_info_of
 
     prefill = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
-        hardware=hardware, host_handler_of=host_handler_for(prefill_gm),
+        hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gm),
     )
     decode = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
-        hardware=hardware, host_handler_of=host_handler_for(decode_gm),
+        hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
     )
 
     return CompiledModel(

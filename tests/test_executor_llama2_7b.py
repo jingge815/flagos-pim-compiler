@@ -23,8 +23,8 @@ from memory.kv_layout import kv_specs_from_placement
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, execute_plan, make_sdpa_handler
-from runtime.kernels import register_all
+from runtime.executor import DecodeState, execute_plan
+from runtime.kernels import register_all, sdpa_kv_info
 from tests.test_partition import _FixedMaskLlama
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -99,20 +99,14 @@ def llama2_compiled_plan():
     state = DecodeState(valid_len=0)
     sdpa_layer = sdpa_layer_map(gm)
 
-    def host_handler_of(node):
-        if "scaled_dot_product_attention" in str(node.target):
-            return make_sdpa_handler(
-                sdpa_layer[node.name], kv_specs, state, np.dtype(np.float16)
-            )
-        return None
+    def sdpa_info_of(node):
+        if "scaled_dot_product_attention" not in str(node.target):
+            return None
+        return sdpa_kv_info(node, kv_specs, sdpa_layer, np.dtype(np.float16))
 
     compiled = build_execution_plan(
-        nodes,
-        gm,
-        entries_by_id,
-        pending,
-        hardware=hardware,
-        host_handler_of=host_handler_of,
+        nodes, gm, entries_by_id, pending, hardware=hardware,
+        sdpa_info_of=sdpa_info_of,
     )
     return model, gm, input_ids, causal_mask, compiled, plans, state
 

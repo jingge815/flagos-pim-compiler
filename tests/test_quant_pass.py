@@ -215,11 +215,34 @@ def test_dq_emits_four_phases(artifact) -> None:
         assert phases == {0, 1, 2, 3}, f"节点 {node.node_id}: {sorted(phases)}"
 
 
-def test_dq_declares_dynamic_quantization(artifact) -> None:
-    """DQ 节点带 `use_dynamic_quantization 1`。"""
+def test_use_dynamic_quantization_marks_the_quantized_consumers(artifact) -> None:
+    """`use_dynamic_quantization 1` 挂在**读定点激活**的算子上，不挂在 DQ 上。
+
+    参考产物实测 72 处 = Gemm 7 + MatMul 64 + Split 1；DQ 节点自己
+    **没有**这个字段——它的输入是 fp16，量化是它算出来的（见
+    `docs/GML字段与bin映射策略.md:340`：这个字段的含义是「输入走动态量化」）。
+    三个 Split 里只有输入来自 DQ 的那个置 1，另两个的上游是
+    `Llama2Activation` / `KV_Cache_DMA`。
+    """
+    by_id = {node.node_id: node for node in artifact.nodes}
+    marked = 0
     for node in artifact.nodes:
-        if node.fields.get("op_type") == "DynamicScaling":
-            assert node.fields["use_dynamic_quantization"] == 1
+        op = node.fields.get("op_type")
+        if op in ("Gemm", "MatMul"):
+            assert node.fields.get("use_dynamic_quantization") == 1, (
+                f"节点 {node.node_id}（{op}）吃定点激活，应当置 1")
+            marked += 1
+        elif op in ("DynamicScaling", "Llama2ActivationDQ"):
+            assert "use_dynamic_quantization" not in node.fields, (
+                f"DQ 节点 {node.node_id} 不该带这个字段")
+        elif op == "Split":
+            source = by_id[int(node.fields["input0_node_id"])]
+            fed_by_dq = source.fields.get("op_type") in (
+                "DynamicScaling", "Llama2ActivationDQ")
+            assert bool(node.fields.get("use_dynamic_quantization")) == fed_by_dq, (
+                f"Split {node.node_id} 的上游是 {source.fields.get('op_type')}")
+            marked += fed_by_dq
+    assert marked
 
 
 def test_dq_group_size_fields_agree(artifact) -> None:

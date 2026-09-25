@@ -262,3 +262,36 @@ def test_input_count_identity_still_holds(graph) -> None:
     total = sum(int(n.fields.get("input_count", 0)) for n in nodes)
     matmuls = sum(1 for n in nodes if n.fields.get("op_type") == "MatMul")
     assert total + matmuls == len(edges)
+
+
+def test_split_graph_carries_the_mask_operand(expanded) -> None:
+    """拆头后每个掩码节点必须真的读到图上的掩码，而不是丢掉它。
+
+    掩码是 SDPA 的第 4 个实参。展开成逐头链后，每个头的掩码节点应当沿操作数
+    回溯得到它；丢掉它等于让每个头各自按位置重算一份，图上换成非标准掩码
+    时会静默失效。中间可能隔着 alias 这类透传节点，所以回溯而不是只看直接
+    操作数。
+    """
+    clone, _ = expanded
+    mask_nodes = [
+        node for node in clone.graph.nodes
+        if node.meta.get(HEAD_ROLE_META_KEY) == ROLE_MASK
+    ]
+    assert mask_nodes, "逐头链上应当有掩码节点"
+
+    def reaches_placeholder(node) -> bool:
+        seen, stack = set(), [node]
+        while stack:
+            cur = stack.pop()
+            if cur in seen or not hasattr(cur, "op"):
+                continue
+            seen.add(cur)
+            if cur.op == "placeholder":
+                return True
+            stack.extend(a for a in cur.args if hasattr(a, "op"))
+        return False
+
+    for node in mask_nodes:
+        assert reaches_placeholder(node), (
+            f"{node.name} 回溯不到图上的掩码，掩码被丢掉了")
+

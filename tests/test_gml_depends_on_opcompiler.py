@@ -108,8 +108,26 @@ def _fresh_graph():
     return gm, fuse_for_gml(gm)
 
 
+# 动态量化族：只有这些节点的相位是下面那条反证动过的。
+_DQ_OP_TYPES = ("DynamicScaling", "Llama2ActivationDQ")
+
+
 def _phase_field_counts(text: str) -> dict[int, int]:
-    return {n: len(re.findall(rf"_phase_{n}\b", text)) for n in range(5)}
+    """按相位号数 `_phase_<n>` 字段，**只数动态量化族**。
+
+    全图计数会把 Softmax / RoPE 的相位字段一起数进来：它们不受篡改影响，
+    却会让「砍半后必须减少一半」这种比例断言失真——实测加上 Softmax 那族
+    相位级 data_extension 后，第 4 相的全局计数从 1578 变成含 64 条不受影响
+    的字段，砍半只剩下 818，比例掉到 0.52 就误报。判据要盯的是被篡改的那
+    一族，不是全图总量。
+    """
+    counts = {n: 0 for n in range(5)}
+    for block in text.split("\n  node [")[1:]:
+        if not any(f'op_type "{op}"' in block for op in _DQ_OP_TYPES):
+            continue
+        for n in range(5):
+            counts[n] += len(re.findall(rf"_phase_{n}\b", block))
+    return counts
 
 
 @requires_live
@@ -220,3 +238,65 @@ def test_kv_cache_dma_input_sf_uses_own_node_id() -> None:
     assert "in_kv_position" in labels
     assert "in_key_cache" in labels or "in_value_cache" in labels
     assert n_buf >= 6
+
+
+def test_changing_an_opcompiler_phase_value_changes_gml() -> None:
+    """性质二的值版本：**改一个相位域的值**，GML 文本必须跟着变。
+
+    只钉相位数不够：值字段（`flp_min_exp` / `kantor_mode` / `activation_mode`）
+    原先整族查常量表，算子编译器改了值 GML 一个字节不动、两边都不报错。
+    这里拿真实的算子编译产物，把某一相的 `flp_min` 改掉再序列化一次，断言
+    文本真的不同。
+    """
+    from dataclasses import replace
+
+    from gml_bridge.export import serialize_gml
+    from opcompiler_bridge.phase_source import phase_source_from_graph
+
+    gm_a, fusion_a = _fresh_graph()
+    source = phase_source_from_graph(gm_a)
+    baseline = serialize_gml(gm_a, fusion_a, phase_source=source)
+
+    # 找一个真有 pim.lut 相位的 (节点, kind)，把那一相的 flp_min 改掉。
+    mutated = PhaseSource(
+        by_node={}, ops=list(source.ops), mlir=source.mlir,
+        expanded=source.expanded)
+    target = None
+    for fx_name, kinds in source.by_node.items():
+        for kind, plan in kinds.items():
+            for phase in plan.phases:
+                if phase.op == "pim.lut" and phase.flp_min is not None:
+                    target = (fx_name, kind, phase.index, phase.flp_min)
+                    break
+            if target:
+                break
+        if target:
+            break
+    assert target, "算子编译产物里应当有带窗口的 pim.lut 相位"
+
+    fx_name, kind, index, original = target
+    bumped = original + 1
+    for name, kinds in source.by_node.items():
+        new_kinds = {}
+        for k, plan in kinds.items():
+            if name == fx_name and k == kind:
+                new_kinds[k] = PhasePlan(
+                    func=plan.func,
+                    phases=[
+                        replace(p, flp_min=bumped) if p.index == index else p
+                        for p in plan.phases
+                    ],
+                    op_attrs=dict(plan.op_attrs),
+                )
+            else:
+                new_kinds[k] = plan
+        mutated.by_node[name] = new_kinds
+
+    gm_b, fusion_b = _fresh_graph()
+    changed = serialize_gml(gm_b, fusion_b, phase_source=mutated)
+
+    assert baseline.text != changed.text, (
+        "算子编译器给的相位值与常量表不同，GML 必须跟着变——"
+        "现在没变，说明值字段的真源还在常量表")
+    assert f"flp_min_exp_phase_{index} {bumped}" in changed.text, (
+        f"改的是第 {index} 相的 flp_min，文本里应当出现 {bumped}")

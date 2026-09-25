@@ -4,5 +4,5 @@
   "flagtree_prefix": "/media/disk/fengjingge/src/flagOS/flagOS-installed/flagTree",
   "genesim_root": "/media/disk/fengjingge/src/genesim",
   "gml_reference_dir": "/media/disk/fengjingge/src/xinfangzhou-resource",
-  "gml_llama2_reference_dir": "/media/disk/fengjingge/src/xinfangzhou-resource/llama2_w4a8_decode_block_0/parser_output"
+  "gml_llama2_reference_dir": "/media/disk/fengjingge/src/xinfangzhou-resource/model_layers_0_decode_v2/parser_output/tvmgen_default_nprm_main_0/runtime_files"
 }
