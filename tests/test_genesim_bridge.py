@@ -751,6 +751,23 @@ def test_known_mnemonic_produces_no_such_note() -> None:
     assert not any("未识别" in note for note in cost.notes), cost.notes
 
 
+def test_convert_layout_is_known_zero_cost() -> None:
+    """`pim.convert_layout` 是类型转换器插入的布局修正 op，零成本是它的语义。
+
+    NoMemoryEffect、降级成零代码（LowerPIMToEmitC 只转发 buffer 视图），
+    本来就不该计 flops 或搬运。它必须登记在 `_ZERO_COST_OPS` 里，否则
+    完整性守卫会给每个带它的 kernel 刷一条「未识别」note（实测 pimir 全量
+    4544 条），把真正的新算子淹在噪声里。
+    """
+    text = ("module { tt.func @k() { "
+            "%0 = pim.convert_layout %1 : "
+            "tensor<4x8xf16> -> tensor<4x8xf16> } }")
+    cost = analyze_ir(text, "k", (1,), {}, ir_level="pimir")
+    assert cost.flops == 0.0
+    assert cost.mram_traffic_bytes == 0.0
+    assert not any("未识别" in note for note in cost.notes), cost.notes
+
+
 def test_a_path_without_a_dot_still_requires_dma() -> None:
     """A 路产物缺 `pim.dma_*` 必须报错——**不看它有没有 `tt.dot`**。
 

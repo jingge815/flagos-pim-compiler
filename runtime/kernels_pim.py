@@ -75,12 +75,11 @@ def _apply_activation(x: np.ndarray, activation: str | None) -> np.ndarray:
     kind = str(activation).lower()
     xf = x.astype(np.float32)
     if kind == "silu":
-        # 读同一张 288 B 表，不现算闭式：闭式与查表不是同一个数，
-        # 两边都用闭式会让对拍绿在一个参考产物并不执行的公式上。
-        from contracts.gml_lut import eval_lut, synth_silu
-        table = synth_silu()
-        out = np.vectorize(lambda v: eval_lut(float(v), table, -4.0, 4.0))(xf)
-        return out.astype(x.dtype)
+        # 闭式，与编译内核的 pim_lut_silu 同一条公式。
+        # 288 B 分段线性表在 32 层里累积后，整网 logits 与 torch 对不上。
+        # |x| 很大时 exp 溢出，fp32 里先夹到闭式已经饱和的位置。
+        z = np.clip(-xf, -80.0, 80.0)
+        return (xf / (1.0 + np.exp(z))).astype(x.dtype)
     if kind == "relu":
         return np.maximum(xf, 0).astype(x.dtype)
     if kind == "gelu":

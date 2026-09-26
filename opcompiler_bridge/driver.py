@@ -509,7 +509,11 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                 f"{request.arg_shapes!r}"
             )
         (vocab, hidden), ids_shape = request.arg_shapes
-        body = gather_kernel("kernel", vocab, hidden, _prod(ids_shape))
+        # 索引宽度跟着请求走：图上的 token id 是 int64，按 int32 读会把
+        # 相邻两个 id 的字节拼成一个行号，整张表查错。
+        index_dtype = {"int32": "i32", "int64": "i64"}.get(request.out_dtype, "i32")
+        body = gather_kernel("kernel", vocab, hidden, _prod(ids_shape),
+                             index_dtype=index_dtype)
         return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
                 f"{body}\n}}\n")
 

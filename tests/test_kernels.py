@@ -188,30 +188,25 @@ def test_mask_kernel_runs_the_compiled_kernel(monkeypatch) -> None:
     assert "mask" in seen, f"运行时没有编译 pim.mask，实际编译了 {seen}"
 
 
-def test_alias_kernel_runs_the_compiled_dynamic_quant(monkeypatch) -> None:
-    """动态量化的载体 `aten.alias` 必须真调 `compile_op(op="dynamic_quant")`。
+def test_alias_kernel_is_an_identity(monkeypatch) -> None:
+    """`aten.alias` 是视图，原样传回，不编译任何算子。
 
-    评审九轮问题 1：`pim.dynamic_quant` 的编译内核只在测试里被调过，
-    运行时 `alias` 注册的是恒等镜像，量化根本没在设备上发生。
+    它曾经被改成 `pim.dynamic_quant` 的载体：把 fp16 量化成 int8 再按 fp16
+    的长度写回，读出来是 fp16 最大值。量化是权重侧的事，激活侧没有节点
+    消费这个产物。
     """
     import opcompiler_bridge.driver as driver
 
     seen: list[str] = []
-    real = driver.compile_op
-
-    def spy(request, *args, **kwargs):
-        seen.append(request.op)
-        return real(request, *args, **kwargs)
-
-    monkeypatch.setattr(driver, "compile_op", spy)
+    monkeypatch.setattr(driver, "compile_op",
+                        lambda request, *a, **k: seen.append(request.op))
 
     backend = _backend()
     register_all(backend)
-    x = np.arange(8, dtype=np.float32).reshape(1, 8)
+    x = np.arange(8, dtype=np.float16).reshape(1, 8)
     _run(backend, str(torch.ops.aten.alias.default), ["tensor"], [(1, 8)], [x],
          (1, 8))
-    assert "dynamic_quant" in seen, (
-        f"运行时没有编译 pim.dynamic_quant，实际编译了 {seen}")
+    assert seen == [], f"alias 不该编译任何算子，实际编译了 {seen}"
 
 
 def test_same_shape_eltwise_uses_the_compiled_kernel() -> None:

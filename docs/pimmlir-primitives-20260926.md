@@ -181,7 +181,7 @@ numpy 假后端、genesim 四条链已全部接上（14 个入口原语、16 个
 | op | 状态 |
 | --- | --- |
 | `pim.conv` | 方言已立，Python 侧无发射点；仅在与 C++ 融合表对拍时被引用 |
-| `pim.convert_layout` | 无发射点、无计费规则 |
+| `pim.convert_layout` | Python 侧无发射点，但 TTIR→PIM 类型转换器会**自动插入**（pimir IR 里 4544 处）。零成本是它的语义（NoMemoryEffect、EmitC 降成零代码）；已登记进 `ir_cost.py` 的 `_ZERO_COST_OPS`，此前完整性守卫按「未识别」刷 4544 条 note |
 | `pim.dequantize` | 无发射点、无计费规则 |
 | `pim.pool` | 无发射点；只作为被融合对象存在（折进主算子的 `fusedPool`） |
 | `pim.split` | 无发射点；`pim.split_heads` 才是入口原语。计费表已把它移出「已知」，出现即留 note |
@@ -214,7 +214,7 @@ numpy 假后端、genesim 四条链已全部接上（14 个入口原语、16 个
 | `opcompiler_bridge/` | 新增 `oplevel_kernel.py`（362 行，15 个算子的 IR 文本发射器，`driver` 与 `oplevel_emitter` 共用）；`driver.py` 新增 15 个算子分支与 `ToolchainUnavailable`；`phase_source.py` 补 `-pim-verify-gml-contract`；`phase_plan.py` 解析口径改为 ODS 属性 |
 | `runtime/` | `kernels.py`（+1027）。白名单从 4 项扩到 34 项；`exec_plan_gen.py` 新增 `dpu_slice` 重分发、SDPA 信息在编译期冻进载荷；新增 `kernels_pim.py`（183 行，助记符级 numpy 镜像，供编译内核逐元素对拍）；`executor.py` 删除主机侧 `_host_softmax` |
 | `graph/` | `partition.py` 分区判据从白名单翻转为**黑名单**；`spec_prop.py` 规则表扩到 30 余项，缺规则的设备算子改为当场抛错；`fuse.py`/`fuse_pim.py` 改引 `contracts.fusion_contract` |
-| `genesim_bridge/` | `op_classify.py` 配方从 4 个扩到 17 个；`ir_cost.py`（+291）新增助记符归一表与四类计费；`flagtree_driver.py` 新增 `lower_oplevel_to_pimir` 与两道工具链自检；`placement_export.py` 新增 B 路条目 |
+| `genesim_bridge/` | `op_classify.py` 配方从 4 个扩到 17 个；`ir_cost.py`（+291）新增助记符归一表与四类计费；零成本表补 `pim.convert_layout`；`flagtree_driver.py` 新增 `lower_oplevel_to_pimir` 与两道工具链自检；`placement_export.py` 新增 B 路条目 |
 | `quant/` `comm/` `memory/` `backend/` | `activations.py` 公式改调 `phase_data` 单一真源（两份实现实测 4096 个元素里 23 个差 1）；`comm/plan.py` 的 `local_slice` 从占位改为真正展开；`hal_numpy.py` 新增 `bind_inputs` |
 
 ### 4.3 genesim

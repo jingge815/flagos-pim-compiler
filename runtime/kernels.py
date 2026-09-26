@@ -294,10 +294,10 @@ def mean_dim_kernel(hal, dpu_id: int, cmd) -> None:
 
 
 def _silu(x: np.ndarray) -> np.ndarray:
-    """silu 走 `pim.lut` 查表，与矩阵乘融合路径读同一张 288 B 表。
+    """silu 走 `pim.lut`，求值用闭式 `x/(1+exp(-x))`。
 
-    闭式 `x/(1+exp(-x))` 和查表不是同一个数，两边各算各的会让对拍绿在
-    一个参考产物并不执行的公式上，所以这里不再保留闭式。
+    编译内核与 numpy 镜像同一条公式，也是 torch 的公式。31 段弦线表在
+    32 层里累积后，logits 与 torch 差到 1 以上。
     """
     array = np.ascontiguousarray(x, dtype=np.float16)
     fn = _compiled_lut(tuple(array.shape), "silu")
@@ -333,7 +333,7 @@ def _compiled_lut(shape: tuple[int, ...], kind: str):
 
 
 def silu_kernel(hal, dpu_id: int, cmd) -> None:
-    """`aten.silu` 的 DPU 内核：走 `pim.lut` 查表，不走闭式公式。"""
+    """`aten.silu` 的 DPU 内核：走 `pim.lut`，闭式求值。"""
     (x,) = _read_tensor_args(hal, dpu_id, cmd)
     _write_result(hal, dpu_id, cmd, _silu(x))
 
@@ -639,14 +639,21 @@ def gather_kernel(hal, dpu_id: int, cmd) -> None:
     # 后面三个开关一并带上（config 里 `pad_token_id` 非空时就在）。查表只用
     # 前两个，其余按定义不影响前向结果，多读一遍只会拿到用不上的缓冲。
     table, indices = _read_tensor_args(hal, dpu_id, cmd)[:2]
-    ids = np.ascontiguousarray(indices, dtype=np.int32)
+    # 索引保持它在设备上的存储宽度。scatter 按图上的 dtype 落盘（token id 是
+    # int64，8 字节一个），而编译内核按它自己的索引类型读——宽度不一致时一个
+    # 索引会吃进相邻索引的字节，查到的全是错行。
+    declared = cmd.payload.get("arg_dtypes")
+    index_dtype = (np.dtype(declared[1]) if declared and declared[1]
+                   else np.dtype(indices.dtype))
+    ids = np.ascontiguousarray(indices, dtype=index_dtype)
     expected = kernels_pim.gather(table, ids)
-    key = ("gather", table.shape, ids.shape)
+    key = ("gather", table.shape, ids.shape, index_dtype.name)
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         result = compile_op(OpCompileRequest(
             op="gather", arg_shapes=[table.shape, ids.shape],
             hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            out_dtype=index_dtype.name,
         ))
         fn = load_kernel(result)
         _COMPILED_KERNEL_CACHE[key] = fn
@@ -656,50 +663,19 @@ def gather_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, out)
 
 
-def _compiled_dynamic_quant(shape: tuple[int, ...], group_size: int):
-    """按形状与组宽编一个 `pim.dynamic_quant`；工具链不在位时返回 None。"""
-    key = ("dynamic_quant", shape, group_size)
-    if key in _COMPILED_KERNEL_CACHE:
-        return _COMPILED_KERNEL_CACHE[key]
-
-    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
-    from opcompiler_bridge.driver import (
-        ToolchainUnavailable, compile_op, load_kernel)
-
-    try:
-        result = compile_op(OpCompileRequest(
-            op="dynamic_quant", arg_shapes=[shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
-            group_size=group_size,
-        ))
-    except ToolchainUnavailable:
-        _COMPILED_KERNEL_CACHE[key] = None
-        return None
-    fn = load_kernel(result)
-    _COMPILED_KERNEL_CACHE[key] = fn
-    return fn
-
-
 def dynamic_quant_kernel(hal, dpu_id: int, cmd) -> None:
-    """动态量化的载体内核：走编出来的 `pim.dynamic_quant` 四相链。
+    """`aten.alias` 的内核：恒等传递。
 
-    图上 `aten.alias` 只是承载量化字段的节点，数值上它必须真的把 fp16 量化成
-    int8——恒等镜像会让这一步在设备上什么都不做。组宽按隐藏维能整除的最大
-    2 的幂取，上限 128（Llama2 的组宽）。
+    `alias` 在图上是视图，不改数值。导出的 Llama 图里它出现在两处：每层把
+    因果掩码传给注意力，以及 `mul` 结果的一次别名。两者的输出 dtype 都是
+    fp16，缓冲区也按 fp16 分配。
+
+    这里曾经改成走 `pim.dynamic_quant`，把输入量化成 int8 再按 fp16 的长度写回
+    ——写进去的是半截 int8 字节，读出来是 fp16 最大值。量化是权重侧的事，
+    激活侧没有节点消费它的产物。
     """
     (x,) = _read_tensor_args(hal, dpu_id, cmd)
-    source = np.ascontiguousarray(x, dtype=np.float16)
-    group_size = 128
-    while source.size % group_size:
-        group_size //= 2
-    fn = _compiled_dynamic_quant(source.shape, group_size)
-    if fn is None:
-        _write_result(hal, dpu_id, cmd,
-                      kernels_pim.dynamic_quant(source, group_size))
-        return
-    out = np.zeros(source.shape, dtype=np.int8)
-    fn(ctypes.c_void_p(source.ctypes.data), ctypes.c_void_p(out.ctypes.data))
-    _write_result(hal, dpu_id, cmd, out)
+    _write_result(hal, dpu_id, cmd, x)
 
 
 def where_kernel(hal, dpu_id: int, cmd) -> None:
@@ -1167,8 +1143,7 @@ _KERNELS = {
     str(torch.ops.aten.cat.default): KernelEntry(concat_kernel),
     str(torch.ops.aten.embedding.default): KernelEntry(gather_kernel),
     str(torch.ops.aten.scaled_dot_product_attention.default): KernelEntry(sdpa_kernel),
-    # `alias` 是动态量化的载体：图上真正的量化发生在 `pim.dynamic_quant`
-    # 的四相流水线里，载体本身不再是恒等。
+    # `alias` 是视图，数值上恒等传递。量化是权重侧的事。
     str(torch.ops.aten.alias.default): KernelEntry(dynamic_quant_kernel),
     str(torch.ops.aten.view.default): KernelEntry(reshape_kernel),
     str(torch.ops.aten.reshape.default): KernelEntry(reshape_kernel),

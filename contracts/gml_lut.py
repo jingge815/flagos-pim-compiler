@@ -154,9 +154,9 @@ def decode_reciprocal(value: float, table: bytes) -> float:
 def eval_lut(value: float, table: bytes, lo: float, hi: float) -> float:
     """用一张衰减型分段线性表求值：`y = A[i]*x + B[i]`。
 
-    段 0 承担「饱和到 0」，有效段均匀覆盖 `[lo, hi)`，域外饱和到两端。
+    段 0 承担「饱和到 0」，有效段均匀覆盖 `[lo, hi)`。
     这是 `synth_decaying` 的逆：SiLU 与 exp 都按这个定域合成，求值必须用
-    同一份定域，否则段索引对不上。
+    同一份定域，否则段索引对不上。域外用边界段的弦线外推。
     """
     entries = struct.unpack("<" + "e" * LUT_ENTRY_COUNT, table)
     slopes, intercepts = entries[0:LUT_SEGMENTS], entries[LUT_SEGMENTS:2 * LUT_SEGMENTS]

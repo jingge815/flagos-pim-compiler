@@ -98,6 +98,9 @@ _ZERO_COST_OPS = frozenset({
     "pim.tasklet_id", "pim.dpu_id", "pim.wram_alloc", "pim.dma_load",
     "pim.dma_store", "pim.wram_load", "pim.wram_store", "pim.barrier",
     "pim.buffer_alloc", "pim.buffer_copy", "pim.decompress_weight", "pim.param",
+    # 类型转换器插入的布局修正 op：NoMemoryEffect，降级成零代码，只改 tasklet
+    # 归属标记。不进这张表会被当成「未识别」刷 note。
+    "pim.convert_layout",
 })
 _KNOWN_PIM_OPS = frozenset(
     set(_OPLEVEL_CANONICAL)

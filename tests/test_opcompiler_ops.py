@@ -200,6 +200,38 @@ def test_gather_kernel_matches_numpy() -> None:
         f"{int((got != ref).sum())} 个元素与 table[indices] 不一致")
 
 
+def test_gather_kernel_reads_int64_indices() -> None:
+    """图上的 token id 是 int64，按 int32 读会把相邻两个 id 拼成一个行号。
+
+    索引宽度跟着 `out_dtype` 走：请求声明 int64，生成的 C 就按 8 字节读。
+    """
+    request = OpCompileRequest(
+        op="gather", arg_shapes=[(100, 8), (1, 5)], hardware=_HARDWARE,
+        dtype="float16", out_dtype="int64",
+    )
+    result = compile_op(request, force=True)
+    assert result.argtypes == ["int16_t", "int64_t", "int16_t"], result.argtypes
+    rng = np.random.default_rng(6)
+    table = rng.standard_normal((100, 8)).astype(np.float16)
+    ids = np.array([[7, 0, 99, 42, 13]], dtype=np.int64)
+    got = _call(load_kernel(result), table, ids, out_shape=(1, 5, 8))
+    assert np.array_equal(got, mirrors.gather(table, ids))
+
+
+def test_lut_silu_matches_the_closed_form() -> None:
+    """编译内核的 SiLU 走闭式，与 numpy 镜像同一条公式。
+
+    31 段弦线表在 32 层里累积后，logits 与 torch 差到 1 以上。闭式在
+    域外自然趋近正确的渐近线，不再需要单独的饱和处理。
+    """
+    fn, _ = _compile_shapes("lut", [[7]], dtype="float16")
+    x = np.array([[-8.0, -4.0, -1.0, 0.0, 1.0, 4.0, 23.0]], dtype=np.float16)
+    got = _call(fn, x, out_shape=(1, 7))
+    xf = x.astype(np.float32)
+    ref = (xf / (1.0 + np.exp(-xf))).astype(np.float16)
+    assert np.array_equal(got, ref), f"编译内核 {got} 与闭式 {ref} 不一致"
+
+
 def test_rope_kernel_matches_numpy() -> None:
     """RoPE：三相展开后编成 C，与镜像逐元素一致。
 
@@ -497,11 +529,9 @@ def test_lut_silu_and_eltwise_match_numpy() -> None:
     rng = np.random.default_rng(17)
     x = (rng.standard_normal((2, 4)) * 2).astype(np.float16)
     got = _call(fn, x, out_shape=(2, 4))
-    # 参照是同一张 288 B 表，不是闭式：闭式与查表不是同一个数。
-    from contracts.gml_lut import eval_lut, synth_silu
-    table = synth_silu()
-    ref = np.vectorize(lambda v: eval_lut(float(v), table, -4.0, 4.0))(
-        x.astype(np.float32)).astype(np.float16)
+    # 参照是闭式，与编译内核同一条公式。
+    xf = x.astype(np.float32)
+    ref = (xf / (1.0 + np.exp(-xf))).astype(np.float16)
     assert np.array_equal(got, ref)
 
     fn, _ = _compile_shapes("eltwise", [[2, 4], [2, 4]], dtype="float16")

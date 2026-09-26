@@ -60,11 +60,17 @@ def test_mask_reaches_the_compiler() -> None:
     assert "mask" in calls
 
 
-def test_dynamic_quant_reaches_the_compiler() -> None:
+def test_alias_is_an_identity() -> None:
+    """`aten.alias` 是视图，原样传回，不编译动态量化。
+
+    以前这里走 `pim.dynamic_quant`，把 fp16 量化成 int8 再按 fp16 的长度写回，
+    读出来是 fp16 最大值。量化是权重侧的事。
+    """
     calls: list[str] = []
-    x = np.zeros((1, 64), dtype=np.float16)
-    _run(kernels.dynamic_quant_kernel, [x], (1, 64), calls)
-    assert "dynamic_quant" in calls
+    x = np.arange(64, dtype=np.float16).reshape(1, 64)
+    out = _run(kernels.dynamic_quant_kernel, [x], (1, 64), calls)
+    assert calls == []
+    assert np.array_equal(out, x)
 
 
 def test_gather_reaches_the_compiler() -> None:
@@ -158,7 +164,7 @@ def test_the_compiled_set_is_what_the_docs_claim() -> None:
     called = set(re.findall(r'op="([a-z_]+)"', text))
     called |= set(re.findall(r'_compiled_view\("([a-z_]+)"', text))
     assert called == {
-        "linear", "softmax", "mask", "gather", "dynamic_quant", "eltwise",
+        "linear", "softmax", "mask", "gather", "eltwise",
         "matmul", "convert", "transpose", "reshape", "concat",
         "normalize", "rope", "lut", "kv_cache", "split_heads",
     }, f"实际调用编译器的算子集合变了：{sorted(called)}"
@@ -182,7 +188,7 @@ def test_rope_reaches_the_compiler() -> None:
 
 
 def test_silu_reaches_the_compiler() -> None:
-    """silu 走 `pim.lut` 查表，不再走闭式公式。"""
+    """silu 走 `pim.lut`，求值用闭式。"""
     calls: list[str] = []
     x = np.zeros((4, 16), dtype=np.float16)
     _run(kernels.silu_kernel, [x], (4, 16), calls)
