@@ -9,3 +9,9 @@ paths.local.json
 
 # pytest 每次执行生成的最新结果表格
 test-results/
+
+# GML 导出产物：单次导出数百 MB 至数 GB，不入版本库
+gml-artifacts/
+
+# 终端会话转录，与本仓无关
+*-local-command-*.txt
