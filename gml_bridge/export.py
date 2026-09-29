@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -225,10 +226,51 @@ def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None,
 
 
 
+def _exit_slot_key(exits: list[Node]) -> Callable[[Node], tuple]:
+    """出口缓冲的槽位排序键，按**角色**排：hidden → key cache → value cache。
+
+    参考的 `output_idx` 就是这个顺序（0=hidden、1=key_cache_out、
+    2=value_cache_out）。按 `node_id` 升序发号会排成 value / key / hidden，
+    消费端若按 `output_idx` 绑定缓冲就会把 value cache 当成第一出口
+    （评审 r5 问题 1）。
+
+    两个角色都认字段不认 label 子串或编号：hidden 看 `pim_is_hidden_exit`
+    （裁剪补块出口时盖的）、KV 看 `pim_kv_is_key`。真实图上「编号倒序」今天
+    与角色同解，改天多一个出口就静默换人。入口侧不做这件事：参考的入口槽号
+    是 relay 子图签名顺序（`nprm_0_i3` 排槽 3、`nprm_0_i15` 排槽 5），推不出
+    规则，按节点号升序发号并记为已知差异。
+    """
+    hidden = [n for n in exits if n.fields.get("pim_is_hidden_exit")]
+    if len(hidden) > 1:
+        raise ValueError(
+            f"有 {len(hidden)} 个出口缓冲标了 pim_is_hidden_exit，块出口只该有"
+            f"一个：{[n.node_id for n in hidden]}")
+    hidden_id = hidden[0].node_id if hidden else None
+
+    def role(node: Node) -> tuple[int, int]:
+        # 0 = 本图的数据出口（decode 块是 hidden，整网是 logits），1 = KV cache。
+        # 整网路径没有 `pim_is_hidden_exit`，它的 logits 出口落在同一个桶里，
+        # 两条路都是「数据出口在前、cache 跟后」。
+        is_key = node.fields.get("pim_kv_is_key")
+        if is_key is not None:
+            return (1, 0 if int(is_key) else 1)
+        return (0, 0 if node.node_id == hidden_id else 1)
+
+    return lambda n: (*role(n), n.node_id)
+
+
 def write_io_info(artifact: GmlArtifact, out_dir: Path) -> Path:
     """按参考口径写 `IO_info.txt`：图级入口/出口的 node_id、dtype、shape、size。
 
-    形状取自边的 dims（decode 槽位口径），不是导出图的 seq_len。
+    形状取自边的 dims（decode 槽位口径），不是导出图的 seq_len。三处与参考
+    对齐的口径：
+
+    - `sf` 等于该缓冲对应节点的 `output_sf`：int8 的 KV cache 取真实量化
+      scale，其余留在 fp16 域故为 1.0。IO_info 存 fp32、GML bin 存 fp16。
+    - `sf` 写成 numpy 标量再 repr。参考是直接 repr 一个含 numpy 标量的 dict，
+      消费端必须 eval 带 numpy 命名空间；写裸 float 会让它读不出预期类型。
+    - `shape` 按原始张量的 rank 报（hidden 三维、其余四维），而 GML 的边一律
+      补到四维——两处口径本来就不同，rank 由 `pim_io_rank` 从图侧带过来。
     """
     sources = {e.source for e in artifact.edges}
     targets = {e.target for e in artifact.edges}
@@ -238,11 +280,45 @@ def write_io_info(artifact: GmlArtifact, out_dir: Path) -> Path:
         dims_out.setdefault(e.source, e.dims)
         dims_out.setdefault(e.target, e.dims)
 
-    def shape_of(node_id: int) -> list[int]:
-        dims = dims_out.get(node_id)
+    def shape_of(node: Node) -> list[int]:
+        dims = dims_out.get(node.node_id)
         if not dims:
-            raise ValueError(f"缓冲节点 {node_id} 没有边，写不出 IO_info 的 shape")
-        return [int(p) for p in dims.split("x")]
+            raise ValueError(
+                f"缓冲节点 {node.node_id} 没有边，写不出 IO_info 的 shape")
+        parts = [int(p) for p in dims.split("x")]
+        # 边被左补过维，这里按原始 rank 去掉多补的那几个 1。
+        rank = node.fields.get("pim_io_rank")
+        if rank is not None and len(parts) > int(rank):
+            extra = len(parts) - int(rank)
+            if any(p != 1 for p in parts[:extra]):
+                raise ValueError(
+                    f"缓冲节点 {node.node_id} 的边形状 {dims} 去不掉 {extra} 维："
+                    f"被去掉的维不是 1，说明 pim_io_rank 与边不是同一个张量")
+            parts = parts[extra:]
+        return parts
+
+    def scale_of(node: Node, side: str) -> "np.float32":
+        """这个 I/O 缓冲的 sf：等于它对应节点的 `output_sf`。
+
+        **先按 dtype 分派再按角色**（设计 3.5(1)）：只有 int8 缓冲带真实量化
+        scale，fp16 / int16 留在 fp16 域故为 1.0。角色取图侧盖的
+        `pim_kv_is_key`，不认 label 子串——label 改名会让 sf 静默退回 1.0。
+        写成 np.float32 是序列化口径要求。
+
+        `by_id` 必须传真表：`Split` 自己不带 `pim_kv_is_key`，要靠它回溯上游
+        DMA 的角色。传空表会让这条回溯恒失效，把"判据没接线"报成"字段缺失"。
+        """
+        from gml_bridge import calib_data
+
+        if dtype_of(node, side) != "int8":
+            return np.float32(1.0)
+        is_key = _kv_role_of(node, by_id)
+        if is_key is None:
+            raise ValueError(
+                f"int8 缓冲 {node.node_id}（label "
+                f"{node.fields.get('label')!r}）没有 pim_kv_is_key，算不出它的 "
+                f"sf。新增 int8 I/O 要显式归类，不能默默按 1.0 发")
+        return np.float32(calib_data.kv_cache_scale(is_key=is_key))
 
     def dtype_of(node, side: str) -> str:
         key = f"{side}_buffer_dtype" if side == "input" else "output_buffer_dtype"
@@ -261,14 +337,14 @@ def write_io_info(artifact: GmlArtifact, out_dir: Path) -> Path:
         if n.node_id not in sources:
             exits.append(n)
     entries.sort(key=lambda n: n.node_id)
-    exits.sort(key=lambda n: n.node_id)
+    exits.sort(key=_exit_slot_key(exits))
 
     inputs = {}
     for idx, n in enumerate(entries):
-        shape = shape_of(n.node_id)
+        shape = shape_of(n)
         dt = dtype_of(n, "output")
         inputs[str(n.node_id)] = {
-            "sf": 1.0,
+            "sf": scale_of(n, "output"),
             "dtype": dt,
             "node_name": n.fields.get("label", n.node_id),
             "input_idx": idx,
@@ -279,10 +355,10 @@ def write_io_info(artifact: GmlArtifact, out_dir: Path) -> Path:
             inputs[str(n.node_id)]["mask"] = True
     outputs = {}
     for idx, n in enumerate(exits):
-        shape = shape_of(n.node_id)
+        shape = shape_of(n)
         dt = dtype_of(n, "input")
         outputs[str(n.node_id)] = {
-            "sf": 1.0,
+            "sf": scale_of(n, "input"),
             "dtype": dt,
             "node_name": n.fields.get("label", n.node_id),
             "previous_name": n.fields.get("label", n.node_id),
@@ -326,7 +402,8 @@ def export_llama2(
 
 
 def write_runtime_files(
-    artifact: GmlArtifact, out_dir: Path, *, gm: GraphModule | None = None
+    artifact: GmlArtifact, out_dir: Path, *, gm: GraphModule | None = None,
+    verbose: bool = False,
 ) -> "WrittenFiles":
     """按 GML 引用的清单把 `.bin` 写出来，并交叉校验两侧一致。
 
@@ -336,6 +413,10 @@ def write_runtime_files(
 
     交叉校验在这里做，而不是留给调用方：悬空引用不会在我们这侧报错，
     必须在产出的同一处拦住（见文档第 28 节）。
+
+    `verbose` 打印每个 DQ 节点的标定中间态（`DynamicScalingPhases.__repr__`），
+    满足需求三非功能需求4「标定中间产物要能 print 出可读文本」（评审 r4 问题1）。
+    默认关闭：37 个 DQ 节点逐个打印会刷屏，正常导出不需要。
     """
     from gml_bridge.runtime_files import (
         WrittenFiles,
@@ -357,6 +438,7 @@ def write_runtime_files(
         write_rms_norm_epsilon,
         write_weight,
     )
+    from gml_bridge import calib_data
     from gml_bridge.phase_data import dynamic_scaling, softmax
     from quant.weights import quantize_weight
 
@@ -375,28 +457,42 @@ def write_runtime_files(
         for edge in artifact.edges
     }
 
+    # Split 的 K/V 角色要回溯上游的 KV_Cache_DMA，所以先建按 id 的索引。
+    by_id = {n.node_id: n for n in artifact.nodes}
+    # 定点化的 Kantor scale 要顺着下游找它写进哪块 KV cache，所以也要正向邻接表。
+    consumers_of: dict[int, list[int]] = {}
+    for edge in artifact.edges:
+        consumers_of.setdefault(edge.source, []).append(edge.target)
+
+    # 先把所有 DQ 节点的四相算出来：每个 DQ 的四相要写盘，而同一个节点在
+    # 循环里会被多个字段碰到，先算一次避免重复。下游 int8 入槽**引用**它的
+    # `output_buffer_phase_1_<DQ>.bin`，不各自再算一份。
+    dq_phases = {
+        n.node_id: dynamic_scaling(
+            _dq_source(gm, artifact, n.node_id, spec),
+            group_size=None if spec.is_attention_scores else spec.group_size)
+        for n in artifact.nodes
+        if (spec := artifact.dq_specs.get(n.node_id)) is not None
+    }
+
     # 逐个节点按它实际引用的名字写，而不是遍历所有可能的名字——后者会写出
     # GML 没引用的垃圾文件，交叉校验会拦下来。
     for node in artifact.nodes:
         # DQ 节点的各相 bin 由 phase_data 算，一次写全，然后跳过逐字段扫描
         # —— 那些名字都是本节点自命名的，不走边的形状。
-        # RoPE 的子块缓冲按**每头的 head_dim** 计元素数：cos/sin 是
-        # 逐位置的定标向量，不是整张张量。实测节点 30 的定标三族都是
-        # 32 元素（= head_dim/4，见 §11.4 那条判据）。
-        rope_elements = _rope_elements(node)
         spec = artifact.dq_specs.get(node.node_id)
-        if spec is not None:
-            source = _dq_source(gm, artifact, node.node_id, spec)
+        phases = dq_phases.get(node.node_id)
+        if phases is not None:
+            if verbose:
+                print(f"[DQ] 节点 {node.node_id}: {phases!r}")
+            # RoPE 折叠的 DQ 逐组发 FPSU 三族，普通 DQ 发标量（参考实测）。
             write_dq_phases(
-                files, node.node_id,
-                dynamic_scaling(
-                    source,
-                    group_size=None if spec.is_attention_scores
-                    else spec.group_size))
-            # 输出 requant scale 逐字节等于 phase1（下游走跨节点引用时读它）。
-            write_output_scale(
-                files, node.node_id,
-                np.zeros(spec.groups, dtype=np.float16))
+                files, node.node_id, phases,
+                per_group_fpsu=node.fields.get("op_type")
+                == "Llama2ActivationDQ")
+            # 输出 requant scale 逐字节等于 phase1（下游走跨节点引用时读它），
+            # 所以直接取那一相，不另写一份。
+            write_output_scale(files, node.node_id, phases.output_scale)
             # **不能 continue**：DQ 节点除了 phase 族，还有走通用路径的
             # `input_buffer` / `input_sf`（它在图里仍是一条边的消费者）。
             # 早退会让那两个引用悬空。
@@ -408,18 +504,28 @@ def write_runtime_files(
             if (value := node.fields.get(f"input{slot}_node_id")) is not None
         }
 
+        # RoPE 子块里只有 cos/sin 乘积缓冲按整张激活计元素数（参考 8192 字节
+        # = 4096 个 fp16），其余定标零点族都是单元素标量、宽度在
+        # `write_rope_buffer` 里按族定，不看这个值。
+        rope_elements = elements_between.get(
+            (sources.get(0), node.node_id), 1)
+
         # Softmax 五相：本节点自命名的 phase 族一次写全，同 DQ 的处理——
         # 一直没接（`gml_bridge/runtime_files.py::write_softmax_phases`
         # 早就写好了，之前只是没在这里调用），是 1051 个悬空引用里最大的一块
         # （见 docs/prepare_out-代码评审-20260920.md §3.1）。numel 取自
-        # 输入边（bmm1 输出 -> Softmax），同结构轮 DQ 的零张量占位约定
-        # （`_dq_source`）——尺寸要准，内容不参与结构验证。
+        # 输入边（bmm1 输出 -> Softmax）。
+        #
+        # 输入与 DQ 同取标定激活，**不喂零张量**：零输入会让 phase0（落 -max）
+        # 变 -0.0、phase1 全 1.0、phase2 = 组长，那是「没算」而不是算出来的，
+        # 与 `_dq_source` 同一类问题（设计 3.3 的判定原则）。
         if node.fields.get("op_type") == "Softmax":
             softmax_numel = slots.seq if rewrite else elements_between.get(
                 (sources.get(0), node.node_id), 1)
             write_softmax_phases(
                 files, node.node_id,
-                softmax(np.zeros(softmax_numel, dtype=np.float32)))
+                softmax(calib_data.activation_for(softmax_numel)
+                        .astype(np.float32)))
             # **不能 continue**：Softmax 节点的 `input_buffer`/`input_sf`
             # 仍走通用路径（它在图里是一条边的消费者），同 DQ 的道理。
 
@@ -456,20 +562,29 @@ def write_runtime_files(
                 if value in files.names_written:
                     continue
                 if "Shift" in key or "shift" in key:
-                    files._write(value, np.zeros(1, dtype=np.int8))
+                    files._write(
+                        value,
+                        np.full(1, _kantor_shift_of(key, node), dtype=np.int8))
                 elif "bias" in key.lower():
                     files._write(value, np.zeros(1, dtype=np.float32))
                 else:
-                    files._write(value, np.zeros(1, dtype=np.float16))
+                    files._write(
+                        value,
+                        np.full(1, _kantor_scale_of(key, node, by_id,
+                                                    consumers_of),
+                                dtype=np.float16))
             elif key == "RMSNorm_Add_Const":
                 # eps 取自图里读出的真实值，不假设 config.json。
                 write_rms_norm_epsilon(
                     files, node.node_id, _epsilon_of(gm, artifact, node.node_id))
             elif key == "output_scale_factor_buffer":
-                # vpu_params 里引用的 output_sf。RMSNorm 的输出 sf 走这条路，
-                # 顶层字段里没有它 —— 只在子块里出现，所以要单独认。
+                # vpu_params 里的 output_sf 与顶层 output_sf 字段指向同一个
+                # 文件名（都是 output_sf_<id>.bin），取值走同一处计算，
+                # 不能各写一份——写死 1.0 会在 _output_scale_of 将来对
+                # RMSNorm 给出别的值时静默盖掉计算结果（评审 r4 问题3）。
                 write_output_scale(
-                    files, node.node_id, 1.0, dtype=scale_dtype)
+                    files, node.node_id, _output_scale_of(node, by_id),
+                    dtype=scale_dtype)
             elif _is_rope_file(key):
                 # **必须排在通用 Scaling_buffer_file 分支之前**：
                 # RoPE 子块的键名也以 Scaling_buffer_file 开头
@@ -479,28 +594,40 @@ def write_runtime_files(
                 write_rope_buffer(files, key, value, rope_elements)
             elif key.startswith("Scaling_buffer_file"):
                 # matmul1 的定标是 1/√head_dim（attention scale 折在这里，
-                # 漏掉数值全错）；其余算子 1.0，KV_Cache_DMA 2.0。
+                # 漏掉数值全错）；其余算子 1.0。
+                #
+                # KV_Cache_DMA 是 (scale 2.0, post_shift 14) 这一对固定值：
+                # 参考两个 DMA 节点都是这一对，且都没有声明
+                # `weight_sf_multiplier`，所以推不出来，是 TVM 侧对这个算子
+                # 写死的常量。post_shift 一直按这条发 14，scale 却落到了通用
+                # 分支算成 1.0，与同一处注释自称的 2.0 打架（评审 r7 问题 5）。
                 scaling = node.fields.get(_ATTENTION_SCALE_FIELD)
                 slot = _slot_of(key)
+                is_kv_dma = node.fields.get("op_type") == "KV_Cache_DMA"
                 if scaling is not None:
                     scale_val = float(scaling)
+                elif is_kv_dma:
+                    scale_val = 2.0
                 else:
                     multiplier = int(node.fields.get("weight_sf_multiplier") or 1)
                     scale_val = 1.0 / multiplier
                 write_scaling(
                     files, node.node_id, scale_val,
-                    post_shift=14 if node.fields.get("op_type") == "KV_Cache_DMA"
-                    else 0,
+                    post_shift=14 if is_kv_dma else 0,
                     slot=slot)
             elif key.startswith(("Bias_buffer_file", "Scaling_PS_buffer_file")):
                 continue  # 与 Scaling_buffer_file 同一次写出（三族一起）
             elif key.startswith("updates_") and not key.endswith("_dtype"):
-                # updates 那一路的量化参数，按本节点编号。
+                # updates 那一路的量化参数，按本节点编号。sf 与本节点的
+                # output_sf 同一块 cache、同一个 scale（P0-2：quantize/
+                # dequantize 共用同一常量），不能各写一份 0。
                 if key.endswith("_zp"):
                     write_zero_point(files, value)
                 else:
                     write_named_buffer(
-                        files, value, 1, dtype=np.float16)
+                        files, value, 1, dtype=np.float16,
+                        content=np.full(
+                            1, _output_scale_of(node, by_id), dtype=np.float16))
             elif "_zp" in key and not key.endswith("_dtype"):
                 # 对称量化：4 字节 int32 的 0，但文件必须存在。
                 write_zero_point(files, value)
@@ -508,7 +635,9 @@ def write_runtime_files(
                 # 输出的 requant scale 按**本节点**编号，不是消费者
                 # —— 走 write_output_scale。落到下面那个 input_sf 分支会
                 # 写成 input_sf_<id>.bin，两边都错（一个悬空、一个多余）。
-                write_output_scale(files, node.node_id, 1.0, dtype=scale_dtype)
+                write_output_scale(
+                    files, node.node_id, _output_scale_of(node, by_id),
+                    dtype=scale_dtype)
             elif (key.startswith("input_")
                   and value.startswith(("output_buffer", "weight_buffer"))):
                 # 这一路**引用生产者的文件**（上游是 phase 型 DQ）：
@@ -528,8 +657,18 @@ def write_runtime_files(
                 # 恰好也叫 `input_sf_<id>.bin`，多写的那份正好有人引用。
                 # 直到 input_sf 改成引用上游 DQ 的文件，它才暴露成
                 # 「写了盘但 GML 没引用」。
+                #
+                # KV 那一路的 `input_sf` 取那块 cache 的 scale，不写死 1.0：
+                # 它读的是 int8 的 cache 平面，1.0 等于宣称「没量化」。参考在
+                # 同一批节点上三个 sf 字段是同一个常量（节点 28 的
+                # input/updates/output_sf 全为 0.0459），我方以前只改了后两个
+                # （评审 r2 问题 1）。判据按 K/V 角色，不按 dtype —— 其余 int8
+                # 输入的 sf 是**引用上游 DQ 的 phase1 文件**（上面那条
+                # `input_` 分支已 continue），不走这里。
                 write_activation_scale(
-                    files, node.node_id, 1.0, slot, dtype=scale_dtype)
+                    files, node.node_id,
+                    _input_scale_of(node, by_id, slot),
+                    slot, dtype=scale_dtype)
             elif key.startswith("input_buffer"):
                 source = sources.get(slot if slot is not None else 0)
                 count = elements_between.get((source, node.node_id), 1)
@@ -554,10 +693,22 @@ def write_runtime_files(
                 elif declared == "int16":
                     dtype = np.int16
                 if value == names.data_buffer(node.node_id, slot):
+                    # 这条边的上游是图入口缓冲时，内容取那个入口自己的标定
+                    # 常数（cos / sin / mask / kv_position 各一份），不是
+                    # hidden state 平铺（评审 r7 问题 1）。
+                    producer = by_id.get(source)
                     write_data_buffer(
-                        files, node.node_id, count, slot, dtype=dtype)
-                elif value not in files.names_written:
-                    write_named_buffer(files, value, count, dtype=dtype)
+                        files, node.node_id, count, slot, dtype=dtype,
+                        calib_role=producer.fields.get("pim_calib_role")
+                        if producer else None)
+                # 否则是跨节点引用（本节点复用另一个节点的 input_buffer，
+                # 如 RoPE 的 Q/K 两路共享同一份 cos/sin 乘积）：那个名字属于
+                # 它真正的生产者，会在处理那个节点时按上面的分支写出。这里
+                # 不再兜底补零——补零会先写一份错误内容，等生产者后写时才
+                # 覆盖，同一个文件名在一次导出里被写两种内容，谁生效取决于
+                # 节点遍历顺序（评审 r4 问题4）。真的没有生产者时，
+                # `verify_against_graph` 会以"GML 引用了但没写盘"报出来，
+                # 比静默产零更早暴露问题。
             elif key == "output_buffer" and value.startswith("weight_buffer"):
                 # 本节点的输出流进下游的**权重通路**，所以按
                 # `weight_buffer_<消费者>` 命名（见 from_fx 那段说明）。
@@ -613,10 +764,21 @@ def write_runtime_files(
                             quantized.values, scales.astype(quantized.scales.dtype),
                             quantized.group_size)
                     write_weight(files, node.node_id, quantized)
-            elif key == "output_buffer" and value.startswith("output_buffer_"):
+            elif value == names.phase_output_buffer_self(node.node_id):
                 # phase 型节点自命名的输出缓冲：装本节点的完整输出
-                # （量化后的 int8），不是某条边的数据。
-                write_phase_output_buffer(files, node.node_id, spec.numel)
+                # （量化后的 int8），不是某条边的数据。参考产物上它与
+                # `output_buffer_phase_3_<id>.bin` 逐字节相同，所以直接取那一相。
+                # 走到这里的必是 phase 型节点，spec 一定在（`output_buffer_<self>`
+                # 这个名字只有它们自己发）。断言让违反时立刻炸，不靠默认值兜。
+                #
+                # 判据是「名字里的尾号是不是自己」，不能只看前缀：布局算子把
+                # 上游 DQ 的定点数据传下去时，它的 output_buffer 也叫
+                # `output_buffer_<那个 DQ>`，那是**引用**、由 DQ 自己写盘
+                # （评审 r8 问题 1）。
+                assert spec is not None, (
+                    f"节点 {node.node_id} 自命名 output_buffer 但没有 dq_spec")
+                write_phase_output_buffer(
+                    files, node.node_id, spec.numel, phases.phase3)
             elif key == "output_buffer":
                 # 输出缓冲区按消费者命名，所以它是下游节点的输入缓冲——
                 # 会在那个节点自己的 input_buffer 里写到，这里跳过避免重复。
@@ -687,20 +849,6 @@ def _is_rope_file(key: str) -> bool:
                                 "Bias_buffer_file")))
 
 
-def _rope_elements(node) -> int:
-    """RoPE 子块缓冲的元素数。
-
-    取 `head_dim`：cos/sin 是逐位置的定标向量。取不到形状时退化成 1
-    —— 宁可小也不要瞎猜，尺寸不对会被校验器逐文件查出来。
-    """
-    shape = node.fields.get("original_shape")
-    if isinstance(shape, str):
-        parts = [int(x) for x in shape.strip("[]").split(",")]
-        if parts:
-            return parts[-1]
-    return 32
-
-
 def _matmul_weight_elements(node, elements_between: dict,
                             slots: CompileSlots | None = None,
                             *, rewrite: bool = False) -> int:
@@ -719,6 +867,278 @@ def _matmul_weight_elements(node, elements_between: dict,
     return slots.bmm_weight_elems
 
 
+# 做定点化（fp16 → int8）的 Kantor 模式。其余模式（`elementwise_mul_fp16`、
+# `off`）不改变量化域，scale 是纯逐元素系数。
+_KANTOR_FIXED_POINT_MODE = "fp2int_converter"
+
+
+def _kantor_mode_key(key: str) -> str:
+    """这个 Kantor 系数文件（scale 或 Shift）对应的 `kantor_mode` 字段名。
+
+    同一个节点上可以挂好几族 Kantor 系数，每族自带一个 mode 字段，scale 与
+    Shift 共用同一个 mode——「做不做定点化」是同一件事的两半（1/scale 与
+    ×256），判据不能分叉（评审 r4 问题5）：
+
+    | 系数文件键 | mode 字段 |
+    | --- | --- |
+    | `kantor_A_scale_buffer_file` / `kantor_A_Shift` | `kantor_mode` |
+    | `Kantor_A_Llama2Activation_add_scale_buffer_file` / `_Shift_Llama2Activation_add` | `kantor_mode_Llama2Activation_add` |
+    | `Kantor_B_Llama2Activation_Cos_scale_buffer_file` / `_Shift_Llama2Activation_Cos` | `kantor_mode_Llama2Activation_Cos` |
+    """
+    suffix = key
+    for prefix in ("kantor_A_", "kantor_B_", "Kantor_A_", "Kantor_B_"):
+        if suffix.startswith(prefix):
+            suffix = suffix[len(prefix):]
+            break
+    for marker in ("scale_buffer_file", "Shift_", "Shift"):
+        suffix = suffix.replace(marker, "")
+    suffix = suffix.strip("_")
+    return f"kantor_mode_{suffix}" if suffix else "kantor_mode"
+
+
+def _kantor_scale_of(key: str, node: Node, by_id: dict[int, Node],
+                     consumers_of: dict[int, list[int]]) -> float:
+    """非 phase 的 Kantor scale 取值：**按族**看这一族的 `kantor_mode`。
+
+    | `kantor_mode` | 取值 | 含义 |
+    | --- | --- | --- |
+    | `fp2int_converter` | 1 / 下游那块 KV cache 的 scale | 这一族做定点化 |
+    | 其余（`elementwise_mul_fp16` / `off`） | 1.0 | 不改变量化域，不缩放 |
+
+    定点化族的方向是**量化 scale 的倒数**，与 DQ 的 `phase2 = 1/phase0` 同向
+    （参考实测：v_proj 的 383.25 ≈ 1/0.00261、RoPE 那条 add 的 21.78
+    ≈ 1/0.0459，各是它那次量化用的 cache scale 的倒数）。
+
+    那次量化的 scale 分两种来路，都归到 `_output_scale_of` 这一处取值源：
+
+    - 本节点输出自己就落 int8（v_proj、`KV_Cache_DMA`）：取本节点的 `output_sf`。
+    - 本节点输出留在 fp16 域（RoPE 的 add 折在 `Llama2Activation` 里）：量化发生
+      在下游那块 cache 上，顺着下游找到那个 DMA 取它的角色。
+
+    不缩放族发 1.0 而不是 absmax 倒数：同仓 `write_rope_buffer` 对同一个 RoPE
+    角色写的就是 1.0，写别的值等于把「不缩放」变成一次缩放（评审 r2 问题 2）。
+    """
+    from gml_bridge import calib_data
+
+    mode_key = _kantor_mode_key(key)
+    mode = node.fields.get(mode_key)
+    if mode is None:
+        raise ValueError(
+            f"节点 {node.node_id} 有 Kantor scale {key!r}，但没有配套的 "
+            f"{mode_key!r}，判不出这一族做不做定点化")
+    if str(mode) != _KANTOR_FIXED_POINT_MODE:
+        return 1.0
+    own = _output_scale_of(node, by_id)
+    if own != 1.0:
+        return 1.0 / own
+    is_key = _kv_cache_written_by(node, by_id, consumers_of)
+    return 1.0 / calib_data.kv_cache_scale(is_key=is_key)
+
+
+def _kv_cache_written_by(node: Node, by_id: dict[int, Node],
+                         consumers_of: dict[int, list[int]]) -> bool:
+    """顺着下游找这个节点的输出写进哪块 KV cache；返回 K 还是 V。
+
+    给「本节点输出还在 fp16 域、定点化发生在下游」的那一族用（RoPE 的 add）。
+    走到 DMA 就停，不穿过去。找不到或找到多块都抛：这一族的 scale 只有那块
+    cache 能定，猜一个值会把量化域算错而不报错。
+    """
+    seen = {node.node_id}
+    queue = [node.node_id]
+    roles: set[bool] = set()
+    while queue:
+        current = queue.pop(0)
+        for consumer in consumers_of.get(current, ()):
+            if consumer in seen:
+                continue
+            seen.add(consumer)
+            downstream = by_id.get(consumer)
+            if downstream is None:
+                continue
+            if downstream.fields.get("op_type") == "KV_Cache_DMA":
+                roles.add(bool(downstream.fields.get("pim_kv_is_key")))
+                continue
+            queue.append(consumer)
+    if len(roles) != 1:
+        raise ValueError(
+            f"节点 {node.node_id} 的定点化 Kantor scale 要取下游 cache 的 "
+            f"scale，但顺着下游找到 {len(roles)} 块 KV cache（应当恰好 1 块）")
+    return roles.pop()
+
+
+def _kantor_shift_of(key: str, node: Node) -> int:
+    """非 phase 的 Kantor Shift 取值：做定点化的发 -8（左移 8 位 = ×256），否则 0。
+
+    判据改为**按族看 `kantor_mode`**，与 `_kantor_scale_of` 共用同一个
+    `_kantor_mode_key`（评审 r4 问题5）：此前按文件名前缀各判一次，
+    一族改名或新增一个定点化族时 scale 会跟着 `kantor_mode` 走、Shift 不会，
+    两者本是同一件事的两半（×256 与 1/scale），错的那一份在产物上仍是
+    合法 int8，拦不住。走 `_phase_` 那条路的 37 个由
+    `runtime_files.write_dq_phases` 写，不经这里。
+    """
+    from gml_bridge.phase_data import DQ_PHASE3_SHIFT
+
+    mode_key = _kantor_mode_key(key)
+    mode = node.fields.get(mode_key)
+    if mode is None:
+        raise ValueError(
+            f"节点 {node.node_id} 有 Kantor Shift {key!r}，但没有配套的 "
+            f"{mode_key!r}，判不出这一族做不做定点化")
+    return DQ_PHASE3_SHIFT if str(mode) == _KANTOR_FIXED_POINT_MODE else 0
+
+
+def _output_scale_of(node: Node, by_id: dict[int, Node]) -> float:
+    """这个节点输出的 requant scale。
+
+    输出落进 int8 的 KV cache 的那几个带真实 scale，其余留在 fp16 域故为 1.0：
+
+    | op_type | 取值 |
+    | --- | --- |
+    | `KV_Cache_DMA` | 本节点写的是 K 还是 V cache |
+    | `Split` | 从 cache 切出，继承上游 DMA 的同一个 scale |
+    | `Gemm` 的 v_proj | 输出要写进 value cache，带 requant scale |
+    | 其余 | 1.0 |
+
+    进出同一块 cache 共用同一个 scale，所以三处都从 `calib_data.kv_cache_scale`
+    取，不各算一份。
+
+    **不回落 1.0**：该发 1.0 的算子显式列在 `_FP16_DOMAIN_OP_TYPES` 里，白名单
+    外直接抛。回落会让「新增或改名的算子没被识别」与「本来就该是 1.0」走同一条
+    路，把 bug 静默掉（设计 3.4）。
+    """
+    from gml_bridge import calib_data
+
+    op_type = node.fields.get("op_type")
+    is_key = _kv_role_of(node, by_id)
+    if is_key is not None:
+        return calib_data.kv_cache_scale(is_key=is_key)
+    if op_type == "Gemm" and "v_proj" in str(
+            node.fields.get("pim_weight_param") or ""):
+        # v_proj 的输出写进 int8 的 value cache，与那块 cache 同一个 scale。
+        return calib_data.kv_cache_scale(is_key=False)
+    if op_type in _FP16_DOMAIN_OP_TYPES:
+        return 1.0
+    raise ValueError(
+        f"节点 {node.node_id} 的 op_type {op_type!r} 不在 output_sf 取值表里，"
+        f"算不出它的 requant scale。新增算子要显式归类：落 int8 cache 的取"
+        f"`calib_data.kv_cache_scale`，留在 fp16 域的加进 _FP16_DOMAIN_OP_TYPES")
+
+
+# 输出留在 fp16 域、`output_sf` 恒为 1.0 的算子（需求 2.4「非标定类 sf」实测：
+# MatMul×64、Softmax×32、Mask×32、EltwiseAdd×2、EltwiseMul×1 两边都是 2B/1.0）。
+#
+# 只列**实测带 `output_sf`** 的算子。纯布局的 `Concat` / `Reshape` / `Transpose`
+# 不带这个字段（两条导出路径实测 0 个），曾误列在此：多列不是兜底——将来谁给
+# `Concat` 加上 `output_sf`，它会静默取 1.0，正是设计 3.4 要防的静默路径。
+# `KV_Cache_DMA` 也不在这里：它由前面的 KV 角色分支取真实 scale。
+_FP16_DOMAIN_OP_TYPES = frozenset({
+    "MatMul", "Softmax", "Mask", "EltwiseAdd", "EltwiseMul",
+    "RMSNorm_vpu", "Gemm", "Split", "Llama2Activation", "Llama2ActivationDQ",
+    "DynamicScaling",
+})
+
+
+# 定标沿边传播时可以穿过的算子：它们不改数值，只改布局。
+_LAYOUT_OP_TYPES = frozenset({"Split", "Transpose", "Reshape", "Concat"})
+
+
+def _input_scale_of(node: Node, by_id: dict[int, Node],
+                    slot: int | None) -> float:
+    """一条**按本节点自命名**的输入 `input_sf` 该写什么值。
+
+    定点数据的逐组 scale 属于产生它的那个 DQ，由那个 DQ 自己写盘、消费者只
+    引用（`output_buffer_phase_1_<DQ>.bin`，走 `input_` 分支 continue），所以
+    走到这里的只剩两类自命名来源：
+
+    1. KV cache 那一路（`pim_kv_is_key`）取那块 cache 的 scale；
+    2. **fp16 域的边发 1.0** —— 这条边没做定点化，1.0 是真值而不是兜底。
+
+    **不回落 1.0**：该发 1.0 的来源显式列出，识别不到就抛（设计 3.4，与
+    `_output_scale_of` 同口径）。回落会让「新增一个 int8 入口但没接上定标」
+    与「这条边本来就没量化」走同一条路，把 bug 静默掉。
+
+    dtype **没声明**按 fp16 算：`_NO_TOP_IN_DTYPE` 那几个算子（Mask /
+    EltwiseAdd / EltwiseMul / Concat / KV_Cache_DMA）本来就不写顶层 input
+    dtype，缺省即 fp16，这是 `from_fx` 的既有约定而不是识别失败。真正要抛的是
+    「声明了一个不认识的 dtype」与「int8 却自命名 sf」两种。
+    """
+    kv_role = _kv_role_of(node, by_id)
+    if kv_role is not None:
+        from gml_bridge import calib_data
+        return calib_data.kv_cache_scale(is_key=kv_role)
+
+    declared = node.fields.get(
+        "input_buffer_dtype" if slot is None
+        else f"input_buffer_{slot}_dtype",
+        node.fields.get("input_buffer_dtype"))
+    if declared is None or declared in ("float16", "float32"):
+        return 1.0
+
+    if declared == "int8":
+        # 走到这里说明这条 int8 边的 `input_sf` 是**按本节点自命名**的。定点数据
+        # 的逐组 scale 属于产生它的那个 DQ，组数按 DQ 的整张张量分，与这条边
+        # （以及它标注的那个按边宽定尺寸的缓冲）的元素数根本不是一个口径：照抄
+        # 上游的整条向量，就等于宣称 group_size = 边宽 / 组数，与 DQ 实际的分组
+        # 相矛盾（评审 r8 问题 1，实测那 32 个 MatMul 宣称成了 4）。
+        #
+        # 正确的形态是缓冲与定标**出自同一个节点**：`from_fx` 的
+        # `_quant_origin_of` 会穿过布局算子把两个名字都指到那个 DQ，于是
+        # `input_sf` 落到上面那条 `input_` 分支 continue，不到这里。
+        producer = _quant_producer_of(node, by_id)
+        raise ValueError(
+            f"节点 {node.node_id} 槽 {slot} 是 int8 输入，但 `input_sf` 按本节点"
+            f"自命名"
+            + (f"，而给它定标的是 DQ {producer}：应当引用那个 DQ 的 "
+               f"`output_buffer_phase_1_{producer}.bin`，缓冲也引用它的 "
+               f"`output_buffer_{producer}.bin`，让组数与元素数出自同一个节点"
+               if producer is not None else
+               "，且顺上游找不到给它定标的 DQ 节点——要么把上游的 DQ 接上，"
+               "要么把这条边改成 fp16"))
+
+    raise ValueError(
+        f"节点 {node.node_id} 槽 {slot} 声明的 input dtype 是 {declared!r}，"
+        f"不在取值表里，算不出这条边的 scale。新增 dtype 要显式归类："
+        f"留在 fp16 域的发 1.0，落定点域的接上游 DQ")
+
+
+def _quant_producer_of(node: Node, by_id: dict[int, Node]) -> int | None:
+    """顺 slot0 上游穿过布局算子，找产生这份定点数据的 DQ 节点号。
+
+    布局算子不改数值，定标跟着**原始生产者**走。只认 slot0：布局算子的
+    数据都从第一个输入来。
+    """
+    seen: set[int] = set()
+    current = node
+    while current is not None and current.node_id not in seen:
+        seen.add(current.node_id)
+        upstream = by_id.get(current.fields.get("input0_node_id"))
+        if upstream is None:
+            return None
+        op_type = upstream.fields.get("op_type")
+        if op_type in ("DynamicScaling", "Llama2ActivationDQ"):
+            return upstream.node_id
+        if op_type not in _LAYOUT_OP_TYPES:
+            return None
+        current = upstream
+    return None
+
+
+def _kv_role_of(node: Node, by_id: dict[int, Node]) -> bool | None:
+    """这个节点是不是 KV cache 那一路；是则返回它写/读的是 K 还是 V。
+
+    `KV_Cache_DMA` 与两个 cache 出口缓冲自己带 `pim_kv_is_key`；`Split` 不带，
+    要看它的上游是不是 DMA —— Q 路的 Split 上游是 RoPE，不属于这一路。
+    """
+    if "pim_kv_is_key" in node.fields:
+        return bool(node.fields.get("pim_kv_is_key"))
+    if node.fields.get("op_type") != "Split":
+        return None
+    source = by_id.get(node.fields.get("input0_node_id"))
+    if source is None or source.fields.get("op_type") != "KV_Cache_DMA":
+        return None
+    return bool(source.fields.get("pim_kv_is_key"))
+
+
 def _consumer_of(artifact, buffer_name):
     """从 `weight_buffer_<id>.bin` 反解出消费者的 node_id。
 
@@ -732,15 +1152,17 @@ def _consumer_of(artifact, buffer_name):
 def _dq_source(
     gm: "GraphModule | None", artifact: GmlArtifact, node_id: int, spec
 ) -> "np.ndarray":
-    """DQ 节点要量化的那份激活。
+    """DQ 节点要量化的那份激活，取自 `calib_data` 的标定常数。
 
-    **结构轮用零张量占位**：真实数值要跑一次前向才有，而本轮只保证
-    「字节数与 dtype 对、四相之间数学自洽」。参考产物那些 bin 装的同样是
-    对方的合成数据（见计划 §5 的前提），所以内容不参与跨产物比对。
+    **不能用零张量**：零 absmax 会让 phase0 与 phase1 一路输出 0.0，而
+    sf=0 是形式非法值（下游反量化除零）。标定值嵌在源码里，所以这条路径
+    不读任何外部目录。
 
     尺寸必须准确 —— 它决定各相 bin 的字节数，那是校验器逐文件比对的项。
     """
-    return np.zeros(spec.numel, dtype=np.float16)
+    from gml_bridge import calib_data
+
+    return calib_data.activation_for(spec.numel)
 
 
 def _epsilon_of(

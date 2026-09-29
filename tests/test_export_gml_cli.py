@@ -175,3 +175,28 @@ def test_dtype_coverage_skips_without_reference(tmp_path, monkeypatch) -> None:
 
     assert log.checks[0].passed
     assert "无参考产物，跳过" == log.checks[0].detail
+
+
+def test_decode_block_only_is_the_default() -> None:
+    """参考对齐路径要默认裁掉 lm_head，整网导出走 --no- 反向开关。
+
+    依据设计 3.8：带 decode_block_only 的导出与甲方 node/edge 精确一致
+    （200/331），所以它是默认口径；整网导出仍要留入口。
+    """
+    from scripts.export_gml import build_parser
+
+    assert build_parser().parse_args([]).decode_block_only is True
+    assert build_parser().parse_args(
+        ["--no-decode-block-only"]).decode_block_only is False
+
+
+def test_verbose_flag_defaults_to_off() -> None:
+    """`--verbose` 打印标定中间态，默认关闭（37 个 DQ 节点逐个打印会刷屏）。
+
+    依据需求三非功能需求4、评审 r4 问题1：标定中间产物要能 print 出可读
+    文本，但不应该是默认行为。
+    """
+    from scripts.export_gml import build_parser
+
+    assert build_parser().parse_args([]).verbose is False
+    assert build_parser().parse_args(["--verbose"]).verbose is True

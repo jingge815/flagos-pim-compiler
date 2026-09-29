@@ -112,7 +112,8 @@ def gml_llama2_reference_dir(*, required: bool = True) -> Path | None:
     为它准备的。
 
     **版本字符串不是判据**：切换参考后按字段集合对拍，不拿版本号当失败条件。
-    我方 `GML_VERSION` 也不随参考改。
+    但我方 `GML_VERSION` 已按 v2 改成 `"19.2.0"`（需求 P1-4：这个字段大概率被
+    对方解析器用于版本分派），所以它跟参考走，只是仍不当失败条件用。
     """
     path = _configured_path("gml_llama2_reference_dir")
     if path is not None or not required:

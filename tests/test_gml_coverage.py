@@ -204,3 +204,18 @@ def test_every_reference_family_is_emitted_on_the_same_operator(
     assert not absent, f"参考有、我方完全没有的算子: {absent}"
     assert not missing, f"参考有、我方在同一算子上没有的字段族: {missing}"
     assert not extra, f"参考没有、我方多写的字段族: {extra}"
+
+
+def test_p13_non_debug_reference_only_fields_are_declared() -> None:
+    """需求 P1-3 的 4 个非 DEBUG 甲方独有字段要显式声明不产（设计 4.1）。
+
+    它们不是调试副本，所以不能靠 DEBUG 前缀豁免放过：`from_tvm` 与
+    `original_name` 是对方工具链（TVM / ONNX）的痕迹，我方没有对应物；
+    `lut_debug` 与两个 `*_mul_output_hash` 是调试字段。
+    """
+    from contracts.gml_coverage import NOT_APPLICABLE
+
+    for key in ("from_tvm", "original_name", "lut_debug",
+                "cos_mul_output_hash", "sin_mul_output_hash"):
+        assert key in NOT_APPLICABLE, key
+        assert NOT_APPLICABLE[key].strip(), f"{key} 的理由不能为空"

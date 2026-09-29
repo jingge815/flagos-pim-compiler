@@ -120,7 +120,6 @@ def _attach_op_attrs(layer, phase_source):
 
 
 def orchestrate(artifact, *, phase_source=None,
-                gml_version: str = "26.2.1",
                 decode_block_only: bool = False) -> OrchestrationPlan:
     """跑完编排：展开、发号、L2、逐层 txt、net.ini。
 
@@ -175,7 +174,7 @@ def orchestrate(artifact, *, phase_source=None,
         layer_texts[stem + ".txt"] = render_layer_txt(fields)
         stems.append(stem)
 
-    text = net_ini.render(identities, gml_version=gml_version, stems=stems)
+    text = net_ini.render(identities, stems=stems)
     return OrchestrationPlan(expand=expand, identity=identity, l2=l2,
                              net_ini_text=text, layer_texts=layer_texts)
 

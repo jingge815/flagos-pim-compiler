@@ -231,6 +231,161 @@ def test_decode_block_export_omits_gather() -> None:
     assert not [n for n in nodes if n.fields.get("op_type") == "Gather"]
 
 
+def test_trimmed_exit_buffer_takes_the_hidden_entry_rank() -> None:
+    """裁剪补出的块出口缓冲，rank 取 hidden 入口那一个（验收 A7 / A13）。
+
+    参考 decode block 进 `[1,1,4096]`、出 `[1,1,4096]`：出口装的就是 hidden
+    state，与入口同一个张量角色，所以两处都报 rank 3。
+
+    这里**直接钉住 3**，不按实现那条规则重算期望值：重算只能证明「两处用了
+    同一个规则」，取错入口的 bug 换进来照样绿（评审 r2 问题 3）。
+    """
+    nodes, edges, _, _ = convert(_llama_like_graph(), decode_block_only=True)
+
+    # hidden 入口按角色认：残差旁路挂靠的那一个，`convert` 给它盖了标记。
+    hidden = [n for n in nodes if n.fields.get("pim_is_hidden_entry")]
+    assert len(hidden) == 1, [n.node_id for n in hidden]
+    assert hidden[0].fields["pim_io_rank"] == 3, "hidden 入口是三维张量"
+
+    sources = {e.source for e in edges}
+    exits = [n for n in nodes
+             if n.fields.get("is_buffer") and n.node_id not in sources]
+    assert exits, "裁剪后应当补出块出口缓冲"
+    # 补出来的那个出口（label 以 out_ 开头）与 hidden 入口同报 rank 3。
+    trimmed = [n for n in exits
+               if str(n.fields.get("label", "")).startswith("out_")]
+    assert trimmed, "应当有补出的出口缓冲"
+    for node in trimmed:
+        assert node.fields.get("pim_io_rank") == 3, (
+            node.node_id, node.fields.get("pim_io_rank"))
+
+
+def test_trimmed_exit_rank_ignores_entry_buffer_numbering() -> None:
+    """补出的块出口取**标了 hidden 的**那个入口的 rank，不取编号最小的那个。
+
+    手工图故意让编号更小的入口缓冲（10，四维 mask）不是 hidden，hidden 是
+    编号更大的 20（三维）。按角色取会得到 3，按「编号最小」会得到 4——真实
+    图上两条规则恰好同解，所以这条判据只能用手工图钉住（评审 r2 问题 3）。
+    """
+    from gml_bridge.from_fx import _trim_decode_block
+    from gml_bridge.writer import Edge, Node
+
+    other = Node(10, {"label": "in_mask", "name": "in_mask", "is_buffer": 1,
+                      "pim_io_rank": 4, "residual_output_buffer": [30]})
+    hidden = Node(20, {"label": "in_hidden", "name": "in_hidden",
+                       "is_buffer": 1, "pim_io_rank": 3,
+                       "pim_is_hidden_entry": 1,
+                       "residual_output_buffer": [30]})
+    add = Node(30, {"label": "add_params_30", "op_type": "EltwiseAdd",
+                    "residual_output_buffer": [40]})
+    norm = Node(40, {"label": "norm_params_40", "op_type": "RMSNorm_vpu",
+                     "residual_output_buffer": [50]})
+    head = Node(50, {"label": "lm_head_params_50", "op_type": "Gemm",
+                     "pim_weight_param": "lm_head.weight",
+                     "residual_input_buffer": [40]})
+    kept, _ = _trim_decode_block(
+        [other, hidden, add, norm, head],
+        [Edge(10, 30, "1x1x1x8"), Edge(20, 30, "1x1x1x4"),
+         Edge(30, 40, "1x1x1x4"), Edge(40, 50, "1x1x1x4")])
+
+    trimmed = [n for n in kept
+               if str(n.fields.get("label", "")).startswith("out_")]
+    assert len(trimmed) == 1, [n.fields.get("label") for n in trimmed]
+    assert trimmed[0].fields.get("pim_io_rank") == 3, (
+        "应当取 hidden 入口（20）的 rank 3，而不是编号最小那个入口（10）的 4")
+
+
+def test_trim_rejects_two_hidden_entries() -> None:
+    """标了两个 hidden 入口时直接抛：rank 取哪个都是猜。"""
+    import pytest
+
+    from gml_bridge.from_fx import _trim_decode_block
+    from gml_bridge.writer import Edge, Node
+
+    def entry(node_id, rank):
+        return Node(node_id, {"label": f"in_{node_id}", "is_buffer": 1,
+                              "pim_io_rank": rank, "pim_is_hidden_entry": 1,
+                              "residual_output_buffer": [30]})
+
+    add = Node(30, {"label": "add_params_30", "op_type": "EltwiseAdd",
+                    "residual_output_buffer": [40]})
+    norm = Node(40, {"label": "norm_params_40", "op_type": "RMSNorm_vpu",
+                     "residual_output_buffer": [50]})
+    head = Node(50, {"label": "lm_head_params_50", "op_type": "Gemm",
+                     "pim_weight_param": "lm_head.weight",
+                     "residual_input_buffer": [40]})
+    with pytest.raises(ValueError, match="pim_is_hidden_entry"):
+        _trim_decode_block(
+            [entry(10, 4), entry(20, 3), add, norm, head],
+            [Edge(10, 30, "1x1x1x8"), Edge(20, 30, "1x1x1x4"),
+             Edge(30, 40, "1x1x1x4"), Edge(40, 50, "1x1x1x4")])
+
+
+def test_hidden_entry_is_the_residual_bypass_anchor() -> None:
+    """标了 hidden 的那个入口缓冲，就是残差旁路挂靠的那一个。
+
+    rank 的判据落在这个角色上，所以单独守一条：hidden 入口同时喂「入口算子」
+    与「第一条残差 add」两个读者（参考的 node 1 就是这样）。旁路只在整图导出
+    上存在（decode 块把 embedding 那一段裁掉了），所以这里用整图验。
+    """
+    nodes, _, _, _ = convert(_llama_like_graph())
+
+    hidden = [n for n in nodes if n.fields.get("pim_is_hidden_entry")]
+    assert len(hidden) == 1, [n.node_id for n in hidden]
+    readers = hidden[0].fields.get("residual_output_buffer")
+    assert isinstance(readers, list) and len(readers) >= 2, (
+        f"hidden 入口应当有入口算子 + 残差旁路两个读者，实际 {readers}")
+
+
+def test_boundary_buffers_declare_dtype_and_data_extension() -> None:
+    """图级 I/O 缓冲都要带 dtype 与它的通道编码（评审 r5 问题 2）。
+
+    参考在全部 7 个入口与 3 个出口缓冲上都写了 dtype 与
+    `input_data_extensions` / `output_data_extension`（float16→3、int8→1）；
+    它是消费端解释这个缓冲位宽的前提。`scripts/export_gml.py` 的 dtype 自检
+    把 `is_buffer` 整类跳过，看不见这个缺口，所以判据落在这里。
+    """
+    from contracts import gml_hw_table as hw_table
+
+    nodes, edges, _, _ = convert(_llama_like_graph(), decode_block_only=True)
+    targets = {e.target for e in edges}
+
+    entries = exits = 0
+    for node in nodes:
+        if not node.fields.get("is_buffer"):
+            continue
+        if node.node_id in targets:
+            # 出口缓冲：参考带 dtype + 两类 extension（节点 8 / 199 / 200）。
+            dt = node.fields.get("input_buffer_dtype")
+            assert dt, (node.node_id, "缺 input_buffer_dtype")
+            want = hw_table.data_extension(str(dt))
+            for key in ("input_data_extensions", "output_data_extension"):
+                assert node.fields.get(key) == want, (node.node_id, key, dt)
+            exits += 1
+        else:
+            # 入口缓冲：参考只带 dtype，不带 extension（节点 1~7）。
+            assert node.fields.get("output_buffer_dtype"), (
+                node.node_id, "缺 output_buffer_dtype")
+            entries += 1
+    # 这个手工夹具只有一进一出（没有 KV cache / RoPE 表 / mask 那几路）；
+    # 真实图的 7 入口 + 3 出口由 `tests/test_gml_export.py` 那条守。
+    assert (entries, exits) == (1, 1), (entries, exits)
+
+
+def test_hidden_exit_is_marked_for_the_io_info_slot_order() -> None:
+    """裁剪补的块出口带 `pim_is_hidden_exit`，IO_info 按它把它排到槽 0。
+
+    与 `pim_is_hidden_entry` 同一套办法：判据落在角色上，不落在节点编号上
+    （评审 r5 问题 1）。
+    """
+    nodes, _, _, _ = convert(_llama_like_graph(), decode_block_only=True)
+
+    marked = [n for n in nodes if n.fields.get("pim_is_hidden_exit")]
+    assert len(marked) == 1, [n.node_id for n in marked]
+    assert marked[0].fields.get("pim_io_rank") == 3, marked[0].fields
+    assert marked[0].fields.get("input_buffer_dtype") == "float16"
+
+
 def _cast_graph(*dtypes):
     """最小图：输入 → 一串 `to.dtype` → 输出，用来验 `Convert` 的发射条件。"""
     import torch
@@ -596,3 +751,144 @@ def test_rtl_version_disagreement_is_rejected() -> None:
     assert _resolve_rtl_version("1.4") == "1.4"
     with pytest.raises(ValueError, match="rtl_version"):
         _resolve_rtl_version("9.9")
+
+
+# ---- 节点编号从 1 连续（设计 3.6）--------------------------------------
+
+
+def _convert_small(decode_block_only: bool):
+    """跑一次小模型导出，返回 (nodes, edges)。"""
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from gml_bridge.export import fuse_for_gml, serialize_gml
+    from runtime.compile import export_annotated_graph
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(
+        LlamaConfig(vocab_size=32000, hidden_size=64, intermediate_size=176,
+                    num_hidden_layers=2, num_attention_heads=4,
+                    num_key_value_heads=4, max_position_embeddings=16,
+                    bos_token_id=1, eos_token_id=2, pad_token_id=0)).eval()
+    position_ids = torch.arange(16, dtype=torch.long).unsqueeze(0)
+    gm = export_annotated_graph(model, 16, position_ids, dtype=torch.float32)
+    report = fuse_for_gml(gm)
+    artifact = serialize_gml(
+        gm, report, decode_block_only=decode_block_only)
+    return artifact
+
+
+@pytest.mark.parametrize("decode_block_only", [False, True])
+def test_node_ids_are_one_to_n_without_holes(decode_block_only: bool) -> None:
+    """节点 id 集合 == 1..N 连续无空洞，首个 id == 1（验收 A14）。
+
+    改动前我方是 `196 198 199…205 195 194…`、范围 3~206，裁剪后还留空洞。
+    甲方从 1 顺序排到 200。依据设计 3.6。
+    """
+    artifact = _convert_small(decode_block_only)
+    ids = sorted(n.node_id for n in artifact.nodes)
+    assert min(ids) == 1
+    assert ids == list(range(1, len(ids) + 1)), f"不连续：{ids[:12]}…"
+
+
+@pytest.mark.parametrize("decode_block_only", [False, True])
+def test_edges_only_reference_existing_nodes(decode_block_only: bool) -> None:
+    """重编号后边的两端都还指向存在的节点。"""
+    artifact = _convert_small(decode_block_only)
+    ids = {n.node_id for n in artifact.nodes}
+    for edge in artifact.edges:
+        assert edge.source in ids, edge
+        assert edge.target in ids, edge
+
+
+@pytest.mark.parametrize("decode_block_only", [False, True])
+def test_id_bearing_fields_point_at_existing_nodes(
+        decode_block_only: bool) -> None:
+    """装节点号的字段重编号后仍指向存在的节点。
+
+    遍历面覆盖三类：`*_node_id`、`residual_*_buffer`、以及别名 id 字段
+    （`A`）。只看 `_node_id` 结尾会漏掉单字母的别名键——`A` 曾因此漏改，
+    值仍落在旧编号区间里，合法但指到了另一个算子。
+    """
+    artifact = _convert_small(decode_block_only)
+    ids = {n.node_id for n in artifact.nodes}
+    checked = 0
+    for node in artifact.nodes:
+        for key, value in node.fields.items():
+            if key.endswith("_node_id") or key in _ALIAS_ID_FIELDS:
+                assert value in ids, (node.node_id, key, value)
+                checked += 1
+            elif key.startswith(("residual_input_buffer",
+                                 "residual_output_buffer")):
+                for ref in value:
+                    assert ref in ids, (node.node_id, key, ref)
+                    checked += 1
+    assert checked, "图里应当有指向别的节点的字段"
+
+
+# 装节点号但键名不以 `_node_id` 结尾的别名字段。
+_ALIAS_ID_FIELDS = frozenset({"A"})
+
+
+@pytest.mark.parametrize("decode_block_only", [False, True])
+def test_matrix_unit_alias_a_equals_input0_node_id(
+        decode_block_only: bool) -> None:
+    """`A` 与 `input0_node_id` 逐节点同值，与参考同口径（实测 71/71 相等）。
+
+    `A` 是矩阵单元 A 侧操作数的别名，按 `A` 取值的读者只认这个名字。它曾在
+    `_renumber_from_one` 里漏改：`input0_node_id` 压到新编号、`A` 留旧号，
+    因为新旧区间重叠，值仍合法却指向另一个算子——静默指错，5 条结构规则
+    与当时全部单测都拦不住。
+    """
+    artifact = _convert_small(decode_block_only)
+    paired = [(n.node_id, n.fields["A"], n.fields["input0_node_id"])
+              for n in artifact.nodes
+              if "A" in n.fields and "input0_node_id" in n.fields]
+    assert paired, "图里应当有带 A 的 MatMul/Gemm"
+    mismatched = [p for p in paired if p[1] != p[2]]
+    assert not mismatched, f"A 与 input0_node_id 不等：{mismatched[:5]}"
+    # 带 A 的节点必须同时带 input0_node_id，否则别名无从派生。
+    assert not [n.node_id for n in artifact.nodes
+                if "A" in n.fields and "input0_node_id" not in n.fields]
+
+
+@pytest.mark.parametrize("decode_block_only", [False, True])
+def test_bin_names_carry_a_live_node_id(decode_block_only: bool) -> None:
+    """每个 bin 引用的尾号都是存在的节点 id——重编号要连文件名一起改。"""
+    import re
+
+    artifact = _convert_small(decode_block_only)
+    ids = {n.node_id for n in artifact.nodes}
+    checked = 0
+    for node in artifact.nodes:
+        entries = list(node.fields.items())
+        for block in node.nested.values():
+            entries += list(block.items())
+        for _, block in node.contraction:
+            entries += list(block.items())
+        for key, value in entries:
+            if not (isinstance(value, str) and value.endswith(".bin")):
+                continue
+            match = re.search(r"_(\d+)\.bin$", value)
+            assert match, (key, value)
+            assert int(match.group(1)) in ids, (key, value)
+            checked += 1
+    assert checked, "图里应当有 bin 引用"
+
+
+def test_renumbering_keeps_the_reverse_topological_convention() -> None:
+    """编号方向不变：算子区仍是 id 越小越靠输出（甲方同一约定）。
+
+    实测甲方 331 条边里 190 条 `source > target`（9→8、10→9…），所以它的算子区
+    也是逆拓扑。本项只把 id 压到 1..N，不改方向——改成正向会让两边方向相反。
+    """
+    artifact = _convert_small(True)
+    by_id = {n.node_id: n for n in artifact.nodes}
+    operator_edges = [
+        e for e in artifact.edges
+        if not by_id[e.source].fields.get("is_buffer")
+        and not by_id[e.target].fields.get("is_buffer")]
+    assert operator_edges
+    backward = sum(1 for e in operator_edges if e.source > e.target)
+    assert backward > len(operator_edges) // 2, (
+        f"算子边只有 {backward}/{len(operator_edges)} 条逆向，方向被改了")

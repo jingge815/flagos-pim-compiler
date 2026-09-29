@@ -70,12 +70,12 @@ def render_general_section(
     return text
 
 
-def render(identities: list[LayerIdentity], *, gml_version: str = "",
+def render(identities: list[LayerIdentity], *,
            stems: list[str] | None = None,
            dumps_bin_path: str = "llama2_w4a8_decode_block_0/parser_output",
            dumps_txt_path: str = (
                "llama2_w4a8_decode_block_0/prepare_out/txt_files")) -> str:
-    """整份 `net.ini`。`gml_version` 不进 net.ini（版本走 gml_version.txt）。"""
+    """整份 `net.ini`。版本号不进 net.ini，它走 `gml_version.txt`。"""
     return (render_general_section(dumps_bin_path=dumps_bin_path,
                                   dumps_txt_path=dumps_txt_path)
             + render_layers_section(identities, stems=stems))

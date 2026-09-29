@@ -429,7 +429,7 @@ def _run_orchestrator(artifact, phase_source, out_dir: Path,
         stale.unlink()
     (prepare_out / "net.ini").write_text(plan.net_ini_text)
 
-    # 两个版本戳：参考里**没有结尾换行**（6 字节 `26.2.1`、13 字节
+    # 两个版本戳：参考里**没有结尾换行**（6 字节 `19.2.0`、13 字节
     # `0.0.0-c45e54f`），也是整个 txt_files 里唯一不带 CRLF 的两个文件。
     from contracts.gml_quant import GML_VERSION
     (txt_dir / "gml_version.txt").write_text(GML_VERSION)
@@ -599,7 +599,8 @@ def _check_dtype_coverage(gml_text: str, log: CheckLog) -> None:
             notes=missing[:8])
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """命令行参数表。单独一个函数，让默认值本身可被测试断言。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=16,
                         help="prefill 序列长度")
@@ -609,6 +610,9 @@ def main() -> int:
     parser.add_argument("--skip-weights", action="store_true",
                         help="不量化权重，只产结构。此时 GML 若引用权重会被"
                              "交叉校验拦下")
+    parser.add_argument("--verbose", action="store_true",
+                        help="打印每个 DQ 节点的标定中间态（absmax、四相），"
+                             "供人工核对定位问题")
     parser.add_argument("--use-opcompiler", action="store_true",
                         help="跑一遍算子编译器（FlagTree）取回相位模板，与 GML "
                              "侧静态表交叉校验。**不改变产物**：加与不加导出的 "
@@ -617,11 +621,17 @@ def main() -> int:
                         help="跑编排器：层展开、Layer ID 发号、L2 地址分配、"
                              "net.ini 执行序与 txt_files。产物写到 "
                              "<out-dir>/prepare_out/。同样不改变 GML")
-    parser.add_argument("--decode-block-only", action="store_true",
-                        help="丢掉模型末尾 RMSNorm + lm_head + DQ，层数与参考 "
-                             "纯 decode block 的 422 对齐。裁剪发生在 GML 生成前，"
-                             "parser_output 与编排器共用同一张图")
-    args = parser.parse_args()
+    # 默认裁掉末尾 RMSNorm + lm_head + DQ：参考产物就是纯 decode block，
+    # 带这一步导出的 node/edge 与它精确一致。整网导出走下面的反向开关。
+    parser.add_argument("--no-decode-block-only", dest="decode_block_only",
+                        action="store_false", default=True,
+                        help="保留模型末尾 RMSNorm + lm_head + DQ 做整网导出。"
+                             "默认只导 decode block，与参考产物对齐")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     from contracts.compile_slots import CompileSlots
     from runtime.compile import export_annotated_graph
@@ -667,7 +677,8 @@ def main() -> int:
 
     try:
         files = write_runtime_files(
-            artifact, args.out_dir, gm=None if args.skip_weights else graph)
+            artifact, args.out_dir, gm=None if args.skip_weights else graph,
+            verbose=args.verbose)
     except Exception as exc:
         log.add("GML 与 bin 写盘", False, f"{type(exc).__name__}: {exc}")
         return log.verdict()

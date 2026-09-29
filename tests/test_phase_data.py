@@ -214,9 +214,46 @@ def test_dq_all_zero_group_does_not_produce_inf() -> None:
     assert (result.phase3 == 0).all()
 
 
+def test_dq_nonzero_input_gives_nonzero_phase0_and_phase1() -> None:
+    """非零输入 → phase0/phase1 逐组非零（设计 4.1 的清单项，P0-1 的判据）。
+
+    这是 `_dq_source` 接标定数据之后要守住的不变量：全零输入会让
+    `phase0 = 2·absmax` 归零、`phase1 = phase0/256` 跟着归零，而
+    phase1 就是 `output_sf`，sf=0 是形式非法值（下游反量化除零）。
+    与上面那条全零组用例正好互为反向。
+    """
+    from gml_bridge import calib_data
+
+    result = dynamic_scaling(calib_data.activation_for(512), group_size=128)
+
+    assert (result.phase0.astype(np.float32) != 0).all(), result.phase0
+    assert (result.phase1.astype(np.float32) != 0).all(), result.phase1
+    # phase1 就是 output_sf，逐字节等于它。
+    assert np.array_equal(result.phase1, result.output_scale)
+
+
 def test_dq_rejects_indivisible_group_size() -> None:
     with pytest.raises(ValueError, match="不能被 group_size"):
         dynamic_scaling(np.zeros(100, dtype=np.float16), group_size=128)
+
+
+def test_dq_phases_repr_is_readable_and_bounded(monkeypatch) -> None:
+    """`DynamicScalingPhases.__repr__` 要能 print 出可读文本，不整表转储
+    （需求三非功能需求4、CLAUDE.md「关键中间产物要能 print 出可读文本」，
+    评审 r4 问题1）。裸 dataclass repr 会把 4096 个 source 元素全打出来，
+    这里守住改动后的行为：字符串带上关键字段名，且长度远小于整表转储。
+    """
+    from gml_bridge import calib_data
+
+    result = dynamic_scaling(calib_data.activation_for(4096), group_size=128)
+    text = repr(result)
+
+    for label in ("numel=", "group_size=", "groups=",
+                  "phase0(2*absmax)=", "phase1(output_sf)=",
+                  "phase2(kantor_scale)=", "phase3(int8)="):
+        assert label in text, (label, text)
+    # 整表转储 4096 个 source 元素会远超千字符；这里只截首尾几项。
+    assert len(text) < 1000, len(text)
 
 
 def test_dq_whole_tensor_as_one_group() -> None:

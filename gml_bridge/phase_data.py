@@ -117,6 +117,30 @@ class DynamicScalingPhases:
         """phase3 的 Kantor scale。**逐字节等于 phase2**，实测 32/32 组。"""
         return self.phase2
 
+    def __repr__(self) -> str:
+        """按组打印 absmax 与四相首尾几项，供人工核对定位问题。
+
+        不整表转储：source 可达数千元素，裸打印看不出「哪一组的 absmax
+        是多少」（需求三非功能需求4、CLAUDE.md「关键中间产物要能 print
+        出可读文本」，评审 r4 问题1）。
+        """
+        groups = self.phase1.size
+
+        def head_tail(arr: np.ndarray, n: int = 3) -> str:
+            flat = np.asarray(arr).ravel()
+            if flat.size <= 2 * n:
+                return np.array2string(flat, precision=4)
+            return (f"[{', '.join(f'{v:.4g}' for v in flat[:n])}, ..., "
+                    f"{', '.join(f'{v:.4g}' for v in flat[-n:])}]")
+
+        return (
+            f"DynamicScalingPhases(numel={self.source.size}, "
+            f"group_size={self.group_size}, groups={groups}, "
+            f"phase0(2*absmax)={head_tail(self.phase0)}, "
+            f"phase1(output_sf)={head_tail(self.phase1)}, "
+            f"phase2(kantor_scale)={head_tail(self.phase2)}, "
+            f"phase3(int8)={head_tail(self.phase3)})")
+
 
 def dynamic_scaling(
     source: np.ndarray, *, group_size: int | None = 128

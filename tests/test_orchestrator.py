@@ -412,6 +412,20 @@ class _Artifact:
         self.edges = edges
 
 
+def test_no_second_default_for_the_gml_version() -> None:
+    """版本号只有 `contracts.gml_quant.GML_VERSION` 一个真源（评审 r5 问题 4）。
+
+    `orchestrate` 与 `net_ini.render` 曾各带一个 `gml_version` 参数，默认值是
+    改动前的 `"26.2.1"`，而两者都不把它写进 net.ini（版本走 `gml_version.txt`）。
+    参数无效果、默认值又与真源不一致，谁把它用起来就会盖上旧号，所以删掉。
+    """
+    import inspect
+
+    for func in (orchestrate, net_ini.render):
+        assert "gml_version" not in inspect.signature(func).parameters, (
+            f"{func.__name__} 又多了一个版本号入口")
+
+
 def test_orchestrate_runs_all_four_steps() -> None:
     nodes = [_node(10, "dq0", "DynamicScaling"), _node(11, "g0", "Gemm")]
     edges = [Edge(source=10, target=11, dims="1x4096")]

@@ -151,17 +151,26 @@ def placeholder_weight(node_id: int, element_count: int) -> np.ndarray:
 
 
 def write_phase_output_buffer(
-    files: WrittenFiles, node_id: int, element_count: int, dtype=np.int8
+    files: WrittenFiles, node_id: int, element_count: int,
+    content: np.ndarray,
 ) -> None:
     """写 phase 型节点**自命名**的 output_buffer。
 
     与 `write_data_buffer` 的区别只在命名：这个按本节点编号
     （`output_buffer_<self>.bin`），那个按消费者编号
     （`input_buffer_<consumer>.bin`）。装的是本节点量化后的完整输出（int8）。
+
+    `content` 必填，传 DQ 的 phase3——参考产物上 `output_buffer_<id>.bin` 与
+    `output_buffer_phase_3_<id>.bin` 逐字节相同（实测 3/3 个节点）。以前缺省
+    补零，那是给「忘了传内容」开了一条静默产零的路（评审 r2 问题 4）。
+
+    `element_count` 当校验用：与内容长度不符说明上游算错了尺寸，直接抛。
     """
-    files._write(
-        names.phase_output_buffer_self(node_id),
-        np.zeros(element_count, dtype=dtype))
+    if len(content) != element_count:
+        raise ValueError(
+            f"节点 {node_id} 自命名 output_buffer 的内容有 {len(content)} 个元素，"
+            f"但这条边报 {element_count} 个——两处口径不一致")
+    files._write(names.phase_output_buffer_self(node_id), content)
 
 
 def write_activation_scale(
@@ -194,19 +203,46 @@ def write_activation_zero_point(
 
 def write_data_buffer(
     files: WrittenFiles, consumer_id: int, element_count: int,
-    slot: int | None = None, dtype=np.int8,
+    slot: int | None = None, dtype=np.int8, calib_role: str | None = None,
 ) -> None:
     """写一条边上的数据缓冲区。
 
     按**消费者**编号——缓冲区代表边，编号取读它的那个节点（规则 2）。
 
-    结构层写全零：这些是运行时才有内容的激活缓冲区，实物里它们带的是某次推理的
-    真实数据。尺寸必须对，因为对方按形状读取；内容在结构验证阶段不参与。
+    内容分两种来源：`calib_role` 非空时（cos / sin / mask / kv_position 四个
+    图入口）取它自己那份标定常数，与参考逐字节相同；其余是图内中间激活，
+    甲方没有导出，取标定激活平铺——参考产物这一族逐元素非零，全零的 bin 与
+    「真的算出 0」在盘上无法区分。尺寸两种情况下都是硬要求，对方按它读取。
     """
     files._write(
         names.data_buffer(consumer_id, slot),
-        np.zeros(element_count, dtype=dtype),
+        calibration_buffer(element_count, dtype, calib_role),
     )
+
+
+def calibration_buffer(
+    element_count: int, dtype, calib_role: str | None = None,
+) -> np.ndarray:
+    """按 dtype 铺一份非零的标定数据，供各类激活缓冲共用。
+
+    `calib_role` 非空时取该角色的标定常数，**按值转 dtype**（位置索引这类
+    整数常数直接落值，不做量化——满量程量化会把 96 个 0 变成噪声）。
+    否则取标定激活：fp16 直接转，定点类按 absmax 归一后量化到满量程，
+    与参考产物那一族的取值范围一致。
+    """
+    from gml_bridge import calib_data
+
+    if calib_role is not None:
+        return calib_data.calibration_for_role(
+            calib_role, element_count).astype(dtype)
+    activation = calib_data.activation_for(element_count).astype(np.float32)
+    if np.dtype(dtype) == np.float16:
+        return activation.astype(np.float16)
+    if np.dtype(dtype) == np.float32:
+        return activation.astype(np.float32)
+    info = np.iinfo(dtype)
+    quantized = np.round(activation / np.abs(activation).max() * info.max)
+    return np.clip(quantized, info.min, info.max).astype(dtype)
 
 
 def write_identity_lut(files: WrittenFiles, node_id: int) -> None:
@@ -258,16 +294,22 @@ def write_zero_point(files: WrittenFiles, name: str) -> None:
 
 
 def write_dq_phases(
-    files: WrittenFiles, node_id: int, phases: DynamicScalingPhases
+    files: WrittenFiles, node_id: int, phases: DynamicScalingPhases,
+    *, per_group_fpsu: bool = False
 ) -> None:
     """写一个 DynamicScaling 节点的四相：缓冲、定标、LUT、Kantor 系数。
 
     这些文件按**本节点**自命名，不按消费者——它们是节点内部的中间态，不流经边。
 
-    定标三族的宽度按相取：常量相是标量，逐组相是向量（实测节点 22 是 32 元素
-    向量，节点 12/193 是标量）。这里按 phases 的组数决定。
+    `per_group_fpsu` 定 FPSU 三族（`Scaling_buffer_phase_*`、
+    `Bias_buffer_phase_*`、`Scaling_PS_buffer_phase_*`）的宽度：RoPE 折叠的
+    `Llama2ActivationDQ` 逐组发一份，普通 `DynamicScaling` 发标量。判据是
+    **节点类型而不是组数**——参考节点 12/24/196 同样是 32 组，三族仍是标量，
+    只有 `Llama2ActivationDQ`（节点 22）逐组。取值与标量那版逐相相同，
+    只是重复 `groups` 份。
     """
     groups = phases.phase1.size
+    fpsu_width = groups if per_group_fpsu else 1
 
     # 各相的输入缓冲。**四相各有一个**，尺寸各不相同 —— 每一相的输入就是
     # 上一相的输出，只有 p0 与 p3 吃完整张量。实测节点 12（4096 元素 / 32 组）：
@@ -298,17 +340,17 @@ def write_dq_phases(
         bias = DQ_PHASE0_BIAS if phase == 0 else 0.0
         files._write(
             names.phase_fpsu_bias(node_id, phase),
-            np.full(1, bias, dtype=np.float32))
+            np.full(fpsu_width, bias, dtype=np.float32))
         files._write(
             names.phase_fpsu_post_shift(node_id, phase),
-            np.zeros(1, dtype=np.uint8))
+            np.zeros(fpsu_width, dtype=np.uint8))
 
     # 定标常量：p1 乘 1/256、p3 乘 256，p0/p2 不缩放。
     for phase, scale in enumerate(
             (1.0, DQ_PHASE1_SCALE, 1.0, DQ_PHASE3_SCALE)):
         files._write(
             names.phase_fpsu_scale(node_id, phase),
-            np.full(1, scale, dtype=np.float16))
+            np.full(fpsu_width, scale, dtype=np.float16))
 
     # p1 走恒等表，p2 走倒数表。两张都自行合成。
     files._write(names.phase_lut(node_id, 1), synth_identity())
@@ -441,24 +483,41 @@ def write_rope_buffer(
 ) -> None:
     """写一个 RoPE 子块的缓冲。
 
-    宽度按族分（实测）：
+    宽度按族分（逐族比参考字节数得出）：定标、零点、Shift、bias 这四类都是
+    **单元素标量**，只有 cos/sin 乘积按整张中间态。所以 `element_count`
+    只对后者有用。
 
-    | 族 | dtype | 元素数 |
-    | --- | --- | --- |
-    | `*_sf` / `Scaling_buffer_file_*` / `*_scale_buffer_file` | fp16 | head_dim |
-    | `*_zp` | int32 | 1（对称量化恒为 0） |
-    | `Scaling_PS_buffer_file_*` / `*_Shift_*` | uint8 | head_dim |
-    | `*_bias_buffer_file` | fp32 | head_dim |
-    | `cos_mul_output` / `sin_mul_output` | fp16 | 整张中间态 |
+    | 族 | dtype | 元素数 | 参考字节 |
+    | --- | --- | --- | ---: |
+    | `*_sf` / `Scaling_buffer_file_*` / `*_scale_buffer_file` | fp16 | 1 | 2 |
+    | `*_zp` | int32 | 1（对称量化恒为 0） | 4 |
+    | `Scaling_PS_buffer_file_*` / `*_Shift_*` | uint8 | 1 | 1 |
+    | `*_bias_buffer_file` | fp32 | 1 | 4 |
+    | `cos_mul_output` / `sin_mul_output` | fp16 | `element_count` | 8192 |
 
-    cos/sin 本身的取值域是 [-1, 1]（校验器有这条断言），但这里写零占位 ——
-    真实值要跑一次前向标定，见计划 §11.6 的说明。
+    取值按族分（参考逐族实测）：`zp` 与 `Scaling_PS` 恒 0（硬件语义），
+    定标族恒 1.0，`cos_mul_output` / `sin_mul_output` 取标定 cos/sin 的乘积
+    （参考那两族逐元素非零）。
     """
     if key.endswith("_zp"):
         files._write(name, np.zeros(1, dtype=np.int32))
     elif "_Shift_" in key or key.startswith("Scaling_PS_buffer_file"):
-        files._write(name, np.zeros(element_count, dtype=np.uint8))
+        files._write(name, np.zeros(1, dtype=np.uint8))
     elif key.endswith("_bias_buffer_file"):
-        files._write(name, np.zeros(element_count, dtype=np.float32))
+        files._write(name, np.zeros(1, dtype=np.float32))
+    elif key.startswith(("cos_mul_output", "sin_mul_output")):
+        files._write(name, _rope_product(key, element_count))
     else:
-        files._write(name, np.zeros(element_count, dtype=np.float16))
+        files._write(name, np.ones(1, dtype=np.float16))
+
+
+def _rope_product(key: str, element_count: int) -> np.ndarray:
+    """RoPE 的 cos/sin 乘积缓冲：标定激活逐元素乘标定 cos 或 sin。"""
+    from gml_bridge import calib_data
+
+    table = (calib_data.COS_EMBEDDING if key.startswith("cos")
+             else calib_data.SIN_EMBEDDING)
+    activation = calib_data.activation_for(element_count).astype(np.float32)
+    repeats = -(-element_count // table.size)
+    tiled = np.tile(table, repeats)[:element_count]
+    return (activation * tiled).astype(np.float16)
