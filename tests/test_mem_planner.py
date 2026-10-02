@@ -280,6 +280,37 @@ def test_plan_dpu_raises_when_over_budget() -> None:
         _plan_both_dpus(hw)
 
 
+def test_the_kernel_tile_footprint_counts_against_the_same_budget() -> None:
+    """内核 tile 占用与三区相加才是单台峰值 —— 判据必须把两者加在一起。
+
+    三区（权重 + KV + 激活）是常驻，内核的 x/w/out tile 是算子执行期的临时占用，
+    两者并存于同一块 MRAM。改动前这里只校验三区，而算子编译器回传的 tile 占用
+    只被 GeneSim 那侧核对 —— 于是「三区刚好装满、内核再要一份」这种真实超限
+    两边都看不见。
+
+    判据设计成「不带内核占用时通过、带上就超」，所以它只在相加真的发生时才红。
+    """
+    probe_hw = HwBudget(mram_bytes=1 << 30, align=64, sys_reserve_bytes=0)
+    (gm1, _), (gm2, _) = _two_appendix_a_graphs()
+    kv_specs = _kv_specs()
+    nodes1, nodes2 = list(gm1.graph.nodes), list(gm2.graph.nodes)
+    three_regions = plan_dpu(0, nodes1, nodes2, kv_specs, probe_hw).total
+
+    # 预算恰好等于三区：不带内核占用通过。
+    tight = HwBudget(mram_bytes=three_regions, align=64, sys_reserve_bytes=0)
+    plan_dpu(0, nodes1, nodes2, kv_specs, tight)
+
+    # 同一个预算，带上内核 tile：必须被拒，且报错要说清是哪两部分相加。
+    with pytest.raises(ValueError, match="内存超限") as excinfo:
+        plan_dpu(0, nodes1, nodes2, kv_specs, tight, kernel_mram_bytes=4096)
+    assert "内核 tile" in str(excinfo.value), str(excinfo.value)
+
+    # 预算放宽到容得下两部分：通过（判据不是一味从严）。
+    roomy = HwBudget(mram_bytes=three_regions + 4096, align=64,
+                     sys_reserve_bytes=0)
+    plan_dpu(0, nodes1, nodes2, kv_specs, roomy, kernel_mram_bytes=4096)
+
+
 def test_format_mem_plan_printable() -> None:
     hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=1024)
     plans, _, _ = _plan_both_dpus(hw)

@@ -29,6 +29,7 @@ from pathlib import Path
 
 from torch.fx import GraphModule
 
+from contracts.unified_ir import STAGE_FUSED, require_stage
 from genesim_bridge.paths import flagtree_prefix
 from opcompiler_bridge.oplevel_emitter import EmittedOp, emit_oplevel_mlir
 from opcompiler_bridge.phase_plan import PhasePlan, parse_phase_plans
@@ -169,6 +170,7 @@ def phase_source_from_graph(gm: GraphModule) -> PhaseSource:
 
     `gm` 必须已经跑过 `gml_bridge.export.export_graph` 的那串融合 pass。
     """
+    require_stage(gm, STAGE_FUSED, who="phase_source_from_graph")
     report = emit_oplevel_mlir(gm)
     expanded = _run_passes(report.text)
     plans = parse_phase_plans(expanded)
@@ -285,3 +287,5 @@ def cross_check(source: PhaseSource) -> list[PhaseMismatch]:
                         fx_name, kind, f"phase{phase.index}.kantor_mode",
                         None, "int"))
     return mismatches
+
+

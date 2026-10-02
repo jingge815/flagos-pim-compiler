@@ -24,6 +24,17 @@ if TYPE_CHECKING:  # 只为类型标注；运行时不拖进算子编译那条�
 #
 # 这张表本身消不掉：右边的 fx 节点名是图编译器侧的事实，IR 不可能知道。消掉的是
 # 「依赖 GeneSim 的权重命名约定」和「扫 dependencies 反推身份」这两件事。
+
+# sidecar entry 里 GeneSim 侧没有读者的三个字段。
+# 它们是有意为之的排错信息，不是遗漏，登记在此以免后续被当死字段删掉；
+# P1-2 的「回传字段必须有消费方」这条判据不适用于它们——它们是导出侧的
+# 调试副本，不是回传通道的一部分。
+#
+# 注意「无消费者」只限 GeneSim 仓：本仓的测试与
+# `scripts/run_full_pipeline.py` 的流水线自检都在读 `semantic_role`，
+# 删掉写入点会让它们失败。
+DEBUG_ONLY_SIDECAR_FIELDS = frozenset({"semantic_role", "weight", "shard_axis"})
+
 _ROLE_TO_WEIGHT_PATTERN = {
     "q_proj": "self_attn.q_proj.weight",
     "k_proj": "self_attn.k_proj.weight",
@@ -47,8 +58,8 @@ def _measure_kernel_tile_n(
     local_out: int,
     dtype: str,
     hardware: "PIMHardwareConfig | None",
-    cache: Dict[tuple[int, int], tuple[int, str]],
-) -> tuple[int, str]:
+    cache: Dict[tuple[int, int], tuple[int, str, int | None]],
+) -> tuple[int, str, int | None]:
     """编译一个本地分片形状，返回 `(tile_n, pim mlir 路径)`。
 
     这是算子编译器影响 GeneSim 代价的实际入口：`pim-tile-to-budget` 按 WRAM 预算
@@ -59,7 +70,8 @@ def _measure_kernel_tile_n(
     真实 DMA 量和循环嵌套进入周期数，只喂一个分块常量是不够的（手写模板里
     `tile_size` 会约掉）。
 
-    同一形状只编一次，结果放进 `cache`。
+    同一形状只编一次，结果放进 `cache`。第三个返回值是算子编译器回传的
+    单台 MRAM 占用（`pim.placed-mram-bytes`），没回传时为 None。
     """
     key = (local_in, local_out)
     if key in cache:
@@ -106,7 +118,7 @@ def _measure_kernel_tile_n(
             f"算子编译没有留下 pim mlir 的落盘路径（本地形状 {local_in}->{local_out}）。"
             "GeneSim 侧要照这份 IR 生成 trace，缺了路径就只能退回手写模板。"
         )
-    cache[key] = (tile_n, str(result.pimir_path))
+    cache[key] = (tile_n, str(result.pimir_path), cost.mram_bytes_per_dpu)
     return cache[key]
 
 
@@ -413,6 +425,7 @@ def export_placement_to_genesim(
                 "shards": shards,
                 # 这个 GEMM 的投影身份，以及它实际匹配到的 fx 节点——排错时不用
                 # 再猜「哪个 role 落到了哪个权重上」。
+                # 无消费者，理由见 `DEBUG_ONLY_SIDECAR_FIELDS`。
                 "semantic_role": role,
                 "weight": str(weight_node.target),
             }
@@ -425,10 +438,14 @@ def export_placement_to_genesim(
             sidecar["operators"][str(op_id)] = entry
 
             if measure_kernel_tiles:
-                tile_n, pimir_path = _measure_kernel_tile_n(
+                tile_n, pimir_path, placed = _measure_kernel_tile_n(
                     int(rep_in), int(rep_out), dtype, hardware, tile_cache
                 )
                 entry["kernel_tile_n"] = tile_n
+                # 算子编译器回传的单台 MRAM 占用。GeneSim 用它核对常驻容量，
+                # 没回传就不写，免得 sidecar 里多一个恒为 null 的键。
+                if placed is not None:
+                    entry["placed_mram_bytes"] = placed
                 # GeneSim 照这份 pim mlir 生成 PIM trace，而不是用手写模板。
                 #
                 # 这是导出这台机器上的绝对路径（算子编译缓存在仓库里）。换机器、

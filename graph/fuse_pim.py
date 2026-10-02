@@ -19,13 +19,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from torch.fx import GraphModule, Node
 
 from contracts.fusion_contract import GATE_ACTIVATIONS, GATE_TARGETS
-from contracts.graph_meta import FUSED_TAIL_META_KEY
+from contracts.graph_meta import (
+    ABSORBED_META_KEY,
+    ATTENTION_SCALE_META_KEY,
+    FUSED_TAIL_META_KEY,
+    RMS_NORM_META_KEY,
+)
+from contracts.ir_payloads import FusedTail, RmsNormFusion
 
 # RMSNorm 在 aten 里的算子链。顺序固定，中间可能夹 `to` 与 `_assert_tensor_metadata`
 # （dtype 提升与断言），跳过它们不影响语义。
@@ -47,38 +53,14 @@ TRANSPARENT = (
 # 条件表在 `contracts/fusion_contract.py`：门控激活（含 silu）与能吃它们的
 # gate 投影主算子。`rsqrt` 不在表里 —— RMSNorm 折成自己的独立节点。
 
-# 本模块自己的 meta 键。
-RMS_NORM_META_KEY = "pim_rms_norm"
-ATTENTION_SCALE_META_KEY = "pim_attention_scale"
-
-# 被折进别的节点、因此**不该单独发射成 GML 节点**的算子。
-#
+# 被折进别的节点、因此**不该单独发射成 GML 节点**的算子的标记键，
+# 以及本模块产出的 RMSNorm / attention 缩放键，都登记在 contracts/unified_ir.py。
 # 折叠用「打标记」而不是「删节点」：删掉链中间的算子会让 fx 图不再可执行
 # （锚点算的是 x²，不是整条 RMSNorm），语义等价性测试会失败。打标记则两者兼得
 # —— 图照旧能跑出正确数值，GML 侧靠 `_is_emittable` 跨过这些节点。
 #
 # `gml_bridge.from_fx._tensor_inputs` 本来就会「跨过」不可映射的算子去找最近的
 # 上游 GML 节点，所以这条路是现成的。
-ABSORBED_META_KEY = "pim_absorbed"
-
-
-@dataclass
-class RmsNormFusion:
-    """一个折出来的 RMSNorm_vpu 节点要用到的东西。
-
-    `epsilon` 落进 `RMSNorm_Add_Const_<id>.bin`（fp32），取自 `config.json` 的
-    `rms_norm_eps`——但这里是从图里读出来的，避免与 config 不一致。
-
-    `weight_node` 是那个一维缩放张量（`input_layernorm.weight`），
-    走 `weight_buffer` 但量化粒度是 per-tensor、sf 是 **fp32**（实测 2 处）。
-    """
-
-    epsilon: float
-    weight_node: Node | None
-    eaten: list[Node] = field(default_factory=list)
-    # 链中间跨过的透明节点（`to` / `alias` / 断言）。必须一起删，
-    # 否则它们仍引用链中间的节点，`rsqrt` 就删不掉。
-    passthrough: list[Node] = field(default_factory=list)
 
 
 @dataclass
@@ -227,8 +209,6 @@ def _fuse_activations(gm: GraphModule) -> int:
     复用 `FUSED_TAIL_META_KEY`，这样 `gml_bridge.from_fx._contraction_of`
     不必改就能发射 `contraction[fused_..._activation]` 块。
     """
-    from graph.fuse import FusedTail
-
     fused = 0
     hosts = [n for n in gm.graph.nodes
              if n.op == "call_function" and n.target in GATE_TARGETS]

@@ -9,16 +9,20 @@ import threading
 import re
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
+from contracts.op_semantics import oplevel_ops
 from contracts.op_contract import (
     DEFAULT_HARDWARE_CONFIG,
     OpCompileRequest,
     OpCompileResult,
     PIMHardwareConfig,
     flatten_leading_dims,
+    flatten_shard_dim,
 )
 from genesim_bridge.paths import flagtree_prefix, pim_options
+from contracts import mlir_layout
 from opcompiler_bridge.oplevel_emitter import PIM_TARGET
 from opcompiler_bridge.oplevel_kernel import (
     concat_kernel,
@@ -80,11 +84,7 @@ class ToolchainUnavailable(RuntimeError):
 # kernel 出发经 TTIR 与显式 DMA，这条从整算子级 PIM IR 出发，没有 DMA。
 # 图上 14 类设备侧算子各自的 mnemonic。缺一个名字 = 那个算子执行失败，
 # 而不是悄悄跑回主机 numpy：静默回退会让「两端对齐」这个判据失去意义。
-_OPLEVEL_OPS = frozenset({
-    "softmax", "dynamic_quant", "gather", "rope", "matmul", "normalize",
-    "mask", "transpose", "reshape", "concat", "convert", "lut", "eltwise",
-    "kv_cache", "split_heads",
-})
+_OPLEVEL_OPS = oplevel_ops()
 
 # 将存储数据类型映射为 Triton 实参的 PyTorch 数据类型。
 _TORCH_DTYPES: dict[str, object] = {}
@@ -121,7 +121,15 @@ def _cache_key(request: OpCompileRequest) -> str:
         f"{request.num_tasklets}:{request.group_size}:{request.activation}:"
         f"{request.kind}:{request.tail_card_value}:{request.sf_multiplier}:"
         f"{request.out_dtype}:"
-        f"{request.hardware.to_payload()}"
+        f"{request.hardware.to_payload()}:"
+        # `shard` 必须在内：它改变下发文本（多 DPU 时加硬件属性与
+        # `dpusPerDevice` 编码）。漏掉它，先编的单 DPU 与后来的 tp2 会落到同
+        # 一份 `.so` 与同一份 pimir 上，多 DPU 请求拿回不带编码的旧文本 ——
+        # P1-1 的「多 DPU 时 dpusPerDevice 出现」在热缓存上静默不成立。
+        f"{request.shard}"
+        # `elem_strides` 决定 `order`，`mram_offset` / `align_bytes` 决定 DMA 的
+        # 起始地址与步幅，三者都是下发文本的一部分，漏掉就会拿回旧文本。
+        f"{request.elem_strides}:{request.mram_offset}:{request.align_bytes}"
     ).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -244,7 +252,11 @@ def _make_ttir_without_gpu(
     )
 
 
-def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> tuple[str, str]:
+def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig,
+                    shard=None,
+                    elem_strides: tuple[int, ...] = (),
+                    mram_offset: int = 0,
+                    align_bytes: int = 0) -> tuple[str, str]:
     """将 TTIR 转换为 PIM IR 和 EmitC 文本，两者都返回。
 
     分两次调用 `triton-opt`，而不是把五个 pass 串成一条命令：pim mlir 是
@@ -254,6 +266,15 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> tuple[str, str]:
 
     两段的产物与合并跑完全一致：pass 顺序没变，只是在中间落了一次盘。
     """
+    # 跨 DPU 切分决策先写进 TTIR 模块头：A 路的张量编码由 FlagTree 生成，
+    # 那个 builder 把 `dpusPerDevice` 固定为全 1，图编译器碰不到。不写的话
+    # `request.shard` 在主算子上被整条丢掉（llama tp2 里 3/4 的带切分命令是
+    # linear），正是需求 P1-2 反面判据禁止的「只写不读」。
+    # 传进来的 `shard` 已由 `_a_path_shard` 换算到 kernel 的二维坐标系。
+    ttir = _with_placement_attr(ttir, shard, rank=_A_PATH_TENSOR_RANK,
+                                 elem_strides=elem_strides,
+                                 mram_offset=mram_offset,
+                                 align_bytes=align_bytes)
     opts = pim_options()
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -289,6 +310,67 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig) -> tuple[str, str]:
     return pimir, emitc
 
 
+# A 路 kernel 里张量的秩：`_make_ttir` 把 x 压成 (M, K)、权重是 (N, K)、输出是
+# (M, N)，全是二维。切分决策的维号必须先换算到这个坐标系再下发。
+_A_PATH_TENSOR_RANK = 2
+
+
+def _a_path_shard(request: OpCompileRequest):
+    """把请求里的切分决策换算到 A 路 kernel 的坐标系。
+
+    `request.shard.dim` 是**图张量**输出的维号（llama tp2 的 linear 输出是三维、
+    维号是 2），而 kernel 里的张量是压平后的二维。`linear` 保留前导维，所以图输出
+    的秩等于 `arg_shapes[0]` 的秩，按这个秩换算。
+
+    不换算的后果是维号越界：FlagTree 的 placement 版 builder 对越界维号静默跳过，
+    `dpusPerDevice` 恒为全 1 —— 真实 tp2 主算子的切分决策整条丢掉而无任何诊断。
+    """
+    shard = request.shard
+    if shard is None or shard.num_dpus <= 1:
+        return shard
+    # 只有 shard 档有维号要换算。`replicate` / `partial` 的 `dim` 恒为 -1
+    # （「不按某一维切开」），拿 -1 去换算会被 `flatten_shard_dim` 的范围检查
+    # 挡下 —— 那是误报：它们本来就没有轴。
+    if shard.kind != "shard":
+        return shard
+    graph_rank = len(request.arg_shapes[0])
+    return replace(shard,
+                   dim=flatten_shard_dim(shard.dim, graph_rank))
+
+
+def _with_placement_attr(ttir: str, shard, *, rank: int,
+                           elem_strides: tuple[int, ...] = (),
+                           mram_offset: int = 0, align_bytes: int = 0) -> str:
+    """把切分决策写进 TTIR 的模块头。没有切分时原样返回。
+
+    Triton 前端出来的 TTIR 模块头是 `module {` 或 `module attributes {...} {`
+    两种形态，两种都要能接。
+
+    `rank` 是这个 kernel 里张量的秩，用来把图张量的维号换算过来并挡住越界。
+
+    这是交接点：`convert-triton-to-pim` 读这个属性，把切分决策落进它自己生成的
+    每个张量编码的 `dpusPerDevice`，再穿过 `-pim-tile-to-budget` →
+    `-pim-explicit-dma` 存活到成本模型与仿真侧。
+    """
+    attrs = mlir_layout.placement_attribute(
+        shard, rank=rank, elem_strides=elem_strides,
+        mram_offset=mram_offset, align_bytes=align_bytes)
+    if not attrs:
+        return ttir                     # 单 DPU：文本与改动前逐字节相同
+    joined = ", ".join(attrs)
+    marker = "module attributes {"
+    index = ttir.find(marker)
+    if index >= 0:
+        cut = index + len(marker)
+        return f"{ttir[:cut]}{joined}, {ttir[cut:]}"
+    marker = "module {"
+    index = ttir.find(marker)
+    if index < 0:
+        raise ValueError(f"TTIR 里找不到模块头，无法下发切分决策：\n{ttir[:200]}")
+    return (f"{ttir[:index]}module attributes {{{joined}}} {{"
+            f"{ttir[index + len(marker):]}")
+
+
 def _run_passes(triton_opt: Path, input_text: str, passes: list[str],
                 stage: str) -> str:
     """跑一遍 `triton-opt`，返回它的输出文本。"""
@@ -309,6 +391,129 @@ def _run_passes(triton_opt: Path, input_text: str, passes: list[str],
         return proc.stdout
     finally:
         os.unlink(path)
+
+
+def _module_text(body: str, request: OpCompileRequest) -> str:
+    """拼模块头并把四维下发给算子编译器。
+
+    - `pim.target` 必须在：手写的 MLIR 不经过 `convert-triton-to-pim`，
+      没有它 Triton 的 tensor 元素数 2 的幂限制会挡下 11008 这类维度。
+    - 有跨 DPU 放置决策时补硬件属性与 `#pim.placement`，并把
+      `#pim.tasklet_tiled` 编码贴到算子的**结果**类型上。单 DPU 时一个字都不加
+      —— 文本与改动前逐字节相同。
+
+    `#pim.placement` 两条路都发：早先只有 A 路发模块级 placement，B 路只贴张量
+    编码，于是跨载体漂移校验（`verifyLayoutsMatchPlacement`）在 B 路恒不触发 ——
+    它比的是「模块说的」与「编码记的」，少了一边就无从比较。两路都发之后那条
+    校验在两条路上都活。
+    """
+    attrs = [f'pim.target = "{PIM_TARGET}"']
+    shard = request.shard
+    if shard is not None and shard.num_dpus > 1:
+        attrs.extend(mlir_layout.module_attributes(request.hardware))
+        # tasklet 数与模块属性同源取 `hardware`：两处若各取一边会互相矛盾
+        # （模块头声明 16 个，编码同时声明每 DPU 4 个）。`request.num_tasklets`
+        # 只剩缓存键用途，不参与文本生成。
+        #
+        # 秩从**结果类型文本**数出来，与 `_attach_layout` 同一个来源：B 路的
+        # 算子级 IR 不压平形状，但输入输出不同形的算子（gather / reshape /
+        # transpose / concat）的结果秩并不等于 `arg_shapes[0]` 的秩 ——
+        # 按实参猜会让下发的 placement 与贴上的编码落在两个坐标系上。
+        if request.op not in _NO_RESULT_OPS:
+            rank = len(_dims_of_type(_result_type_of(body)))
+            attrs.extend(mlir_layout.placement_attribute(
+                shard, rank=rank, elem_strides=request.elem_strides,
+                mram_offset=request.mram_offset,
+                align_bytes=request.align_bytes))
+            body = _attach_layout(body, shard=shard,
+                                  num_tasklets=request.hardware.num_tasklets)
+        elif shard.kind != "shard":
+            # 没有张量结果的算子没有挂载点（目标缓冲由调用方持有），贴不了编码，
+            # 于是 **shard 档一个 placement 都不发**：FlagTree 的跨载体漂移校验
+            # 要求 shard 必须有某个张量编码记下切分，没有挂载点却发模块属性等于
+            # 自报「切分整条丢失」，整个模块被拒（实测 rc=1）。
+            #
+            # `replicate` / `partial` 没有这个要求（它们本就不该有任何张量被
+            # 切开），仍然要发：这两档与单 DPU 的区别只在模块属性上表达得出，
+            # 容量与归约口径要用它。秩按首个实参取 —— 这类算子的切分由调用方
+            # 那侧的编码描述，这里只记档位。
+            attrs.extend(mlir_layout.placement_attribute(
+                shard, rank=max(len(request.arg_shapes[0]), 1),
+                elem_strides=request.elem_strides,
+                mram_offset=request.mram_offset,
+                align_bytes=request.align_bytes))
+    return f"module attributes {{{', '.join(attrs)}}} {{\n{body}\n}}\n"
+
+
+# 把结果写进 memdesc、没有张量结果的算子。`#pim.tasklet_tiled` 是**张量类型的
+# 编码**，没有结果类型就没有挂载点，所以这些算子不下发布局编码 —— 它们的目标
+# 缓冲由调用方持有，跨 DPU 切分由调用方那侧的编码描述。
+#
+# 登记成集合而不是「没有 `->` 就跳过」：后者会让将来任何一个漏写结果类型的
+# 算子静默不下发编码。不在这张表里而又取不到结果类型的，`_result_type_of`
+# 照旧抛错。
+_NO_RESULT_OPS = frozenset({"kv_cache"})
+
+
+def _result_type_of(body: str) -> str:
+    """算子结果的张量类型文本（`->` 右边第一个）。
+
+    多结果算子（`dynamic_quant` 的值与标度、`split_heads` 的 32 个头）取第一个：
+    切分决策描述的是主输出那块数据。
+    """
+    arrow = body.find("->")
+    if arrow < 0:
+        raise ValueError(f"算子正文里没有 `->`，取不到结果类型：\n{body}")
+    match = re.search(r"tensor<([^<>]*)>", body[arrow:])
+    if match is None:
+        raise ValueError(f"算子正文的结果不是张量类型：\n{body}")
+    return match.group(0)
+
+
+def _dims_of_type(type_text: str) -> tuple[int, ...]:
+    """从类型文本取形状：`tensor<1x16x4096xf16>` → `(1, 16, 4096)`。
+
+    末段是元素类型（`f16` / `i8`），不是维度，所以只收纯数字段。
+    """
+    inner = type_text[len("tensor<"):-1].split(",")[0]
+    return tuple(int(seg) for seg in inner.split("x") if seg.isdigit())
+
+
+def _attach_layout(body: str, *, shard, num_tasklets: int) -> str:
+    """把布局编码贴到**结果**类型，以及与它同形的那些类型上。
+
+    以结果为准而不是第一个实参：切分决策取自输出的 `shard_map`
+    （`runtime/exec_plan_gen._shard_decision_of` 收的是 `out_detail`），
+    两者必须同一个坐标系。贴到实参上时，输入输出不同形的算子
+    （reshape / transpose / concat / gather）会把决策标到另一块张量的另一根轴上。
+
+    秩也从结果这一段类型文本数出来，不从 `arg_shapes` 取 —— 否则秩与轴各有
+    来源，切分维越界时会静默贴到错误的轴上而不是抛错。
+
+    与结果同形的操作数一起贴：同一个算子里形状相同的张量按同一个决策切分
+    （`dynamic_quant` 的输入 f16 与输出 i8 就是这种，只差元素类型）。
+    不贴的话展开 pass 重建结果类型时编码会整个丢掉，信息传不下去。
+    形状不同的操作数不碰：它们各有自己的决策，替它们编一个就是造假值。
+
+    MLIR 要求同值同型，所以每一段类型文本的所有出现处必须一起替换 ——
+    只贴形参不贴正文里的用法，`triton-opt` 会以
+    「expects different type than prior uses」直接拒绝。
+    """
+    plain = _result_type_of(body)
+    dims = _dims_of_type(plain)
+    # 张量编码的 order 固定行主序：B 路没有 pass 读它。排布走模块属性
+    # `#pim.placement` 的 order，A 路的 `-pim-explicit-dma` 才读它。
+    layout = mlir_layout.tasklet_tiled(dims, shard=shard,
+                                       num_tasklets=num_tasklets)
+    # 空串 = 这一档没有编码可发（replicate / partial 每台持有完整形状，编码全 1，
+    # 与不发逐字节相同）。拼进去会得到 `tensor<...f16, >` 这种空编码槽。
+    if not layout:
+        return body
+    same_shape = {t for t in re.findall(r"tensor<[^<>]*>", body)
+                  if _dims_of_type(t) == dims}
+    for text in same_shape:
+        body = body.replace(text, f"{text[:-1]}, {layout}>")
+    return body
 
 
 def _make_oplevel_mlir(request: OpCompileRequest) -> str:
@@ -348,16 +553,14 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                              activation=request.activation,
                              sf_multiplier=request.sf_multiplier,
                              fp16=fp16)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "lut":
         if len(request.arg_shapes) != 1:
             raise ValueError(
                 f"lut 契约要求 arg_shapes=[输入形状]，收到 {request.arg_shapes!r}")
         body = lut_kernel("kernel", tuple(request.arg_shapes[0]), "silu")
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "eltwise":
         if len(request.arg_shapes) != 2:
@@ -374,8 +577,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
             raise ValueError(
                 f"eltwise 只覆盖 add / mul / sub，收到 kind={kind!r}")
         body = eltwise_kernel("kernel", tuple(request.arg_shapes[0]), kind)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "kv_cache":
         # arg_shapes=[新值形状, (缓存元素数,)]；group_size 非 0 表示散写。
@@ -397,8 +599,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         elem = {"float16": "f16", "float32": "f32"}.get(request.dtype, "i8")
         body = kv_cache_kernel("kernel", value_shape, cache_elems,
                                indexed=bool(request.group_size), elem=elem)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "split_heads":
         if len(request.arg_shapes) != 1:
@@ -414,8 +615,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
             raise ValueError(
                 f"轴 {axis} 长 {shape[axis]} 分不出 {heads} 个整头")
         body = split_heads_kernel("kernel", shape, axis, heads)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "transpose":
         if len(request.arg_shapes) != 2:
@@ -427,8 +627,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         if sorted(axes) != list(range(len(shape))):
             raise ValueError(f"轴序 {axes} 不是 {len(shape)} 维的排列")
         body = transpose_kernel("kernel", tuple(shape), tuple(axes))
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "reshape":
         if len(request.arg_shapes) != 2:
@@ -441,8 +640,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
             raise ValueError(
                 f"reshape 两侧元素数必须相同：{_prod(shape)} != {_prod(out_shape)}")
         body = reshape_kernel("kernel", tuple(shape), tuple(out_shape))
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "concat":
         # 最后一维是轴号；前面若干维是各输入的形状。
@@ -459,8 +657,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         if len({s[:axis] + s[axis + 1:] for s in shapes}) != 1:
             raise ValueError(f"concat 除轴 {axis} 外的维度必须一致：{shapes}")
         body = concat_kernel("kernel", shapes, axis)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "convert":
         if len(request.arg_shapes) != 1:
@@ -473,8 +670,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                 "只能猜一个，而猜错的后果是整块按另一种类型重解释")
         body = convert_kernel("kernel", tuple(request.arg_shapes[0]),
                               request.out_dtype, src_dtype=request.dtype)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "mask":
         if len(request.arg_shapes) != 2:
@@ -483,8 +679,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                 f"{request.arg_shapes!r}")
         body = mask_kernel("kernel", tuple(request.arg_shapes[0]),
                            tuple(request.arg_shapes[1]))
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.dtype != "float16":
         raise ValueError(
@@ -498,8 +693,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                 f"{request.arg_shapes!r}")
         rows, cols = request.arg_shapes[0]
         body = normalize_kernel("kernel", rows, cols, cols)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "gather":
         # 两个输入：表与索引。其余算子只有一个，所以形状校验按算子分。
@@ -514,8 +708,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         index_dtype = {"int32": "i32", "int64": "i64"}.get(request.out_dtype, "i32")
         body = gather_kernel("kernel", vocab, hidden, _prod(ids_shape),
                              index_dtype=index_dtype)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if request.op == "rope":
         # 保留 rank-4：广播沿 head 轴发生，压平会把那个轴抹掉。
@@ -527,8 +720,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         _, heads, seq, head_dim = request.arg_shapes[0]
         body = rope_kernel("kernel", heads, seq, head_dim,
                            tail_card_value=request.tail_card_value)
-        return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-                f"{body}\n}}\n")
+        return _module_text(body, request)
 
     if len(request.arg_shapes) != 1:
         raise ValueError(
@@ -556,10 +748,7 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
             f"{sorted(_OPLEVEL_OPS)}"
         )
 
-    # `pim.target` 必须在：手写的 MLIR 不经过 `convert-triton-to-pim`，
-    # 没有它 Triton 的 tensor 元素数 2 的幂限制会挡下 11008 这类维度。
-    return (f'module attributes {{pim.target = "{PIM_TARGET}"}} {{\n'
-            f"{body}\n}}\n")
+    return _module_text(body, request)
 
 
 def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
@@ -682,7 +871,10 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
         pimir_text, emitc_text = _run_oplevel_triton_opt(mlir_text)
     elif request.op == "linear":
         ttir = _make_ttir(request)
-        pimir_text, emitc_text = _run_triton_opt(ttir, request.hardware)
+        pimir_text, emitc_text = _run_triton_opt(
+            ttir, request.hardware, _a_path_shard(request),
+            elem_strides=request.elem_strides,
+            mram_offset=request.mram_offset, align_bytes=request.align_bytes)
     else:
         # 名字不认识就在这里断掉。放到 A 路里面判会让 `arg_shapes[1]` 先解包，
         # 未知名拿到的是 IndexError，看现场只看到"列表越界"，看不出是名字错了。

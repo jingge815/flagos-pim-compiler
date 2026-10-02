@@ -40,16 +40,14 @@ import torch
 from torch.fx import GraphModule, Node
 
 from contracts.gml_quant import dq_group_size
-from graph.fuse_pim import ABSORBED_META_KEY
-from graph.split_heads import (
+from contracts.graph_meta import (
+    ABSORBED_META_KEY,
+    DQ_META_KEY,
     HEAD_INDEX_META_KEY,
     HEAD_ROLE_META_KEY,
-    ROLE_MATMUL_PV,
-    ROLE_MATMUL_QK,
 )
-
-# DQ 节点的标记。GML 侧见到它就按 DynamicScaling 发射（4 相字段 + 相应的 bin）。
-DQ_META_KEY = "pim_dynamic_scaling"
+from contracts.ir_payloads import DynamicScalingSpec
+from graph.split_heads import ROLE_MATMUL_PV, ROLE_MATMUL_QK
 
 # 吃激活的矩阵乘。matmul1 排除在外：它的两个 operand 都已是定点。
 _MATMUL_TARGETS = (
@@ -59,28 +57,6 @@ _MATMUL_TARGETS = (
     torch.ops.aten.bmm.default,
     torch.ops.aten.matmul.default,
 )
-
-
-@dataclass
-class DynamicScalingSpec:
-    """一个 DQ 节点的编译期规格。
-
-    `group_size` 决定 phase0 的 `global_pooling_group_size_phase_0`
-    与 phase3 的 `kantor_A_spg_group_size_phase_3`（实测两者在同节点上必相等）。
-
-    `numel` / `groups` 决定各相 bin 的元素数，写盘时按它分配。
-    `is_attention_scores` 记下它是不是 attention scores 那一路 ——
-    那 32 个节点整条当一组。
-    """
-
-    group_size: int
-    numel: int
-    is_attention_scores: bool
-    head_index: int | None = None
-
-    @property
-    def groups(self) -> int:
-        return self.numel // self.group_size
 
 
 @dataclass

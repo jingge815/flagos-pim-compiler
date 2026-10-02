@@ -277,8 +277,11 @@ def test_appendix_a_placements() -> None:
     w1_spec = nodes["w1"].meta[SPEC_META_KEY]
     assert w1_spec.placement == Placement("Shard", 0)
     assert w1_spec.residency == "pinned"
-    assert w1_spec.shard_map[0] == TensorShardDetail(0, 0, 0, 3, (3, 4))
-    assert w1_spec.shard_map[1] == TensorShardDetail(1, 0, 3, 6, (3, 4))
+    # 分片一出生就带显式排布：行主序紧密是**数据**，不再是 `bytes_of` 的假设。
+    assert w1_spec.shard_map[0] == TensorShardDetail(0, 0, 0, 3, (3, 4),
+                                                     elem_strides=(4, 1))
+    assert w1_spec.shard_map[1] == TensorShardDetail(1, 0, 3, 6, (3, 4),
+                                                     elem_strides=(4, 1))
 
     # 列切输出沿第 1 维分片。
     y1_spec = nodes["y1"].meta[SPEC_META_KEY]

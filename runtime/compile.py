@@ -10,8 +10,9 @@ from torch.fx import GraphModule
 
 from comm.plan import build_comm_plan
 from contracts.graph_meta import SPEC_META_KEY
-from contracts.op_contract import PIMHardwareConfig
+from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.pim_tensor_spec import RedistributeEdge
+from contracts.unified_ir import STAGE_PLANNED, mark_stage
 from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
@@ -105,6 +106,91 @@ def _q_proj_layer_of(node) -> int:
     raise ValueError(f"未能从 {node.name} 回溯到 q_proj 权重")
 
 
+def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
+                           widths: dict | None = None) -> int:
+    """计划里各内核回传的单台 MRAM 占用取最大值，取不到回传时返回 0。
+
+    `widths` 非空时，顺手把回传的元素宽度按 GML op_type 收进去，
+    供执行计划按它算访问字节数。探测只编译一次，两处共用这份结果。
+
+    取**最大**而不是求和：内核的 tile 缓冲是一个算子执行期间的临时占用，
+    算子之间复用同一块地方，所以峰值由最大的那个决定。三区是常驻、内核 tile 是
+    瞬时，两者并存，相加才是单台 DPU 的真实峰值 —— 这是 `plan_dpu` 容量判据要
+    的那个数。
+
+    这份占用含 `partial` 档的归约暂存（`pim.placed-mram-bytes` 已经把它算进去）。
+
+    工具链不在位、或某个形状走不了编译内核（`_compiled_linear_supports` 判否、
+    或分块挑不出来）时跳过那个算子：拿不到就不猜，返回 0 让判据退回只看三区。
+    """
+    from contracts.dtypes import dtype_bytes
+    from contracts.graph_meta import SPEC_META_KEY
+    from contracts.ir_payloads import placement_of_module
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import compile_op
+    from runtime.exec_plan_gen import _shard_decision_of
+    from runtime.kernels import _compiled_linear_supports
+
+    peak = 0
+    seen: set[tuple] = set()
+    for node in nodes:
+        if "linear" not in str(getattr(node, "target", "")):
+            continue
+        spec = node.meta.get(SPEC_META_KEY)
+        if spec is None or not getattr(spec, "shard_map", None):
+            continue
+        # 形状要取**实参**的，不是输出的：`linear` 的契约是
+        # `arg_shapes=[x.shape, weight.shape]`，而 `spec.shard_map` 挂的是这个
+        # 节点**输出**的分片。拿输出当 x 会让 K 维对不上（实测全部 8 个 linear
+        # 都抛「K 维不一致」，于是峰值恒为 0 —— 判据静默退化成只看三区）。
+        if len(node.args) < 2:
+            continue
+        x_spec = getattr(node.args[0], "meta", {}).get(SPEC_META_KEY)
+        w_spec = getattr(node.args[1], "meta", {}).get(SPEC_META_KEY)
+        if x_spec is None or w_spec is None:
+            continue
+        for dpu_id in spec.shard_map:
+            if (dpu_id not in getattr(x_spec, "shard_map", {})
+                    or dpu_id not in getattr(w_spec, "shard_map", {})):
+                continue
+            x_shape = tuple(x_spec.shard_map[dpu_id].local_shape)
+            w_shape = tuple(w_spec.shard_map[dpu_id].local_shape)
+            dtype = spec.dtype or "float16"
+            key = (x_shape, w_shape, dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not _compiled_linear_supports([x_shape, w_shape], dtype):
+                continue
+            raw = _shard_decision_of(spec, spec.shard_map[dpu_id])
+            try:
+                result = compile_op(OpCompileRequest(
+                    op="linear", arg_shapes=[x_shape, w_shape],
+                    hardware=hardware, dtype=dtype,
+                    num_tasklets=hardware.num_tasklets,
+                    shard=None if raw is None else DpuShard.from_payload(raw)))
+            except (RuntimeError, ValueError):
+                # 这是**探测**，不是编译：拿不到就跳过这个形状，绝不让它打断
+                # 整个 compile_llama2。三种拿不到的情形都走这里：
+                #   - `ToolchainUnavailable`（RuntimeError 子类）：没装 PIM pass
+                #   - `ValueError`：形状不满足 A 路契约（K 维、2 的幂等）
+                #   - `RuntimeError`：`triton-opt` 自己拒了。实测 tp4 的
+                #     `M=1 N=16 K=64` 没有合法的 2 的幂分块，而运行时对这种
+                #     形状本来就退回 numpy 内核 —— 它不占内核 tile。
+                continue
+            if not result.pimir:
+                continue
+            back = placement_of_module(result.pimir)
+            if back.placed_mram_bytes:
+                peak = max(peak, back.placed_mram_bytes)
+            # 宽度与图上 dtype 相同就是回声，不是新信息：探测按 spec.dtype 编译，
+            # 回传必然等于 dtype_bytes(spec.dtype)。只留真正不同的那个。
+            if (widths is not None and back.placed_elem_bytes
+                    and back.placed_elem_bytes != dtype_bytes(dtype)):
+                widths.setdefault("Gemm", back)
+    return peak
+
+
 def compile_llama2(
     model: torch.nn.Module,
     strategy: ShardStrategy,
@@ -143,10 +229,20 @@ def compile_llama2(
 
     prefill_nodes = list(prefill_gm.graph.nodes)
     decode_nodes = list(decode_gm.graph.nodes)
+    # 内核 tile 占的是与三区同一块 MRAM，所以容量判据要把两者相加。那份占用只有
+    # 算子编译器知道（它定分块），这里问它回传；工具链不在位时退回 0，判据只看
+    # 三区，与改动前逐字节等价。
+    kernel_mram = peak_kernel_mram_bytes(prefill_nodes + decode_nodes,
+                                         hardware=hardware)
     mem_plans = {
-        dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw)
+        dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
+                         kernel_mram_bytes=kernel_mram)
         for dpu_id in strategy.dpu_ids
     }
+    # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
+    # 两张图的 mram_offset 都已回填。
+    mark_stage(prefill_gm, STAGE_PLANNED)
+    mark_stage(decode_gm, STAGE_PLANNED)
 
     prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}
     decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}

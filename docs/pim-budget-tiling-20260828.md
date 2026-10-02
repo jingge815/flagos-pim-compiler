@@ -457,8 +457,22 @@ python -m pytest tests/test_opcompiler_e2e_llama2_7b.py -q
 到达唯一一次 `tt.store`）。任何不符合这个形态的 IR（比如同一个 `tt.dot`
 结果被多处消费、或者算子序列跟 `kernel_src.py` 写法不同）会被直接拒绝，
 不会尝试猜测或强行改写。这是有意为之——宁可拒绝也不猜错，但意味着这个
-pass 目前只服务于本仓库这一条 `linear` 垂直链路，不是通用的分块基础
-设施。
+pass 目前只服务于 `linear` 这一类算子，不是通用的分块基础设施。
+
+**2026-10-02 更新**：A 路（`genesim_bridge` 跑 FlagGems）的内核是 launch
+grid 切分的——一个 program 只算一块，写法与 `kernel_src.py` 的整算子内核不同
+（权重加载时已按 K 主序取好、没有 `tt.trans`）。原来它在超 WRAM 预算时会被
+送进改写器并整条失败。现在按「改写的前提是整算子内核」把它挡在重建之外：
+grid 切分的内核（模块里有 `tt.get_program_id`）只按实测分块回写属性，不改写，
+超预算由 `pim.tile-wram-bytes > pim.wram-bytes` 如实体现。改动在 FlagTree 仓
+`lib/Dialect/TritonPIM/Transforms/TileToBudget.cpp::isGridPartitioned`，用
+`test/Dialect/TritonPIM/tile_to_budget_grid_partitioned.mlir` 固定行为。
+
+同一轮还修了成本侧的配套缺陷：`genesim_bridge/ir_cost.py` 的 `_ConstFolder`
+原来只按**形参名**匹配 `arg_values`，而真实 TTIR 里参数是位置名 `%argN`，
+于是由运行时标量算出的 K 循环次数折不出来、按 1 次计，GEMM 成本低估约 126 倍。
+现在按签名把位置参数与标量实参对上。细节见 FlagTree 仓
+`docs/tile-to-budget-flaggems-linear-20261002.md`。
 
 ### 9.3 `genesim_bridge` 没有跟进读取新属性
 

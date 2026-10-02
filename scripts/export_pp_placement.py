@@ -134,7 +134,7 @@ def main() -> None:
         num_dpus = args.num_dpus
     print(format_strategy(strategy, cfg.num_hidden_layers))
 
-    hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
         mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536, dma_align=64,

@@ -80,7 +80,7 @@ def llama2_compiled_plan():
         dtype_bytes=KV_DTYPE_BYTES,
         kv_base=0,
     )
-    hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS,
         num_tasklets=4,

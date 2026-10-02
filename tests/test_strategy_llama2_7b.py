@@ -92,7 +92,7 @@ def _run_strategy_cached(cache, model, strategy):
 
 def _run_strategy(model, strategy):
     """编译策略、加载权重并返回解码结果和运行时对象。"""
-    hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64,
@@ -174,7 +174,7 @@ def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
 @pytest.mark.parametrize("strategy", _representative_strategies(), ids=lambda s: s.name)
 def test_real_llama2_7b_memory_footprint_fits_and_scales(strategy, llama2_model) -> None:
     """验证各策略的内存布局不超过单 DPU 容量。"""
-    hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64,

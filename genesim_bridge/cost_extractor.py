@@ -194,6 +194,21 @@ def _pim_kernel_dict(cost) -> Dict[str, Any]:
         "tile_n": cost.tile_n,
         "tile_k": cost.tile_k,
         "tile_wram_bytes": cost.tile_wram_bytes,
+        # 图编译器下发的跨 DPU 切分决策，读回来后随 sidecar 进仿真输入。
+        # 没有切分时为 None（单 DPU），既有字段语义不受影响。
+        "shard_dim": cost.shard_dim,
+        "shard_dpus": cost.shard_dpus,
+        # 放置档位。核对「意图与效果」时要看它：`partial` 与 `replicate` 的
+        # numDpus 是参与的 DPU 数，不是切分宽度，只有 `shard` 才该与
+        # `placed_shards` 相等。缺了它，消费方分不清这两件事。
+        "shard_kind": cost.placement.kind,
+        # PIMMLIR 回传：切分之后单台 DPU 实际占的 MRAM 字节数，以及那个 pass
+        # 实际用的除数。随 sidecar 进仿真输入。
+        "placed_mram_bytes": cost.mram_bytes_per_dpu,
+        "placed_shards": cost.placement.placed_shards,
+        # `partial` 档下，算子编译器为「接收对端那一份局部和」留的单台字节数。
+        # 留多少取决于分块，只有定了分块的那个 pass 知道，所以是回传而非下发。
+        "placed_reduce_bytes": cost.placement.placed_reduce_bytes,
     }
 
 

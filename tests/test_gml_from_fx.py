@@ -584,6 +584,25 @@ def test_every_computing_op_declares_node_dtypes() -> None:
     assert checked, "小图里应当有做计算的算子"
 
 
+def test_the_returned_element_width_overrides_the_buffer_dtype() -> None:
+    """PIMMLIR 回传的元素宽度要改变 GML 的缓冲位宽。
+
+    同一个算子，回传说 1 字节与回传说 4 字节必须落到不同的
+    `output_buffer_dtype` 上。两条相同就说明回传没进 GML 决策。
+    """
+    from contracts.ir_payloads import PlacementBack
+
+    narrow = convert(_llama_like_graph(),
+                     placed_elem_bytes={"Gemm": PlacementBack(placed_elem_bytes=1)})
+    wide = convert(_llama_like_graph(),
+                   placed_elem_bytes={"Gemm": PlacementBack(placed_elem_bytes=4)})
+    def dtype_of(nodes):
+        return next(n.fields["output_buffer_dtype"] for n in nodes
+                    if n.fields.get("op_type") == "Gemm")
+    assert dtype_of(narrow[0]) == "int8", dtype_of(narrow[0])
+    assert dtype_of(wide[0]) == "float16", dtype_of(wide[0])
+
+
 def test_layout_ops_propagate_dtype_and_carry_no_scale() -> None:
     """布局算子的 dtype 沿边传播，且不带 sf/zp。
 
@@ -892,3 +911,70 @@ def test_renumbering_keeps_the_reverse_topological_convention() -> None:
     backward = sum(1 for e in operator_edges if e.source > e.target)
     assert backward > len(operator_edges) // 2, (
         f"算子边只有 {backward}/{len(operator_edges)} 条逆向，方向被改了")
+
+
+def _two_linears_around(activation) -> "object":
+    """`linear → <激活> → linear`：激活夹在两个可发射节点中间。
+
+    这个形状是最小反例：激活两侧都能映射成 GML 节点，所以图不会被判成
+    「没有可映射的算子」，错误只体现在中间那个激活的去向上。
+    """
+    import torch
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Linear(64, 64, bias=False)
+            self.b = torch.nn.Linear(64, 64, bias=False)
+
+        def forward(self, x):
+            return self.b(activation(self.a(x)))
+
+    example = torch.randn(1, 64, dtype=torch.float16)
+    return torch.export.export(M().to(torch.float16), (example,)).module()
+
+
+def test_an_unfused_activation_is_not_silently_dropped() -> None:
+    """没折进主算子的激活必须报错，不能从产物里消失。
+
+    `contracts.fusion_contract.ACTIVATIONS` 这七个在 GML 里**没有**独立节点
+    类型（`aten_to_gml()` 查不到），只能作为主算子的尾部（`Lut` 配
+    `activation_op_type`）。`_is_emittable` 因此判它们不发射，而
+    `_tensor_inputs` 又会跨过去接上下游 —— 于是一个没折的激活就这样蒸发：
+    产出的 GML 结构合法、五条规则全过，只是少算了一层激活。
+
+    实测：`linear → relu → linear` 转出 4 个节点（两个 linear 加两个 buffer），
+    relu 一个字都没有。这是 `convert` 文档里「图里若还有独立激活节点，
+    GML 无法表达，这里会直接抛」承诺过、但一直没实现的检查。
+    """
+    import torch
+
+    gm = _two_linears_around(torch.relu)
+    with pytest.raises(ValueError, match="独立激活"):
+        convert(gm)
+
+
+def test_silu_is_allowed_to_stand_alone() -> None:
+    """`silu` 有自己的 GML 节点类型（`Silu`），不在被禁之列。
+
+    判据是「GML 能不能表达」，不是「是不是激活」。把 `silu` 一起禁掉会
+    误伤门控投影那条路径 —— 它由 `fuse_pim` 折，`fuse_graph` 不碰。
+    """
+    import torch
+    from contracts.op_semantics import aten_to_gml
+
+    assert aten_to_gml().get(torch.ops.aten.silu.default) == "Silu"
+    nodes, _, _, _ = convert(_two_linears_around(torch.nn.functional.silu))
+    assert any(n.fields.get("op_type") == "Silu" for n in nodes)
+
+
+def test_the_real_pipeline_leaves_no_unfused_activation() -> None:
+    """真实图跑完融合后不该剩下这七个中的任何一个 —— 守卫不会误伤主路。"""
+    from contracts.fusion_contract import ACTIVATIONS
+    from tests.test_partition import _export_random_llama
+
+    gm = _export_random_llama()
+    fuse_graph(gm)
+    remaining = [n.name for n in gm.graph.nodes
+                 if n.op == "call_function" and n.target in ACTIVATIONS]
+    assert remaining == [], f"融合后仍有未折的激活：{remaining}"

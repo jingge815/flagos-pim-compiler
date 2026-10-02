@@ -22,6 +22,7 @@ from contracts import gml_names as names
 from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
 from contracts.gml_quant import GML_VERSION
 from contracts.graph_meta import FUSED_TAIL_META_KEY
+from contracts.unified_ir import STAGE_FUSED, mark_stage
 from graph.fuse import fuse_graph
 from graph.fuse_pim import fuse_for_pim
 from graph.fuse_rope import ROPE_META_KEY, fuse_rope
@@ -102,7 +103,11 @@ def export_graph(gm: GraphModule, *, version: str = GML_VERSION,
     `fuse_for_gml` + `serialize_gml` 这对函数，不要调两次本函数。
     """
     report = fuse_for_gml(gm)
-    return serialize_gml(gm, report, version=version, phase_source=phase_source)
+    # 回传宽度只在 A 路产出，不给硬件配置就收集不到。用默认硬件，
+    # 调用方有自己的配置时应改走 serialize_gml 显式传入。
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
+    return serialize_gml(gm, report, version=version, phase_source=phase_source,
+                         hardware=DEFAULT_HARDWARE_CONFIG)
 
 
 @dataclass
@@ -140,20 +145,59 @@ def fuse_for_gml(gm: GraphModule) -> FusionReport:
     heads = split_attention_heads(gm)
     insert_kv_dma_and_split(gm)
     quantized = insert_dynamic_scaling(gm)
+    mark_stage(gm, STAGE_FUSED)
     return FusionReport(fusions=fusions, heads=heads.heads,
                         dq_nodes=quantized.inserted)
+
+
+def _placed_widths_of(gm, phase_source, hardware=None) -> dict | None:
+    """按 GML op_type 收元素宽度。
+
+    `pim.placed-elem-bytes` 只有过 `-pim-tile-to-budget` 的 A 路才回传，
+    所以优先走 A 路探测（`peak_kernel_mram_bytes`，与 numpy 执行同一份）。
+    B 路的 `phase_source.expanded` 里没有这个属性，只作没有硬件配置时的退路。
+    收不到就返回 None，GML 退回沿边传播的类型。
+    """
+    from contracts.ir_payloads import placement_of_module
+    from gml_bridge.from_fx import _op_type_of
+
+    if hardware is not None:
+        from runtime.compile import peak_kernel_mram_bytes
+        widths: dict = {}
+        peak_kernel_mram_bytes(list(gm.graph.nodes), hardware=hardware,
+                               widths=widths)
+        if widths:
+            return widths
+
+    text = getattr(phase_source, "expanded", "") or ""
+    back = placement_of_module(text)
+    if back.placed_elem_bytes is None:
+        return None
+    by_node = getattr(phase_source, "by_node", {})
+    widths = {}
+    for node in gm.graph.nodes:
+        if node.name not in by_node:
+            continue
+        widths.setdefault(_op_type_of(node), back)
+    return widths or None
 
 
 def serialize_gml(gm: GraphModule, report: FusionReport, *,
                   version: str = GML_VERSION,
                   phase_source=None,
                   decode_block_only: bool = False,
-                  slots: CompileSlots | None = None) -> GmlArtifact:
-    """把已融合的图序列化成 GML。**纯函数**：可重复调用，不改图。"""
+                  slots: CompileSlots | None = None,
+                  hardware=None) -> GmlArtifact:
+    """把已融合的图序列化成 GML。**纯函数**：可重复调用，不改图。
+
+    `hardware` 给了才收集回传宽度：那份宽度只在 A 路（过
+    `-pim-tile-to-budget`）出现，B 路的 `phase_source` 里没有。
+    """
     slots = slots or DEFAULT_SLOTS
     nodes, edges, weight_params, extra_dq = convert(
         gm, version=version, phase_source=phase_source,
-        decode_block_only=decode_block_only, slots=slots)
+        decode_block_only=decode_block_only, slots=slots,
+        placed_elem_bytes=_placed_widths_of(gm, phase_source, hardware))
     text = write_gml(nodes, edges, version=version)
     return GmlArtifact(
         text=text,

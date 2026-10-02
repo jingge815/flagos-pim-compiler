@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from contracts.mem_layout import NET_INI_STRIDES
 from orchestrator.l2_alloc import QMAN_OFFSET, QMAN_SIZE
 
 
@@ -78,15 +79,13 @@ CONSTANTS: dict[str, object] = {
     "Pooling Pad Bottom": 0,
 }
 
-# net.ini [general]，四个 stride 物理含义见 Q10。
+# net.ini [general]。四个 stride 的取值是排布规则，真源在
+# `contracts/mem_layout.NET_INI_STRIDES`；这里只拼出 net.ini 要的那张表。
 NET_INI_GENERAL: dict[str, object] = {
     "is_seq_test": 0,
     "seq_tunneling": 0,
     "test_update_buffer": 0,
-    "input_line_stride": 8,
-    "input_map_stride": 4,
-    "output_line_stride": 12,
-    "output_map_stride": 5,
+    **NET_INI_STRIDES,
     "seq_output_bin_file": "/net.bin",
 }
 

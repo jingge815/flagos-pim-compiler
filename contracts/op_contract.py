@@ -70,6 +70,101 @@ def flatten_leading_dims(shape: tuple[int, ...]) -> tuple[int, int]:
     return prod(leading), k
 
 
+def flatten_shard_dim(shard_dim: int, rank: int) -> int:
+    """把图张量的切分维号换算到 `flatten_leading_dims` 压平后的坐标系。
+
+    A 路的 kernel 张量是二维的（x 是 (M, K)、out 是 (M, N)），而切分决策的维号
+    取自**图张量**：llama tp2 的 linear 输出是三维、`shard_dim` 是 2。压平规则是
+    「末维留下、前导维合并」，所以末维换算成 1、其余换算成 0。
+
+    不换算就会把一个秩 2 张量没有的维号写进去：越界的那一位被 FlagTree 的 builder
+    静默跳过，`dpusPerDevice` 恒为全 1 —— 决策整条丢掉而无任何诊断。
+    """
+    if rank < 2:
+        raise ValueError(f"压平后的秩至少是 2，got rank={rank}")
+    if not 0 <= shard_dim < rank:
+        raise ValueError(f"切分维 {shard_dim} 超出秩 {rank}")
+    return 1 if shard_dim == rank - 1 else 0
+
+
+# Placement 的三档与 partial 的归约方式。名字与统一 IR 的 `Placement.kind`
+# （`contracts/pim_tensor_spec.py`）以及 FlagTree 的 `PlacementKind` /
+# `PartialReduce` 枚举逐字对应 —— 三处是一条契约，改名要一起改。
+PLACEMENT_KINDS = frozenset({"shard", "replicate", "partial"})
+PARTIAL_REDUCES = frozenset({"sum", "mean"})
+
+
+@dataclass(frozen=True)
+class DpuShard:
+    """一块张量的跨 DPU 放置决策（Placement 维的下发载体）。
+
+    由 `runtime/exec_plan_gen` 从统一 IR 的 `spec.placement` 与 `shard_map`
+    算出，随请求下发，落成 pimir 的 `#pim.placement` 与
+    `#pim.tasklet_tiled.dpusPerDevice`。
+
+    三档与统一 IR 的 `Placement.kind` 一一对应，不另立一套词：
+
+    - `shard`：按 `dim` 这一维切开，每台 DPU 持有其中一片
+    - `replicate`：每台 DPU 持有完整形状（`dim = -1`）
+    - `partial`：每台 DPU 持有一份**全形状的局部和**，要按 `reduce` 跨 DPU
+      归约才是完整值（`dim = -1`，`reduce` 必须给）
+
+    早先这个结构只能表达 `shard` 一档，`replicate` / `partial` 在下发侧被整条
+    丢掉（`placement_attribute` 对它们返回空元组），于是 PIMMLIR 侧分不清
+    「复制」与「单 DPU」—— 而这两者的归约与容量口径并不相同。
+    """
+
+    dim: int              # 切分维；-1 表示不按维切（replicate / partial）
+    num_dpus: int         # 参与这块张量的 DPU 数
+    kind: str = "shard"   # shard / replicate / partial
+    reduce: str | None = None   # 仅 partial：sum / mean
+
+    def __post_init__(self) -> None:
+        if self.kind not in PLACEMENT_KINDS:
+            raise ValueError(
+                f"未知的 placement 档位 {self.kind!r}，可选：{sorted(PLACEMENT_KINDS)}")
+        if self.kind == "shard":
+            if self.dim < 0:
+                raise ValueError(
+                    f"shard 要指明切哪一维，got dim={self.dim}")
+            if self.reduce is not None:
+                raise ValueError("shard 不欠归约，reduce 必须为 None")
+        else:
+            # replicate / partial 都是「每台持有完整形状」，没有被切开的轴。
+            if self.dim >= 0:
+                raise ValueError(
+                    f"{self.kind} 不按某一维切开，dim 必须为 -1，got {self.dim}")
+        if self.kind == "partial":
+            if self.reduce not in PARTIAL_REDUCES:
+                raise ValueError(
+                    f"partial 的全部内容就是「怎么归约」，reduce 必须是 "
+                    f"{sorted(PARTIAL_REDUCES)} 之一，got {self.reduce!r}")
+        elif self.kind == "replicate" and self.reduce is not None:
+            raise ValueError("replicate 不欠归约，reduce 必须为 None")
+
+    @property
+    def splits(self) -> bool:
+        """这块张量是否真的被切开（而非复制或局部和）。"""
+        return self.kind == "shard" and self.num_dpus > 1
+
+    def to_payload(self) -> list:
+        """命令 payload 里的形态。
+
+        旧形态是 `[dim, num_dpus]` 两元素列表，新增两项**追加在尾部**，
+        读取侧按长度兼容 —— 蓝图是编译期产物、可能与运行时版本不同步。
+        """
+        return [self.dim, self.num_dpus, self.kind, self.reduce]
+
+    @classmethod
+    def from_payload(cls, raw) -> "DpuShard":
+        """从 payload 还原。两元素的旧形态按 `shard` 读。"""
+        dim, num_dpus = int(raw[0]), int(raw[1])
+        kind = str(raw[2]) if len(raw) > 2 else "shard"
+        reduce = raw[3] if len(raw) > 3 else None
+        return cls(dim=dim, num_dpus=num_dpus, kind=kind,
+                   reduce=None if reduce is None else str(reduce))
+
+
 @dataclass(frozen=True)
 class OpCompileRequest:
     op: str
@@ -98,6 +193,16 @@ class OpCompileRequest:
     # **输入**的存储类型，换类型这件事只有这一位说得出来；原来把它写死在
     # 降级侧，于是 f16→f32 也会被编成 f16→i8。
     out_dtype: str | None = None
+    # 跨 DPU 切分决策。None = 单 DPU（不下发 `dpusPerDevice`，文本与改动前相同）。
+    shard: DpuShard | None = None
+    # 结果分片的排布（`TensorShardDetail.elem_strides`，元素数）。空元组 =
+    # 没有排布信息，按行主序紧密处理。它决定布局编码的 `order`：哪一维步幅
+    # 最小，哪一维就是最内层。
+    elem_strides: tuple[int, ...] = ()
+    # 结果分片在 MRAM 的起始字节与额外对齐（`TensorShardDetail` 的同名字段）。
+    # 0 表示从基址起、没有额外对齐，下发文本与改动前逐字节相同。
+    mram_offset: int = 0
+    align_bytes: int = 0
 
 
 @dataclass(frozen=True)

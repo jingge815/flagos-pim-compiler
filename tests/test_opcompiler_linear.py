@@ -90,8 +90,10 @@ def test_compile_request_uses_explicit_hardware_budget(monkeypatch) -> None:
     def fake_make_ttir(request):
         return "module {}"
 
-    def fake_run(ttir, hardware):
+    def fake_run(ttir, hardware, shard=None, elem_strides=(),
+                 mram_offset=0, align_bytes=0):
         seen["hardware"] = hardware
+        seen["shard"] = shard
         # 现在返回 (pim mlir, EmitC) 两段：pim mlir 要留给 GeneSim 的成本模型。
         return (
             "module { func.func @k() { return } }",

@@ -68,6 +68,44 @@ def test_bmm_flops_matches_theory():
     assert not cost.notes
 
 
+# 真实捕获到的 TTIR：Triton 不保留形参名，内核参数打印成位置名 `%argN`。
+BMM_TTIR_POSITIONAL = """
+module {
+  tt.func public @bmm_kernel(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %arg2: !tt.ptr<f16>, %arg3: i32) {
+    %c31_i32 = arith.constant 31 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32>
+    %n0 = arith.addi %arg3, %c31_i32 : i32
+    %n1 = arith.divsi %n0, %c32_i32 : i32
+    %o:1 = scf.for %i = %c0_i32 to %n1 step %c1_i32 iter_args(%acc = %cst) -> (tensor<32x32xf32>) : i32 {
+      %a = tt.load %ap : tensor<32x32x!tt.ptr<f16>>
+      %b = tt.load %bp : tensor<32x32x!tt.ptr<f16>>
+      %d = tt.dot %a, %b, %acc : tensor<32x32xf16> * tensor<32x32xf16> -> tensor<32x32xf32>
+      scf.yield %d : tensor<32x32xf32>
+    }
+    tt.store %op, %o#0 : tensor<32x32x!tt.ptr<f16>>
+    tt.return
+  }
+}
+"""
+
+
+def test_positional_kernel_args_resolve_loop_bounds():
+    """验证位置参数（%argN）也能折出循环次数。
+
+    Triton 不保留形参名，真实捕获的 TTIR 里参数是 `%arg0`/`%arg3` 这种位置名，
+    而 `arg_values` 是按形参名采的。只按名字匹配（`%K`）永远对不上，循环次数
+    解不出来就按 1 次计——`flag_gems.ops.linear` 的 K 是运行时标量，它的 GEMM
+    成本因此被低估一个数量级。
+    """
+    cost = analyze_ir(BMM_TTIR_POSITIONAL, "bmm_kernel", (4, 4, 1), {"K": 64})
+    assert cost.loop_trip_counts == [2]       # ceil(64/32)
+    assert cost.flops == 2 * 128 * 128 * 64
+    assert not cost.notes
+
+
 # 含两个不同迭代次数的顶层循环。
 TWO_LOOP_TTIR = """
 module {
@@ -155,6 +193,24 @@ def test_pimir_flops_identical_to_ttir():
     assert pimir.tile_flops_per_program == ttir.tile_flops_per_program
     assert pimir.loop_trip_counts == ttir.loop_trip_counts == [2]
     assert not pimir.notes
+
+
+def test_a_strided_dma_costs_more_than_a_contiguous_one():
+    """跨步 DMA 的搬运字节必须大于同形状的紧密 DMA。
+
+    `elem_stride` 是统一 IR 的排布字段（`TensorShardDetail.elem_strides`）落到
+    pimir 上的那一位：步幅大于 1 说明行与行之间有填充，真实搬运的字节数大于
+    `元素数 × 元素宽`。此前 `_line_dma_bytes` 只按 memdesc 的形状计、不看这一位，
+    于是排布信息写进了 pimir 却不改变任何数字 —— 只写不读。
+    """
+    tight = analyze_ir(BMM_PIMIR, "bmm_kernel", (1, 1, 1), {"K": 64},
+                       ir_level="pimir")
+    strided = analyze_ir(
+        BMM_PIMIR.replace("elem_stride = 1 : i64", "elem_stride = 4 : i64"),
+        "bmm_kernel", (1, 1, 1), {"K": 64}, ir_level="pimir")
+    # 那条标了 stride 的 dma_load 每次搬运从 2048 涨到 8192，循环 2 次，
+    # 其余两条（未标 stride 的 dma_load 与 dma_store）不变。
+    assert strided.mram_traffic_bytes == tight.mram_traffic_bytes + 2 * (8192 - 2048)
 
 
 def test_pimir_mram_traffic_counts_tile_level_repeats():

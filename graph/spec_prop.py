@@ -10,6 +10,8 @@ from typing import Literal
 import torch
 from torch.fx import GraphModule, Node
 
+from contracts.gml_quant import WEIGHT_LAYOUT, QuantLayout
+from contracts.mem_layout import row_major_strides
 from contracts.graph_meta import (
     DEVICE_DPU,
     DEVICE_HOST,
@@ -22,6 +24,11 @@ from contracts.pim_tensor_spec import (
     Placement,
     RedistributeEdge,
     TensorShardDetail,
+)
+from contracts.unified_ir import (
+    STAGE_SPECS,
+    mark_stage,
+    validate_graph_dimensions,
 )
 from graph.strategy import ShardStrategy, llama_strategy
 
@@ -125,9 +132,25 @@ def llama_shard_config(
     )
 
 
-def _host_spec() -> PIMTensorSpec:
+def _dtype_of(node: Node) -> str:
+    """节点输出的元素类型名。
+
+    这是 dtype 从 PyTorch 进入统一 IR 的**唯一入口**：之后全链路查
+    `spec.dtype`，不再问 `meta["val"]`。跨维校验会守住两者不漂移。
+
+    `val` 可能是元组（`split_with_sizes` 这类节点带的是形状列表），
+    那不是张量、没有类型，返回空串。
+    """
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor):
+        return ""
+    return str(val.dtype).removeprefix("torch.")
+
+
+def _host_spec(dtype: str = "") -> PIMTensorSpec:
     """构造无 DPU 分片的 host 张量规格。"""
-    spec = PIMTensorSpec(DEVICE_HOST, REPLICATE, "transient", None, {}, None)
+    spec = PIMTensorSpec(DEVICE_HOST, REPLICATE, "transient", None, {}, None,
+                         dtype=dtype)
     spec.validate()
     return spec
 
@@ -137,6 +160,9 @@ def _dpu_spec(
     shape: tuple[int, ...],
     dpu_ids: tuple[int, ...],
     residency: Literal["transient", "pinned"] = "transient",
+    *,
+    dtype: str = "",
+    quant: QuantLayout | None = None,
 ) -> PIMTensorSpec:
     spec = PIMTensorSpec(
         DEVICE_DPU,
@@ -145,6 +171,8 @@ def _dpu_spec(
         None,
         _shard_map(shape, placement, dpu_ids),
         placement.reduce_type,
+        dtype=dtype,
+        quant=quant,
     )
     spec.validate()
     return spec
@@ -163,20 +191,26 @@ def _shard_map(
         if length % len(dpu_ids):
             raise ValueError(f"shape={shape} 的 dim {dim} 长 {length} 不能被 num_dpus={len(dpu_ids)} 整除")
         width = length // len(dpu_ids)
+        local = shape[:dim] + (width,) + shape[dim + 1 :]
         return {
             dpu_id: TensorShardDetail(
                 dpu_id=dpu_id,
                 shard_dim=dim,
                 start_idx=i * width,
                 end_idx=(i + 1) * width,
-                local_shape=shape[:dim] + (width,) + shape[dim + 1 :],
+                local_shape=local,
+                # 排布层：分片一出生就把「怎么摆」写成数据。原先这是
+                # `bytes_of()` 里的隐含假设，字段恒为空 —— 等于没人声明。
+                elem_strides=row_major_strides(local),
             )
             for i, dpu_id in enumerate(dpu_ids)
         }
     numel = prod(shape)
     full = tuple(shape)
+    # replicate / partial 每台持有完整形状，排布同样是行主序紧密。
     return {
-        dpu_id: TensorShardDetail(dpu_id, -1, 0, numel, full)
+        dpu_id: TensorShardDetail(dpu_id, -1, 0, numel, full,
+                                  elem_strides=row_major_strides(full))
         for dpu_id in dpu_ids
     }
 
@@ -184,8 +218,12 @@ def _shard_map(
 def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTensorSpec:
     """按策略为权重构造常驻的 host 或 DPU 张量规格。"""
     shape = tuple(node.meta["val"].shape)
+    dt = _dtype_of(node)
+    # 权重量化布局：定点权重按 WEIGHT_LAYOUT，浮点权重不带量化。
+    qz = WEIGHT_LAYOUT if dt in ("int4", "int8") else None
     dpus = _dpus_of_node(node, strategy, num_layers)
-    dpu_users = [u for u in node.users if u.meta.get(DEVICE_META_KEY) == DEVICE_DPU]
+    # propagate_specs 的入口断言已保证全图每个节点都有 device，这里不必再容忍缺失
+    dpu_users = [u for u in node.users if u.meta[DEVICE_META_KEY] == DEVICE_DPU]
     linear_users = [
         u for u in dpu_users if u.target in (torch.ops.aten.linear.default, torch.ops.aten.addmm.default)
     ]
@@ -194,11 +232,13 @@ def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTen
         if mode is None:
             raise ValueError(f"权重 {node.target} 被 linear 消费，但策略未指定其切法")
         return _dpu_spec(
-            Placement("Shard", 0 if mode == "col" else 1), shape, dpus, residency="pinned"
+            Placement("Shard", 0 if mode == "col" else 1), shape, dpus,
+            residency="pinned", dtype=dt, quant=qz,
         )
     if dpu_users:
-        return _dpu_spec(REPLICATE, shape, dpus, residency="pinned")
-    return _host_spec()
+        return _dpu_spec(REPLICATE, shape, dpus, residency="pinned",
+                         dtype=dt, quant=qz)
+    return _host_spec(dt)
 
 
 @dataclass(frozen=True)
@@ -481,8 +521,9 @@ def _required_spec(
 ) -> PIMTensorSpec:
     """按消费节点的 DPU 集合构造所需的输入规格。"""
     if req.device == DEVICE_HOST:
-        return _host_spec()
-    return _dpu_spec(req.placement, tuple(src.meta["val"].shape), dst_dpus)
+        return _host_spec(_dtype_of(src))
+    return _dpu_spec(req.placement, tuple(src.meta["val"].shape), dst_dpus,
+                     dtype=_dtype_of(src))
 
 
 def _edge_type(node: Node, actual: PIMTensorSpec, req: _Req) -> str:
@@ -539,7 +580,7 @@ def _diff_edge(
         nbytes=val.numel() * val.element_size(),
         reduce_type=actual.reduce_type,
         shape=tuple(val.shape),
-        dtype=str(val.dtype).removeprefix("torch."),
+        dtype=_dtype_of(src),
     )
 
 
@@ -556,7 +597,7 @@ def propagate_specs(gm: GraphModule, strategy: ShardStrategy) -> list[Redistribu
     # 1. 初始化输入和权重规格。
     for node in nodes:
         if node.op == "placeholder":
-            node.meta[SPEC_META_KEY] = _host_spec()
+            node.meta[SPEC_META_KEY] = _host_spec(_dtype_of(node))
         elif node.op == "get_attr":
             val = node.meta.get("val")
             if isinstance(val, torch.Tensor):  # 跳过非张量属性。
@@ -573,9 +614,13 @@ def propagate_specs(gm: GraphModule, strategy: ShardStrategy) -> list[Redistribu
             # 跳过没有张量输出的守卫节点。
             if node.meta.get("val") is not None:
                 _require_host_inputs(node, edges, strategy, num_layers)
-            node.meta[SPEC_META_KEY] = _host_spec()
+            node.meta[SPEC_META_KEY] = _host_spec(_dtype_of(node))
         else:
             _propagate_dpu_node(node, edges, strategy, num_layers)
+    # 出口校验：此刻全图应当满足 STAGE_SPECS 的跨维不变式
+    # （spec.dtype 与 val.dtype 不漂移、切分维落在本地形状的秩内）。
+    validate_graph_dimensions(gm, stage=STAGE_SPECS)
+    mark_stage(gm, STAGE_SPECS)
     return edges
 
 
@@ -662,7 +707,8 @@ def _propagate_dpu_node(
     for src, req in reqs:
         _append_edge(node, src, req, edges, strategy, num_layers)
     node.meta[SPEC_META_KEY] = _dpu_spec(
-        out_placement, tuple(val.shape), _dpus_of_node(node, strategy, num_layers)
+        out_placement, tuple(val.shape), _dpus_of_node(node, strategy, num_layers),
+        dtype=_dtype_of(node),
     )
 
 

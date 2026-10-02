@@ -33,24 +33,8 @@ from dataclasses import dataclass, field
 import torch
 from torch.fx import GraphModule, Node
 
-from graph.fuse_pim import ABSORBED_META_KEY
-
-# 折出来的 RoPE 节点带这个键，GML 侧见到它就发 Llama2Activation。
-ROPE_META_KEY = "pim_rope"
-
-
-@dataclass
-class RopeMatch:
-    """一条匹配上的 RoPE 链。
-
-    `cos` / `sin` 是两个广播张量的产出节点 —— GML 侧要按它们生成
-    `Llama2Activation_Cos` / `_Sin` 两个子块的缓冲与定标。
-    """
-
-    source: Node          # 被旋转的张量（Q 或 K）
-    cos: Node
-    sin: Node
-    absorbed: list[Node] = field(default_factory=list)
+from contracts.graph_meta import ABSORBED_META_KEY, ROPE_META_KEY
+from contracts.ir_payloads import RopeMatch
 
 
 @dataclass

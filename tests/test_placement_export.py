@@ -525,6 +525,23 @@ def test_unknown_semantic_role_raises(annotated_tiny_llama, tmp_path) -> None:
 # `run_full_pipeline.py` 的校验若把 GEMM 那套字段要求套到全部条目，B 路的
 # 6626 条会全部判失败，全链路验收命令跑不通——而它们本身是完好的。
 
+def test_the_measured_tile_carries_the_returned_footprint() -> None:
+    """测分块时必须同时带回传的单台占用。
+
+    `placed_mram_bytes` 与 `kernel_tile_n` 出自同一次 A 路编译，只写后者会让
+    GeneSim 的容量核对在真实 sidecar 上一次都核对不了。
+    """
+    from contracts.op_contract import PIMHardwareConfig
+    from genesim_bridge.placement_export import _measure_kernel_tile_n
+
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4, mram_bytes_per_dpu=1 << 32,
+                           wram_bytes_per_dpu=65536, dma_align=64)
+    tile_n, _path, placed = _measure_kernel_tile_n(4096, 4096, "float16", hw, {})
+    assert tile_n > 0
+    assert placed is not None and placed > 0, (
+        "测出了分块却没有回传单台占用，sidecar 写不出 placed_mram_bytes")
+
+
 def test_sidecar_checks_split_by_entry_class() -> None:
     """GEMM 条目查五项，B 路条目查自己那套，都要通过。"""
     from scripts.run_full_pipeline import check_sidecar_entries
@@ -663,3 +680,28 @@ def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) ->
     assert "stationarity = #pim.stationarity<kv>" in text, text
     # 符号维不能退化成字面 1（`<1x` 是 tensor 形状里"第一维是 1"的写法）。
     assert "<1x" not in text, text
+
+
+def test_the_no_consumer_sidecar_fields_are_registered() -> None:
+    """三个无消费者字段必须显式登记理由（需求 P1-2 的豁免机制）。
+
+    缺了这条登记就无法区分「有意为之的调试字段」与「漏接的语义字段」，
+    后续清理死字段时会把它们一起删掉。登记内容要与真实写入的字段对齐：
+    登记表漏一个、或登记了并不写入的名字，两种漂移都要报出来。
+    """
+    import re
+
+    from genesim_bridge.placement_export import DEBUG_ONLY_SIDECAR_FIELDS
+
+    assert DEBUG_ONLY_SIDECAR_FIELDS == {"semantic_role", "weight", "shard_axis"}
+    text = (Path(__file__).parent.parent
+            / "genesim_bridge" / "placement_export.py").read_text(encoding="utf-8")
+    # 只看**写入点**形态，并排除登记表自己那一行：按子串扫的话
+    # `"semantic_role"` 在 `frozenset({...})` 里就命中了，写入点删光也照样通过。
+    body = "\n".join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith("DEBUG_ONLY_SIDECAR_FIELDS"))
+    for name in DEBUG_ONLY_SIDECAR_FIELDS:
+        write = (re.search(rf'"{name}"\s*:', body)
+                 or re.search(rf'\[\s*"{name}"\s*\]\s*=', body))
+        assert write, f"{name} 登记了但没有写入点"

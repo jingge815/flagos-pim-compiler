@@ -43,6 +43,7 @@ from torch.fx import GraphModule, Node as FxNode
 
 from contracts import gml_hw_table as hw_table
 from contracts.graph_meta import FUSED_TAIL_META_KEY
+from contracts.unified_ir import STAGE_FUSED, require_stage
 from graph.fuse_pim import RMS_NORM_META_KEY
 from graph.fuse_rope import ROPE_META_KEY
 from graph.quant_pass import DQ_META_KEY
@@ -345,6 +346,7 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
     所以这里按 meta 标记认算子，不按 aten 目标扫——否则同一条 RoPE 会既按
     3 相发一次、又按散落的 mul/add 发若干次。
     """
+    require_stage(gm, STAGE_FUSED, who="emit_oplevel_mlir")
     report = EmitReport()
     bodies: list[str] = []
     seen: set[str] = set()

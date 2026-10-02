@@ -87,7 +87,7 @@ def kv_specs(llama2_two_graphs):
 @pytest.fixture(scope="module")
 def hw_budget():
     # 容量覆盖每个 DPU 的权重分片。
-    return HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    return HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
 
 
 @pytest.fixture(scope="module")
@@ -152,7 +152,7 @@ def test_capacity_check_passes_with_realistic_budget(plans, hw_budget) -> None:
 
 def test_capacity_check_rejects_too_small_budget(llama2_two_graphs, kv_specs) -> None:
     _, _, prefill_gm, decode_gm = llama2_two_graphs
-    tiny = HwBudget(mram_bytes=1 << 20, align=1024, sys_reserve_bytes=0)  # 1MiB，装不下 7B 权重分片
+    tiny = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)  # 1MiB，装不下 7B 权重分片
     with pytest.raises(ValueError, match="内存超限"):
         plan_dpu(0, list(prefill_gm.graph.nodes), list(decode_gm.graph.nodes), kv_specs, tiny)
 

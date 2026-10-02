@@ -19,7 +19,10 @@ from torch.fx import GraphModule, Node as FxNode
 from contracts import gml_hw_table as hw_table
 from contracts import gml_names as names
 from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
+from contracts.dtypes import ELEMENT_DTYPES
 from contracts.gml_quant import ACTIVATION_LAYOUT, GML_VERSION, PHASE_COUNTS, QuantLayout
+from contracts.op_semantics import aten_to_gml, role_to_gml
+from contracts.fusion_contract import ACTIVATIONS
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 from graph.fuse_pim import (
     ABSORBED_META_KEY,
@@ -41,54 +44,8 @@ from gml_bridge.writer import Edge, Node
 
 # FX 算子到 GML `op_type` 的映射。GML 的算子集比 aten 小得多，因为定点流水线里
 # 很多 aten 算子（类型转换、断言）没有对应的硬件节点。
-OP_TYPES = {
-    torch.ops.aten.linear.default: "Gemm",
-    torch.ops.aten.addmm.default: "Gemm",
-    torch.ops.aten.mm.default: "MatMul",
-    torch.ops.aten.bmm.default: "MatMul",
-    # 逐头展开产出的是 `matmul`（保留 4 维），不是 `bmm`（要先压成 3 维）。
-    torch.ops.aten.matmul.default: "MatMul",
-    torch.ops.aten.add.Tensor: "EltwiseAdd",
-    torch.ops.aten.sub.Tensor: "EltwiseSub",
-    torch.ops.aten.mul.Tensor: "EltwiseMul",
-    torch.ops.aten.div.Tensor: "EltwiseDiv",
-    torch.ops.aten._softmax.default: "Softmax",
-    # 以下按 llama2 W4A8 实物校正：它们在 GML 里是**独立节点**，
-    # 不是折进主算子 contraction 的项（见文档 18.6）。
-    # `RMSNorm_vpu` 的 `_vpu` 后缀说明它显式绑定在向量单元上，
-    # 还带 vpu_params / Vpu_Axis / Use_Scaling / RMSNorm_Add_Const 等专属字段。
-    torch.ops.aten.rsqrt.default: "RMSNorm_vpu",
-    # `Silu` 自带 nmu_mode / fpsu_* / kantor_mode，以及一个放 fused_Silu_act
-    # 的 contraction——它是主算子而非激活。
-    torch.ops.aten.silu.default: "Silu",
-    # causal mask 在硬件上是一步操作，实物里 32 个（每 head 一个）。
-    torch.ops.aten.masked_fill.Scalar: "Mask",
-    torch.ops.aten.where.self: "Mask",
-    # 按 head 切分：实物用一个 Split 节点带 num_heads 表达。
-    torch.ops.aten.split.Tensor: "Split",
-    torch.ops.aten.split_with_sizes.default: "Split",
-    torch.ops.aten.transpose.int: "Transpose",
-    torch.ops.aten.permute.default: "Transpose",
-    torch.ops.aten.view.default: "Reshape",
-    torch.ops.aten.reshape.default: "Reshape",
-    torch.ops.aten.cat.default: "Concat",
-    torch.ops.aten.max_pool2d.default: "MaxPool",
-    torch.ops.aten.avg_pool2d.default: "AveragePool",
-    torch.ops.aten.convolution.default: "Conv",
-    # 类型转换是一次真实的数据运动：输入输出位宽不同，必须有节点承载
-    # `input_data_extensions` / `output_data_extension`，不能被跨过。
-    torch.ops.aten.to.dtype: "Convert",
-    torch.ops.aten.to.dtype_layout: "Convert",
-    # 词嵌入查表。全模型导出的图入口是 input_ids，嵌入在块内，必须发这个节点；
-    # decode 块以隐藏态为入口、嵌入在块外，那条导出在 `convert` 里按
-    # `decode_block_only` 裁掉（见那里的说明），所以同一个算子两种导出各发各的。
-    torch.ops.aten.embedding.default: "Gather",
-    # attention 在 GML 里是真实节点（scores/context 两个 MatMul 加一个 Softmax）。
-    # 本仓的 NumPy 路径把它放在主机侧执行，但那是执行策略，不是图结构——
-    # 如果这里跨过它，它的 q/k/v 三个上游会被下游节点误当成自己的输入。
-    torch.ops.aten.scaled_dot_product_attention.default: "MatMul",
-}
-
+# 真源在 `contracts/op_semantics.py`，这里只是它的一个派生视图。
+OP_TYPES = aten_to_gml()
 # 带 output_sf / output_zp 的算子。实测规则：**做计算的带，纯布局的不带**。
 #
 #   带（个数/总数）：MatMul 64/64、DynamicScaling 36/36、Softmax 32/32、
@@ -220,13 +177,9 @@ _FPSU_OPS = frozenset({
 _FPSU_SLOTS = {"EltwiseAdd": 2, "EltwiseMul": 2}
 
 
-# 逐头展开产出的节点，按角色定 op_type。
-_ROLE_OP_TYPES = {
-    ROLE_MATMUL_QK: "MatMul",
-    ROLE_MATMUL_PV: "MatMul",
-    ROLE_MASK: "Mask",
-    ROLE_SOFTMAX: "Softmax",
-}
+# 逐头展开产出的节点，按角色定 op_type。与 OP_TYPES 分开是**必须的**：
+# `_op_type_of` 先查角色再查 aten，合并成一张表会丢掉这个优先级。
+_ROLE_OP_TYPES = role_to_gml()
 
 
 # 折进 contraction 的激活，GML 用 `Lut` 加 `activation_op_type` 表示。
@@ -558,7 +511,8 @@ _NO_TOP_IN_DTYPE = frozenset({
 
 # 产物能落盘的缓冲元素类型。`int64` 这类索引/主机侧类型不在其中——声明了
 # 没有宽度可核文件大小（`verify_gml_artifact` 的宽度表只认这四种）。
-_BUFFER_DTYPES = frozenset({"int8", "int16", "float16", "float32"})
+# GML 缓冲能落盘的元素类型，是真源的子集（int4 不单独落 —— 它按 int8 存）。
+_BUFFER_DTYPES = ELEMENT_DTYPES - {"int4"}
 
 # 不逐槽声明输入定标的算子。参考实测：Mask / KV_Cache_DMA / 两个 RoPE 锚点
 # 都**没有** `input_<槽>_sf` / `_zp` / `_sf_dtype`——Mask 读的是浮点分数与
@@ -654,7 +608,12 @@ def _stamp_idx(nodes: list[Node]) -> None:
             node.fields["idx"] = port_of[node.node_id]
 
 
-def _stamp_dtypes(nodes: list[Node]) -> None:
+# GML 缓冲位宽只有 int8 与 float16 两种（contracts.gml_hw_table.DATA_EXTENSION）。
+# 回传 1 字节落 int8，其余落 float16。
+_DTYPE_BY_WIDTH = {1: "int8", 2: "float16", 4: "float16"}
+
+
+def _stamp_dtypes(nodes: list[Node], placed_elem_bytes=None) -> None:
     """补齐节点级 dtype / extension，并删不该有的 sf/zp。
 
     **布局算子的 dtype 是沿边传播的，不是按 op_type 固定**。参考里同一个
@@ -739,6 +698,13 @@ def _stamp_dtypes(nodes: list[Node]) -> None:
         out_dt = resolve(node_id)
 
         if "output_buffer_dtype" not in fields:
+            # 回传的元素宽度优先于沿边传播的类型：算子编译器按真实类型定的
+            # 宽度与图上猜的不一致时，以它为准，缓冲字节数才不会差一倍。
+            width = None
+            if placed_elem_bytes and op_type in placed_elem_bytes:
+                width = placed_elem_bytes[op_type].placed_elem_bytes
+            if width in _DTYPE_BY_WIDTH:
+                out_dt = _DTYPE_BY_WIDTH[width]
             fields["output_buffer_dtype"] = out_dt
             fields["output_data_extension"] = hw_table.data_extension(out_dt)
 
@@ -947,10 +913,40 @@ def _phase_count_for(phase_source, op_type: str, label: str) -> int:
     return fallback if plan is None else plan.count
 
 
+# 必须折进主算子才能发射的激活：`ACTIVATIONS` 这七个在 GML 里没有独立节点
+# 类型，只能作为主算子的尾部（`Lut` 配 `activation_op_type`）。
+# `silu` 不在此列 —— 它有自己的 `Silu` 节点，独立存在是合法的。
+_MUST_BE_FUSED_ACTIVATIONS = frozenset(ACTIVATIONS)
+
+
+def _assert_no_standalone_activation(gm: GraphModule) -> None:
+    """图里不能留下没折进主算子的激活节点。
+
+    留一个下来不会报错，而是**静默消失**：`_is_emittable` 判它不发射，
+    `_tensor_inputs` 又跨过它把上下游直接接上，于是产出的 GML 结构合法、
+    五条规则全过，只是少算了一层激活 —— 要到数值对拍才发现。
+
+    判据是「GML 能不能表达」而不是「是不是激活」：已折的激活被 `fuse_graph`
+    从图里删掉（只在主算子的 `FUSED_TAIL_META_KEY` 上留记录），所以图里还能
+    查到这七个中的任何一个，就说明融合没跑或没匹配上。
+    """
+    standalone = [
+        node.name for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target in _MUST_BE_FUSED_ACTIVATIONS
+        and not node.meta.get(ABSORBED_META_KEY)
+    ]
+    if standalone:
+        raise ValueError(
+            f"图里还有独立激活节点，GML 表达不了（只能作主算子尾部）："
+            f"{standalone}。请先跑 gml_bridge.export.fuse_for_gml")
+
+
 def convert(
     gm: GraphModule, *, version: str = GML_VERSION, phase_source=None,
     decode_block_only: bool = False,
     slots: CompileSlots | None = None,
+    placed_elem_bytes=None,
 ) -> tuple[list[Node], list[Edge], dict[int, str], dict[int, object]]:
     """把融合后的图转成 GML 节点与边。
 
@@ -970,6 +966,7 @@ def convert(
     seq_len（prepare_out 的尺寸真源，见 contracts.compile_slots）。
     """
     slots = slots or DEFAULT_SLOTS
+    _assert_no_standalone_activation(gm)
     rewrite_dims = any(
         4096 in tuple(int(x) for x in getattr(n.meta.get("val"), "shape", ()) or ())
         for n in gm.graph.nodes)
@@ -2170,7 +2167,7 @@ def convert(
             edges.append(Edge(node_id, node_ids[consumer], dims))
 
     # dtype 收尾：布局算子要沿边传播，所以必须等全部节点发射完再统一盖章。
-    _stamp_dtypes(gml_nodes)
+    _stamp_dtypes(gml_nodes, placed_elem_bytes)
     # idx 要等所有 inputN_node_id 都写完才能反查，与 dtype 同一处收尾。
     _stamp_idx(gml_nodes)
 

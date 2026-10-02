@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from math import prod
 
-import numpy as np
 from torch.fx import Node
 
+from contracts.dtypes import dtype_bytes
 from contracts.graph_meta import DEVICE_DPU, REDISTRIBUTE_META_KEY, SPEC_META_KEY
 from contracts.pim_tensor_spec import RedistributeEdge
 from memory.kv_layout import KVRegionSpec, align_up, build_kv_layout
@@ -18,7 +18,11 @@ class HwBudget:
     """定义单台 DPU 的 MRAM 容量、对齐和系统预留。"""
 
     mram_bytes: int          # 单 DPU MRAM 总量（≤8GB）
-    align: int                # DMA 对齐边界
+    # DMA 对齐边界。必须与 `PIMHardwareConfig.dma_align` 取同一个值：这个数会被
+    # 写进分片的 `align_bytes`，随命令下发给算子编译器，成为 `-pim-tile-to-budget`
+    # 选分块时的**每块缓冲**对齐。给大了（如 1024）就凑不出整数倍的缓冲——
+    # decode 的 M=1/K=32 分片一行只有 64 字节，分块搜索会直接失败。
+    align: int
     sys_reserve_bytes: int    # 系统预留：kernel 二进制 + runtime 栈 + workspace 等非三区占用
 
 
@@ -47,9 +51,22 @@ class TransientTensor:
     readers: list[str] = field(default_factory=list)
 
 
-def bytes_of(local_shape: tuple[int, ...], itemsize: int) -> int:
-    """返回本地分片的字节数。"""
-    return prod(local_shape) * itemsize
+def bytes_of(local_shape: tuple[int, ...], itemsize: int,
+             elem_strides: tuple[int, ...] = ()) -> int:
+    """本地分片占的字节数。
+
+    `elem_strides` 为空时按行主序紧密算 —— 与本轮改动前**逐字节等价**，
+    这是三个调用点（权重区 / 激活区 / KV 区）的现状。
+    非空时按最外维步幅算，覆盖带填充的排布：此时字节数不等于
+    `prod(shape) * itemsize`，因为每行末尾有填充。
+    """
+    if not elem_strides:
+        return prod(local_shape) * itemsize       # 原路径，一字未改
+    if len(elem_strides) != len(local_shape):
+        raise ValueError(
+            f"elem_strides 秩 {len(elem_strides)} 与 local_shape 秩 "
+            f"{len(local_shape)} 不符")
+    return local_shape[0] * elem_strides[0] * itemsize
 
 
 def weights_of(dpu_nodes: list[Node], dpu_id: int) -> dict[str, Node]:
@@ -86,9 +103,12 @@ def _pack_weights(
         offsets[name] = off
         for node in nodes:
             spec = node.meta[SPEC_META_KEY]
-            spec.shard_map[dpu_id] = replace(spec.shard_map[dpu_id], mram_offset=off)
-        itemsize = nodes[0].meta["val"].element_size()
-        off += align_up(bytes_of(first.local_shape, itemsize), align)
+            # 排布层：把这次规划实际用的对齐落到分片上，而不是只留在
+            # 全局的 `HwBudget.align` 里（设计 §4.4.2 的回填写法）。
+            spec.shard_map[dpu_id] = replace(
+                spec.shard_map[dpu_id], mram_offset=off, align_bytes=align)
+        itemsize = dtype_bytes(nodes[0].meta[SPEC_META_KEY].dtype)
+        off += align_up(bytes_of(first.local_shape, itemsize, first.elem_strides), align)
     return offsets, off
 
 
@@ -127,10 +147,10 @@ def redistribute_landing_tensors(
             if edge.dst_loc.get("device") != DEVICE_DPU or dpu_id not in edge.dst_loc.get("dpus", []):
                 continue
             detail = edge.dst_spec.shard_map[dpu_id]
-            itemsize = np.dtype(edge.dtype).itemsize
+            itemsize = dtype_bytes(edge.dtype)
             tensors.append(TransientTensor(
                 name=f"redist_dst:e{edge.edge_id}",
-                size=bytes_of(detail.local_shape, itemsize),
+                size=bytes_of(detail.local_shape, itemsize, detail.elem_strides),
                 produced_at=edge_step[edge.edge_id],
                 last_read_at=node_step[node],
                 readers=[node.name],
@@ -157,7 +177,7 @@ def transient_tensors(dpu_nodes: list[Node], dpu_id: int) -> list[TransientTenso
             continue
         i = node_step[node]
         detail = spec.shard_map[dpu_id]
-        itemsize = node.meta["val"].element_size()
+        itemsize = dtype_bytes(node.meta[SPEC_META_KEY].dtype)
         readers: list[str] = []
         last_read_at = i
 
@@ -177,7 +197,7 @@ def transient_tensors(dpu_nodes: list[Node], dpu_id: int) -> list[TransientTenso
 
         tensors.append(TransientTensor(
             name=node.name,
-            size=bytes_of(detail.local_shape, itemsize),
+            size=bytes_of(detail.local_shape, itemsize, detail.elem_strides),
             produced_at=i,
             last_read_at=last_read_at,
             readers=readers,
@@ -246,8 +266,16 @@ def plan_dpu(
     decode_nodes: list[Node],
     kv_specs: dict[int, KVRegionSpec],
     hw: HwBudget,
+    *,
+    kernel_mram_bytes: int = 0,
 ) -> DPUPlan:
-    """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。"""
+    """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
+
+    `kernel_mram_bytes` 是算子编译器回传的单台内核 tile 占用
+    （`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。它与三区占的是同一
+    块 MRAM，所以算进容量判据。默认 0 = 没有回传可用，判据退回只看三区，
+    与改动前逐字节等价。
+    """
     weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
 
     kv_spec = kv_specs[dpu_id]
@@ -271,18 +299,34 @@ def plan_dpu(
                 continue  # 落地缓冲在后续循环写回。
             node = by_name[name]
             spec = node.meta[SPEC_META_KEY]
-            spec.shard_map[dpu_id] = replace(spec.shard_map[dpu_id], mram_offset=node_off)
+            spec.shard_map[dpu_id] = replace(spec.shard_map[dpu_id],
+                                              mram_offset=node_off,
+                                              align_bytes=hw.align)
 
     # 写回重分布落地缓冲的 MRAM 偏移。
     for edges, offsets in ((_redistribute_edges_landing_on(prefill_nodes, dpu_id), act_prefill),
                            (_redistribute_edges_landing_on(decode_nodes, dpu_id), act_decode)):
         for edge_id, edge in edges.items():
             name = f"redist_dst:e{edge_id}"
-            edge.dst_spec.shard_map[dpu_id] = replace(edge.dst_spec.shard_map[dpu_id], mram_offset=offsets[name])
+            edge.dst_spec.shard_map[dpu_id] = replace(
+                edge.dst_spec.shard_map[dpu_id], mram_offset=offsets[name],
+                align_bytes=hw.align)
 
     budget = hw.mram_bytes - hw.sys_reserve_bytes
-    if total > budget:
-        raise ValueError(f"dpu{dpu_id} 内存超限: total={total} > 可用预算={budget}")
+    # `total` 只是**三区**（权重 + KV + 激活）的末端。内核运行时还要为
+    # x / w / out 三块 tile 占一份 MRAM，而那份占用由算子编译器定分块后才知道，
+    # 只能由它回传（`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。
+    #
+    # 两个口径以前从未相加：这里只校验三区、GeneSim 那侧只核对 tile 占用，
+    # 于是「三区占满 + tile 再要一份」这种真实超限两边都看不见。相加才是单台
+    # DPU 的真实峰值。取不到回传时按 0 计 —— 与改动前逐字节等价。
+    kernel_bytes = kernel_mram_bytes or 0
+    peak = total + kernel_bytes
+    if peak > budget:
+        detail = (f"（三区 {total} + 内核 tile {kernel_bytes}）"
+                  if kernel_bytes else "")
+        raise ValueError(
+            f"dpu{dpu_id} 内存超限: peak={peak}{detail} > 可用预算={budget}")
 
     return DPUPlan(
         weight=weight,

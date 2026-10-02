@@ -64,3 +64,23 @@ GATE_ACTIVATIONS = {
     torch.ops.aten.relu.default: "relu",
     torch.ops.aten.gelu.default: "gelu",
 }
+
+
+def _validate_fusion_targets() -> None:
+    """融合表引用的 aten 目标必须在算子登记表里能查到 GML 类型。
+
+    两表不同步时融合会**静默不发生** —— 不报错，只是少折一个算子，
+    而少折的算子会以独立节点落进 GML，产物结构变了却没人发现。
+    """
+    from contracts.op_semantics import aten_to_gml
+
+    known = set(aten_to_gml())
+    for group, label in ((FUSION_TARGETS, "FUSION_TARGETS"),
+                         (GATE_TARGETS, "GATE_TARGETS")):
+        unknown = group - known
+        if unknown:
+            raise ValueError(
+                f"{label} 引用了未登记的算子：{sorted(str(t) for t in unknown)}")
+
+
+_validate_fusion_targets()

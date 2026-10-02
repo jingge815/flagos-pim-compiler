@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 from orchestrator.layer_id import LayerIdentity
 from contracts.compile_slots import DEFAULT_SLOTS
+from contracts.mem_layout import L2_ALIGN, align_up, l2_output_bytes
 
 # L2 窗口常量。来自 docs/prepare_out-域确认表-20260918.md 步骤 C：
 #   QMAN offset = 0x1FFF0000，size = 65536，本样例全层相同
@@ -33,14 +34,6 @@ QMAN_OFFSET = 0x1FFF0000
 QMAN_SIZE = 65536
 # 数据区顶端 = QMAN 起点，向下不与队列区重叠。
 L2_DATA_TOP = QMAN_OFFSET
-# 对齐粒度。文档 B7：L2 output size 按 align16(Width) + 16 算。
-L2_ALIGN = 16
-# 输出段的尾部填充，同上。
-L2_OUTPUT_PAD = 16
-
-
-def align_up(value: int, align: int) -> int:
-    return (value + align - 1) // align * align
 
 
 def _is_dual_input(op_type: str, phase: int | None, node=None) -> bool:
@@ -97,14 +90,6 @@ def _dual_slot1_size(op_type: str, phase: int | None, slot0_size: int,
             return slots.hidden * 2
         return slots.head_dim * 2
     return slot0_size
-
-
-def l2_output_bytes(width: int, elem_bytes: int) -> int:
-    """输出段字节数（闭合公式，文档步骤 C）。
-
-        L2 output size = (align16(Width) + 16) * elem_bytes
-    """
-    return (align_up(width, L2_ALIGN) + L2_OUTPUT_PAD) * elem_bytes
 
 
 @dataclass

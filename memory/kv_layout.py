@@ -9,6 +9,7 @@ from typing import Literal
 import numpy as np
 
 from contracts.exec_plan import Access
+from contracts.mem_layout import align_up
 from contracts.pim_tensor_spec import PIMTensorSpec
 
 _NP_DTYPE = {2: np.dtype(np.float16), 4: np.dtype(np.float32)}
@@ -22,13 +23,6 @@ def _check_position(name: str, value: int, upper: int, *, inclusive: bool) -> No
     if not in_range:
         bound = f"[0,{upper}]" if inclusive else f"[0,{upper})"
         raise ValueError(f"{name}={value} 越界 {bound}")
-
-
-def align_up(n: int, align: int) -> int:
-    """向上对齐到 DMA 边界。"""
-    if align <= 0:
-        raise ValueError(f"align 必须为正，got {align}")
-    return (n + align - 1) // align * align
 
 
 @dataclass

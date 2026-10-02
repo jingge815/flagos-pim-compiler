@@ -12,7 +12,9 @@ from collections import OrderedDict
 from contracts import gml_names as names
 from contracts.compile_slots import DEFAULT_SLOTS
 from contracts.gml_quant import WEIGHT_GROUP_SIZE
-from orchestrator import l2_alloc, layer_hw_table
+from contracts.mem_layout import (l2_dual_in_size, l2_in_size,
+                                  l2_out_size, stride_z)
+from orchestrator import layer_hw_table
 from orchestrator.layer_hw_table import HwRow
 from orchestrator.layer_id import LayerIdentity
 
@@ -22,19 +24,6 @@ EXT_SIGNED, EXT_FLOAT = 1, 3
 # 编译期 KV 槽位。prepare_out 的 mask/softmax/bmm 宽用它，不是导出时的 seq_len。
 H, I, HD, S = (DEFAULT_SLOTS.hidden, DEFAULT_SLOTS.intermediate,
                DEFAULT_SLOTS.head_dim, DEFAULT_SLOTS.seq)
-
-
-def align16(width: int) -> int:
-    return l2_alloc.align_up(width, 16)
-
-
-def stride_z(width: int, *, final: bool, scalar_align16: bool = False) -> int:
-    """终相 align16(W)+15；中间相 =W；Width=1 的中间相有时 16。"""
-    if final:
-        return align16(width) + 15
-    if scalar_align16 and width == 1:
-        return 16
-    return width
 
 
 def dtype_code(elem_bytes: int) -> int:
@@ -569,59 +558,6 @@ def _virtual(kind: str) -> tuple[bool, bool]:
     if kind == "sm_p5":
         return True, False
     return False, False
-
-
-def _elem_bytes(dt: int) -> int:
-    return {0: 1, 1: 2, 3: 4}[dt]
-
-
-def _l2_in_size(kind: str, in_w: int, in_dt: int) -> int:
-    """L2 输入段字节数。
-
-    参考实测（422 层）：
-      int8 平面        = Width          （q_proj 4096、mask 2048 是 fp16 的 W×2）
-      bmm              = Width + 16     （hd→144、S→1040）
-      DQ p4 终相       = align16(W)+16 再 ×2  （4096→8224、1024→2080）
-    """
-    if kind in ("bmm1", "bmm2"):
-        return in_w + 16
-    if kind == "dq_p4":
-        return (align16(in_w) + 16) * 2
-    if kind == "sm_p2":
-        # 实测 W=1024 → 2080 = (align16(W)+16)×2：exp 相要多留一行。
-        return (align16(in_w) + 16) * 2
-    return in_w * _elem_bytes(in_dt)
-
-
-def _l2_dual_in_size(kind: str, width: int) -> int:
-    """双输入层某一路的 L2 输入段字节数。
-
-    参考实测：两路都是 fp16 平面，`Width × 2`
-    （H=4096→8192、hd=128→256、I=11008→22016、S=1024→2048）。
-    """
-    return width * 2
-
-
-def _l2_out_size(kind: str, out_w: int, out_dt: int) -> int:
-    """L2 输出段字节数。
-
-    参考实测（422 层）：
-
-      bmm2      按 hidden 占位 8224
-      DQ p2     Gn=32→96、Gn=1→32、Gn=86→208，即 `(align16(Gn)+16)×2`，
-                Gn=1 例外取 32（16×2）
-      DQ p4     终相 int8 平面 `align16(W)+16`：4096→4112、1024→1040、
-                11008→11024（**不乘 2**，它已是 int8）
-    """
-    if kind == "bmm2":
-        return (align16(H) + 16) * 2
-    if kind == "dq_p2":
-        # 实测 Gn=32→96、86→208，即 `align16((Gn+16)×2)`；Gn=1 例外取 32
-        # （按公式会得 48，参考是 32 —— 单组时不留那一行余量）。
-        return 32 if out_w <= 1 else align16((out_w + 16) * 2)
-    if kind == "dq_p4":
-        return align16(out_w) + 16
-    return l2_alloc.l2_output_bytes(out_w, _elem_bytes(out_dt))
 
 
 def build_layer_fields(
@@ -1454,7 +1390,7 @@ def build_layer_fields(
         fields["L2 input num of buffers 0"] = 1
         fields["L2 input num of buffers 1"] = 1
         offset0 = l2_offsets.get(identity.stem, 0)
-        size0 = _l2_dual_in_size(kind, w0)
+        size0 = l2_dual_in_size(kind, w0)
         fields["L2 input buffer offset 0"] = offset0
         fields["L2 input buffer size 0"] = size0
         fields["L2 input num of maps 0"] = 1
@@ -1468,7 +1404,7 @@ def build_layer_fields(
         # 的地址（域确认表 Q11 这一项本身标了「待确认」）。
         fields["L2 input buffer offset 1"] = l2_offsets.get(
             f"{identity.stem}#1", offset0 + size0)
-        fields["L2 input buffer size 1"] = _l2_dual_in_size(kind, w1)
+        fields["L2 input buffer size 1"] = l2_dual_in_size(kind, w1)
         fields["L2 input num of maps 1"] = 1
         fields["L2 input slice maps offset 1"] = 0
         fields["L2 input slice num of maps 1"] = 1
@@ -1482,7 +1418,7 @@ def build_layer_fields(
         # （它读的是 p1 留在片上的结果，没有独立入口段）。
         if kind not in ("sm_p5", "dq_p2", "dq_p3", "sm_p3", "sm_p4"):
             fields["L2 input buffer offset 0"] = l2_offsets.get(identity.stem, 0)
-            fields["L2 input buffer size 0"] = _l2_in_size(kind, in_w, in_dt)
+            fields["L2 input buffer size 0"] = l2_in_size(kind, in_w, in_dt)
             fields["L2 input num of maps 0"] = 1
             fields["L2 input slice maps offset 0"] = 0
             fields["L2 input slice num of maps 0"] = 1
@@ -1492,7 +1428,7 @@ def build_layer_fields(
 
     if hw.l2_output_id is not None and not vout:
         fields["L2 output buffer offset"] = l2_offsets.get(identity.stem, 0)
-        fields["L2 output buffer size"] = _l2_out_size(kind, out_w, out_dt)
+        fields["L2 output buffer size"] = l2_out_size(kind, out_w, out_dt)
         fields["L2 output buffer id"] = hw.l2_output_id
     elif kind in ("dq_p2",) or (not vout and hw.l2_output_id is None):
         if kind == "dq_p2":

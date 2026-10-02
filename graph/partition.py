@@ -8,6 +8,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from contracts.graph_meta import DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, PART_ID_META_KEY
+from contracts.unified_ir import STAGE_PARTITIONED, mark_stage
 
 
 # 留在主机的算子。这是一张**黑名单**：默认下设备，列进来的才留主机。
@@ -148,4 +149,5 @@ def partition_graph(gm: GraphModule) -> list[Partition]:
         for node in component:
             node.meta[PART_ID_META_KEY] = part_id
         partitions.append(Partition(part_id=part_id, nodes=component))
+    mark_stage(gm, STAGE_PARTITIONED)
     return partitions

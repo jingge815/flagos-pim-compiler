@@ -150,13 +150,17 @@ def test_compiled_linear_end_to_end_matches_hf_generate(
     monkeypatch.setattr(km, "compiled_linear_kernel", wrapped)
 
     prompt_ids_list, ref_ids, ref_text = hf_reference
-    hw = HwBudget(mram_bytes=4 * 2**30, align=1024, sys_reserve_bytes=64 * 2**20)
+    # 内存规划的对齐会随命令下发，成为内核选分块时的**每块缓冲**对齐
+    # （`align_bytes` → `#pim.placement<alignBytes>` → `-pim-tile-to-budget`），
+    # 所以这里必须与下面的 `dma_align` 取同一个值。取 1024 时 decode 那种
+    # M=1、K=32 的分片凑不出 1024 字节整数倍的缓冲，分块搜索直接失败：
+    # `no legal power-of-two tile fits`。
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS,
         num_tasklets=NUM_TASKLETS,
         mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536,
-        # DMA 分块使用独立于 MRAM 布局的字节对齐。
         dma_align=64,
     )
     compiled = compile_llama2(

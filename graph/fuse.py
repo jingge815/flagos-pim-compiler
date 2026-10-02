@@ -9,13 +9,12 @@ GML 把激活放进主算子的 `contraction` 块，没有独立激活节点的�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from torch.fx import GraphModule, Node
 
 from contracts.fusion_contract import ACTIVATIONS, FUSION_TARGETS
 from contracts.graph_meta import FUSED_TAIL_META_KEY
+from contracts.ir_payloads import FusedTail
 
 # 条件表在 `contracts/fusion_contract.py`，两个 pass 共用那一份。本模块折的是
 # 通用主算子（matmul + eltwise）；`silu` 只折 gate 投影，走 `fuse_pim.py` 的
@@ -27,19 +26,6 @@ POOLS = {
     torch.ops.aten.avg_pool2d.default: "average",
     torch.ops.aten.mean.dim: "global_average",
 }
-
-
-@dataclass
-class FusedTail:
-    """折进主算子的尾部算子。
-
-    `activation` 是激活的 GML 名；`pool` 是紧随其后的池化，没有则为 None。
-    `nodes` 保留被折掉的 FX 节点，供序列化器生成 contraction 块时取参数。
-    """
-
-    activation: str
-    pool: str | None
-    nodes: list[Node]
 
 
 def _single_consumer(node: Node) -> bool:

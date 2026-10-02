@@ -16,6 +16,53 @@ from memory.kv_layout import PIMStaticKVCache, decode_mask, prefill_mask
 from runtime import kernels_pim
 
 
+@dataclass(frozen=True)
+class _OpContext:
+    """一次算子编译的硬件、切分与排布上下文。"""
+
+    hardware: object
+    shard: object | None = None
+    # 结果分片的排布（`TensorShardDetail.elem_strides`）。切分与排布同源，
+    # 但排布在单 DPU 上也有内容，所以不跟 `shard` 合用「None = 不下发」。
+    elem_strides: tuple[int, ...] = ()
+    mram_offset: int = 0
+    align_bytes: int = 0
+
+
+def _default_context() -> _OpContext:
+    """没有命令上下文时用的默认硬件与单 DPU 切分。"""
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
+
+    return _OpContext(hardware=DEFAULT_HARDWARE_CONFIG)
+
+
+DEFAULT_OPS_CONTEXT = _default_context()
+
+
+def _ctx_of(cmd) -> _OpContext:
+    """命令上的硬件配置与跨 DPU 切分决策。
+
+    payload 里没有 `hardware`（手搓的最小命令、测试夹具）时退回默认硬件 ——
+    与这些调用点在改动前一律用 `DEFAULT_HARDWARE_CONFIG` 的行为一致。
+    没有 `shard` 就是单 DPU，下发的文本与改动前逐字节相同。
+    """
+    from contracts.op_contract import DpuShard, PIMHardwareConfig
+
+    raw_hw = cmd.payload.get("hardware")
+    raw_shard = cmd.payload.get("shard")
+    return _OpContext(
+        hardware=(DEFAULT_OPS_CONTEXT.hardware if raw_hw is None
+                  else PIMHardwareConfig.from_payload(raw_hw)),
+        # `from_payload` 兼容两元素的旧形态（按 shard 读），所以编译期产的旧蓝图
+        # 在新运行时上照旧能跑。
+        shard=None if raw_shard is None else DpuShard.from_payload(raw_shard),
+        # 旧蓝图没有这一项，退回行主序 —— 与改动前一致。
+        elem_strides=tuple(cmd.payload.get("elem_strides") or ()),
+        mram_offset=int(cmd.payload.get("mram_offset") or 0),
+        align_bytes=int(cmd.payload.get("align_bytes") or 0),
+    )
+
+
 def _limit_blas_threads(n: int = 1) -> bool:
     """将 OpenBLAS 线程数设为 ``n``；未找到库时返回 ``False``。"""
     try:
@@ -146,7 +193,8 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
         )
     num_tasklets = hardware.num_tasklets
     # 键包含数据类型、tasklet 数和硬件配置。
-    key = ("linear", arg_shapes, dtype, tuple(hardware.to_payload().items()))
+    ctx = _ctx_of(cmd)
+    key = (ctx, "linear", arg_shapes, dtype, tuple(hardware.to_payload().items()))
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         # 锁内检查编译缓存。
@@ -156,7 +204,9 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
                 result = compile_op(
                     OpCompileRequest(
                         op="linear", arg_shapes=list(arg_shapes), hardware=hardware,
-                        dtype=dtype, num_tasklets=num_tasklets,
+                        dtype=dtype, num_tasklets=num_tasklets, shard=ctx.shard,
+                        elem_strides=ctx.elem_strides,
+                        mram_offset=ctx.mram_offset, align_bytes=ctx.align_bytes,
                     )
                 )
                 fn = load_kernel(result)
@@ -172,13 +222,13 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     )
 
 
-def _compiled_eltwise(kind: str, shape: tuple[int, ...]):
+def _compiled_eltwise(kind: str, shape: tuple[int, ...], *, ctx: _OpContext | None = None):
     """按形状编一个逐元素算子（带缓存）；工具链不在位时返回 None。
 
     只回退工具链缺失。编译器自己报的错往上抛——静默回退镜像会让
     「编译内核与镜像一致」这条判据在编译失败时也通过。
     """
-    key = ("eltwise", kind, shape)
+    key = (ctx, "eltwise", kind, shape)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -189,7 +239,11 @@ def _compiled_eltwise(kind: str, shape: tuple[int, ...]):
     try:
         result = compile_op(OpCompileRequest(
             op="eltwise", arg_shapes=[shape, shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16", kind=kind,
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16", kind=kind,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -293,14 +347,14 @@ def mean_dim_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, np.mean(x, axis=axis, keepdims=keepdim))
 
 
-def _silu(x: np.ndarray) -> np.ndarray:
+def _silu(x: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     """silu 走 `pim.lut`，求值用闭式 `x/(1+exp(-x))`。
 
     编译内核与 numpy 镜像同一条公式，也是 torch 的公式。31 段弦线表在
     32 层里累积后，logits 与 torch 差到 1 以上。
     """
     array = np.ascontiguousarray(x, dtype=np.float16)
-    fn = _compiled_lut(tuple(array.shape), "silu")
+    fn = _compiled_lut(tuple(array.shape), "silu", ctx=ctx)
     if fn is None:
         return kernels_pim._apply_activation(array, "silu")
     out = np.zeros(array.shape, dtype=np.float16)
@@ -308,9 +362,9 @@ def _silu(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def _compiled_lut(shape: tuple[int, ...], kind: str):
+def _compiled_lut(shape: tuple[int, ...], kind: str, *, ctx: _OpContext | None = None):
     """按形状编一个 `pim.lut` 查表激活；工具链不在位时返回 None。"""
-    key = ("lut", shape, kind)
+    key = (ctx, "lut", shape, kind)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -321,8 +375,12 @@ def _compiled_lut(shape: tuple[int, ...], kind: str):
     try:
         result = compile_op(OpCompileRequest(
             op="lut", arg_shapes=[shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
             activation=kind,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -335,19 +393,19 @@ def _compiled_lut(shape: tuple[int, ...], kind: str):
 def silu_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.silu` 的 DPU 内核：走 `pim.lut`，闭式求值。"""
     (x,) = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, _silu(x))
+    _write_result(hal, dpu_id, cmd, _silu(x, ctx=_ctx_of(cmd)))
 
 
 def rmsnorm_kernel(hal, dpu_id: int, cmd) -> None:
     """RMSNorm：走 `pim.normalize`，不再拆成 pow/mean/rsqrt/mul 四步。"""
     x, gamma = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, _normalize(x, gamma))
+    _write_result(hal, dpu_id, cmd, _normalize(x, gamma, ctx=_ctx_of(cmd)))
 
 
-def _normalize(x: np.ndarray, gamma: np.ndarray) -> np.ndarray:
+def _normalize(x: np.ndarray, gamma: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     array = np.ascontiguousarray(x, dtype=np.float16)
     g = np.ascontiguousarray(gamma, dtype=np.float16)
-    fn = _compiled_normalize(tuple(array.shape))
+    fn = _compiled_normalize(tuple(array.shape), ctx=ctx)
     if fn is None:
         return kernels_pim.normalize(array, g)
     out = np.zeros(array.shape, dtype=np.float16)
@@ -357,9 +415,9 @@ def _normalize(x: np.ndarray, gamma: np.ndarray) -> np.ndarray:
     return out
 
 
-def _compiled_normalize(shape: tuple[int, ...]):
+def _compiled_normalize(shape: tuple[int, ...], *, ctx: _OpContext | None = None):
     """按形状编一个 `pim.normalize`；工具链不在位时返回 None。"""
-    key = ("normalize", shape)
+    key = (ctx, "normalize", shape)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -370,7 +428,11 @@ def _compiled_normalize(shape: tuple[int, ...]):
     try:
         result = compile_op(OpCompileRequest(
             op="normalize", arg_shapes=[shape, (shape[-1],)],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -383,14 +445,14 @@ def _compiled_normalize(shape: tuple[int, ...]):
 def rope_kernel(hal, dpu_id: int, cmd) -> None:
     """RoPE：走 `pim.rope` 三相链，不再拆成 neg/mul/add。"""
     x, cos, sin = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, _rope(x, cos, sin))
+    _write_result(hal, dpu_id, cmd, _rope(x, cos, sin, ctx=_ctx_of(cmd)))
 
 
-def _rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+def _rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     array = np.ascontiguousarray(x, dtype=np.float16)
     c = np.ascontiguousarray(cos, dtype=np.float16)
     s = np.ascontiguousarray(sin, dtype=np.float16)
-    fn = _compiled_rope(tuple(array.shape))
+    fn = _compiled_rope(tuple(array.shape), ctx=ctx)
     if fn is None:
         return kernels_pim.rope(array, c, s)
     out = np.zeros(array.shape, dtype=np.float16)
@@ -401,9 +463,9 @@ def _rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
     return out
 
 
-def _compiled_rope(shape: tuple[int, ...]):
+def _compiled_rope(shape: tuple[int, ...], *, ctx: _OpContext | None = None):
     """按形状编一个 `pim.rope`；工具链不在位时返回 None。"""
-    key = ("rope", shape)
+    key = (ctx, "rope", shape)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -414,7 +476,11 @@ def _compiled_rope(shape: tuple[int, ...]):
     try:
         result = compile_op(OpCompileRequest(
             op="rope", arg_shapes=[shape, shape, shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -444,10 +510,10 @@ def softmax_kernel(hal, dpu_id: int, cmd) -> None:
     `expf`。在主机上现算等于把这个误差凭空抹掉，而对拍器比的就是这个误差。
     """
     (x,) = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, softmax(x))
+    _write_result(hal, dpu_id, cmd, softmax(x, ctx=_ctx_of(cmd)))
 
 
-def softmax(x: np.ndarray) -> np.ndarray:
+def softmax(x: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     """对一个张量沿最后一维做 softmax：编译内核优先，镜像兜底。
 
     `pim.softmax` 只沿最后一维归约（相位链把轴写死在展开里），所以这里也只
@@ -460,7 +526,7 @@ def softmax(x: np.ndarray) -> np.ndarray:
     array = np.ascontiguousarray(x, dtype=_SOFTMAX_DTYPE)
     cols = int(array.shape[-1])
     rows = int(array.size // cols)
-    fn = _compiled_softmax(rows, cols)
+    fn = _compiled_softmax(rows, cols, ctx=ctx)
     if fn is None:
         return kernels_pim.softmax(x)
     source = array.reshape(rows, cols)
@@ -474,7 +540,7 @@ def softmax(x: np.ndarray) -> np.ndarray:
 _SOFTMAX_DTYPE = np.float16
 
 
-def _compiled_softmax(rows: int, cols: int):
+def _compiled_softmax(rows: int, cols: int, *, ctx: _OpContext | None = None):
     """按 `[rows, cols]` 编一个 softmax（带缓存）；工具链不在位时返回 None。
 
     **只回退工具链缺失这一种**（评审 20260923 的 P1-5）。原来这里捕获
@@ -488,7 +554,7 @@ def _compiled_softmax(rows: int, cols: int):
     环境缺失是真实边界（CI 上可能没重建 FlagTree），所以它仍回退镜像；
     编译器本身报的错一律往上抛。
     """
-    key = (rows, cols)
+    key = (ctx, rows, cols)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -499,7 +565,11 @@ def _compiled_softmax(rows: int, cols: int):
     try:
         result = compile_op(OpCompileRequest(
             op="softmax", arg_shapes=[(rows, cols)],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -512,10 +582,10 @@ def _compiled_softmax(rows: int, cols: int):
 def matmul_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.matmul` / `aten.bmm`：交给 `matmul`。"""
     x, w = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, matmul(x, w))
+    _write_result(hal, dpu_id, cmd, matmul(x, w, ctx=_ctx_of(cmd)))
 
 
-def _compiled_matmul(a: np.ndarray, b: np.ndarray):
+def _compiled_matmul(a: np.ndarray, b: np.ndarray, *, ctx: _OpContext | None = None):
     """按两个操作数的形状编一个 fp16 `pim.matmul`；条件不满足时返回 None。
 
     只走二维：矩阵单元乘的就是那两个维度，`pim.matmul` 是整算子级 op，
@@ -526,7 +596,7 @@ def _compiled_matmul(a: np.ndarray, b: np.ndarray):
     """
     if a.ndim != 2 or b.ndim != 2 or a.dtype != np.float16 or b.dtype != np.float16:
         return None
-    key = ("matmul", a.shape, b.shape)
+    key = (ctx, "matmul", a.shape, b.shape)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -537,7 +607,11 @@ def _compiled_matmul(a: np.ndarray, b: np.ndarray):
     try:
         result = compile_op(OpCompileRequest(
             op="matmul", arg_shapes=[tuple(a.shape), tuple(b.shape)],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -547,7 +621,7 @@ def _compiled_matmul(a: np.ndarray, b: np.ndarray):
     return fn
 
 
-def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def matmul(a: np.ndarray, b: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     """二维 fp16 矩阵乘：编译内核优先，`x @ w` 兜底。
 
     设备侧的矩阵乘按 fp16 存、f32 累加（与 EmitC 的 `pim_f16_to_f32` /
@@ -556,7 +630,7 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     a16 = np.ascontiguousarray(a, dtype=np.float16) if a.dtype == np.float16 else a
     b16 = np.ascontiguousarray(b, dtype=np.float16) if b.dtype == np.float16 else b
-    fn = _compiled_matmul(a16, b16)
+    fn = _compiled_matmul(a16, b16, ctx=ctx)
     if fn is None:
         return a.astype(np.float32) @ b.astype(np.float32)
     out = np.zeros((a16.shape[0], b16.shape[1]), dtype=np.float16)
@@ -565,13 +639,13 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
-def _compiled_mask(scores_shape: tuple[int, ...], mask_shape: tuple[int, ...]):
+def _compiled_mask(scores_shape: tuple[int, ...], mask_shape: tuple[int, ...], *, ctx: _OpContext | None = None):
     """按分数与掩码的形状编一个 `pim.mask`；工具链不在位时返回 None。
 
     回退口径与 `_compiled_softmax` 一致：只回退 `ToolchainUnavailable`，
     编译器自己报的错往上抛。
     """
-    key = ("mask", scores_shape, mask_shape)
+    key = (ctx, "mask", scores_shape, mask_shape)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -582,7 +656,11 @@ def _compiled_mask(scores_shape: tuple[int, ...], mask_shape: tuple[int, ...]):
     try:
         result = compile_op(OpCompileRequest(
             op="mask", arg_shapes=[scores_shape, mask_shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -603,10 +681,10 @@ def masked_fill_kernel(hal, dpu_id: int, cmd) -> None:
     scores = scores.astype(np.float32)
     offset = np.where(np.asarray(mask, dtype=bool),
                       np.float32(value) - scores, np.float32(0.0))
-    _write_result(hal, dpu_id, cmd, add_mask(scores, offset))
+    _write_result(hal, dpu_id, cmd, add_mask(scores, offset, ctx=_ctx_of(cmd)))
 
 
-def add_mask(scores: np.ndarray, offset: np.ndarray) -> np.ndarray:
+def add_mask(scores: np.ndarray, offset: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     """`scores + offset` 的加性掩码：编译内核优先，镜像兜底。
 
     `pim.mask` 做的就是这一笔加法（掩码在浮点域里是偏置），所以注意力把它
@@ -614,7 +692,7 @@ def add_mask(scores: np.ndarray, offset: np.ndarray) -> np.ndarray:
     """
     scores16 = np.ascontiguousarray(scores, dtype=np.float16)
     offset16 = np.ascontiguousarray(offset, dtype=np.float16)
-    fn = _compiled_mask(scores16.shape, offset16.shape)
+    fn = _compiled_mask(scores16.shape, offset16.shape, ctx=ctx)
     if fn is None:
         return kernels_pim.mask(np.asarray(scores, dtype=np.float32),
                                 np.asarray(offset, dtype=np.float32))
@@ -647,13 +725,14 @@ def gather_kernel(hal, dpu_id: int, cmd) -> None:
                    else np.dtype(indices.dtype))
     ids = np.ascontiguousarray(indices, dtype=index_dtype)
     expected = kernels_pim.gather(table, ids)
-    key = ("gather", table.shape, ids.shape, index_dtype.name)
+    key = (_ctx_of(cmd), "gather", table.shape, ids.shape, index_dtype.name)
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         result = compile_op(OpCompileRequest(
             op="gather", arg_shapes=[table.shape, ids.shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
-            out_dtype=index_dtype.name,
+            hardware=(_ctx_of(cmd) or DEFAULT_OPS_CONTEXT).hardware,
+            dtype="float16", out_dtype=index_dtype.name,
+            shard=_ctx_of(cmd).shard,
         ))
         fn = load_kernel(result)
         _COMPILED_KERNEL_CACHE[key] = fn
@@ -693,9 +772,10 @@ def where_kernel(hal, dpu_id: int, cmd) -> None:
     _mirror(mirror)(hal, dpu_id, cmd)
 
 
-def _compiled_view(op: str, arg_shapes: list, *, group_size: int | None = None):  # op 取 "transpose" / "reshape" / "concat"
+def _compiled_view(op: str, arg_shapes: list, *, group_size: int | None = None,
+                   ctx: _OpContext | None = None):  # op 取 "transpose" / "reshape" / "concat"
     """按形状编一个视图类算子；工具链不在位时返回 None。"""
-    key = (op, tuple(tuple(s) if isinstance(s, (list, tuple)) else s
+    key = (ctx, op, tuple(tuple(s) if isinstance(s, (list, tuple)) else s
                      for s in arg_shapes), group_size)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
@@ -705,7 +785,11 @@ def _compiled_view(op: str, arg_shapes: list, *, group_size: int | None = None):
     try:
         result = compile_op(OpCompileRequest(
             op=op, arg_shapes=arg_shapes, group_size=group_size,
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16"))
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
         return None
@@ -718,7 +802,7 @@ def transpose_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.permute`：编出来的 `pim.transpose`，镜像兜底。"""
     args = _read_tensor_args(hal, dpu_id, cmd)
     x, order = args[0], tuple(args[1])
-    fn = _compiled_view("transpose", [tuple(x.shape), order])
+    fn = _compiled_view("transpose", [tuple(x.shape), order], ctx=_ctx_of(cmd))
     if fn is None:
         _write_result(hal, dpu_id, cmd, kernels_pim.transpose(x, order))
         return
@@ -755,7 +839,7 @@ def reshape_kernel(hal, dpu_id: int, cmd) -> None:
                 known *= d
         raw[raw.index(-1)] = int(np.prod(x.shape)) // known
     shape = tuple(raw)
-    fn = _compiled_view("reshape", [tuple(x.shape), shape])
+    fn = _compiled_view("reshape", [tuple(x.shape), shape], ctx=_ctx_of(cmd))
     if fn is None:
         _write_result(hal, dpu_id, cmd, kernels_pim.reshape(x, shape))
         return
@@ -794,7 +878,8 @@ def concat_kernel(hal, dpu_id: int, cmd) -> None:
     # `-1` 是末轴：图上的 cat 常写 dim=-1，契约要的是非负轴。
     if axis < 0:
         axis += tensors[0].ndim
-    fn = _compiled_view("concat", [tuple(t.shape) for t in tensors], group_size=axis)
+    fn = _compiled_view("concat", [tuple(t.shape) for t in tensors],
+                        group_size=axis, ctx=_ctx_of(cmd))
     if fn is None:
         _write_result(hal, dpu_id, cmd, kernels_pim.concat(tensors, axis))
         return
@@ -818,7 +903,7 @@ def split_heads_kernel(hal, dpu_id: int, cmd) -> None:
     axis = dim if dim >= 0 else dim + x.ndim
     if x.shape[axis] % pieces:
         raise ValueError(f"轴 {axis} 长 {x.shape[axis]} 分不出 {pieces} 个整份")
-    fn = _compiled_split_heads(tuple(x.shape), axis, pieces)
+    fn = _compiled_split_heads(tuple(x.shape), axis, pieces, ctx=_ctx_of(cmd))
     if fn is None:
         _write_result(hal, dpu_id, cmd, np.split(x, pieces, axis=axis))
         return
@@ -832,9 +917,9 @@ def split_heads_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, outs)
 
 
-def _compiled_split_heads(shape: tuple[int, ...], axis: int, num_heads: int):
+def _compiled_split_heads(shape: tuple[int, ...], axis: int, num_heads: int, *, ctx: _OpContext | None = None):
     """按形状编一个 `pim.split_heads`；工具链不在位时返回 None。"""
-    key = ("split_heads", shape, axis, num_heads)
+    key = (ctx, "split_heads", shape, axis, num_heads)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -845,8 +930,12 @@ def _compiled_split_heads(shape: tuple[int, ...], axis: int, num_heads: int):
     try:
         result = compile_op(OpCompileRequest(
             op="split_heads", arg_shapes=[shape],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
             group_size=num_heads,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -896,7 +985,8 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
 
 
 def _kv_row_write(hal, owner: int, base: int, slot_index: int,
-                  row: np.ndarray, max_seq: int) -> None:
+                  row: np.ndarray, max_seq: int,
+                  ctx: _OpContext | None = None) -> None:
     """把一行 K 或 V 写进缓存：走 `pim.kv_cache` 的散写相，不再直连 HAL。
 
     散写的目的行由**索引**给出（校验器要求 scatter 必须有 indices，`pos` 不是
@@ -907,7 +997,8 @@ def _kv_row_write(hal, owner: int, base: int, slot_index: int,
     `_compiled_*` 一致，只挡工具链缺失这一种。
     """
     row = np.ascontiguousarray(row)
-    fn = _compiled_kv_cache(tuple(row.shape), max_seq * row.shape[-1], row.dtype)
+    fn = _compiled_kv_cache(tuple(row.shape), max_seq * row.shape[-1],
+                            row.dtype, ctx=ctx)
     if fn is None:
         hal.write_local(owner, base + slot_index * row.nbytes, row)
         return
@@ -920,12 +1011,12 @@ def _kv_row_write(hal, owner: int, base: int, slot_index: int,
 
 
 def _compiled_kv_cache(value_shape: tuple[int, ...], cache_elems: int,
-                       dtype: np.dtype):
+                       dtype: np.dtype, *, ctx: _OpContext | None = None):
     """按一行新值的形状编一个 `pim.kv_cache` 散写；工具链不在位时返回 None。
 
     元素类型跟着 KV 区域的 dtype 走（运行时存 fp16），不是量化后的 i8。
     """
-    key = ("kv_cache", value_shape, cache_elems, str(dtype))
+    key = (ctx, "kv_cache", value_shape, cache_elems, str(dtype))
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -936,8 +1027,12 @@ def _compiled_kv_cache(value_shape: tuple[int, ...], cache_elems: int,
     try:
         result = compile_op(OpCompileRequest(
             op="kv_cache", arg_shapes=[value_shape, (cache_elems,)],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype=str(dtype),
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=str(dtype),
             group_size=1,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None
@@ -976,9 +1071,11 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
         for t in range(tq):
             row = pos + t
             _kv_row_write(hal, owner, entry["k_off"], row,
-                          np.ascontiguousarray(k[0, head, t], np_dtype), max_seq)
+                          np.ascontiguousarray(k[0, head, t], np_dtype), max_seq,
+                          ctx=_ctx_of(cmd))
             _kv_row_write(hal, owner, entry["v_off"], row,
-                          np.ascontiguousarray(v[0, head, t], np_dtype), max_seq)
+                          np.ascontiguousarray(v[0, head, t], np_dtype), max_seq,
+                          ctx=_ctx_of(cmd))
 
     valid_len = pos + tq
     out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
@@ -1033,10 +1130,10 @@ def convert_kernel(hal, dpu_id: int, cmd) -> None:
         out = cmd.payload.get("dtype", "float32")
         key = f"torch.{out}" if not str(out).startswith("torch.") else str(out)
         dtype = _NP_DTYPE.get(key, np.dtype(out))
-    _write_result(hal, dpu_id, cmd, convert(x, dtype))
+    _write_result(hal, dpu_id, cmd, convert(x, dtype, ctx=_ctx_of(cmd)))
 
 
-def convert(source: np.ndarray, dtype) -> np.ndarray:
+def convert(source: np.ndarray, dtype, *, ctx: _OpContext | None = None) -> np.ndarray:
     """换元素类型：编译内核优先，`astype` 兜底。
 
     `pim.convert` 的源侧按 fp16 读（相位缓冲按 fp16 落盘），所以只有 fp16
@@ -1049,7 +1146,7 @@ def convert(source: np.ndarray, dtype) -> np.ndarray:
     """
     if np.dtype(dtype) == source.dtype:
         return source
-    fn = _compiled_convert(source.shape, source.dtype.name, np.dtype(dtype).name)
+    fn = _compiled_convert(source.shape, source.dtype.name, np.dtype(dtype).name, ctx=ctx)
     if fn is None:
         return kernels_pim.convert(source, dtype)
     src = np.ascontiguousarray(source)
@@ -1058,12 +1155,12 @@ def convert(source: np.ndarray, dtype) -> np.ndarray:
     return out
 
 
-def _compiled_convert(shape: tuple[int, ...], source: str, target: str):
+def _compiled_convert(shape: tuple[int, ...], source: str, target: str, *, ctx: _OpContext | None = None):
     """按形状与两侧类型编一个 `pim.convert`；没有对应形态时返回 None。"""
     supported = ("float16", "float32", "int8")
     if source not in supported or target not in supported or source == target:
         return None
-    key = ("convert", tuple(shape), source, target)
+    key = (ctx, "convert", tuple(shape), source, target)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -1074,8 +1171,12 @@ def _compiled_convert(shape: tuple[int, ...], source: str, target: str):
     try:
         result = compile_op(OpCompileRequest(
             op="convert", arg_shapes=[tuple(shape)],
-            hardware=DEFAULT_HARDWARE_CONFIG, dtype=source,
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=source,
             out_dtype=target,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
         ))
     except ToolchainUnavailable:
         _COMPILED_KERNEL_CACHE[key] = None

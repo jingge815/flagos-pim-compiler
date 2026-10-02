@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+from contracts.gml_hw_constants import ROPE_UNITS
+
 _F16 = "f16"
 _I8 = "i8"
 
@@ -82,8 +84,12 @@ def rope_kernel(func: str, heads: int, seq: int, head_dim: int,
     src_ty = _tensor((1, heads, seq, head_dim), _F16)
     tab_ty = _tensor((1, 1, seq, head_dim), _F16)
     kantor = f"tailCardValue = {tail_card_value} : i64, " if tail_card_value else ""
+    # 6 个定点子块的名单**必须保序**：FlagTree 的 verifier 按位置逐字比对，
+    # 读回侧也按位置展开，乱序会让整块字段错位而不报错（C++ 侧注释明写要求
+    # 两处同步）。名单与 `contracts/gml_hw_constants.py::ROPE_UNITS` 同一份。
+    blocks = ", ".join(f'"{name}"' for _, name in ROPE_UNITS)
     return f"""  tt.func @{func}(%x: {src_ty}, %c: {tab_ty}, %s: {tab_ty}) {{
-    %y = pim.rope %x, %c, %s {{{kantor}numHeads = {heads} : i64, unit = #pim.unit<cstl>}}
+    %y = pim.rope %x, %c, %s {{{kantor}numHeads = {heads} : i64, subBlocks = [{blocks}], unit = #pim.unit<cstl>}}
        : {src_ty}, {tab_ty}, {tab_ty} -> {src_ty}
     tt.return
   }}"""

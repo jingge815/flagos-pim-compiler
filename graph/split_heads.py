@@ -38,12 +38,15 @@ from dataclasses import dataclass, field
 import torch
 from torch.fx import Graph, GraphModule, Node
 
-from graph.fuse_pim import ABSORBED_META_KEY, ATTENTION_SCALE_META_KEY
+from contracts.graph_meta import (
+    ABSORBED_META_KEY,
+    ATTENTION_SCALE_META_KEY,
+    HEAD_INDEX_META_KEY,
+    HEAD_ROLE_META_KEY,
+)
 
-# 逐头展开产出的节点用这个键标注它在 attention 里的角色，
+# 逐头展开产出的节点用 HEAD_ROLE_META_KEY 标注它在 attention 里的角色，
 # GML 侧按角色填 weight_format / Scaling_buffer_file / split_channel_number。
-HEAD_ROLE_META_KEY = "pim_head_role"
-HEAD_INDEX_META_KEY = "pim_head_index"
 
 # 角色取值。
 ROLE_MATMUL_QK = "matmul1"
@@ -173,7 +176,6 @@ def _expand_one(
                 _set_shape(node, head_slice(source.meta.get("val"), head))
                 _rename(graph, node, f"{name}_head{head}")
                 node.meta[HEAD_INDEX_META_KEY] = head
-                node.meta[ROLE_SPLIT] = True
                 node.meta[HEAD_ROLE_META_KEY] = ROLE_SPLIT
                 return node
 

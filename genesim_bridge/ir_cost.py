@@ -6,6 +6,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from contracts.ir_payloads import (
+    LayoutFeedback,
+    PlacementBack,
+    layout_feedback_of_module,
+    module_int_attrs,
+    placement_of_module,
+)
+
 # 定义逐元素算子的每元素浮点运算量。
 _ELEMENTWISE_FLOPS = {
     "arith.addf": 1.0,
@@ -182,6 +190,19 @@ class KernelCost:
     tile_n: Optional[int] = None
     tile_k: Optional[int] = None
     tile_wram_bytes: Optional[int] = None
+    # 图编译器下发的跨 DPU 切分决策（统一 IR 的 Placement 维）。A 路把它写成
+    # 模块属性（张量编码由 FlagTree 生成、`dpusPerDevice` 恒全 1，写不进去），
+    # B 路写进 `#pim.tasklet_tiled`。读回来是为了让成本模型按**本地**规模算
+    # 代价：切了 N 台 DPU，单台只算 1/N。
+    shard_dim: Optional[int] = None
+    shard_dpus: Optional[int] = None
+    # 回传载体原件。上面两个字段是它的摊平副本（sidecar 既有字段名不动）。
+    placement: PlacementBack = field(default_factory=PlacementBack)
+    # 算子编译器回传的单台 DPU MRAM 占用（切分之后）。
+    mram_bytes_per_dpu: Optional[int] = None
+    # 算子编译器的布局回传原件。上面几个字段是它的摊平副本（sidecar 的既有
+    # 字段名不动），判「超不超 WRAM 预算」这类结论走它自己的属性。
+    layout_feedback: LayoutFeedback = field(default_factory=LayoutFeedback)
 
 
 def _tensor_numel(dims: str) -> int:
@@ -191,6 +212,10 @@ def _tensor_numel(dims: str) -> int:
     return n
 
 
+# 函数签名里的一对「参数名 : 类型」。
+_SIG_PARAM_RE = re.compile(r"(%arg\d+)\s*:\s*([^,)]+)")
+
+
 class _ConstFolder:
     """折叠循环边界中的整数表达式。"""
 
@@ -198,8 +223,31 @@ class _ConstFolder:
         self.vals: Dict[str, Optional[float]] = {}
         for name, v in arg_values.items():
             self.vals["%" + name] = float(v)
+        # 按参数顺序排列的标量实参，供 `_bind_signature` 给位置参数取值。
+        self.ordered_args = [float(v) for v in arg_values.values()]
+
+    def _bind_signature(self, line: str) -> None:
+        """把签名里的位置参数 `%argN` 与 `arg_values` 里的标量实参对上。
+
+        真实捕获的 TTIR 里 Triton 不保留形参名，参数打印成 `%arg0`/`%arg3`，
+        而 `arg_values` 是按形参名采的（`K`、`stride_wn`……）。只按名字匹配
+        （`%K`）永远对不上，由它算出的循环次数就折不出来、按 1 次计，成本被
+        低估一个数量级。这里数一遍签名里哪些参数是指针、哪些是标量，标量的
+        按顺序取 `arg_values` 的前若干个——指针实参是张量，采集时已被过滤掉，
+        所以剩下这些就是署名里那些标量参数，顺序与签名一致。
+        """
+        scalar = 0
+        for name, ty in _SIG_PARAM_RE.findall(line):
+            if "!tt.ptr" in ty:
+                continue
+            if scalar < len(self.ordered_args):
+                self.vals.setdefault(name, self.ordered_args[scalar])
+            scalar += 1
 
     def feed(self, line: str) -> None:
+        if "tt.func" in line:
+            self._bind_signature(line)
+            return
         m = _SSA_RE.match(line)
         if not m:
             return
@@ -365,6 +413,15 @@ def _line_movement_bytes(line: str) -> float:
     `pim.kv_cache` 是例外：它的结果张量是那整个跨步存活的缓存，按它计会凭空放大
     几个数量级。写入是"往缓存的第 pos 行塞一段新值"，所以按**第一个**张量
     （新值）计。散写与区间写在这条口径下天然不同：后者一次写多行。
+
+    三种 purpose 计费**完全相同**，这是刻意的，不是漏算：`absorbed` /
+    `onthefly` 说的是图层面「这一层不单独发射节点」，而**内核仍然要把值排到正确
+    顺序上**——输出是一个扁平缓冲（见 FlagTree `LowerPIMToEmitC.cpp` 里那段
+    逐元素置换）。按 absorbed 少计就是把真实搬运漏掉。
+
+    图层面的那个区分有它自己的消费方，走的是 `node.meta`：
+    `gml_bridge/from_fx.py:233,925` 的 `ABSORBED_META_KEY` 决定发不发节点。
+    两个载体（图的 meta 与 IR 的属性）回答的是不同层次的问题。
     """
     tensors = _TENSOR_RE.findall(line)
     if not tensors:
@@ -389,13 +446,23 @@ def _line_phase_movement_bytes(line: str) -> float:
 
 
 def _line_dma_bytes(line: str) -> float:
-    """返回一行 PIM DMA 指令的搬运字节数。"""
+    """返回一行 PIM DMA 指令的搬运字节数。
+
+    带 `elem_stride` 时按步幅计：那是统一 IR 的排布字段落到 pimir 上的那一位，
+    步幅大于 1 说明行间有填充，真实搬运大于 `元素数 × 元素宽`。不带时按紧密计，
+    与改动前逐字节相同。
+    """
     if not _DMA_RE.search(line):
         return 0.0
     match = _MEMDESC_RE.search(line)
     assert match, f"pim.dma_* 找不到 memdesc 类型: {line.strip()}"
     dims, dtype, _space = match.groups()
-    return float(_tensor_numel(dims) * _DTYPE_BYTES[dtype])
+    nbytes = _tensor_numel(dims) * _DTYPE_BYTES[dtype]
+    stride = re.search(r"elem_stride\s*=\s*(\d+)", line)
+    if stride:
+        # 步幅是「沿 contiguous_dim 每走一步跨几个元素」，紧密时为 1。
+        nbytes *= int(stride.group(1))
+    return float(nbytes)
 
 
 def _infer_dtype(ttir: str) -> str:
@@ -538,14 +605,70 @@ def analyze_ir(
     cost.dma_ops = dma_ops
     cost.dma_ops_with_layout = dma_ops_with_layout
     cost.group_dequant_steps = group_dequant_steps
-    cost.wram_bytes_used = _module_int_attr(text, "pim.wram-bytes-used")
-    cost.wram_bytes_budget = _module_int_attr(text, "pim.wram-bytes")
-    cost.mram_bytes_budget = _module_int_attr(text, "pim.mram-bytes")
-    cost.dma_align = _module_int_attr(text, "pim.dma-align")
-    cost.tile_m = _module_int_attr(text, "pim.tile-m")
-    cost.tile_n = _module_int_attr(text, "pim.tile-n")
-    cost.tile_k = _module_int_attr(text, "pim.tile-k")
-    cost.tile_wram_bytes = _module_int_attr(text, "pim.tile-wram-bytes")
+    # 布局回传走统一 IR 的载体（`LayoutFeedback`），不再各自写一遍正则：
+    # tile 形状与 WRAM 用量是算子编译器的决策，成本模型是它的消费方。
+    feedback = layout_feedback_of_module(text)
+    cost.layout_feedback = feedback
+    cost.wram_bytes_used = feedback.wram_bytes_used
+    cost.wram_bytes_budget = feedback.wram_bytes_budget
+    cost.mram_bytes_budget = feedback.mram_bytes
+    tile = feedback.tile_shape
+    cost.tile_m = None if tile is None else tile[0]
+    cost.tile_n = None if tile is None else tile[1]
+    # `tile-k` / `tile-wram-bytes` / `dma-align` 不在回传载体里（载体只收
+    # 四维相关的那几项），仍按模块属性直取 —— 用同一份解析结果，不另起正则。
+    attrs = module_int_attrs(text)
+    cost.dma_align = attrs.get("pim.dma-align")
+    cost.tile_k = attrs.get("pim.tile-k")
+    cost.tile_wram_bytes = attrs.get("pim.tile-wram-bytes")
+    # 跨 DPU 切分决策：图编译器下发 `#pim.placement`，这里读回来参与代价计算。
+    placement = placement_of_module(text)
+    cost.placement = placement
+    cost.shard_dim = placement.dim
+    cost.shard_dpus = placement.num_dpus if placement.kind else None
+    if placement.is_sharded:
+        # 这里**不除** `shard_dpus`：搬运量是从这份 pimir 自己的 `pim.dma_*`
+        # 累出来的，而这份 pimir 由图编译器按执行计划的 `local_shape` 生成 ——
+        # 文本里的字节数本来就是单台口径（tp2 的权重已经是 32x64，不是 64x64）。
+        # 再除一次就把单台流量算成了实际的 1/N：实测同一份本地形状，带 placement
+        # 得 3584B、不带得 7168B，而真实单台搬运量是后者。
+        #
+        # 切分决策仍然是被消费的，只是落点不是这个除法：`shard_dim` /
+        # `shard_dpus` 读回来进 sidecar 并在 GeneSim 侧参与容量核对，
+        # `placed_mram_bytes` 覆盖单台占用，意图与效果不符时出 note。
+        cost.notes.append(
+            f"跨 DPU 切分：第 {cost.shard_dim} 维分给 {cost.shard_dpus} 台 DPU；"
+            f"搬运量取自本地形状，不再按 1/{cost.shard_dpus} 分摊")
+    # 回传的单台 MRAM 占用优先于我们自己按「全局/N」估：那个 pass 定了分块，
+    # 只有它知道切完实际摆了多少字节。取不到才退回静态估算（与 phase_value()
+    # 的「取不到才退回常量表」同口径）。
+    if placement.placed_mram_bytes is not None:
+        cost.mram_bytes_per_dpu = placement.placed_mram_bytes
+    # dtype 维的回传：元素宽度优先用算子编译器实际用的那个，而不是按类型名猜。
+    # `_DTYPE_BYTES.get(dtype, 2)` 的默认 2 是个猜测 —— 认不出的类型（int8 的
+    # w4a8 投影是 1 字节）会让由它推出的每个字节数一起偏掉。取不到回传才退回
+    # 猜测，与 `phase_value()` 的「取不到才退回常量表」同口径。
+    if placement.placed_elem_bytes:
+        if placement.placed_elem_bytes != cost.element_bytes:
+            cost.notes.append(
+                f"元素宽度按回传取 {placement.placed_elem_bytes} 字节"
+                f"（按类型名 {cost.dtype!r} 猜的是 {cost.element_bytes}）")
+        cost.element_bytes = placement.placed_elem_bytes
+    # 同一份文本里的两个 MRAM 数自相矛盾：`pim.mram-bytes` 是下发的每台预算的
+    # 回显，`pim.placed-mram-bytes` 是那个 pass 定完分块后算出的单台占用。
+    # 占用超过预算说明两者不是同一套配置下算出来的 —— 静默下去会让容量结论
+    # 基于一个自相矛盾的输入。能同时出现这两个数的地方只有手写或旧产物。
+    budget, footprint = feedback.mram_bytes, placement.placed_mram_bytes
+    if budget is not None and footprint is not None and footprint > budget:
+        cost.notes.append(
+            f"MRAM 超预算：算子编译器回传的单台占用 {footprint} B 超过它自己"
+            f"声明的每台预算 {budget} B（同一份 IR 内两个数矛盾）")
+    # 意图与效果不符说明两侧对切分的理解漂了，静默下去会让成本按错的规模算。
+    if not placement.intent_matches_effect:
+        cost.notes.append(
+            f"切分意图与算子编译器实际除数不符：下发 kind={placement.kind} "
+            f"numDpus={placement.num_dpus}，回传 placed_shards="
+            f"{placement.placed_shards}")
 
     # 显式 DMA 是 **A 路**的判据：那条链从 tt.load/store 出发，必然经过它。
     # B 路（整算子级）没有访存可显式化，拿这条去卡会把正常的产物判成
@@ -559,12 +682,9 @@ def analyze_ir(
         assert dma_ops, (
             f"{kernel_name} 的 pim mlir 里还有没显式化的 tt.load/tt.store 或 "
             f"tt.dot，却没有 pim.dma_*：pass 可能没生效")
-    # 在结果中记录超过 WRAM 预算的分块。
-    if (
-        cost.wram_bytes_used is not None
-        and cost.wram_bytes_budget is not None
-        and cost.wram_bytes_used > cost.wram_bytes_budget
-    ):
+    # 在结果中记录超过 WRAM 预算的分块。判据走回传载体自己的属性，
+    # 免得「怎么算超限」在消费方各写一遍。
+    if feedback.over_wram_budget:
         notes.append(
             f"WRAM 超预算: 用了 {cost.wram_bytes_used} B / 预算 "
             f"{cost.wram_bytes_budget} B（FlagTree 当前只 warning、不重切 tile）"
@@ -593,7 +713,3 @@ def count_mnemonics(text: str) -> Dict[str, float]:
     return counts
 
 
-def _module_int_attr(text: str, name: str) -> Optional[int]:
-    """读 module 上的整数属性，如 `"pim.wram-bytes-used" = 28672 : i32`。"""
-    match = re.search(re.escape(f'"{name}"') + r"\s*=\s*(\d+)\s*:", text)
-    return int(match.group(1)) if match else None

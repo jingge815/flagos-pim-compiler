@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
+from contracts.op_semantics import mnemonics
 from opcompiler_bridge.oplevel_kernel import (
     concat_kernel,
     dynamic_quant_kernel,
@@ -246,11 +247,7 @@ def _concat_ir(dims: Dict[str, int], point: ShapePoint) -> str:
 
 # 表 1.2.4 的 14 个设备侧 mnemonic，计算 10 + 视图 4。B 路每个都得能发 IR、
 # 展开、抽出成本：计算类 flops > 0，视图类搬运 > 0。
-MNEMONICS = (
-    "pim.normalize", "pim.matmul", "pim.softmax", "pim.mask", "pim.rope",
-    "pim.lut", "pim.eltwise", "pim.dynamic_quant", "pim.kv_cache", "pim.gather",
-    "pim.transpose", "pim.reshape", "pim.split_heads", "pim.concat",
-)
+MNEMONICS = mnemonics()
 
 # 每个 mnemonic 的代表形状。视图类四个不在此列之外另计（见 MNEMONICS 后半段）。
 _OPLEVEL_IR: Dict[str, Callable[[Dict[str, int], ShapePoint], str]] = {

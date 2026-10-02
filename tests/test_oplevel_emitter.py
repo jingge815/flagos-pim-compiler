@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from graph.fuse_rope import ROPE_META_KEY, RopeMatch
 from graph.quant_pass import DQ_META_KEY, DynamicScalingSpec
 from graph.split_heads import HEAD_ROLE_META_KEY, ROLE_SOFTMAX
+from contracts.unified_ir import STAGE_FUSED, STAGE_PARTITIONED, mark_stage
 from opcompiler_bridge.oplevel_emitter import (
     PIM_TARGET,
     emit_oplevel_mlir,
@@ -35,11 +36,19 @@ class _Val:
 
 
 def _graph_with(build) -> GraphModule:
-    """造一个只含 call_function 节点的最小 GraphModule。"""
+    """造一个只含 call_function 节点的最小 GraphModule。
+
+    手搓的图直接标到 `STAGE_FUSED`：这些夹具造的就是「融合之后」那个形态
+    （节点自带 DQ / RoPE / 相位标记），只是没跑真正的 pass 链。
+    `emit_oplevel_mlir` 的入口断言要求这个阶段，夹具得如实声明自己是什么。
+    """
     graph = Graph()
     build(graph)
     graph.output(None)
-    return GraphModule(torch.nn.Module(), graph)
+    gm = GraphModule(torch.nn.Module(), graph)
+    mark_stage(gm, STAGE_PARTITIONED)
+    mark_stage(gm, STAGE_FUSED)
+    return gm
 
 
 def _add_node(graph: Graph, name: str, shape: tuple[int, ...]):
@@ -207,3 +216,19 @@ def test_expected_phase_counts_match_reference() -> None:
     report = emit_oplevel_mlir(_graph_with(build))
     expected = {op.kind: op.expected_phases for op in report.ops}
     assert expected == {"dq": 4, "softmax": 5, "rope": 3}
+
+
+def test_an_unfused_graph_is_rejected_at_the_entry() -> None:
+    """没跑过融合的图要在入口被拦住，不能发出半成品 pimir。
+
+    设计 §3.3.3：出口标记只是记账，前置断言才是执行点。这条链的顺序依赖
+    （必须先融合）原先只写在 docstring 里，跑错顺序不会有任何编译期信号 ——
+    发出去的 pimir 缺 DQ / RoPE 锚点，算子编译器照样接受，相位数静默变少。
+    """
+    graph = Graph()
+    _add_node(graph, "x", (1, 4096))
+    graph.output(None)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    with pytest.raises(ValueError, match="要求图已达到阶段"):
+        emit_oplevel_mlir(gm)

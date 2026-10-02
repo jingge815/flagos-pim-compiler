@@ -660,9 +660,11 @@ def main() -> int:
     # 范围）。裹起来记成检查项，而不是让 traceback 冒出去——那样看不出是哪一
     # 项不成立，只看到一串栈。
     try:
+        from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
         artifact = serialize_gml(
             graph, fusion, phase_source=phase_source,
-            decode_block_only=args.decode_block_only, slots=slots)
+            decode_block_only=args.decode_block_only, slots=slots,
+            hardware=DEFAULT_HARDWARE_CONFIG)
     except Exception as exc:
         log.add("GML 序列化", False, f"{type(exc).__name__}: {exc}")
         return log.verdict()

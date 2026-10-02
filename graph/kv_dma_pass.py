@@ -33,32 +33,15 @@ from dataclasses import dataclass, field
 import torch
 from torch.fx import GraphModule, Node
 
-from graph.fuse_rope import ROPE_META_KEY
-from graph.split_heads import HEAD_INDEX_META_KEY, ROLE_SPLIT
-
-# 插出来的节点带这些键，GML 侧按它们发射。
-KV_DMA_META_KEY = "pim_kv_cache_dma"
-SPLIT_META_KEY = "pim_split"
-
-
-@dataclass
-class KvDmaSpec:
-    """一个 KV_Cache_DMA 的编译期规格。
-
-    `is_key` 区分 K / V 两路 —— 它们配置相同，但落盘的 cache 不同。
-    `numel` 定各缓冲的元素数。
-    """
-
-    is_key: bool
-    numel: int
-
-
-@dataclass
-class SplitSpec:
-    """一个 Split 的编译期规格。`heads` 是输出个数。"""
-
-    heads: int
-    numel: int
+from contracts.graph_meta import (
+    HEAD_INDEX_META_KEY,
+    HEAD_ROLE_META_KEY,
+    KV_DMA_META_KEY,
+    ROPE_META_KEY,
+    SPLIT_META_KEY,
+)
+from contracts.ir_payloads import KvDmaSpec, SplitSpec
+from graph.split_heads import ROLE_SPLIT
 
 
 @dataclass
@@ -119,7 +102,7 @@ def insert_kv_dma_and_split(gm: GraphModule) -> KvDmaReport:
     # V：被逐头 slice 消费、自身不是 RoPE 的那个源。
     sliced_sources = []
     for n in gm.graph.nodes:
-        if n.meta.get("pim_head_role") != ROLE_SPLIT:
+        if n.meta.get(HEAD_ROLE_META_KEY) != ROLE_SPLIT:
             continue
         src = n.args[0] if n.args else None
         if isinstance(src, Node) and src not in sliced_sources:
@@ -148,7 +131,7 @@ def insert_kv_dma_and_split(gm: GraphModule) -> KvDmaReport:
     # 每组一个 Split（实测 3 个：Q/K/V 各一个）。
     groups: dict[Node, list[Node]] = {}
     for node in gm.graph.nodes:
-        if node.meta.get("pim_head_role") != ROLE_SPLIT:
+        if node.meta.get(HEAD_ROLE_META_KEY) != ROLE_SPLIT:
             continue
         source = node.args[0] if node.args else None
         if isinstance(source, Node):
