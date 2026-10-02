@@ -75,6 +75,9 @@ partial 必须写明归约方式（FlagTree 自己的用例
 `test_flagtree_ods_hygiene.py`、`test_unified_ir_contract.py`、`test_no_bypass.py`、
 `test_placement_export.py`、`test_mem_layout.py` 合计 162 passed。
 
+端到端那两条（`[tp8_pp1]` / `[tp2_pp4]`）在修完本条 + 下一条对齐问题后一起变绿：
+`test_opcompiler_e2e_llama2_7b.py` 4 passed，全量 `-k llama2_7b` PASS 42 / FAIL 0。
+
 ## 余留问题
 
 1. 修好这条之后，端到端用例又在**下一个点**上失败（分片对齐 1024 与 DMA 对齐 64

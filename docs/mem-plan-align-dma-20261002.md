@@ -61,7 +61,7 @@ offset 与 spec 自洽），没有钉死 1024 的数字。
 | 测试 | 结果 |
 | --- | --- |
 | `tests/test_opcompiler_e2e_llama2_7b.py`（三档策略全跑） | **4 passed**（28 分 17 秒）；改动前 tp8_pp1 / tp2_pp4 两档 FAIL |
-| 配置改过的 5 个 llama2 用例 | 见下 |
+| `pytest tests/ -q -k "llama2_7b"`（全量，含配置改过的 5 个用例） | **PASS 42 / FAIL 0**，exit 0（40 分 47 秒）；改动前 PASS 28 / FAIL 2 / 被中断 |
 
 ## 余留问题
 
