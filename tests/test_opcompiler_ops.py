@@ -1339,6 +1339,42 @@ def test_mean_of_wide_squares_stays_finite() -> None:
     np.testing.assert_allclose(got, ref, rtol=1e-3, atol=1e-3)
 
 
+def test_wide_sum_keeps_numpy_precision() -> None:
+    """4096 宽的求和精度要跟上 numpy，不能逐个累加。
+
+    fp32 尾数只有 23 位。4096 个几百量级的平方从头加到尾，累加器涨到几十万，
+    后面加进来的数被舍掉，一行的和能偏出 1，均值偏 0.001。这个偏差每层都有，
+    32 层之后把 llama2 的贪心解码从第一个 token 就推偏。求和要分段累加，
+    每段的累加器保持在小范围里。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    rng = np.random.default_rng(8)
+    width = 4096
+    squares = (rng.standard_normal((1, 4, width)) * 15).astype(np.float32) ** 2
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 24))
+    backend.write_local(0, 0, squares)
+    out_shape = (1, 4, 1)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "mean", "node": "n",
+                 "arg_kinds": ["tensor", [-1], True],
+                 "arg_shapes": [squares.shape, None, None],
+                 "arg_dtypes": ["float32", None, None],
+                 "dtype": "float32", "out_shape": out_shape},
+        reads=[Access(("dpu", 0), 0, squares.nbytes)],
+        writes=[Access(("dpu", 0), squares.nbytes, int(np.prod(out_shape)) * 4)],
+        waits=[], num_tasklets=1,
+    )
+    km.mean_dim_kernel(backend, 0, cmd)
+    got = backend.read_local(0, squares.nbytes, out_shape, np.float32)
+    ref = squares.astype(np.float64).mean(axis=-1, keepdims=True)
+    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-4)
+
+
 def test_reduce_mean_matches_numpy() -> None:
     """沿末轴求均值要与 numpy 逐元素一致。"""
     request = OpCompileRequest(
