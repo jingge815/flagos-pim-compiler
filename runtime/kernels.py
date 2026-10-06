@@ -159,20 +159,47 @@ _COMPILED_KERNEL_CACHE: dict[tuple, object] = {}
 # 保护编译缓存的互斥锁。
 _COMPILE_LOCK = threading.Lock()
 
+# 每个算子走编译内核还是退回镜像的次数。键是 (算子名, "hit" 或 "fallback")。
+_KERNEL_ROUTE: dict[tuple[str, str], int] = {}
 
-def _is_pow2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
+
+def _float_dtype_name(dtype) -> str | None:
+    """浮点 dtype 的契约名。`x.dtype` 是 `dtype` 对象，与 `np.float32` 不相等，
+    所以按 kind 判断，不拿它当字典键。"""
+    dt = np.dtype(dtype)
+    if dt.kind != "f":
+        return None
+    return {2: "float16", 4: "float32"}.get(dt.itemsize)
+
+
+def record_route(op: str, route: str) -> None:
+    """记一次路由。hit 是调用编译内核前，fallback 是调用镜像前。"""
+    key = (op, route)
+    _KERNEL_ROUTE[key] = _KERNEL_ROUTE.get(key, 0) + 1
+
+
+def route_counts() -> dict[tuple[str, str], int]:
+    """返回到目前为止的路由计数，调用方不要改这份拷贝。"""
+    return dict(_KERNEL_ROUTE)
+
+
+def reset_route_counts() -> None:
+    """清空路由计数，测试在每次运行前调用。"""
+    _KERNEL_ROUTE.clear()
 
 
 def _compiled_linear_supports(arg_shapes, dtype: str = "float32") -> bool:
-    """判断线性算子形状和数据类型是否可由已编译内核处理。"""
+    """判断线性算子是否可由已编译内核处理。
+
+    形状不再是拒绝理由：三个维度都按分块遍历，最后一块由掩码处理。
+    K 的下限是 Triton `tl.dot` 的硬约束，低于它编译器直接报错。
+    """
     from contracts.op_contract import flatten_leading_dims
 
     if dtype not in ("float16", "float32"):
         return False
-    m, k = flatten_leading_dims(arg_shapes[0])
-    n = arg_shapes[1][0]
-    return k >= 16 and _is_pow2(m) and _is_pow2(k) and _is_pow2(n)
+    _m, k = flatten_leading_dims(arg_shapes[0])
+    return k >= 16
 
 
 def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
@@ -180,8 +207,10 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     arg_shapes = tuple(tuple(s) for s in cmd.payload["arg_shapes"])
     dtype = str(cmd.payload["dtype"])
     if not _compiled_linear_supports(arg_shapes, dtype):
+        record_route("linear", "fallback")
         linear_kernel(hal, dpu_id, cmd)
         return
+    record_route("linear", "hit")
 
     from contracts.op_contract import OpCompileRequest, PIMHardwareConfig
     from opcompiler_bridge.driver import compile_op, load_kernel
@@ -222,13 +251,15 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     )
 
 
-def _compiled_eltwise(kind: str, shape: tuple[int, ...], *, ctx: _OpContext | None = None):
+def _compiled_eltwise(kind: str, shape: tuple[int, ...], *,
+                      dtype: str = "float16", ctx: _OpContext | None = None):
     """按形状编一个逐元素算子（带缓存）；工具链不在位时返回 None。
 
     只回退工具链缺失。编译器自己报的错往上抛——静默回退镜像会让
     「编译内核与镜像一致」这条判据在编译失败时也通过。
+    fp16 与 fp32 各有一种内核形态，缓存键带上类型，两种不能混用。
     """
-    key = (ctx, "eltwise", kind, shape)
+    key = (ctx, "eltwise", kind, shape, dtype)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -239,7 +270,7 @@ def _compiled_eltwise(kind: str, shape: tuple[int, ...], *, ctx: _OpContext | No
     try:
         result = compile_op(OpCompileRequest(
             op="eltwise", arg_shapes=[shape, shape],
-            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16", kind=kind,
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=dtype, kind=kind,
             shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
             elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
             mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
@@ -253,29 +284,48 @@ def _compiled_eltwise(kind: str, shape: tuple[int, ...], *, ctx: _OpContext | No
     return fn
 
 
-def _eltwise(kind: str, numpy_op):
-    """逐元素二元算子：同形状且两边都是张量时走编译内核，其余走 numpy。
+def _align_broadcast(x, y, out_shape: tuple[int, ...], dtype):
+    """把两个操作数展开成输出契约的形状与类型。
 
-    编译内核只覆盖两槽同形（`driver.py` 的契约），标量与广播没有对应的
-    设备循环，那些形态仍由 numpy 算。
+    编译内核只收同形输入，广播要在进编译前做完。标量铺成整块常数。
+    """
+    np_dtype = np.dtype(dtype)
+    def expand(value):
+        if isinstance(value, np.ndarray):
+            return np.ascontiguousarray(
+                np.broadcast_to(value.astype(np_dtype), out_shape))
+        return np.full(out_shape, value, dtype=np_dtype)
+    return expand(x), expand(y)
+
+
+def _eltwise(kind: str, numpy_op):
+    """逐元素二元算子：先广播到输出形状，再按输出类型走编译内核。
+
+    编译内核只覆盖两槽同形（`driver.py` 的契约），所以广播在进内核前展开。
+    类型取命令 payload 的 `dtype`，那是输出契约，两侧类型不同时不能降到
+    第一槽的精度。
     """
     def kernel(hal, dpu_id: int, cmd) -> None:
         args = _read_tensor_args(hal, dpu_id, cmd)
         x, y = args[0], args[1]
-        fn = None
-        if (isinstance(y, np.ndarray) and x.shape == y.shape
-                and x.dtype == np.float16):
-            fn = _compiled_eltwise(kind, tuple(int(d) for d in x.shape))
-        if fn is None:
-            y_value = y.astype(np.float32) if isinstance(y, np.ndarray) else y
-            _write_result(hal, dpu_id, cmd,
-                          numpy_op(x.astype(np.float32), y_value))
-            return
-        out = np.zeros(x.shape, dtype=np.float16)
-        fn(np.ascontiguousarray(x, dtype=np.float16).ctypes.data_as(ctypes.c_void_p),
-           np.ascontiguousarray(y, dtype=np.float16).ctypes.data_as(ctypes.c_void_p),
-           out.ctypes.data_as(ctypes.c_void_p))
-        _write_result(hal, dpu_id, cmd, out)
+        out_shape = tuple(int(d) for d in cmd.payload["out_shape"])
+        dtype = str(cmd.payload["dtype"])
+        ctx = _ctx_of(cmd)
+        if dtype in ("float16", "float32"):
+            left, right = _align_broadcast(x, y, out_shape, dtype)
+            fn = _compiled_eltwise(kind, out_shape, dtype=dtype, ctx=ctx)
+            if fn is not None:
+                record_route("eltwise", "hit")
+                out = np.zeros(out_shape, dtype=dtype)
+                fn(left.ctypes.data_as(ctypes.c_void_p),
+                   right.ctypes.data_as(ctypes.c_void_p),
+                   out.ctypes.data_as(ctypes.c_void_p))
+                _write_result(hal, dpu_id, cmd, out)
+                return
+        record_route("eltwise", "fallback")
+        y_value = y.astype(np.float32) if isinstance(y, np.ndarray) else y
+        _write_result(hal, dpu_id, cmd,
+                      numpy_op(x.astype(np.float32), y_value))
 
     return kernel
 
@@ -309,14 +359,41 @@ def div_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, x / y)
 
 
-def _unary(fn):
-    """把一个 numpy 一元函数包成内核。
+def neg_kernel(hal, dpu_id: int, cmd) -> None:
+    """`aten.neg`：`0 - x`，走 `pim.eltwise` 的减法。
+
+    取负没有单独的编译种类，但减法在覆盖范围内。RoPE 的 rotate_half
+    对每一层的后半段都做一次取负，记成退回会让计数判据失败。
+    """
+    (x,) = _read_tensor_args(hal, dpu_id, cmd)
+    dtype = _float_dtype_name(x.dtype)
+    if dtype is not None:
+        shape = tuple(int(d) for d in x.shape)
+        fn = _compiled_eltwise("sub", shape, dtype=dtype, ctx=_ctx_of(cmd))
+        if fn is not None:
+            record_route("eltwise", "hit")
+            src = np.ascontiguousarray(x, dtype=dtype)
+            zero = np.zeros(shape, dtype=dtype)
+            out = np.zeros(shape, dtype=dtype)
+            fn(zero.ctypes.data_as(ctypes.c_void_p),
+               src.ctypes.data_as(ctypes.c_void_p),
+               out.ctypes.data_as(ctypes.c_void_p))
+            _write_result(hal, dpu_id, cmd, out)
+            return
+    record_route("neg", "fallback")
+    _write_result(hal, dpu_id, cmd, np.negative(x.astype(np.float32)))
+
+
+def _unary(fn, op: str):
+    """把一个 numpy 一元函数包成内核，并记一次退回。
 
     运算一律在 fp32 里做，存储 dtype 由 `_write_result` 按 payload 决定——与
-    `linear_kernel` 同口径，也是硬件的口径（fp16 存、fp32 算）。
+    `linear_kernel` 同口径，也是硬件的口径（fp16 存、fp32 算）。这些算子没有
+    编译形态，退回计数是唯一能看见它们在主机上算的地方。
     """
 
     def kernel(hal, dpu_id: int, cmd) -> None:
+        record_route(op, "fallback")
         (x,) = _read_tensor_args(hal, dpu_id, cmd)
         _write_result(hal, dpu_id, cmd, fn(x.astype(np.float32)))
 
@@ -326,9 +403,24 @@ def _unary(fn):
 def pow_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.pow.Tensor_Scalar(x, exponent)`：逐元素幂。
 
-    指数是标量（`_read_tensor_args` 会把非张量实参原样带回来），RMSNorm 里恒为 2。
+    指数是标量（`_read_tensor_args` 会把非张量实参原样带回来）。指数为 2 时
+    就是自己乘自己，走 `pim.eltwise` 的乘；其它指数没有对应的编译形态。
+    隐藏状态到几百时单个平方超过 fp16 上限，平方在 fp32 上做完再按输出类型存。
     """
     x, exponent = _read_tensor_args(hal, dpu_id, cmd)
+    if exponent == 2 and _float_dtype_name(x.dtype) is not None:
+        shape = tuple(int(d) for d in x.shape)
+        fn = _compiled_eltwise("mul", shape, dtype="float32", ctx=_ctx_of(cmd))
+        if fn is not None:
+            record_route("eltwise", "hit")
+            src = np.ascontiguousarray(x, dtype=np.float32)
+            out = np.zeros(shape, dtype=np.float32)
+            fn(src.ctypes.data_as(ctypes.c_void_p),
+               src.ctypes.data_as(ctypes.c_void_p),
+               out.ctypes.data_as(ctypes.c_void_p))
+            _write_result(hal, dpu_id, cmd, out)
+            return
+    record_route("pow", "fallback")
     _write_result(hal, dpu_id, cmd, np.power(x.astype(np.float32), exponent))
 
 
@@ -337,14 +429,59 @@ def mean_dim_kernel(hal, dpu_id: int, cmd) -> None:
 
     切分规则（`spec_prop._rule_reduce_last`）只放行沿最后一维、keepdim=True 的
     形态，所以这里拿到的 `dim` 必然是最后一维；仍按实参算而不是写死 -1，免得
-    规则将来放宽了这里悄悄算错。
+    规则将来放宽了这里悄悄算错。4096 宽的平方和超过 fp16 上限，求和在 fp32 上
+    做完再按输出类型存，其余类型退回 numpy。
     """
     args = _read_tensor_args(hal, dpu_id, cmd)
-    x = args[0].astype(np.float32)
+    x = args[0]
     dim = args[1] if len(args) > 1 else -1
     keepdim = bool(args[2]) if len(args) > 2 else False
     axis = tuple(dim) if isinstance(dim, (list, tuple)) else dim
-    _write_result(hal, dpu_id, cmd, np.mean(x, axis=axis, keepdims=keepdim))
+    single = axis[0] if isinstance(axis, tuple) and len(axis) == 1 else axis
+    if isinstance(single, int) and _float_dtype_name(x.dtype) is not None:
+        fn = _compiled_reduce(tuple(int(d) for d in x.shape), single,
+                              dtype="float32", ctx=_ctx_of(cmd))
+        if fn is not None:
+            record_route("reduce", "hit")
+            reduced = single if single >= 0 else x.ndim + single
+            out_shape = tuple(1 if i == reduced else d
+                              for i, d in enumerate(x.shape))
+            src = np.ascontiguousarray(x, dtype=np.float32)
+            out = np.zeros(out_shape, dtype=np.float32)
+            scale = np.array([1.0 / x.shape[reduced]], dtype=np.float32)
+            fn(src.ctypes.data_as(ctypes.c_void_p),
+               scale.ctypes.data_as(ctypes.c_void_p),
+               out.ctypes.data_as(ctypes.c_void_p))
+            if not keepdim:
+                out = np.squeeze(out, axis=reduced)
+            _write_result(hal, dpu_id, cmd, out)
+            return
+    record_route("reduce", "fallback")
+    _write_result(hal, dpu_id, cmd,
+                  np.mean(x.astype(np.float32), axis=axis, keepdims=keepdim))
+
+
+def rsqrt_kernel(hal, dpu_id: int, cmd) -> None:
+    """`aten.rsqrt`：走 `pim.lut` 的 rsqrt，镜像兜底。
+
+    RMSNorm 的倒数平方根在 fp32 上算，fp16 与 fp32 都要能编，降到另一种
+    精度再求会丢掉尾数。
+    """
+    (x,) = _read_tensor_args(hal, dpu_id, cmd)
+    dtype = _float_dtype_name(x.dtype)
+    if dtype is not None:
+        fn = _compiled_lut(tuple(int(d) for d in x.shape), "rsqrt",
+                           dtype=dtype, ctx=_ctx_of(cmd))
+        if fn is not None:
+            record_route("lut", "hit")
+            src = np.ascontiguousarray(x, dtype=dtype)
+            out = np.zeros(src.shape, dtype=dtype)
+            fn(src.ctypes.data_as(ctypes.c_void_p),
+               out.ctypes.data_as(ctypes.c_void_p))
+            _write_result(hal, dpu_id, cmd, out)
+            return
+    record_route("rsqrt", "fallback")
+    _write_result(hal, dpu_id, cmd, 1.0 / np.sqrt(x.astype(np.float32)))
 
 
 def _silu(x: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
@@ -356,15 +493,54 @@ def _silu(x: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     array = np.ascontiguousarray(x, dtype=np.float16)
     fn = _compiled_lut(tuple(array.shape), "silu", ctx=ctx)
     if fn is None:
+        record_route("lut", "fallback")
         return kernels_pim._apply_activation(array, "silu")
+    record_route("lut", "hit")
     out = np.zeros(array.shape, dtype=np.float16)
     fn(array.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p))
     return out
 
 
-def _compiled_lut(shape: tuple[int, ...], kind: str, *, ctx: _OpContext | None = None):
-    """按形状编一个 `pim.lut` 查表激活；工具链不在位时返回 None。"""
-    key = (ctx, "lut", shape, kind)
+def _compiled_reduce(shape: tuple[int, ...], axis: int, *,
+                     dtype: str = "float16", ctx: _OpContext | None = None):
+    """按形状编一个沿单轴求均值的 `pim.reduce`；工具链不在位时返回 None。
+
+    RMSNorm 的均方在 fp32 上算，所以类型要跟着输入走。两种类型各有一份内核，
+    缓存键带上类型，fp16 与 fp32 不能混用。
+    """
+    key = (ctx, "reduce", shape, axis, dtype)
+    if key in _COMPILED_KERNEL_CACHE:
+        return _COMPILED_KERNEL_CACHE[key]
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import (
+        ToolchainUnavailable, compile_op, load_kernel)
+
+    try:
+        result = compile_op(OpCompileRequest(
+            op="reduce", arg_shapes=[shape], group_size=axis,
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=dtype,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
+        ))
+    except ToolchainUnavailable:
+        _COMPILED_KERNEL_CACHE[key] = None
+        return None
+    fn = load_kernel(result)
+    _COMPILED_KERNEL_CACHE[key] = fn
+    return fn
+
+
+def _compiled_lut(shape: tuple[int, ...], kind: str, *,
+                  dtype: str = "float16", ctx: _OpContext | None = None):
+    """按形状编一个 `pim.lut` 查表激活；工具链不在位时返回 None。
+
+    RMSNorm 的 rsqrt 在 fp32 上算，类型跟着输入走。缓存键带上类型，两种
+    内核形态不能混用。
+    """
+    key = (ctx, "lut", shape, kind, dtype)
     if key in _COMPILED_KERNEL_CACHE:
         return _COMPILED_KERNEL_CACHE[key]
 
@@ -375,7 +551,7 @@ def _compiled_lut(shape: tuple[int, ...], kind: str, *, ctx: _OpContext | None =
     try:
         result = compile_op(OpCompileRequest(
             op="lut", arg_shapes=[shape],
-            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=dtype,
             activation=kind,
             shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
             elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
@@ -407,10 +583,15 @@ def _normalize(x: np.ndarray, gamma: np.ndarray, *, ctx: _OpContext | None = Non
     g = np.ascontiguousarray(gamma, dtype=np.float16)
     fn = _compiled_normalize(tuple(array.shape), ctx=ctx)
     if fn is None:
+        record_route("normalize", "fallback")
         return kernels_pim.normalize(array, g)
+    record_route("normalize", "hit")
     out = np.zeros(array.shape, dtype=np.float16)
+    # epsilon 是内核的第三个操作数，与镜像的默认值同一个数。
+    eps = np.array([1e-5], dtype=np.float32)
     fn(array.ctypes.data_as(ctypes.c_void_p),
        g.ctypes.data_as(ctypes.c_void_p),
+       eps.ctypes.data_as(ctypes.c_void_p),
        out.ctypes.data_as(ctypes.c_void_p))
     return out
 
@@ -427,7 +608,8 @@ def _compiled_normalize(shape: tuple[int, ...], *, ctx: _OpContext | None = None
 
     try:
         result = compile_op(OpCompileRequest(
-            op="normalize", arg_shapes=[shape, (shape[-1],)],
+            # 契约只要输入形状；gamma 的长度等于最后一维，内核自己取。
+            op="normalize", arg_shapes=[shape],
             hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
             shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
             elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
@@ -454,7 +636,9 @@ def _rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray, *, ctx: _OpContext | 
     s = np.ascontiguousarray(sin, dtype=np.float16)
     fn = _compiled_rope(tuple(array.shape), ctx=ctx)
     if fn is None:
+        record_route("rope", "fallback")
         return kernels_pim.rope(array, c, s)
+    record_route("rope", "hit")
     out = np.zeros(array.shape, dtype=np.float16)
     fn(array.ctypes.data_as(ctypes.c_void_p),
        c.ctypes.data_as(ctypes.c_void_p),
@@ -528,7 +712,9 @@ def softmax(x: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
     rows = int(array.size // cols)
     fn = _compiled_softmax(rows, cols, ctx=ctx)
     if fn is None:
+        record_route("softmax", "fallback")
         return kernels_pim.softmax(x)
+    record_route("softmax", "hit")
     source = array.reshape(rows, cols)
     out = np.zeros((rows, cols), dtype=_SOFTMAX_DTYPE)
     fn(source.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p))
@@ -622,17 +808,23 @@ def _compiled_matmul(a: np.ndarray, b: np.ndarray, *, ctx: _OpContext | None = N
 
 
 def matmul(a: np.ndarray, b: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
-    """二维 fp16 矩阵乘：编译内核优先，`x @ w` 兜底。
+    """fp16 矩阵乘：编译内核优先，`x @ w` 兜底。
 
     设备侧的矩阵乘按 fp16 存、f32 累加（与 EmitC 的 `pim_f16_to_f32` /
-    `pim_f32_to_f16` 一致），所以对拍取的就是这条路径。其它形状与 dtype
-    （三维 bmm、fp32 图）没有对应的编译内核，退回同口径的 numpy 乘。
+    `pim_f32_to_f16` 一致）。三维 bmm 逐批拆成二维再折回；fp32、四维、
+    两侧类型不同的形状没有对应的编译内核，退回同口径的 numpy 乘。
     """
+    if (a.ndim == 3 and b.ndim == 3 and a.shape[0] == b.shape[0]
+            and a.dtype == np.float16 and b.dtype == np.float16):
+        batches = [matmul(a[i], b[i], ctx=ctx) for i in range(a.shape[0])]
+        return np.stack(batches, axis=0)
     a16 = np.ascontiguousarray(a, dtype=np.float16) if a.dtype == np.float16 else a
     b16 = np.ascontiguousarray(b, dtype=np.float16) if b.dtype == np.float16 else b
     fn = _compiled_matmul(a16, b16, ctx=ctx)
     if fn is None:
+        record_route("matmul", "fallback")
         return a.astype(np.float32) @ b.astype(np.float32)
+    record_route("matmul", "hit")
     out = np.zeros((a16.shape[0], b16.shape[1]), dtype=np.float16)
     fn(ctypes.c_void_p(a16.ctypes.data), ctypes.c_void_p(b16.ctypes.data),
        ctypes.c_void_p(out.ctypes.data))
@@ -694,8 +886,10 @@ def add_mask(scores: np.ndarray, offset: np.ndarray, *, ctx: _OpContext | None =
     offset16 = np.ascontiguousarray(offset, dtype=np.float16)
     fn = _compiled_mask(scores16.shape, offset16.shape, ctx=ctx)
     if fn is None:
+        record_route("mask", "fallback")
         return kernels_pim.mask(np.asarray(scores, dtype=np.float32),
                                 np.asarray(offset, dtype=np.float32))
+    record_route("mask", "hit")
     out = np.zeros(scores16.shape, dtype=np.float16)
     fn(ctypes.c_void_p(scores16.ctypes.data),
        ctypes.c_void_p(offset16.ctypes.data),
@@ -736,6 +930,7 @@ def gather_kernel(hal, dpu_id: int, cmd) -> None:
         ))
         fn = load_kernel(result)
         _COMPILED_KERNEL_CACHE[key] = fn
+    record_route("gather", "hit")
     out = np.zeros(expected.shape, dtype=np.float16)
     fn(ctypes.c_void_p(np.ascontiguousarray(table, np.float16).ctypes.data),
        ctypes.c_void_p(ids.ctypes.data), ctypes.c_void_p(out.ctypes.data))
@@ -804,25 +999,38 @@ def transpose_kernel(hal, dpu_id: int, cmd) -> None:
     x, order = args[0], tuple(args[1])
     fn = _compiled_view("transpose", [tuple(x.shape), order], ctx=_ctx_of(cmd))
     if fn is None:
+        record_route("transpose", "fallback")
         _write_result(hal, dpu_id, cmd, kernels_pim.transpose(x, order))
         return
+    record_route("transpose", "hit")
     out = np.zeros(tuple(x.shape[i] for i in order), dtype=np.float16)
     fn(ctypes.c_void_p(np.ascontiguousarray(x, np.float16).ctypes.data),
        ctypes.c_void_p(out.ctypes.data))
     _write_result(hal, dpu_id, cmd, out)
 
 
+def _swap_order(ndim: int, dim0, dim1) -> tuple[int, ...]:
+    """两个轴号对换成全轴序，`pim.transpose` 收的是全轴序。"""
+    order = list(range(ndim))
+    order[int(dim0)], order[int(dim1)] = order[int(dim1)], order[int(dim0)]
+    return tuple(order)
+
+
 def transpose_int_kernel(hal, dpu_id: int, cmd) -> None:
-    """`aten.transpose.int(x, dim0, dim1)`：换两轴，再交给同一个镜像。
-
-    `pim.transpose` 收的是**全轴序**，所以这里先把两个轴对换成轴序。
-    """
-    def mirror(x, dim0, dim1):
-        order = list(range(x.ndim))
-        order[int(dim0)], order[int(dim1)] = order[int(dim1)], order[int(dim0)]
-        return kernels_pim.transpose(x, tuple(order))
-
-    _mirror(mirror)(hal, dpu_id, cmd)
+    """`aten.transpose.int(x, dim0, dim1)`：换两轴，走 `pim.transpose`。"""
+    args = _read_tensor_args(hal, dpu_id, cmd)
+    x, dim0, dim1 = args[0], args[1], args[2]
+    order = _swap_order(x.ndim, dim0, dim1)
+    fn = _compiled_view("transpose", [tuple(x.shape), order], ctx=_ctx_of(cmd))
+    if fn is None:
+        record_route("transpose", "fallback")
+        _write_result(hal, dpu_id, cmd, kernels_pim.transpose(x, order))
+        return
+    record_route("transpose", "hit")
+    out = np.zeros(tuple(x.shape[i] for i in order), dtype=np.float16)
+    fn(ctypes.c_void_p(np.ascontiguousarray(x, np.float16).ctypes.data),
+       ctypes.c_void_p(out.ctypes.data))
+    _write_result(hal, dpu_id, cmd, out)
 
 
 def reshape_kernel(hal, dpu_id: int, cmd) -> None:
@@ -841,28 +1049,82 @@ def reshape_kernel(hal, dpu_id: int, cmd) -> None:
     shape = tuple(raw)
     fn = _compiled_view("reshape", [tuple(x.shape), shape], ctx=_ctx_of(cmd))
     if fn is None:
+        record_route("reshape", "fallback")
         _write_result(hal, dpu_id, cmd, kernels_pim.reshape(x, shape))
         return
+    record_route("reshape", "hit")
     out = np.zeros(shape, dtype=np.float16)
     fn(ctypes.c_void_p(np.ascontiguousarray(x, np.float16).ctypes.data),
        ctypes.c_void_p(out.ctypes.data))
     _write_result(hal, dpu_id, cmd, out)
 
 
+def _slice_bounds(length: int, start, end) -> tuple[int, int]:
+    """切片的起止下标，None 取整轴，越界夹回轴内。"""
+    lo = 0 if start is None else max(int(start), 0)
+    hi = length if end is None else min(int(end), length)
+    return lo, hi
+
+
+def _compiled_slice(x: np.ndarray, dim: int, lo: int, hi: int, *,
+                    ctx: _OpContext | None):
+    """用两次转置加一次连续拷贝切出一段；编不出时返回 None。
+
+    被切的轴先转到轴首，目标区间就成了连续前缀，`pim.reshape` 按元素数
+    拷这段前缀，再转回原轴序。步长不是 1 的切片没有对应的编译形态。
+    """
+    axis = int(dim)
+    order = (axis,) + tuple(i for i in range(x.ndim) if i != axis)
+    moved_shape = tuple(x.shape[i] for i in order)
+    moved = _compiled_view("transpose", [tuple(x.shape), order], ctx=ctx)
+    if moved is None:
+        return None
+    prefix_shape = (hi - lo,) + moved_shape[1:]
+    copied = _compiled_view("reshape", [prefix_shape, prefix_shape], ctx=ctx)
+    if copied is None:
+        return None
+    back_order = tuple(sorted(range(x.ndim), key=lambda i: order[i]))
+    back = _compiled_view("transpose", [prefix_shape, back_order], ctx=ctx)
+    if back is None:
+        return None
+
+    src = np.ascontiguousarray(x, dtype=np.float16)
+    moved_out = np.zeros(moved_shape, dtype=np.float16)
+    moved(src.ctypes.data_as(ctypes.c_void_p),
+          moved_out.ctypes.data_as(ctypes.c_void_p))
+    prefix = np.ascontiguousarray(moved_out[lo:hi])
+    copied_out = np.zeros(prefix_shape, dtype=np.float16)
+    copied(prefix.ctypes.data_as(ctypes.c_void_p),
+           copied_out.ctypes.data_as(ctypes.c_void_p))
+    out = np.zeros(tuple(prefix_shape[i] for i in back_order), dtype=np.float16)
+    back(copied_out.ctypes.data_as(ctypes.c_void_p),
+         out.ctypes.data_as(ctypes.c_void_p))
+    return out
+
+
 def slice_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.slice.Tensor(x, dim, start, end, step)`：按维切一段。
 
-    没有编译内核：切片改的是**视图的形状**，`pim.reshape` 只改形状不丢元素，
-    两者不是同一个算子；按 reshape 编会把整段数据原样发出去而不报错。
+    步长为 1 的切片走编译：被切的轴转到轴首后目标区间是连续前缀，
+    `pim.reshape` 按元素数拷这段前缀，再转回原轴序。其余形态退回镜像。
     """
     def mirror(x, dim, start, end, step=1):
-        axis = x.shape[int(dim)]
-        lo = 0 if start is None else max(int(start), 0)
-        hi = axis if end is None else min(int(end), axis)
+        lo, hi = _slice_bounds(x.shape[int(dim)], start, end)
         index = [slice(None)] * x.ndim
         index[int(dim)] = slice(lo, hi, 1 if step is None else int(step))
         return x[tuple(index)]
 
+    args = _read_tensor_args(hal, dpu_id, cmd)
+    x, dim, start, end = args[0], args[1], args[2], args[3]
+    step = args[4] if len(args) > 4 else 1
+    if x.dtype == np.float16 and (step is None or int(step) == 1):
+        lo, hi = _slice_bounds(x.shape[int(dim)], start, end)
+        out = _compiled_slice(x, int(dim), lo, hi, ctx=_ctx_of(cmd))
+        if out is not None:
+            record_route("reshape", "hit")
+            _write_result(hal, dpu_id, cmd, out)
+            return
+    record_route("slice", "fallback")
     _mirror(mirror)(hal, dpu_id, cmd)
 
 
@@ -881,8 +1143,10 @@ def concat_kernel(hal, dpu_id: int, cmd) -> None:
     fn = _compiled_view("concat", [tuple(t.shape) for t in tensors],
                         group_size=axis, ctx=_ctx_of(cmd))
     if fn is None:
+        record_route("concat", "fallback")
         _write_result(hal, dpu_id, cmd, kernels_pim.concat(tensors, axis))
         return
+    record_route("concat", "hit")
     out_shape = list(tensors[0].shape)
     out_shape[axis] = sum(t.shape[axis] for t in tensors)
     out = np.zeros(tuple(out_shape), dtype=np.float16)
@@ -905,8 +1169,10 @@ def split_heads_kernel(hal, dpu_id: int, cmd) -> None:
         raise ValueError(f"轴 {axis} 长 {x.shape[axis]} 分不出 {pieces} 个整份")
     fn = _compiled_split_heads(tuple(x.shape), axis, pieces, ctx=_ctx_of(cmd))
     if fn is None:
+        record_route("split_heads", "fallback")
         _write_result(hal, dpu_id, cmd, np.split(x, pieces, axis=axis))
         return
+    record_route("split_heads", "hit")
     head = x.shape[axis] // pieces
     piece_shape = list(x.shape)
     piece_shape[axis] = head
@@ -1000,8 +1266,10 @@ def _kv_row_write(hal, owner: int, base: int, slot_index: int,
     fn = _compiled_kv_cache(tuple(row.shape), max_seq * row.shape[-1],
                             row.dtype, ctx=ctx)
     if fn is None:
+        record_route("kv_cache", "fallback")
         hal.write_local(owner, base + slot_index * row.nbytes, row)
         return
+    record_route("kv_cache", "hit")
     slot = np.zeros((1,), dtype=np.int16)
     slot[0] = slot_index
     fn(ctypes.c_void_p(row.ctypes.data),
@@ -1110,10 +1378,24 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
 
 
 def unsqueeze_kernel(hal, dpu_id: int, cmd) -> None:
-    """`aten.unsqueeze.default(x, dim)`：在 dim 处插一根长度为 1 的轴。"""
-    def mirror(x, dim):
-        return np.expand_dims(x, int(dim))
-    _mirror(mirror)(hal, dpu_id, cmd)
+    """`aten.unsqueeze.default(x, dim)`：在 dim 处插一根长度为 1 的轴。
+
+    插轴不改元素，走 `pim.reshape`；镜像是 `expand_dims`。
+    """
+    args = _read_tensor_args(hal, dpu_id, cmd)
+    x, dim = args[0], int(args[1])
+    axis = dim if dim >= 0 else x.ndim + dim + 1
+    out_shape = x.shape[:axis] + (1,) + x.shape[axis:]
+    fn = _compiled_view("reshape", [tuple(x.shape), out_shape], ctx=_ctx_of(cmd))
+    if fn is None:
+        record_route("reshape", "fallback")
+        _write_result(hal, dpu_id, cmd, np.expand_dims(x, dim))
+        return
+    record_route("reshape", "hit")
+    out = np.zeros(out_shape, dtype=np.float16)
+    fn(ctypes.c_void_p(np.ascontiguousarray(x, np.float16).ctypes.data),
+       ctypes.c_void_p(out.ctypes.data))
+    _write_result(hal, dpu_id, cmd, out)
 
 
 def convert_kernel(hal, dpu_id: int, cmd) -> None:
@@ -1148,7 +1430,9 @@ def convert(source: np.ndarray, dtype, *, ctx: _OpContext | None = None) -> np.n
         return source
     fn = _compiled_convert(source.shape, source.dtype.name, np.dtype(dtype).name, ctx=ctx)
     if fn is None:
+        record_route("convert", "fallback")
         return kernels_pim.convert(source, dtype)
+    record_route("convert", "hit")
     src = np.ascontiguousarray(source)
     out = np.zeros(src.shape, dtype=dtype)
     fn(ctypes.c_void_p(src.ctypes.data), ctypes.c_void_p(out.ctypes.data))
@@ -1157,7 +1441,7 @@ def convert(source: np.ndarray, dtype, *, ctx: _OpContext | None = None) -> np.n
 
 def _compiled_convert(shape: tuple[int, ...], source: str, target: str, *, ctx: _OpContext | None = None):
     """按形状与两侧类型编一个 `pim.convert`；没有对应形态时返回 None。"""
-    supported = ("float16", "float32", "int8")
+    supported = ("float16", "float32", "int8", "int32", "int64")
     if source not in supported or target not in supported or source == target:
         return None
     key = (ctx, "convert", tuple(shape), source, target)
@@ -1224,15 +1508,15 @@ _KERNELS = {
     # RMSNorm 拆开后的三步、RoPE 的取负、MLP 的 SiLU——原来这些全落在主机上。
     str(torch.ops.aten.pow.Tensor_Scalar): KernelEntry(pow_kernel),
     str(torch.ops.aten.mean.dim): KernelEntry(mean_dim_kernel),
-    str(torch.ops.aten.rsqrt.default): KernelEntry(_unary(lambda x: 1.0 / np.sqrt(x))),
-    str(torch.ops.aten.neg.default): KernelEntry(_unary(np.negative)),
+    str(torch.ops.aten.rsqrt.default): KernelEntry(rsqrt_kernel),
+    str(torch.ops.aten.neg.default): KernelEntry(neg_kernel),
     str(torch.ops.aten.silu.default): KernelEntry(silu_kernel),
-    str(torch.ops.aten.relu.default): KernelEntry(_unary(lambda x: np.maximum(x, 0.0))),
+    str(torch.ops.aten.relu.default): KernelEntry(_unary(lambda x: np.maximum(x, 0.0), "relu")),
     str(torch.ops.aten.sigmoid.default): KernelEntry(
-        _unary(lambda x: 1.0 / (1.0 + np.exp(-x)))),
-    str(torch.ops.aten.exp.default): KernelEntry(_unary(np.exp)),
-    str(torch.ops.aten.sqrt.default): KernelEntry(_unary(np.sqrt)),
-    str(torch.ops.aten.reciprocal.default): KernelEntry(_unary(np.reciprocal)),
+        _unary(lambda x: 1.0 / (1.0 + np.exp(-x)), "sigmoid")),
+    str(torch.ops.aten.exp.default): KernelEntry(_unary(np.exp, "exp")),
+    str(torch.ops.aten.sqrt.default): KernelEntry(_unary(np.sqrt, "sqrt")),
+    str(torch.ops.aten.reciprocal.default): KernelEntry(_unary(np.reciprocal, "reciprocal")),
     # 算子级 mnemonic 对应的 aten（方案 4.8 的映射表）。
     str(torch.ops.aten.matmul.default): KernelEntry(matmul_kernel),
     str(torch.ops.aten.bmm.default): KernelEntry(matmul_kernel),

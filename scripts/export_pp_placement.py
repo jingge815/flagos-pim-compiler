@@ -153,6 +153,8 @@ def main() -> None:
         measure_kernel_tiles=args.measure_kernel_tiles,
         # GeneSim 给了方案就把它的 Cluster 映射原样带进 sidecar，往返用同一份声明。
         dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,
+        # 非 GEMM 算子按所在层钉到该层流水段的第一台 DPU。
+        strategy=strategy,
     )
 
     # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。一个 GEMM 可能切在多台

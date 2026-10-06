@@ -169,6 +169,12 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     print(f"generated (our orchestrator): {our_text!r}")
     print(f"generated (HF model.generate): {ref_text!r}")
 
+    if our_ids != ref_ids:
+        # 失败时带上退回计数，否则看不出是哪个算子退回了主机。
+        from runtime.kernels import route_counts
+        print(f"token 不一致：ours={our_ids} ref={ref_ids}")
+        print(f"route_counts={route_counts()}")
+
     assert our_ids == ref_ids
     assert our_text == ref_text
     assert our_text.startswith(PROMPT)

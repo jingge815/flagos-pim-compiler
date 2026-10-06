@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from torch.fx import Graph, GraphModule, Node
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -328,6 +329,88 @@ def test_only_scaffolding_stays_on_the_host() -> None:
     }
     assert host_targets <= scaffolding, (
         f"这些算子留在了主机，但它们不是脚手架：{sorted(host_targets - scaffolding)}")
+
+
+def test_decode_graph_device_marks_match_the_blacklist() -> None:
+    """decode 图上每个算子的设备标记必须与黑名单逐节点一致。
+
+    现有的 `test_only_scaffolding_stays_on_the_host` 只导出 prefill 一张图，
+    而且只断言主机侧 ⊆ 脚手架集合。decode 才走 `index`、`slice` 这类解码期
+    算子，黑名单漏项最可能在这里露头，所以两边都要遍历。
+    """
+    from runtime.compile import export_annotated_graph
+
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32000, hidden_size=64, intermediate_size=176,
+            num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=4,
+            max_position_embeddings=16, bos_token_id=1, eos_token_id=2,
+            pad_token_id=0,
+        )
+    ).float().eval()
+    pos = torch.tensor([[0]], dtype=torch.long)
+    gm = export_annotated_graph(model, 1, pos, dtype=torch.float32)
+    _assert_aten_hosts_are_only_the_allowed(gm)
+
+
+def test_prefill_graph_aten_hosts_are_only_the_allowed() -> None:
+    """prefill 导出图里留主机的 aten 算子必须是允许项，差集为空。
+
+    需求 P0-1 的验收判据：aten 算子与黑名单求差必须为空（除允许项）。
+    期望值写死在测试里，不从 `_is_host_only` 反推——否则标记规则与黑名单
+    同源，增删黑名单都不会失败。
+    """
+    gm = _export_random_llama()
+    partition_graph(gm)
+    _assert_aten_hosts_are_only_the_allowed(gm)
+
+
+# 允许留主机的 aten 名字。需求 2.3 划出的范围：脚手架、位置下标、广播视图。
+# 不从 HOST_ONLY 读——那张表是被测对象，期望值必须独立。
+_ALLOWED_HOST_ATEN = frozenset({
+    "aten._assert_tensor_metadata.default",
+    "aten.arange.start",
+    "aten.arange.default",
+    "aten.expand.default",
+    "aten.repeat.default",
+    "aten.contiguous.default",
+    "aten.squeeze.dim",
+    "aten.layer_norm.default",
+})
+
+
+def test_a_real_aten_op_must_not_stay_on_the_host() -> None:
+    """把真正动张量的 aten 算子标成主机时必须失败。
+
+    原先的谓词从 `_is_host_only` 反推期望值，增删黑名单都不会红。
+    这条独立于黑名单：图上出现 `aten.add` 留主机，就是漏项。
+    """
+    graph = Graph()
+    x = graph.placeholder("x")
+    y = graph.call_function(torch.ops.aten.add.Tensor, (x, 1))
+    y.meta[DEVICE_META_KEY] = DEVICE_HOST
+    graph.output(y)
+    gm = GraphModule({}, graph)
+    # 直接断言被测函数失败：复刻它的表达式的话，函数被掏空时这里照样绿。
+    with pytest.raises(AssertionError, match="不在允许项里"):
+        _assert_aten_hosts_are_only_the_allowed(gm)
+
+
+def _assert_aten_hosts_are_only_the_allowed(gm) -> None:
+    """图上每个 call_function 必须有设备标记；aten 主机侧 ⊆ 允许项。"""
+    missing = [
+        str(node.target) for node in gm.graph.nodes
+        if node.op == "call_function" and DEVICE_META_KEY not in node.meta
+    ]
+    assert not missing, f"这些算子没有设备标记：{missing}"
+    host_aten = {
+        str(node.target) for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.meta[DEVICE_META_KEY] == DEVICE_HOST
+        and str(node.target).startswith("aten.")
+    }
+    extra = sorted(host_aten - _ALLOWED_HOST_ATEN)
+    assert not extra, f"这些 aten 算子留在了主机，但不在允许项里：{extra}"
 
 
 def test_no_kernel_is_registered_for_a_host_only_op() -> None:

@@ -264,7 +264,8 @@ def concat_kernel(func: str, shapes: list[tuple[int, ...]], axis: int) -> str:
 
 # 契约里的元素类型名（torch 风格）到 MLIR 类型名的映射。`pim.convert` 的目标
 # 类型来自契约，不能把 `float32` 直接拼进 IR——那不是合法的 MLIR 类型。
-_CONTRACT_DTYPES = {"float16": _F16, "float32": "f32", "int8": _I8}
+_CONTRACT_DTYPES = {"float16": _F16, "float32": "f32", "int8": _I8,
+                    "int32": "i32", "int64": "i64"}
 
 
 def convert_kernel(func: str, shape: tuple[int, ...], dtype: str,
@@ -292,22 +293,52 @@ def convert_kernel(func: str, shape: tuple[int, ...], dtype: str,
   }}"""
 
 
-def lut_kernel(func: str, shape: tuple[int, ...], kind: str) -> str:
+def reduce_kernel(func: str, shape: tuple[int, ...], axis: int,
+                  dtype: str = _F16) -> str:
+    """沿一轴求和再除以轴长，得到均值。
+
+    归约用 `pim.reduce_axis` 的加法，除法是一次逐元素乘（乘 1/轴长）。
+    输出保秩，被归约的那一轴变成 1。`dtype` 是 MLIR 类型名：RMSNorm 的
+    均方在 fp32 上做，求和的中间结果也要留在 fp32，不能先降到 fp16。
+    """
+    out_shape = tuple(1 if i == axis else d for i, d in enumerate(shape))
+    src_ty = _tensor(shape, dtype)
+    out_ty = _tensor(out_shape, dtype)
+    scale_ty = _tensor((1,), "f32")
+    return f"""  tt.func @{func}(%x: {src_ty}, %c: {scale_ty}) {{
+    %s = pim.reduce_axis %x {{kind = #pim.eltwise<add>, axis = {axis} : i64,
+        unit = #pim.unit<vpu>}} : {src_ty} -> {out_ty}
+    %y = pim.eltwise %s, %c
+       {{kind = #pim.eltwise<mul>,
+         datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>}}
+       : {out_ty}, {scale_ty} -> {out_ty}
+    tt.return
+  }}"""
+
+
+def lut_kernel(func: str, shape: tuple[int, ...], kind: str,
+               dtype: str = _F16) -> str:
     """查表激活。Silu 是 Llama2 里唯一未融合时的兜底路径。
 
     表体不在这里发：C 侧按 kind 直接算那个函数，`phase_data.py` 是数值真源，
-    再带一份 288 字节的表就是第三份公式。
+    再带一份 288 字节的表就是第三份公式。`dtype` 是 MLIR 类型名：RMSNorm 的
+    rsqrt 在 fp32 上算，降到 fp16 再求倒数平方根会丢掉尾数。
     """
-    ty = _tensor(shape, _F16)
+    ty = _tensor(shape, dtype)
     return f"""  tt.func @{func}(%x: {ty}) {{
     %y = pim.lut %x {{kind = #pim.activation<{kind}>}} : {ty} -> {ty}
     tt.return
   }}"""
 
 
-def eltwise_kernel(func: str, shape: tuple[int, ...], kind: str) -> str:
-    """逐元素二元运算。两槽形态打印与旧糖一致，成本抽取按 mnemonic 计数。"""
-    ty = _tensor(shape, _F16)
+def eltwise_kernel(func: str, shape: tuple[int, ...], kind: str,
+                   dtype: str = _F16) -> str:
+    """逐元素二元运算。两槽形态打印与旧糖一致，成本抽取按 mnemonic 计数。
+
+    两侧同类型，fp16 与 fp32 各有一种内核形态；`dtype` 是 MLIR 类型名。
+    RMSNorm 链的 eps 加法与门控乘都在 fp32 域。
+    """
+    ty = _tensor(shape, dtype)
     return f"""  tt.func @{func}(%a: {ty}, %b: {ty}) {{
     %y = pim.eltwise %a, %b
        {{kind = #pim.eltwise<{kind}>,

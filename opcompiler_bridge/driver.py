@@ -25,8 +25,10 @@ from genesim_bridge.paths import flagtree_prefix, pim_options
 from contracts import mlir_layout
 from opcompiler_bridge.oplevel_emitter import PIM_TARGET
 from opcompiler_bridge.oplevel_kernel import (
+    _CONTRACT_DTYPES,
     concat_kernel,
     convert_kernel,
+    reduce_kernel,
     dynamic_quant_kernel,
     eltwise_kernel,
     gather_kernel,
@@ -111,6 +113,38 @@ def _mlir_translate() -> Path:
     return flagtree_prefix() / "llvm-7d5de303" / "bin" / "mlir-translate"
 
 
+def _compiler_fingerprint() -> str:
+    """内核源码与降级工具链的指纹，让缓存随编译器一起失效。
+
+    缓存键原先只含请求参数。改了 `kernel_src.py` 的内核结构或 FlagTree 的
+    降级 pass 之后，磁盘上的 `.pimir.mlir` 与 `.so` 不会被判失效，新的形状
+    请求可能命中旧内核编出来的产物——形状相关的逻辑再改一次就会踩到。
+    """
+    digest = hashlib.sha256()
+    # 生成 IR 的源文件都要入摘要：kernel_src 是 A 路，oplevel_* 是 B 路。
+    # 漏掉后两份时，改了 convert 类型表或 eltwise dtype 也不会让缓存失效。
+    for name in ("kernel_src.py", "oplevel_kernel.py", "oplevel_emitter.py"):
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    # 工具链本身也是编译器的一部分：pass 改了，同一份 TTIR 会降出不同的 C。
+    # 降级 pass 编进两份产物：`triton-opt` 给离线编译用，`libtriton.so` 是
+    # 进程内实际加载的那份。只盯其中一个，另一个被单独重编时缓存不会失效，
+    # 运行时就会拿旧内核的产物去对拍。
+    for tool in (_triton_opt(), _loaded_libtriton()):
+        if tool is not None and tool.is_file():
+            stat = tool.stat()
+            digest.update(f"{tool}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    return digest.hexdigest()[:16]
+
+
+def _loaded_libtriton() -> Path | None:
+    """进程实际加载的 `libtriton.so`。导入失败时返回 None，指纹只看工具链。"""
+    try:
+        import triton
+    except ImportError:
+        return None
+    return Path(triton.__file__).parent / "_C" / "libtriton.so"
+
+
 def _cache_key(request: OpCompileRequest) -> str:
     # 缓存键包含数据类型、目标类型、tasklet 数、组大小和硬件配置。
     # `out_dtype` 必须在内：`convert` 的 f16→i8 与 f16→f32 只有这一位不同，
@@ -129,7 +163,9 @@ def _cache_key(request: OpCompileRequest) -> str:
         f"{request.shard}"
         # `elem_strides` 决定 `order`，`mram_offset` / `align_bytes` 决定 DMA 的
         # 起始地址与步幅，三者都是下发文本的一部分，漏掉就会拿回旧文本。
-        f"{request.elem_strides}:{request.mram_offset}:{request.align_bytes}"
+        f"{request.elem_strides}:{request.mram_offset}:{request.align_bytes}:"
+        # 编译器指纹放末尾：前面几位不变时，换编译器仍会得到不同的键。
+        f"{_compiler_fingerprint()}"
     ).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -158,25 +194,8 @@ def _kernel_launcher(request: OpCompileRequest):
             f"收到 K={k}。llama2-7b 的真实 K 远超这个下限，仅在自验证等极小 "
             f"shape 测试时可能触发。"
         )
-    # 只有 M 需要自己是 2 的幂：kernel_src.py 里 `tl.arange(0, M)` 直接铺满 M，
-    # 而 K/N 是按 BLOCK_K/BLOCK_N 分块遍历的，arange 作用在分块上。所以 K/N 的
-    # 约束是「存在一个既是 2 的幂、又能整除它的分块」，由 pick_blocks 判定。
-    #
-    # 这条约束以前对 M/K/N 一律要求 2 的幂，把 llama2-7b 的 MLP 直接挡在门外：
-    # intermediate_size = 11008 = 2^8 × 43，任何切分下都不是 2 的幂（tp2 是
-    # 5504、tp4 是 2752）。而 5504 = 128 × 43，分块 128 完全合法。
-    if m & (m - 1) != 0:
-        raise ValueError(
-            f"kernel_src.py 用 tl.arange(0, M) 直接生成整块索引，Triton 要求 "
-            f"arange 的范围是 2 的幂，收到 M={m}。decode 口径下 M=1，prefill 用 "
-            f"2 的幂序列长度即可。"
-        )
-
-    from .kernel_src import pick_blocks
-
-    # 分块不合法时在这里报错，而不是等 Triton 抛出含义模糊的 arange 报错。
-    pick_blocks(k, n)
-
+    # M、K、N 都按分块遍历，最后一块由掩码处理，不再要求维度是 2 的幂
+    # 或能被分块整除。
     from .kernel_src import make_kernel_launcher
 
     return make_kernel_launcher(m, k, n)
@@ -228,9 +247,8 @@ def _make_ttir_without_gpu(
     from .cpu_host import make_ttir
     from .kernel_src import NUM_STAGES, linear_kernel, pick_blocks
 
-    # 形状约束与有卡路径共用同一套判定（M 是 2 的幂、K/N 有合法分块）。
     _kernel_launcher(request)
-    block_n, block_k = pick_blocks(k, n)
+    block_m, block_n, block_k = pick_blocks(k, n, m)
     elem = _TRITON_DTYPE_BY_NAME[request.dtype]
     return make_ttir(
         linear_kernel,
@@ -241,12 +259,13 @@ def _make_ttir_without_gpu(
             "M": "constexpr",
             "K": "constexpr",
             "N": "constexpr",
+            "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "BLOCK_K": "constexpr",
         },
         constexprs={
             "M": m, "K": k, "N": n,
-            "BLOCK_N": block_n, "BLOCK_K": block_k,
+            "BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k,
         },
         num_stages=NUM_STAGES,
     )
@@ -555,11 +574,27 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
                              fp16=fp16)
         return _module_text(body, request)
 
+    if request.op == "reduce":
+        if len(request.arg_shapes) != 1:
+            raise ValueError(
+                f"reduce 契约要求 arg_shapes=[输入形状]，收到 {request.arg_shapes!r}")
+        shape = tuple(request.arg_shapes[0])
+        axis = request.group_size if request.group_size is not None else -1
+        if axis < 0:
+            axis += len(shape)
+        if not 0 <= axis < len(shape):
+            raise ValueError(f"reduce 的轴 {axis} 超出形状 {shape}")
+        body = reduce_kernel("kernel", shape, axis,
+                             _CONTRACT_DTYPES[request.dtype])
+        return _module_text(body, request)
+
     if request.op == "lut":
         if len(request.arg_shapes) != 1:
             raise ValueError(
                 f"lut 契约要求 arg_shapes=[输入形状]，收到 {request.arg_shapes!r}")
-        body = lut_kernel("kernel", tuple(request.arg_shapes[0]), "silu")
+        kind = request.activation or "silu"
+        body = lut_kernel("kernel", tuple(request.arg_shapes[0]), kind,
+                          _CONTRACT_DTYPES[request.dtype])
         return _module_text(body, request)
 
     if request.op == "eltwise":
@@ -576,7 +611,8 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         if kind not in ("add", "mul", "sub"):
             raise ValueError(
                 f"eltwise 只覆盖 add / mul / sub，收到 kind={kind!r}")
-        body = eltwise_kernel("kernel", tuple(request.arg_shapes[0]), kind)
+        body = eltwise_kernel("kernel", tuple(request.arg_shapes[0]), kind,
+                              _CONTRACT_DTYPES[request.dtype])
         return _module_text(body, request)
 
     if request.op == "kv_cache":

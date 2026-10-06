@@ -168,10 +168,16 @@ def _write_fixture_ir(path: Path, *, roles: dict[int, str] | None = None) -> Non
             out_shapes = [["Tq", out_features]]
         elif op_id == 1:
             op_type, hint = "GEMV_SCORE", "pim"
+            in_shapes = [["Tq", HIDDEN_SIZE]]
+            out_shapes = [["Tq", HIDDEN_SIZE]]
         elif op_id == 2:
             op_type, hint = "SOFTMAX", "pim"
+            in_shapes = [["Tq", HIDDEN_SIZE]]
+            out_shapes = [["Tq", HIDDEN_SIZE]]
         elif op_id == 3:
             op_type, hint = "GEMV_CONTEXT", "pim"
+            in_shapes = [["Tq", HIDDEN_SIZE]]
+            out_shapes = [["Tq", HIDDEN_SIZE]]
         else:
             op_type, hint = "GELU", "cpu"
         operators.append({
@@ -240,6 +246,83 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
             1: "pim", 2: "pim", 3: "pim", 6: "cpu",
         }[op_id], op_id
         assert str(op_id) not in sidecar["operators"], op_id
+
+
+def _two_layer_graph() -> GraphModule:
+    """两层的小模型图，用来验证层到流水段的钉死。"""
+    sequence_length = 16
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32000, hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE, num_hidden_layers=2,
+            num_attention_heads=NUM_HEADS, num_key_value_heads=NUM_HEADS,
+            max_position_embeddings=sequence_length,
+            bos_token_id=1, eos_token_id=2, pad_token_id=0,
+        )
+    ).eval()
+    input_ids = torch.arange(sequence_length, dtype=torch.long).unsqueeze(0)
+    blocked = torch.triu(
+        torch.ones(sequence_length, sequence_length, dtype=torch.bool), diagonal=1
+    )
+    causal_mask = torch.zeros(
+        (1, 1, sequence_length, sequence_length), dtype=torch.float32
+    )
+    causal_mask.masked_fill_(blocked, torch.finfo(causal_mask.dtype).min)
+    gm = torch.export.export(
+        _FixedMaskLlama(model), (input_ids, causal_mask), strict=True
+    ).module()
+    partition_graph(gm)
+    strategy = llama_strategy(
+        NUM_DPUS, num_stages=2,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE, vocab_size=32000, num_layers=2,
+    )
+    propagate_specs(gm, strategy)
+    return gm
+
+
+def test_non_gemm_ops_are_pinned_to_their_layer_stage(tmp_path) -> None:
+    """非 GEMM 算子要钉到所在层流水段的第一台 DPU。
+
+    放置 sidecar 里只有 GEMM 带 `shards`，其余算子是空列表。GeneSim 的钉死
+    只认 `shards` 或顶层 `dpu_id`，空列表的算子一个都钉不住，贪心把它们分到
+    GPU。两层、两段流水时，第 0 层的算子钉到段 0 的第一台 DPU，第 1 层钉到
+    段 1 的第一台；GEMM 的分片不受影响。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    ir = json.loads(ir_path.read_text())
+    layer0 = [op["op_id"] for op in ir["operators"]]
+    layer1 = [op_id + 100 for op_id in layer0]
+    ir["operators"] += [
+        {**op, "op_id": op["op_id"] + 100} for op in ir["operators"]
+    ]
+    ir["num_layers"] = 2
+    ir["subgraphs"] = [layer0, layer1]
+    ir_path.write_text(json.dumps(ir))
+
+    strategy = llama_strategy(
+        NUM_DPUS, num_stages=2,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE, vocab_size=32000, num_layers=2,
+    )
+    sidecar = export_placement_to_genesim(
+        _two_layer_graph(), ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+        measure_kernel_tiles=True,
+        strategy=strategy,
+    )
+
+    # 段 0 持有 dpu 0、1，段 1 持有 dpu 2、3；层内不切分的算子落在段首。
+    for op_id, entry in sidecar["operators"].items():
+        if entry["shards"]:
+            continue
+        expected = 0 if int(op_id) in ir["subgraphs"][0] else 2
+        assert entry["dpu_id"] == expected, (op_id, entry["op_type"], entry["dpu_id"])
+
+    gemm = sidecar["operators"]["0"]
+    assert gemm["shards"], "GEMM 的分片被钉层逻辑冲掉了"
 
 
 def test_bpath_entries_keep_the_sidecar_shape() -> None:
@@ -680,6 +763,194 @@ def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) ->
     assert "stationarity = #pim.stationarity<kv>" in text, text
     # 符号维不能退化成字面 1（`<1x` 是 tensor 形状里"第一维是 1"的写法）。
     assert "<1x" not in text, text
+
+
+def test_template_trace_is_rejected_without_an_opt_out(tmp_path) -> None:
+    """来源校验没有放宽开关，模板 trace 在默认调用下就被拒。
+
+    评审 r2 问题 5：`expect_pimir` 全仓没有调用点传 False，是死参数。
+    校验函数不带这个开关，模板产物一律拒绝。
+    """
+    import json
+    import struct
+
+    from scripts.run_full_pipeline import StepFailed, verify_trace_provenance
+
+    traces = tmp_path / "pim_traces"
+    traces.mkdir()
+    meta = {"op_id": 7, "op_type": "ROPE",
+            "compile_signature": {"trace_source": "template"}}
+    body = json.dumps(meta).encode()
+    header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
+        + struct.pack("<I", len(body))
+    (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+
+    with pytest.raises(StepFailed, match="ROPE"):
+        verify_trace_provenance(tmp_path)
+
+
+def test_template_trace_of_a_non_gemm_is_rejected(tmp_path) -> None:
+    """非 GEMM 的 trace 走了手写模板也要被拒绝。
+
+    校验原先只扫 op_*_GEMM.pim_trace，注意力那一组（ROPE、MASK、SOFTMAX、
+    GEMV）退回模板时照样通过，算子编译器的分块进不了代价链。
+    """
+    import json
+    import struct
+
+    from scripts.run_full_pipeline import StepFailed, verify_trace_provenance
+
+    traces = tmp_path / "pim_traces"
+    traces.mkdir()
+    meta = {"op_id": 7, "op_type": "ROPE",
+            "compile_signature": {"trace_source": "template"}}
+    # 与 genesim `save_trace_file` 同一布局：PIMT + version(4) + 指令条数(8)
+    # + 元数据长度(4)。简化头会在「头部损坏」分支被拒，测不到来源校验。
+    body = json.dumps(meta).encode()
+    header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
+        + struct.pack("<I", len(body))
+    (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+
+    with pytest.raises(StepFailed, match="ROPE"):
+        verify_trace_provenance(tmp_path)
+
+
+def test_trace_metadata_rejects_a_truncated_file(tmp_path) -> None:
+    """损坏的 trace 文件要给出可读的错误，不能抛解码异常。
+
+    仿真中断时留下的半截文件没有 `{`，按字节扫描会抛 `ValueError`，
+    流水线的错误口径是 `StepFailed`。
+    """
+    from scripts.run_full_pipeline import StepFailed, _trace_metadata
+
+    traces = tmp_path / "pim_traces"
+    traces.mkdir()
+    path = traces / "op_7_ROPE.pim_trace"
+    path.write_bytes(b"PIMT" + b"\x00" * 8)
+    with pytest.raises(StepFailed, match="op_7_ROPE"):
+        _trace_metadata(path)
+
+
+def test_trace_metadata_rejects_a_header_whose_length_overruns(tmp_path) -> None:
+    """头部是 PIMT 但元数据长度超出文件时要报错，不能退回扫描。
+
+    长度字段与文件实际大小矛盾说明头部损坏。文件后面碰巧有一段 JSON 时，
+    按字节扫描会把它当成元数据返回，损坏被静默放过。
+    """
+    import json
+    import struct
+
+    from scripts.run_full_pipeline import StepFailed, _trace_metadata
+
+    traces = tmp_path / "pim_traces"
+    traces.mkdir()
+    path = traces / "op_7_ROPE.pim_trace"
+    body = json.dumps({"op_id": 7}).encode()
+    header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
+        + struct.pack("<I", len(body) + 100)
+    path.write_bytes(header + body)
+    with pytest.raises(StepFailed, match="op_7_ROPE"):
+        _trace_metadata(path)
+
+
+def test_trace_metadata_survives_a_header_byte_of_0x7b(tmp_path) -> None:
+    """头部字节恰好是 `{` 时，元数据解析不能错位。
+
+    trace 头是 `PIMT` + version(4) + 指令条数(8) + 元数据长度(4)。解析按
+    "找第一个 `{`" 定位时，这 12 个字节里任意一个等于 0x7B 就会落到 JSON
+    之前，`verify_trace_provenance` 直接抛解码错误。
+    """
+    import json
+    import struct
+
+    from scripts.run_full_pipeline import verify_trace_provenance
+
+    traces = tmp_path / "pim_traces"
+    traces.mkdir()
+    meta = {"op_id": 7, "op_type": "ROPE",
+            "compile_signature": {"trace_source": "pimir"}}
+    body = json.dumps(meta).encode()
+    # 指令条数取 0x7B，落在 8 字节小端计数的最低字节上。
+    header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0x7B) \
+        + struct.pack("<I", len(body))
+    (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+
+    verify_trace_provenance(tmp_path)
+
+
+def test_simulation_step_rejects_a_stale_sidecar(tmp_path, monkeypatch) -> None:
+    """仿真步骤要拒绝与磁盘产物对不上的 sidecar，不能只在主流程里才查。
+
+    sidecar 记的是绝对路径。缓存被重建过、而 sidecar 还是旧的时，路径还在、
+    内容已经变了，`pimir_sha256` 与磁盘对不上。只查 trace 来源发现不了这个：
+    仿真照样跑完，代价链吃的却不是当前的算子编译产物。
+    """
+    import json
+
+    import scripts.run_full_pipeline as pipeline
+    from scripts.run_full_pipeline import StepFailed
+
+    pimir = tmp_path / "cache.pimir.mlir"
+    pimir.write_text("module {}\n")
+    sidecar = tmp_path / "models" / "llama2_7b_placement.json"
+    sidecar.parent.mkdir()
+    sidecar.write_text(json.dumps({
+        "operators": {"4": {
+            "op_type": "GEMM",
+            "pimir_path": str(pimir),
+            "pimir_sha256": "0" * 64,
+        }},
+    }))
+    config = tmp_path / "conf" / "conf.yaml"
+    config.parent.mkdir()
+    config.write_text(
+        "scheduler:\n  compiler_placement_file: models/llama2_7b_placement.json\n")
+
+    monkeypatch.setattr(pipeline, "_genesim_sim_command", lambda *a, **k: ["true"])
+    monkeypatch.setattr(pipeline, "_run", lambda *a, **k: None)
+    summary = tmp_path / "results" / "summary.json"
+    summary.parent.mkdir()
+    summary.write_text(json.dumps({"total_time_s": 1.0, "throughput_tokens_per_s": 1.0}))
+
+    with pytest.raises(StepFailed, match="pimir_sha256"):
+        pipeline.step_e_simulate(
+            tmp_path, "conf.yaml", tmp_path / "logs", label="pytest")
+
+
+def test_simulation_step_rejects_a_template_trace(tmp_path, monkeypatch) -> None:
+    """仿真步骤本身要拒绝模板 trace，不能只在流水线主流程里才查。
+
+    `verify_trace_provenance` 原先只挂在 `run_full_pipeline.py` 的主流程上，
+    慢速仿真测试走 `step_e_simulate`，绕开了它。于是整批 trace 退回手写模板
+    时，这条测试照样是绿的。
+    """
+    import json
+    import struct
+
+    import scripts.run_full_pipeline as pipeline
+    from scripts.run_full_pipeline import StepFailed
+
+    traces = tmp_path / "pim_traces"
+    meta = {"op_id": 7, "op_type": "ROPE",
+            "compile_signature": {"trace_source": "template"}}
+    body = json.dumps(meta).encode()
+    header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
+        + struct.pack("<I", len(body))
+
+    def fake_run(cmd, *, cwd, log_path) -> None:
+        # 仿真步骤开头会清掉 pim_traces，模板产物得在仿真运行期间才出现。
+        traces.mkdir()
+        (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+
+    monkeypatch.setattr(pipeline, "_genesim_sim_command", lambda *a, **k: ["true"])
+    monkeypatch.setattr(pipeline, "_run", fake_run)
+    summary = tmp_path / "results" / "summary.json"
+    summary.parent.mkdir()
+    summary.write_text(json.dumps({"total_time_s": 1.0, "throughput_tokens_per_s": 1.0}))
+
+    with pytest.raises(StepFailed, match="ROPE"):
+        pipeline.step_e_simulate(
+            tmp_path, "conf.yaml", tmp_path / "logs", label="pytest")
 
 
 def test_the_no_consumer_sidecar_fields_are_registered() -> None:

@@ -24,11 +24,11 @@ from contracts.op_semantics import (
     role_to_gml,
 )
 
-# 改动前 _OPLEVEL_OPS 的字面量（driver.py:83）。
+# 重构前 _OPLEVEL_OPS 的字面量（driver.py:83），加上本轮新增的 reduce。
 OLD_OPLEVEL_OPS = frozenset({
     "softmax", "dynamic_quant", "gather", "rope", "matmul", "normalize",
     "mask", "transpose", "reshape", "concat", "convert", "lut", "eltwise",
-    "kv_cache", "split_heads",
+    "kv_cache", "split_heads", "reduce",
 })
 
 # 改动前 MNEMONICS 的字面量（op_classify.py:249），**含顺序**。

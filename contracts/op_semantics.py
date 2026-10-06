@@ -57,6 +57,11 @@ OP_SEMANTICS: tuple[OpSemantics, ...] = (
                 note="折进 contraction 的激活，GML 用 Lut 加 activation_op_type"),
     OpSemantics("eltwise", None, has_kernel=True, is_mnemonic=True,
                 note="加/减/乘/除共用一个内核入口，GML 名各不相同，见下面四条目"),
+    # reduce 有内核入口但不进助记符统计：llama 图里它只出现在 RMSNorm 链里，
+    # GML 侧折进 RMSNorm_vpu，不单发节点，与 convert 同一口径。
+    OpSemantics("reduce", None, has_kernel=True, is_mnemonic=False,
+                aten_targets=("mean.dim",),
+                note="沿一轴求和再除以轴长；llama 图里只出现在 RMSNorm 链里"),
     OpSemantics("dynamic_quant", "DynamicScaling", has_kernel=True,
                 is_mnemonic=True,
                 note="由 quant_pass 插入，aten 图里没有"),

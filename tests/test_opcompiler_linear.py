@@ -249,7 +249,7 @@ def test_compiled_linear_real_llama_shape_with_tight_wram_triggers_tile_rewrite(
     )
 
 
-def test_compiled_linear_falls_back_for_non_power_of_two_shapes() -> None:
+def test_compiled_linear_handles_non_power_of_two_n() -> None:
     """验证非二次幂形状使用 NumPy 线性内核。"""
     rng = np.random.default_rng(2)
     M, K, N = 2, 16, 11  # N=11 不是 2 的幂
@@ -266,30 +266,35 @@ def test_compiled_linear_falls_back_for_non_power_of_two_shapes() -> None:
     np.testing.assert_allclose(result, ref, atol=1e-4)
 
 
-def test_pick_blocks_returns_power_of_two_below_default() -> None:
-    """分块必须自己是 2 的幂，而不只是能整除。
+def test_clamp_block_takes_the_largest_power_of_two_below_full() -> None:
+    """分块取不超过维度和上限的最大 2 的幂，不再要求整除维度。
 
-    `_pick` 原先用 `min(want, full)` 起步：`full` 比 `want` 小且不是 2 的幂时
-    （如 176），`full % full == 0` 让折半循环一次都不走，返回的 176 直接触发
-    Triton 的 "arange's range must be a power of 2"。
+    维度本身不超过上限且是 2 的幂时直接取整维。不是 2 的幂时向下取到 2 的幂：
+    176 取 128、344 取 256。超过上限（默认 512）的一律取 512。余下的部分由
+    尾块掩码处理，所以不需要整除，也不需要为「最大 2 的幂因子小于下界」报错。
     """
-    from opcompiler_bridge.kernel_src import DEFAULT_BLOCK_N, _pick, pick_blocks
+    from opcompiler_bridge.kernel_src import (
+        DEFAULT_BLOCK_N, _clamp_block, pick_blocks)
 
-    for full in (176, 688, 1376, 2752, 5504, 11008, 2048, 4096, 64):
-        block = _pick(full, DEFAULT_BLOCK_N, 16)
+    for full, expected in (
+        (64, 64), (176, 128), (344, 256), (512, 512),
+        (688, 512), (1376, 512), (2752, 512), (5504, 512),
+        (11008, 512), (2048, 512), (4096, 512),
+    ):
+        block = _clamp_block(full, DEFAULT_BLOCK_N)
         assert block & (block - 1) == 0, (full, block)
-        assert full % block == 0, (full, block)
-        assert block <= DEFAULT_BLOCK_N
+        assert block <= min(full, DEFAULT_BLOCK_N), (full, block)
+        assert block == expected, (full, block, expected)
 
-    # 最大 2 的幂因子小于下界时应明确报错，而不是返回一个非法分块。
-    # 344 = 2^3 × 43，最大 2 的幂因子是 8 < 16。
-    with pytest.raises(ValueError, match="2 的幂"):
-        _pick(344, DEFAULT_BLOCK_N, 16)
+    # 维度 1 也要给出合法分块，不能退化成 0。
+    assert _clamp_block(1, DEFAULT_BLOCK_N) == 1
 
     # llama2 的 MLP 本地形状：intermediate_size = 11008 = 2^8 × 43。
-    block_n, block_k = pick_blocks(4096, 5504)
-    assert 5504 % block_n == 0 and block_n & (block_n - 1) == 0
-    assert 4096 % block_k == 0 and block_k & (block_k - 1) == 0
+    # 三个维都只要求分块是 2 的幂且不超维度。
+    block_m, block_n, block_k = pick_blocks(4096, 5504, 1)
+    assert block_m == 1
+    assert block_n == 512
+    assert block_k == 32
 
 
 @pytest.mark.parametrize(
@@ -298,15 +303,16 @@ def test_pick_blocks_returns_power_of_two_below_default() -> None:
         (1, 64, 176),     # N 不是 2 的幂，且小于默认 BLOCK_N
         (1, 176, 64),     # K 不是 2 的幂
         (2, 64, 688),     # 688 = 2^4 × 43，与 llama2 的 MLP 同构
+        (1, 20, 16),      # K=20 落在 [16, 31]，BLOCK_K 取 16，K 维出尾块
     ],
 )
 def test_compiled_linear_handles_non_power_of_two_k_and_n(M, K, N) -> None:
     """K/N 不是 2 的幂时也要走真实编译产物，并与 NumPy 一致。
 
-    只有 M 需要自己是 2 的幂（`tl.arange(0, M)` 铺满 M）；K/N 是按分块遍历的，
-    约束是「存在既是 2 的幂、又能整除它的分块」。原先的守卫对三个维度一律要求
-    2 的幂，把 llama2-7b 的 MLP 整个挡在门外——intermediate_size = 11008
-    = 2^8 × 43，任何切分下都不是 2 的幂。
+    M、K、N 三个维度都按分块遍历，约束只剩「分块自己是 2 的幂」，维度不必被
+    分块整除、也不必是 2 的幂，余数由尾块掩码处理。原先的守卫对三个维度一律
+    要求 2 的幂，把 llama2-7b 的 MLP 整个挡在门外——intermediate_size
+    = 11008 = 2^8 × 43，任何切分下都不是 2 的幂。
     """
     from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
     from opcompiler_bridge.driver import compile_op, load_kernel
@@ -332,6 +338,222 @@ def test_compiled_linear_handles_non_power_of_two_k_and_n(M, K, N) -> None:
         out.ctypes.data_as(ctypes.c_void_p),
     )
     np.testing.assert_allclose(out, x @ w.T, atol=1e-4)
+
+
+def test_mlp_shapes_reach_the_compiled_kernel() -> None:
+    """1376 和 32000 这类维度必须走编译内核，不能在进编译器前被退回。
+
+    这是 llama2 的 MLP 与 lm_head 在 8 DPU 下的真实维度，原先被
+    `_compiled_linear_supports` 的 2 的幂判断挡掉。
+    """
+    from runtime.kernels import _compiled_linear_supports
+
+    cases = [
+        ([(1, 8, 4096), (1376, 4096)], "float16"),
+        ([(1, 8, 1376), (4096, 1376)], "float16"),
+        ([(1, 1, 4096), (32000, 4096)], "float16"),
+        ([(3, 32), (16, 32)], "float32"),
+    ]
+    for shapes, dtype in cases:
+        assert _compiled_linear_supports(shapes, dtype), (shapes, dtype)
+
+
+def test_arbitrary_shape_compiles() -> None:
+    """llama2 的真实投影形状都要真的编出内核，并与 numpy 对拍。
+
+    MLP 的 `intermediate_size = 1376`（本地宽度）、`down_proj` 的 K=1376、
+    `lm_head` 的 N=32000 原先被 `_compiled_linear_supports` 的 2 的幂判断
+    整个挡在编译器外面。硬件用 `DEFAULT_HARDWARE_CONFIG`（8 DPU / 16
+    tasklet）：分块装不装得进 WRAM 由 DPU 数与 tasklet 数决定，1 DPU 编得过
+    不等于 8 DPU 编得过。
+    """
+    import ctypes
+
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    from runtime.kernels import _compiled_linear_supports
+
+    hardware = DEFAULT_HARDWARE_CONFIG
+    rng = np.random.default_rng(13)
+    # N=1376 是 gate/up 的本地输出宽度，K=1376 是 down_proj 的本地输入宽度，
+    # N=32000 是 lm_head 的词表宽度。
+    cases = (
+        ("gate_proj", 4096, 1376),
+        ("down_proj", 1376, 4096),
+        ("lm_head", 4096, 32000),
+    )
+    for M in (1, 128):
+        for name, k, n in cases:
+            shapes = [(M, k), (n, k)]
+            assert _compiled_linear_supports(shapes, "float16"), (name, M)
+            result = compile_op(OpCompileRequest(
+                op="linear", arg_shapes=shapes, hardware=hardware,
+                dtype="float16",
+            ))
+            assert Path(result.so_path).is_file(), f"{name} M={M} 没有产出内核"
+            fn = load_kernel(result)
+
+            x = (rng.standard_normal((M, k)) * 0.05).astype(np.float16)
+            w = (rng.standard_normal((n, k)) * 0.05).astype(np.float16)
+            out = np.zeros((M, n), dtype=np.float16)
+            fn(
+                x.ctypes.data_as(ctypes.c_void_p),
+                w.ctypes.data_as(ctypes.c_void_p),
+                out.ctypes.data_as(ctypes.c_void_p),
+            )
+            ref = x.astype(np.float32) @ w.astype(np.float32).T
+            rel = np.abs(out.astype(np.float32) - ref).max() / max(
+                np.abs(ref).max(), 1e-6)
+            assert rel < 0.05, f"{name} M={M} 相对误差 {rel:.4e}"
+
+
+def test_odd_m_compiles() -> None:
+    """M 不是 2 的幂时也要编译通过，并与 numpy 逐元素一致。
+
+    内核原先用 `tl.arange(0, M)` 一次铺满 M，Triton 要求这个范围是 2 的幂，
+    于是 prefill 的序列长度被限制死。M 维也要能分块。
+    """
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    import ctypes
+    import dataclasses
+
+    M, K, N = 3, 32, 16
+    hardware = dataclasses.replace(DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hardware, dtype="float32",
+    ))
+    fn = load_kernel(result)
+
+    rng = np.random.default_rng(5)
+    x = (rng.standard_normal((M, K)) * 0.05).astype(np.float32)
+    w = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+    fn(
+        x.ctypes.data_as(ctypes.c_void_p),
+        w.ctypes.data_as(ctypes.c_void_p),
+        out.ctypes.data_as(ctypes.c_void_p),
+    )
+    np.testing.assert_allclose(out, x @ w.T, atol=1e-4)
+
+
+def test_cross_check_wrapper_records_the_fallback_route() -> None:
+    """对拍包装退回镜像时也要记 fallback。
+
+    端到端测试用 `_wrap_with_numpy_cross_check` 包住 `compiled_linear_kernel`，
+    而不支持的形状下包装函数直接调 `km.linear_kernel`——记录点在
+    `compiled_linear_kernel` 里，被这一绕就没了。于是「每个算子的兜底次数为 0」
+    这条判据看不见 linear 的退回。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+    from tests.test_opcompiler_e2e_llama2_7b import _wrap_with_numpy_cross_check
+
+    km.reset_route_counts()
+    wrapped, _stats = _wrap_with_numpy_cross_check(km.compiled_linear_kernel)
+
+    backend = NumpyBackend(
+        NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    m, k, n = 1, 8, 4  # K=8 小于 tl.dot 的下限 16，只能退回镜像
+    x = np.ones((m, k), dtype=np.float16)
+    w = np.ones((n, k), dtype=np.float16)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, 64, w)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "linear", "node": "n",
+                 "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, w.shape], "dtype": "float16",
+                 "out_shape": (m, n)},
+        reads=[Access(("dpu", 0), 0, x.nbytes), Access(("dpu", 0), 64, w.nbytes)],
+        writes=[Access(("dpu", 0), 128, m * n * 2)],
+        waits=[], num_tasklets=1,
+    )
+    wrapped(backend, 0, cmd)
+
+    counts = km.route_counts()
+    assert counts.get(("linear", "fallback"), 0) == 1, counts
+
+
+def test_cache_key_follows_the_compiler_fingerprint(monkeypatch) -> None:
+    """缓存键要随编译器一起失效，否则改内核或改 pass 后仍复用旧产物。
+
+    缓存原先只比对请求参数（形状、dtype、硬件……）。改了 `kernel_src.py` 的
+    内核结构或 FlagTree 的降级 pass 之后，磁盘上的 `.pimir.mlir` 与 `.so`
+    不会被判失效，仿真拿到的就不是当前代码的产物。
+    """
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge import driver
+
+    request = OpCompileRequest(
+        op="linear", arg_shapes=[(2, 32), (16, 32)],
+        hardware=DEFAULT_HARDWARE_CONFIG, dtype="float32",
+    )
+    before = driver._cache_key(request)
+    monkeypatch.setattr(driver, "_compiler_fingerprint", lambda: "另一个编译器")
+    assert driver._cache_key(request) != before, "缓存键没有跟着编译器指纹变"
+
+
+def test_compiler_fingerprint_reflects_the_kernel_source() -> None:
+    """指纹要由真实的内核源码与工具链文件算出来，且可重复。"""
+    from opcompiler_bridge.driver import _compiler_fingerprint
+
+    first = _compiler_fingerprint()
+    assert first and first == _compiler_fingerprint()
+
+
+def test_compiler_fingerprint_covers_ir_generators(monkeypatch) -> None:
+    """指纹要覆盖生成 IR 的源文件，不能只盯 kernel_src.py。
+
+    算子级（B 路）的 IR 由 `oplevel_kernel.py` 与 `oplevel_emitter.py` 生成。
+    改了它们而不改 kernel_src 时，旧产物会被静默复用，形状、类型全对、
+    数值全错。把这一项从摘要里拿掉，指纹必须因此不同。
+    """
+    from pathlib import Path
+
+    from opcompiler_bridge import driver
+
+    original = Path.read_bytes
+
+    def stripped(self):
+        if self.name in ("oplevel_kernel.py", "oplevel_emitter.py"):
+            return b""
+        return original(self)
+
+    before = driver._compiler_fingerprint()
+    monkeypatch.setattr(Path, "read_bytes", stripped)
+    assert driver._compiler_fingerprint() != before, (
+        "指纹没有覆盖 oplevel_kernel.py / oplevel_emitter.py")
+
+
+def test_compiler_fingerprint_covers_the_loaded_libtriton() -> None:
+    """指纹要覆盖进程实际加载的 `libtriton.so`，不能只盯 `triton-opt`。
+
+    降级 pass 编进两份产物：离线的 `triton-opt` 与进程内的 `libtriton.so`。
+    只盯前者时，单独重编后者不会让缓存失效，运行时会拿旧内核的产物去对拍。
+    """
+    import hashlib
+    from pathlib import Path
+
+    import triton
+
+    from opcompiler_bridge import driver
+
+    loaded = driver._loaded_libtriton()
+    assert loaded is not None and loaded.is_file(), loaded
+    assert loaded == Path(triton.__file__).parent / "_C" / "libtriton.so"
+
+    # 用同一套算法去掉 libtriton 这一项，指纹必须因此不同。
+    digest = hashlib.sha256()
+    for name in ("kernel_src.py", "oplevel_kernel.py", "oplevel_emitter.py"):
+        digest.update(Path(driver.__file__).with_name(name).read_bytes())
+    tool = driver._triton_opt()
+    if tool.is_file():
+        stat = tool.stat()
+        digest.update(f"{tool}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    assert driver._compiler_fingerprint() != digest.hexdigest()[:16], (
+        "指纹没有覆盖 libtriton.so")
 
 
 def test_compile_result_carries_pim_mlir() -> None:
@@ -460,3 +682,115 @@ def test_compiled_linear_requires_non_aliasing_output_buffer() -> None:
         "已编译内核在读写别名下竟与参考值接近——若内核已改为对别名安全，"
         "可以放宽 greedy_reuse 的判据并删除本断言"
     )
+
+
+def test_tail_block_matches_numpy() -> None:
+    """维度不被分块整除时，最后一块也要与 numpy 逐元素一致。
+
+    三个维度都取不能被分块整除的值，尾块掩码算多或算少都会在这一块上露出来。
+    """
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    import ctypes
+    import dataclasses
+
+    M, K, N = 3, 40, 20
+    hardware = dataclasses.replace(DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hardware, dtype="float32",
+    ))
+    fn = load_kernel(result)
+
+    rng = np.random.default_rng(9)
+    x = (rng.standard_normal((M, K)) * 0.05).astype(np.float32)
+    w = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
+    out = np.zeros((M, N), dtype=np.float32)
+    fn(
+        x.ctypes.data_as(ctypes.c_void_p),
+        w.ctypes.data_as(ctypes.c_void_p),
+        out.ctypes.data_as(ctypes.c_void_p),
+    )
+    np.testing.assert_allclose(out, x @ w.T, atol=1e-4)
+
+
+def test_triton_and_emitc_agree_on_the_tail_block() -> None:
+    """同一个尾块形状下，Triton 内核与 EmitC 产物必须逐元素一致。
+
+    Triton 侧用掩码（`other=0`）丢掉越界元素，EmitC 侧没有掩码机制，改成把
+    越界下标夹到最后一个合法位置。两种口径只有在越界元素**不参与累加**时
+    才等价，这条测试就是钉住这个前提。
+
+    数据里埋了陷阱：K 的尾块越界位置会夹到最后一个合法下标，于是那个元素
+    被反复读到。把它设成 100，一旦它进了累加，结果会比参考值大 8 万倍量级
+    （8 个越界位置各多算一次），任何一处口径出错都藏不住。
+    """
+    import ctypes
+    import dataclasses
+
+    import torch
+
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    from opcompiler_bridge.kernel_src import NUM_STAGES, pick_blocks
+
+    if not torch.cuda.is_available():
+        pytest.skip("Triton 原生内核需要 GPU 才能对照")
+
+    M, K, N = 3, 40, 20
+    block_m, block_n, block_k = pick_blocks(K, N, M)
+    # 三个维都要有尾块，否则这条对照退化成整除情形。
+    assert M % block_m and K % block_k and N % block_n, (block_m, block_n, block_k)
+
+    rng = np.random.default_rng(3)
+    x = (rng.standard_normal((M, K)) * 0.05).astype(np.float32)
+    w = (rng.standard_normal((N, K)) * 0.05).astype(np.float32)
+    x[:, K - 1] = 100.0
+    w[:, K - 1] = 100.0
+
+    # 一、Triton 原生内核（掩码口径）。
+    from opcompiler_bridge.kernel_src import linear_kernel
+    tx = torch.from_numpy(x).cuda()
+    tw = torch.from_numpy(w).cuda()
+    t_out = torch.zeros(M, N, device="cuda", dtype=torch.float32)
+    linear_kernel[(1,)](
+        tx, tw, t_out, M=M, K=K, N=N,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        num_stages=NUM_STAGES,
+    )
+    triton_out = t_out.cpu().numpy()
+
+    # 二、EmitC 产物（下标夹取口径）。
+    hardware = dataclasses.replace(
+        DEFAULT_HARDWARE_CONFIG, num_dpus=1, num_tasklets=1)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)],
+        hardware=hardware, dtype="float32",
+    ))
+    fn = load_kernel(result)
+    emitc_out = np.zeros((M, N), dtype=np.float32)
+    fn(
+        x.ctypes.data_as(ctypes.c_void_p),
+        w.ctypes.data_as(ctypes.c_void_p),
+        emitc_out.ctypes.data_as(ctypes.c_void_p),
+    )
+
+    ref = x @ w.T
+    np.testing.assert_allclose(triton_out, ref, atol=1e-2)
+    np.testing.assert_allclose(emitc_out, ref, atol=1e-2)
+    # 互比：两套口径的产物之间也要一致。
+    np.testing.assert_allclose(emitc_out, triton_out, atol=1e-3)
+
+
+def test_k_below_16_stays_on_the_numpy_mirror() -> None:
+    """K 小于 16 时必须退回 numpy 镜像，不能进编译。
+
+    Triton 的 tl.dot 要求 K>=16，编译器对这种形状直接抛 ValueError。
+    如果谓词仍判它"支持"，运行时就会把一次正常的小矩阵乘变成崩溃，
+    而且这次崩溃不进退回计数。
+    """
+    from runtime.kernels import _compiled_linear_supports
+
+    assert not _compiled_linear_supports([(1, 8), (4, 8)], "float16")
+    assert not _compiled_linear_supports([(2, 4), (4, 4)], "float32")
+    # 恰好 16 仍走编译。
+    assert _compiled_linear_supports([(1, 16), (4, 16)], "float16")

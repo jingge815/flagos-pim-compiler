@@ -5,7 +5,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# N 和 K 方向使用固定大小的分块。
+# 三个方向都用固定大小的分块。M 也分块，才能接受任意序列长度。
+DEFAULT_BLOCK_M = 16
 DEFAULT_BLOCK_N = 512
 DEFAULT_BLOCK_K = 32
 
@@ -21,60 +22,65 @@ def linear_kernel(
     M: tl.constexpr,
     K: tl.constexpr,
     N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """计算 `y = x @ w.T`，其中输入形状为 `(M, K)` 和 `(N, K)`。"""
-    offs_m = tl.arange(0, M)
-    for n0 in range(0, N, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        acc = tl.zeros((M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(0, K, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            x_off = offs_m[:, None] * K + offs_k[None, :]
-            w_off = offs_n[:, None] * K + offs_k[None, :]
-            x_blk = tl.load(x_ptr + x_off)
-            w_blk = tl.load(w_ptr + w_off)
-            acc = tl.dot(x_blk, tl.trans(w_blk), acc, allow_tf32=False)
-        o_off = offs_m[:, None] * N + offs_n[None, :]
-        tl.store(out_ptr + o_off, acc.to(out_ptr.dtype.element_ty))
+    """计算 `y = x @ w.T`，其中输入形状为 `(M, K)` 和 `(N, K)`。
 
-
-def _pick(full: int, want: int, floor: int) -> int:
-    """选一个能整除 `full`、不超过 `want`、不小于 `floor` 的 2 的幂分块大小。
-
-    起点必须先向下取到 2 的幂再开始折半。直接用 `min(want, full)` 起步是不对的：
-    `full` 比 `want` 小且本身不是 2 的幂时（例如 `full=176`），`full % full == 0`
-    让循环一次都不走，返回的 176 不是 2 的幂，`tl.arange(0, BLOCK_N)` 随即报
-    "arange's range must be a power of 2"。llama2 的 MLP 宽度正是这一类：
-    `intermediate_size = 11008 = 2^8 × 43`，任何切分下都不是 2 的幂。
+    三个维度都按分块遍历。最后一块可能不满，用掩码丢掉越界的元素，
+    这样维度不必被分块整除，也不必是 2 的幂。
     """
-    start = min(want, full)
-    block = 1 << (start.bit_length() - 1)   # 向下取到 2 的幂
-    while block > floor and full % block != 0:
-        block //= 2
-    if full % block != 0 or block & (block - 1):
-        raise ValueError(
-            f"找不到既是 2 的幂、又能整除 {full} 的分块大小（下界 {floor}）。"
-            f"这条链路要求各维能被 2 的幂整除；{full} 的最大 2 的幂因子小于下界。"
-        )
-    return block
+    for m0 in range(0, M, BLOCK_M):
+        offs_m = m0 + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        for n0 in range(0, N, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < N
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k0 in range(0, K, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                mask_k = offs_k < K
+                x_off = offs_m[:, None] * K + offs_k[None, :]
+                w_off = offs_n[:, None] * K + offs_k[None, :]
+                x_blk = tl.load(x_ptr + x_off, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+                w_blk = tl.load(w_ptr + w_off, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+                acc = tl.dot(x_blk, tl.trans(w_blk), acc, allow_tf32=False)
+            o_off = offs_m[:, None] * N + offs_n[None, :]
+            tl.store(out_ptr + o_off, acc.to(out_ptr.dtype.element_ty),
+                     mask=mask_m[:, None] & mask_n[None, :])
 
 
-def pick_blocks(K: int, N: int) -> tuple[int, int]:
-    """返回 `(BLOCK_N, BLOCK_K)`。`tl.dot` 要求参与的 K 维 >= 16，故 K 的下界
-    是 16；N 方向没有这个约束，但小于 16 也没意义，取同一个下界。"""
-    return _pick(N, DEFAULT_BLOCK_N, 16), _pick(K, DEFAULT_BLOCK_K, 16)
+def _clamp_block(full: int, want: int) -> int:
+    """取不超过 `want` 和 `full` 的最大 2 的幂，作为分块大小。
+
+    不再要求分块整除维度：最后一块由内核里的掩码处理。维度本身是 2 的幂
+    且不超过 `want` 时直接取整维，否则取不超过两者的最大 2 的幂。
+    """
+    if full <= want and (full & (full - 1)) == 0:
+        return full
+    block = 1 << (min(want, full).bit_length() - 1)
+    return max(block, 1)
+
+
+def pick_blocks(K: int, N: int, M: int = 1) -> tuple[int, int, int]:
+    """返回 `(BLOCK_M, BLOCK_N, BLOCK_K)`。"""
+    return (
+        _clamp_block(M, DEFAULT_BLOCK_M),
+        _clamp_block(N, DEFAULT_BLOCK_N),
+        _clamp_block(K, DEFAULT_BLOCK_K),
+    )
 
 
 def make_kernel_launcher(M: int, K: int, N: int):
     """返回固定 M、K、N 的 Triton 内核启动函数。"""
-    block_n, block_k = pick_blocks(K, N)
+    block_m, block_n, block_k = pick_blocks(K, N, M)
 
     def launch(x, w, out):
         return linear_kernel[(1,)](
             x, w, out, M=M, K=K, N=N,
-            BLOCK_N=block_n, BLOCK_K=block_k, num_stages=NUM_STAGES,
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            num_stages=NUM_STAGES,
         )
 
     return launch

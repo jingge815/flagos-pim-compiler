@@ -44,12 +44,18 @@ def _strategies():
 
 
 def _representative_strategies():
-    """返回用于真实模型验证的代表策略。"""
-    return [strategy for strategy in _strategies() if strategy.name == "tp4_pp2"]
+    """返回用于真实模型验证的代表策略：纯张量、混合、纯流水各一种。
+
+    `tp8_pp1` 的本地宽度不是 2 的幂（1376），`tp2_pp4` 带流水段，
+    `tp1_pp8` 是不切分的纯流水。`tp4_pp2` 与 `tp2_pp4` 同属混合，不重复跑。
+    """
+    keep = {"tp8_pp1", "tp2_pp4", "tp1_pp8"}
+    return [strategy for strategy in _strategies() if strategy.name in keep]
 
 
-def test_real_7b_suite_keeps_tp4_pp2_as_representative_strategy() -> None:
-    assert [strategy.name for strategy in _representative_strategies()] == ["tp4_pp2"]
+def test_real_7b_suite_keeps_three_representative_strategies() -> None:
+    assert [strategy.name for strategy in _representative_strategies()] == [
+        "tp8_pp1", "tp2_pp4", "tp1_pp8"]
 
 
 @pytest.fixture(scope="module")

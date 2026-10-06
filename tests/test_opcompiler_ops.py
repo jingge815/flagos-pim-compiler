@@ -609,6 +609,24 @@ def test_kv_cache_range_write_starts_at_pos() -> None:
     assert not at2[:8].any() and not at2[12:].any(), "写到了别处"
 
 
+def test_split_heads_with_outer_dimension_matches_numpy() -> None:
+    """拆分轴前面还有维度时，每一份都要与镜像一致。
+
+    降级侧写回下标只用了内层循环变量，外层每转一圈就把同一段重写一次，
+    于是只有最后一块外层的数据留下来。outer=1 的用例盖不住这个错。
+    """
+    fn, _ = _compile_shapes("split_heads", [[2, 6, 8]], dtype="float16",
+                            group_size=3)
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((2, 6, 8)).astype(np.float16)
+    pieces = [np.zeros((2, 2, 8), dtype=np.float16) for _ in range(3)]
+    fn(x.ctypes.data_as(ctypes.c_void_p),
+       *[p.ctypes.data_as(ctypes.c_void_p) for p in pieces])
+    ref = np.split(x, 3, axis=1)
+    for got, want in zip(pieces, ref):
+        assert np.array_equal(got, want), "外层维度的拆分结果与镜像不一致"
+
+
 def test_split_heads_kernel_matches_numpy() -> None:
     """按头拆开：每个头一个输出指针，值与镜像一致。"""
     fn, result = _compile_shapes("split_heads", [[1, 4, 8]], dtype="float16",
@@ -869,3 +887,504 @@ def test_unknown_op_name_is_refused_with_a_readable_error() -> None:
     )
     with pytest.raises(NotImplementedError, match="没有 'no_such_op' 的编译路径"):
         compile_op(request)
+
+
+def test_eltwise_broadcast_reaches_the_compiled_kernel(monkeypatch) -> None:
+    """形状不同但可广播的逐元素运算也要走编译内核。
+
+    `pim.eltwise` 只接受同形输入，广播要在进编译前展开成同形，
+    不能因为形状不同就退回 numpy。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    seen = []
+    real = km._compiled_eltwise
+
+    def spy(kind, shape, *, dtype="float16", ctx=None):
+        seen.append(shape)
+        return real(kind, shape, dtype=dtype, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_eltwise", spy)
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = np.ones((2, 4), dtype=np.float16)
+    y = np.full((4,), 2, dtype=np.float16)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, 64, y)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "add", "node": "n", "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, y.shape], "dtype": "float16",
+                 "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes), Access(("dpu", 0), 64, y.nbytes)],
+        writes=[Access(("dpu", 0), 128, x.nbytes)], waits=[], num_tasklets=1,
+    )
+    km.add_kernel(backend, 0, cmd)
+    assert seen, "广播形状没有进入编译，退回了 numpy"
+
+
+def test_eltwise_broadcast_works_when_the_first_operand_is_smaller(monkeypatch) -> None:
+    """第一个操作数比第二个小时也要广播进编译，不能退回 numpy。
+
+    广播是两边的事：x 是 (4,)、y 是 (2, 4) 时，公共形状是 (2, 4)，
+    两边都要展开成这个形状再进编译。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    seen = []
+    real = km._compiled_eltwise
+
+    def spy(kind, shape, *, dtype="float16", ctx=None):
+        seen.append(shape)
+        return real(kind, shape, dtype=dtype, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_eltwise", spy)
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = np.ones((4,), dtype=np.float16)
+    y = np.full((2, 4), 2, dtype=np.float16)
+    out_shape = (2, 4)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, 64, y)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "add", "node": "n", "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, y.shape], "dtype": "float16",
+                 "out_shape": out_shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes), Access(("dpu", 0), 64, y.nbytes)],
+        writes=[Access(("dpu", 0), 256, int(np.prod(out_shape)) * 2)],
+        waits=[], num_tasklets=1,
+    )
+    km.add_kernel(backend, 0, cmd)
+    assert seen == [out_shape], seen
+    got = backend.read_local(0, 256, out_shape, np.float16)
+    np.testing.assert_array_equal(got, np.full(out_shape, 3, dtype=np.float16))
+
+
+def test_eltwise_kernel_is_compiled_with_the_command_hardware(monkeypatch) -> None:
+    """逐元素内核必须按命令上的硬件配置编译。
+
+    prefill 的命令是 4 个 tasklet、`dma_align=64`。丢掉命令上下文会落到
+    默认的 16 个 tasklet、`dma_align=8`，编出来的分块与运行时的硬件对不上。
+    """
+    import dataclasses
+
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
+
+    seen = []
+    real = km._compiled_eltwise
+
+    def spy(kind, shape, *, dtype="float16", ctx=None):
+        seen.append(ctx)
+        return real(kind, shape, dtype=dtype, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_eltwise", spy)
+
+    hardware = dataclasses.replace(
+        DEFAULT_HARDWARE_CONFIG, num_tasklets=4, dma_align=64,
+        mram_bytes_per_dpu=4 * 2**30,
+    )
+    backend = NumpyBackend(
+        NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=hardware.mram_bytes_per_dpu)
+    )
+    x = np.ones((16, 128), dtype=np.float16)
+    y = np.full((16, 128), 2, dtype=np.float16)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, x.nbytes, y)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "add", "node": "n", "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, y.shape], "dtype": "float16",
+                 "out_shape": x.shape, "hardware": hardware.to_payload()},
+        reads=[Access(("dpu", 0), 0, x.nbytes),
+               Access(("dpu", 0), x.nbytes, y.nbytes)],
+        writes=[Access(("dpu", 0), 2 * x.nbytes, x.nbytes)],
+        waits=[], num_tasklets=hardware.num_tasklets,
+    )
+    km.add_kernel(backend, 0, cmd)
+    assert seen and seen[0] is not None, "编译没有带上命令的硬件上下文"
+    assert seen[0].hardware == hardware
+
+
+def test_slice_of_a_contiguous_half_compiles() -> None:
+    """按轴切出连续的一段要走编译内核，不能记成退回。
+
+    RoPE 的 rotate_half 把 128 维对半切开再拼接。`pim.reshape` 只改形状、
+    不丢元素，切不开；但切出来的每段都是原缓冲里的连续区间，用编译好的
+    `concat` 把这段复制出来，数值与 numpy 切片一致，也不再计入 fallback。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    km.reset_route_counts()
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = np.arange(2 * 4 * 8, dtype=np.float16).reshape(1, 2, 4, 8)
+    backend.write_local(0, 0, x)
+    out_shape = (1, 2, 4, 4)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "slice", "node": "n",
+                 "arg_kinds": ["tensor", 3, 4, 8],
+                 "arg_shapes": [x.shape, None, None, None],
+                 "arg_dtypes": ["float16", None, None, None],
+                 "dtype": "float16", "out_shape": out_shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes)],
+        writes=[Access(("dpu", 0), x.nbytes, int(np.prod(out_shape)) * 2)],
+        waits=[], num_tasklets=1,
+    )
+    km.slice_kernel(backend, 0, cmd)
+    got = backend.read_local(0, x.nbytes, out_shape, np.float16)
+    np.testing.assert_array_equal(got, x[..., 4:8])
+    counts = km.route_counts()
+    assert counts.get(("slice", "fallback"), 0) == 0, counts
+
+
+def test_neg_compiles_as_subtraction_from_zero() -> None:
+    """取负要走编译内核，不能记成退回。
+
+    `pim.eltwise` 没有取负这个种类，但 `0 - x` 就是取负，减法在覆盖范围内。
+    RoPE 的 rotate_half 对每一层的后半段都做一次取负，记成 fallback 会让
+    「退回次数为 0」在三条策略上全部失败。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    km.reset_route_counts()
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = np.array([[1.5, -2.0, 0.0, 4.0]], dtype=np.float16)
+    backend.write_local(0, 0, x)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "neg", "node": "n", "arg_kinds": ["tensor"],
+                 "arg_shapes": [x.shape], "arg_dtypes": ["float16"],
+                 "dtype": "float16", "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes)],
+        writes=[Access(("dpu", 0), x.nbytes * 2, x.nbytes)],
+        waits=[], num_tasklets=1,
+    )
+    km.neg_kernel(backend, 0, cmd)
+    got = backend.read_local(0, x.nbytes * 2, x.shape, np.float16)
+    np.testing.assert_array_equal(got, -x)
+    counts = km.route_counts()
+    assert counts.get(("neg", "fallback"), 0) == 0, counts
+    assert counts.get(("eltwise", "hit"), 0) >= 1, counts
+
+
+def test_fp32_eltwise_reaches_the_compiled_kernel(monkeypatch) -> None:
+    """fp32 的逐元素运算也要走编译内核，包括第二个操作数是标量的情形。
+
+    RMSNorm 链的两个算子都在 fp32 域：`add(mean, 1e-5)` 的第二个参数是
+    Python 标量，`mul(x, rsqrt)` 两边都是 fp32 张量。原先的类型检查只收
+    fp16，这两个算子整条退回主机——端到端的「兜底次数为 0」就是被它们
+    挡住的。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    seen = []
+    real = km._compiled_eltwise
+
+    def spy(kind, shape, *, dtype="float16", ctx=None):
+        seen.append((kind, shape, dtype))
+        return real(kind, shape, dtype=dtype, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_eltwise", spy)
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = np.full((2, 4), 2.0, dtype=np.float32)
+
+    # 一、标量第二参数（RMSNorm 的 eps 加法）。
+    backend.write_local(0, 0, x)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "add", "node": "n", "arg_kinds": ["tensor", 1e-5],
+                 "arg_shapes": [x.shape, None], "dtype": "float32",
+                 "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes)],
+        writes=[Access(("dpu", 0), 128, x.nbytes)], waits=[], num_tasklets=1,
+    )
+    km.add_kernel(backend, 0, cmd)
+    assert seen and seen[-1] == ("add", (2, 4), "float32"), seen
+
+    # 二、两边都是 fp32 张量。
+    seen.clear()
+    y = np.full((2, 4), 4.0, dtype=np.float32)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, 128, y)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "mul", "node": "n",
+                 "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, y.shape], "dtype": "float32",
+                 "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes), Access(("dpu", 0), 128, y.nbytes)],
+        writes=[Access(("dpu", 0), 256, x.nbytes)], waits=[], num_tasklets=1,
+    )
+    km.mul_kernel(backend, 0, cmd)
+    assert seen and seen[-1] == ("mul", (2, 4), "float32"), seen
+    got = backend.read_local(0, 256, x.shape, np.float32)
+    np.testing.assert_array_equal(got, x * y)
+
+
+def test_mixed_dtype_eltwise_computes_at_the_output_dtype(monkeypatch) -> None:
+    """两侧 dtype 不同时按输出契约的类型计算，不能降到第一槽的精度。
+
+    x 是 fp16、y 是 fp32、输出契约是 fp32 时，加法要在 fp32 上完成并与
+    numpy 镜像逐元素一致。按第一槽的 fp16 算会丢掉 y 的尾数，镜像对不上。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    seen = []
+    real = km._compiled_eltwise
+
+    def spy(kind, shape, *, dtype="float16", ctx=None):
+        seen.append(dtype)
+        return real(kind, shape, dtype=dtype, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_eltwise", spy)
+
+    rng = np.random.default_rng(1)
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    x = (rng.standard_normal((2, 4)) * 0.5).astype(np.float16)
+    y = (rng.standard_normal((2, 4)) * 0.5 + 1.0).astype(np.float32)
+    backend.write_local(0, 0, x)
+    backend.write_local(0, 64, y)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "add", "node": "n", "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [x.shape, y.shape],
+                 "arg_dtypes": ["float16", "float32"],
+                 "dtype": "float32", "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes), Access(("dpu", 0), 64, y.nbytes)],
+        writes=[Access(("dpu", 0), 128, x.size * 4)], waits=[], num_tasklets=1,
+    )
+    km.add_kernel(backend, 0, cmd)
+
+    assert seen == ["float32"], seen
+    got = backend.read_local(0, 128, x.shape, np.float32)
+    ref = x.astype(np.float32) + y
+    np.testing.assert_array_equal(got, ref)
+
+
+def test_bmm_reaches_the_compiled_kernel(monkeypatch) -> None:
+    """三维 bmm 要逐批次走二维编译内核，不能整批退回 numpy。"""
+    import runtime.kernels as km
+
+    seen = []
+    real = km._compiled_matmul
+
+    def spy(a, b, *, ctx=None):
+        seen.append((a.shape, b.shape))
+        return real(a, b, ctx=ctx)
+
+    monkeypatch.setattr(km, "_compiled_matmul", spy)
+    rng = np.random.default_rng(4)
+    a = rng.standard_normal((2, 4, 8)).astype(np.float16)
+    b = rng.standard_normal((2, 8, 4)).astype(np.float16)
+    km.matmul(a, b)
+    assert seen, "bmm 没有进入编译"
+    assert all(len(s) == 2 for pair in seen for s in pair), seen
+
+
+def test_convert_int32_to_float32_compiles() -> None:
+    """int32 到 fp32 的转换也要走编译内核，不再退回 numpy。"""
+    from runtime.kernels import _compiled_convert
+
+    assert _compiled_convert((4,), "int32", "float32") is not None
+
+
+def test_convert_int32_matches_numpy() -> None:
+    """int32 到 fp32 要编得出内核，并且与 numpy 逐元素一致。
+
+    类型表原先只有 fp16、fp32、int8，int32 在发算子前就被拒掉，
+    运行时只能退回主机的 astype。
+    """
+    request = OpCompileRequest(
+        op="convert", arg_shapes=[(4,)], hardware=_HARDWARE,
+        dtype="int32", out_dtype="float32",
+    )
+    result = compile_op(request, force=True)
+    fn = load_kernel(result)
+    src = np.array([1, -2, 3, -4], dtype=np.int32)
+    got = _call(fn, src, out_shape=(4,), out_dtype=np.float32)
+    assert np.array_equal(got, src.astype(np.float32)), got
+
+
+def test_convert_int64_to_float32_compiles() -> None:
+    """位置索引的 int64 -> fp32 也要走编译内核，不再退回主机。
+
+    attention 掩码的坐标是 int64，类型表里原先没有它，每个 decode step
+    都有一批退回。坐标值域远小于 2^31，f32 存得下。
+    """
+    from runtime.kernels import _compiled_convert
+
+    assert _compiled_convert((1, 1, 6), "int64", "float32") is not None
+
+
+def test_fp16_square_stays_finite() -> None:
+    """fp16 上的平方也要保持有限。
+
+    RMSNorm 先平方再求均值。隐藏状态到几百时，单个平方就超过 fp16 上限
+    65504。平方要在 fp32 上做完再按输出类型存。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    x = np.full((2, 4), 300.0, dtype=np.float16)
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    # 输出按 fp32 落盘，占输入的两倍字节，写区要错开输入区。
+    backend.write_local(0, 0, x)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "pow", "node": "n",
+                 "arg_kinds": ["tensor", 2.0],
+                 "arg_shapes": [x.shape, None],
+                 "arg_dtypes": ["float16", None],
+                 "dtype": "float32", "out_shape": x.shape},
+        reads=[Access(("dpu", 0), 0, x.nbytes)],
+        writes=[Access(("dpu", 0), x.nbytes * 2, x.nbytes * 2)],
+        waits=[], num_tasklets=1,
+    )
+    km.pow_kernel(backend, 0, cmd)
+    got = backend.read_local(0, x.nbytes * 2, x.shape, np.float32)
+    assert np.isfinite(got).all(), got
+    np.testing.assert_allclose(got, np.full(x.shape, 90000.0), rtol=1e-4)
+
+
+def test_fp16_wide_sum_stays_finite() -> None:
+    """fp16 输入的宽行求和也要保持有限。
+
+    RMSNorm 的平方在 fp16 上做时，单个元素放得进 fp16，但 4096 个的和
+    超过 fp16 上限。求和必须在 fp32 上做完再按输出类型存，不能按输入类型
+    把中间和收成 fp16。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    rng = np.random.default_rng(6)
+    width = 4096
+    squares = rng.uniform(20000.0, 40000.0, size=(1, 2, width)).astype(np.float16)
+    assert squares.astype(np.float32).sum() > np.finfo(np.float16).max
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 24))
+    backend.write_local(0, 0, squares)
+    out_shape = (1, 2, 1)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "mean", "node": "n",
+                 "arg_kinds": ["tensor", [-1], True],
+                 "arg_shapes": [squares.shape, None, None],
+                 "arg_dtypes": ["float16", None, None],
+                 "dtype": "float16", "out_shape": out_shape},
+        reads=[Access(("dpu", 0), 0, squares.nbytes)],
+        writes=[Access(("dpu", 0), squares.nbytes, int(np.prod(out_shape)) * 2)],
+        waits=[], num_tasklets=1,
+    )
+    km.mean_dim_kernel(backend, 0, cmd)
+    got = backend.read_local(0, squares.nbytes, out_shape, np.float16)
+    ref = squares.astype(np.float32).mean(axis=-1, keepdims=True)
+    assert np.isfinite(got).all(), got
+    np.testing.assert_allclose(got, ref, rtol=1e-2, atol=1.0)
+
+
+def test_mean_of_wide_squares_stays_finite() -> None:
+    """4096 宽的平方和不能在 fp16 里累加。
+
+    RMSNorm 先逐元素平方再沿最后一维求均值。隐藏状态到几百时，4096 个
+    平方的和超过 fp16 上限（65504），收成 fp16 就变成 inf，后面的 rsqrt
+    得到 0，这一行的归一化整体归零。求和要在 fp32 上做完再存。
+    """
+    import runtime.kernels as km
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.exec_plan import Access, Command
+
+    rng = np.random.default_rng(4)
+    width = 4096
+    x = (rng.standard_normal((1, 6, width)) * 30).astype(np.float32)
+    squares = np.ascontiguousarray(x * x, dtype=np.float32)
+    assert squares.sum() > np.finfo(np.float16).max
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 24))
+    backend.write_local(0, 0, squares)
+    out_shape = (1, 6, 1)
+    cmd = Command(
+        id=0, op="launch", dpu_id=0,
+        payload={"kernel": "mean", "node": "n",
+                 "arg_kinds": ["tensor", [-1], True],
+                 "arg_shapes": [squares.shape, None, None],
+                 "arg_dtypes": ["float32", None, None],
+                 "dtype": "float32", "out_shape": out_shape},
+        reads=[Access(("dpu", 0), 0, squares.nbytes)],
+        writes=[Access(("dpu", 0), squares.nbytes, int(np.prod(out_shape)) * 4)],
+        waits=[], num_tasklets=1,
+    )
+    km.mean_dim_kernel(backend, 0, cmd)
+    got = backend.read_local(0, squares.nbytes, out_shape, np.float32)
+    ref = squares.mean(axis=-1, keepdims=True)
+    assert np.isfinite(got).all(), got
+    np.testing.assert_allclose(got, ref, rtol=1e-3, atol=1e-3)
+
+
+def test_reduce_mean_matches_numpy() -> None:
+    """沿末轴求均值要与 numpy 逐元素一致。"""
+    request = OpCompileRequest(
+        op="reduce", arg_shapes=[(4, 16)], hardware=_HARDWARE,
+        dtype="float16", group_size=1,
+    )
+    result = compile_op(request, force=True)
+    fn = load_kernel(result)
+    rng = np.random.default_rng(3)
+    src = (rng.standard_normal((4, 16)) * 0.5).astype(np.float16)
+    scale = np.array([1.0 / 16], dtype=np.float32)
+    got = _call(fn, src, scale, out_shape=(4, 1), out_dtype=np.float16)
+    ref = src.astype(np.float32).mean(axis=1, keepdims=True).astype(np.float16)
+    np.testing.assert_allclose(got, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_convert_int64_matches_numpy() -> None:
+    """int64 转 fp32 要编得出内核，并且与 numpy 逐元素一致。"""
+    request = OpCompileRequest(
+        op="convert", arg_shapes=[(4,)], hardware=_HARDWARE,
+        dtype="int64", out_dtype="float32",
+    )
+    result = compile_op(request, force=True)
+    fn = load_kernel(result)
+    src = np.array([1, -2, 3, -4], dtype=np.int64)
+    got = _call(fn, src, out_shape=(4,), out_dtype=np.float32)
+    assert np.array_equal(got, src.astype(np.float32)), got
+
+
+def test_fallback_is_recorded(monkeypatch) -> None:
+    """拿掉 PIM pass 时退回要被记下来，否则退回是静默的。"""
+    import runtime.kernels as km
+    from opcompiler_bridge.driver import ToolchainUnavailable
+
+    km.reset_route_counts()
+
+    def refuse(request, **kw):
+        raise ToolchainUnavailable("测试桩")
+
+    monkeypatch.setattr("opcompiler_bridge.driver.compile_op", refuse)
+    km._COMPILED_KERNEL_CACHE.clear()
+    try:
+        km.softmax(np.zeros((2, 8), dtype=np.float16))
+    finally:
+        km._COMPILED_KERNEL_CACHE.clear()
+
+    counts = km.route_counts()
+    assert counts.get(("softmax", "fallback"), 0) >= 1, counts
+    assert counts.get(("softmax", "hit"), 0) == 0, counts

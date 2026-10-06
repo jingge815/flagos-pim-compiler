@@ -84,8 +84,9 @@ def _measure_kernel_tile_n(
     from opcompiler_bridge.driver import compile_op
 
     hw = DEFAULT_HARDWARE_CONFIG if hardware is None else hardware
-    # M=1 是 decode 口径：算子编译器这条链只支持 M 方向不分块，而分块的搜索只由
-    # K/N 和 WRAM 预算决定，与 M 无关。
+    # M=1 是 decode 口径。这条链现在三个维度都能分块，但代价模型只需要一条
+    # 代表性的编译产物：分块搜索由 WRAM 预算决定，M=1 给出的 K/N 分块与
+    # prefill 的 M 取值无关。
     request = OpCompileRequest(
         op="linear",
         arg_shapes=[(1, local_in), (local_out, local_in)],
@@ -211,6 +212,30 @@ from genesim_bridge.op_classify import MNEMONIC_OF
 _BPATH_MNEMONIC = {op: mn for op, mn in MNEMONIC_OF.items() if op != "GEMM"}
 
 
+def _pin_unsharded_ops(ir, sidecar, strategy) -> None:
+    """给不做张量并行的算子写上 `dpu_id`。
+
+    GeneSim 的钉死只认 `shards` 或顶层 `dpu_id`。GEMM 有 `shards`，其余算子
+    条目是空列表，一个都钉不住，贪心把它们分到 GPU。这些算子落在所在层的
+    流水段上，段内不切分，所以钉到该段的第一台 DPU。
+    """
+    if strategy is None:
+        return
+    num_layers = ir["num_layers"]
+    op_layer = {
+        op_id: layer
+        for layer, group in enumerate(ir["subgraphs"])
+        for op_id in group
+    }
+    for raw_op_id, entry in sidecar["operators"].items():
+        if entry.get("shards") or "dpu_id" in entry:
+            continue
+        layer = op_layer.get(int(raw_op_id))
+        if layer is None:
+            continue
+        entry["dpu_id"] = int(strategy.dpus_of_layer(layer, num_layers)[0])
+
+
 def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
     """给每个算子级节点编一份 B 路 pimir 并写进 sidecar。
 
@@ -323,6 +348,7 @@ def export_placement_to_genesim(
     hardware: "PIMHardwareConfig | None" = None,
     measure_kernel_tiles: bool = False,
     dpu_to_cluster: tuple[tuple[int, int], ...] | None = None,
+    strategy: "ShardStrategy | None" = None,
 ) -> Dict[str, Any]:
     """更新 GEMM 的设备提示并输出 IR 文件和代表 DPU 编号。
 
@@ -464,6 +490,9 @@ def export_placement_to_genesim(
     # GeneSim 的 trace 编译。之前只有 GEMM 写，相位链那一支在生产里没人喂。
     if measure_kernel_tiles:
         _attach_bpath_pimir(operators_by_id, sidecar)
+
+    # 放在 B 路回填之后：非 GEMM 的条目是那里新建的，之前还没有可钉的对象。
+    _pin_unsharded_ops(ir, sidecar, strategy)
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))

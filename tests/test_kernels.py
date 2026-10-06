@@ -223,7 +223,7 @@ def test_same_shape_eltwise_uses_the_compiled_kernel() -> None:
 
     seen = {}
 
-    def fake_compile(kind, shape):
+    def fake_compile(kind, shape, *, dtype="float16", ctx=None):
         seen["called"] = (kind, shape)
 
         def fn(a, b, out):
@@ -235,7 +235,9 @@ def test_same_shape_eltwise_uses_the_compiled_kernel() -> None:
         return fn
 
     hal = mock.Mock()
-    cmd = mock.Mock()
+    # 命令的 payload 要给出 out_shape：逐元素内核拿它核对广播后的公共形状，
+    # 契约不满足就直接抛，不做兜底。
+    cmd = mock.Mock(payload={"out_shape": (2, 4), "dtype": "float16"})
     x = np.ones((2, 4), dtype=np.float16)
     y = np.ones((2, 4), dtype=np.float16)
     with mock.patch("runtime.kernels._read_tensor_args", return_value=[x, y]), \

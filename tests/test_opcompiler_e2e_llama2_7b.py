@@ -58,7 +58,11 @@ pytestmark = [
 
 
 def _strategies():
-    """返回要验证编译产物的三种策略：纯张量、混合、纯流水。"""
+    """返回要验证编译产物的三种策略：纯张量、混合、纯流水。
+
+    `tp8_pp1` 覆盖非 2 的幂的本地宽度，`tp2_pp4` 覆盖带流水段的切分，
+    `tp1_pp8` 覆盖不切分的纯流水。三种都要退回次数为 0。
+    """
     return [
         llama_strategy(
             NUM_DPUS, num_stages=num_stages, num_heads=32, num_kv_heads=32,
@@ -72,9 +76,7 @@ def test_strategy_set_covers_tensor_hybrid_and_pipeline() -> None:
     """判据 0：三种策略分别落在张量、混合、流水三类上。"""
     kinds = {s.name: s.kind for s in _strategies()}
     assert kinds == {
-        "tp8_pp1": "tensor",
-        "tp2_pp4": "hybrid",
-        "tp1_pp8": "pipeline",
+        "tp8_pp1": "tensor", "tp2_pp4": "hybrid", "tp1_pp8": "pipeline",
     }
 
 
@@ -110,6 +112,9 @@ def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
         shapes = tuple(tuple(s) for s in cmd.payload["arg_shapes"])
         dtype = str(cmd.payload["dtype"])
         if not km._compiled_linear_supports(shapes, dtype):
+            # 记录点在 compiled_linear_kernel 里，这里绕过它直接调镜像，
+            # 不补记的话端到端的「兜底次数为 0」看不见 linear 的退回。
+            km.record_route("linear", "fallback")
             return km.linear_kernel(hal, dpu_id, cmd)
 
         npdt = np.dtype(dtype)
@@ -146,6 +151,7 @@ def test_compiled_linear_end_to_end_matches_hf_generate(
     import runtime.kernels as km
 
     # 包装必须在 register_all 之前完成，注册时才会取到包装后的内核。
+    km.reset_route_counts()
     wrapped, stats = _wrap_with_numpy_cross_check(km.compiled_linear_kernel)
     monkeypatch.setattr(km, "compiled_linear_kernel", wrapped)
 
@@ -203,9 +209,11 @@ def test_compiled_linear_end_to_end_matches_hf_generate(
     print(f"generated (含编译产物): {our_text!r}")
     print(f"generated (HF model.generate): {ref_text!r}")
 
+    counts = km.route_counts()
+    bad = [op for (op, route), n in counts.items() if route == "fallback" and n]
+    assert not bad, f"策略 {strategy.name} 这些算子退回了主机：{bad}"
     assert len(stats) > 0, (
-        f"策略 {strategy.name} 没有任何调用走到编译产物路径——"
-        "检查本地分片 shape 是否满足 2 的幂约束"
+        f"策略 {strategy.name} 没有任何调用走到编译产物路径"
     )
     for (shapes, dtype), rels in per.items():
         assert max(rels) < 0.05, (

@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -259,19 +260,9 @@ def step_bcd_export(
             "重新跑一次本脚本即可补上。"
         )
     else:
-        stale = []
-        for op_id, entry in ops.items():
-            digest = hashlib.sha256(
-                Path(entry["pimir_path"]).read_bytes()
-            ).hexdigest()
-            if digest != entry["pimir_sha256"]:
-                stale.append(op_id)
+        stale = stale_pimir_entries(ops)
         if stale:
-            raise StepFailed(
-                f"{len(stale)} 个算子的 pimir_sha256 与磁盘上的 pim mlir 不一致"
-                f"（如 op{stale[:5]}）：sidecar 与当前算子编译产物不是一套，"
-                "请重新导出。"
-            )
+            raise StepFailed(_stale_sidecar_message(stale))
 
     # 分块是 GEMM 才有的字段（B 路算子级节点不做分块搜索），所以只在 GEMM
     # 条目上取；对全部条目取会在第一条 B 路条目上抛 KeyError。
@@ -299,7 +290,48 @@ def step_bcd_export(
     return sidecar_path
 
 
-def _genesim_sim_command(genesim: Path, config_name: str) -> list[str]:
+def _config_text(genesim: Path, config: str | Path) -> Optional[str]:
+    """读仿真配置的文本。没有这份配置就返回 None。
+
+    传文件名时从 genesim 的 conf 目录找；传路径时直接读，
+    临时收过请求数的配置不在那个目录里。
+    """
+    path = config if isinstance(config, Path) else genesim / "conf" / config
+    if not path.is_file():
+        return None
+    return path.read_text()
+
+
+def _sidecar_of(genesim: Path, config_text: str) -> Optional[Path]:
+    """从配置里取出 `compiler_placement_file`，没有就返回 None。"""
+    import yaml
+
+    config = yaml.safe_load(config_text) or {}
+    relative = (config.get("scheduler") or {}).get("compiler_placement_file")
+    if not relative:
+        return None
+    path = Path(relative)
+    return path if path.is_absolute() else genesim / path
+
+
+def limited_config(source: Path, conf_dir: Path, max_requests: int) -> Path:
+    """复制一份配置，把请求数收成 max_requests，原文件不动。
+
+    仿真时间跟着 token 数走。10 个请求共 8084 个 token 要二十多分钟，
+    而第 1 个请求已经同时有 prefill 和 decode。原配置留着，
+    需要完整数字时显式把请求数加回去。
+    """
+    import yaml
+
+    loaded = yaml.safe_load(source.read_text())
+    loaded.setdefault("trace", {})["num_requests"] = max_requests
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    out = conf_dir / source.name
+    out.write_text(yaml.safe_dump(loaded, sort_keys=False))
+    return out
+
+
+def _genesim_sim_command(genesim: Path, config_path: Path) -> list[str]:
     """返回跑 GeneSim 仿真的命令。
 
     首选 `./run.sh`——那是 GeneSim 上游设计的入口。但它每个子命令都先 `check_uv` +
@@ -315,26 +347,38 @@ def _genesim_sim_command(genesim: Path, config_name: str) -> list[str]:
     uv_available = shutil.which("uv") is not None
     venv_ready = (genesim / ".venv" / "bin" / "python").is_file()
     if uv_available and venv_ready:
-        return ["./run.sh", "--config", f"conf/{config_name}"]
+        return ["./run.sh", "--config", str(config_path)]
 
     missing = "uv" if not uv_available else ".venv"
     print(f"    （缺 {missing}，改用当前 python 直接跑 src/main.py；"
           "结果与 run.sh 一致，见 _genesim_sim_command 的说明）")
-    return [sys.executable, "src/main.py", "--config", f"conf/{config_name}"]
+    return [sys.executable, "src/main.py", "--config", str(config_path)]
 
 
 def step_e_simulate(
     genesim: Path, config_name: str, log_dir: Path, *, label: str,
-    results_dir: Optional[Path] = None,
+    results_dir: Optional[Path] = None, max_requests: Optional[int] = None,
 ) -> Dict[str, Any]:
     """(E) 跑仿真，核对 GEMM 的 trace 真的来自 pim mlir。"""
     print(f"\n[E] GeneSim 仿真（{label}）")
+    config_path = genesim / "conf" / config_name
+    if max_requests is not None:
+        # 临时配置放日志目录，不写进 genesim 仓，免得留下一份请求数被改过的副本。
+        config_path = limited_config(config_path, log_dir, max_requests)
+        print(f"    请求数收成 {max_requests}：{config_path.name}")
+    # sidecar 与磁盘产物不是一套时，仿真跑出来的数字没有意义，先拦下来，
+    # 省掉十几分钟的无效仿真。
+    verify_sidecar_freshness(genesim, config_path)
     # trace 缓存按签名判新旧，但这里要的是"这一轮确实重编过"，所以先清掉。
     traces = genesim / "pim_traces"
     if traces.is_dir():
         shutil.rmtree(traces)
-    _run(_genesim_sim_command(genesim, config_name),
+    _run(_genesim_sim_command(genesim, config_path),
          cwd=genesim, log_path=log_dir / f"e_sim_{label}.log")
+
+    # 来源校验挂在仿真入口上，而不是只挂在主流程里。慢速仿真测试也走这里，
+    # 整批 trace 退回手写模板时必须在这里失败，不能只在主流程里才看得见。
+    verify_trace_provenance(genesim)
 
     summary_path = genesim / "results" / "summary.json"
     if not summary_path.is_file():
@@ -350,32 +394,124 @@ def step_e_simulate(
     return summary
 
 
-def verify_trace_provenance(genesim: Path, *, expect_pimir: bool) -> None:
-    """核对 GEMM 的 trace 来源，避免"跑通了但其实走的是手写模板"。"""
-    sys.path.insert(0, str(genesim / "src"))
-    from pim.pim_trace_loader import load_trace_file
+def _trace_metadata(path: Path) -> Dict[str, Any]:
+    """读一条 pim trace 的元数据。
 
+    头部是 `PIMT` + version(4) + 指令条数(8) + 元数据长度(4)，与
+    genesim `pim_isa.save_trace_file` 同一布局。头部是 `PIMT` 时按长度字段
+    切 JSON，长度超出文件就是头部损坏，直接报错。头部不是 `PIMT` 的
+    （测试里的简化头）退回按字节扫描。
+    """
+    raw = path.read_bytes()
+    if len(raw) >= 20 and raw[:4] == b"PIMT":
+        meta_len = struct.unpack_from("<I", raw, 16)[0]
+        # 头部是 PIMT 就按长度字段切。长度超出文件说明头部损坏，
+        # 不能退回扫描——文件里碰巧有 `{` 会让损坏被静默放过。
+        if 20 + meta_len > len(raw):
+            raise StepFailed(
+                f"trace 头部损坏：{path.name} 声明元数据 {meta_len} 字节，"
+                f"文件只有 {len(raw)} 字节")
+        try:
+            return json.loads(raw[20:20 + meta_len].decode("utf-8"))
+        except json.JSONDecodeError:
+            raise StepFailed(f"trace 文件损坏，读不出元数据：{path.name}")
+    # 头部不是 PIMT（测试里的简化头）时退回扫描。
+    start = raw.find(b"{")
+    if start < 0:
+        raise StepFailed(f"trace 文件损坏，读不出元数据：{path.name}")
+    try:
+        meta, _ = json.JSONDecoder().raw_decode(
+            raw[start:].decode("utf-8", "ignore"))
+    except json.JSONDecodeError:
+        raise StepFailed(f"trace 文件损坏，读不出元数据：{path.name}")
+    return meta
+
+
+def stale_pimir_entries(ops: Dict[str, Dict[str, Any]]) -> list[str]:
+    """返回 `pimir_sha256` 与磁盘文件对不上的算子 id。
+
+    sidecar 记的是绝对路径：缓存重建后路径还在、内容已经变了，哈希是唯一
+    能发现"这份 sidecar 与当前算子编译产物不是一套"的办法。
+    """
+    stale = []
+    for op_id, entry in ops.items():
+        digest = hashlib.sha256(
+            Path(entry["pimir_path"]).read_bytes()
+        ).hexdigest()
+        if digest != entry["pimir_sha256"]:
+            stale.append(op_id)
+    return stale
+
+
+def _stale_sidecar_message(stale: list[str]) -> str:
+    return (
+        f"{len(stale)} 个算子的 pimir_sha256 与磁盘上的 pim mlir 不一致"
+        f"（如 op{stale[:5]}）：sidecar 与当前算子编译产物不是一套，"
+        "请重新导出（scripts/run_full_pipeline.py 不带 --skip-simulation，"
+        "或单独跑 scripts/export_pp_placement.py）。"
+    )
+
+
+def verify_sidecar_freshness(genesim: Path, config: str | Path) -> None:
+    """仿真用的 sidecar 必须与磁盘上的 pim mlir 是一套。
+
+    主流程的哈希核对只在导出步骤里，仿真入口绕得开它：缓存被重建过、
+    sidecar 还是旧的时，仿真照样跑完，代价链吃的却不是当前的产物。
+    配置里没有 `compiler_placement_file` 时没有 sidecar 可核对，直接返回。
+    """
+    config_text = _config_text(genesim, config)
+    if config_text is None:
+        return
+    sidecar_path = _sidecar_of(genesim, config_text)
+    if sidecar_path is None:
+        return
+    if not sidecar_path.is_file():
+        raise StepFailed(f"配置指向的 sidecar 不存在：{sidecar_path}")
+    ops = json.loads(sidecar_path.read_text())["operators"]
+    without_hash = [op_id for op_id, e in ops.items() if not e.get("pimir_sha256")]
+    if without_hash:
+        raise StepFailed(
+            f"{len(without_hash)}/{len(ops)} 个算子的 sidecar 没有 pimir_sha256，"
+            "无法确认它与当前算子编译产物是一套，请重新导出。"
+        )
+    stale = stale_pimir_entries(ops)
+    if stale:
+        raise StepFailed(_stale_sidecar_message(stale))
+
+
+def verify_trace_provenance(genesim: Path) -> None:
+    """核对每个算子的 trace 来源，避免"跑通了但其实走的是手写模板"。
+
+    原先只扫 GEMM。注意力那一组（ROPE、MASK、SOFTMAX、GEMV）退回模板时
+    这里看不见，仿真照样算通过，而那些算子的分块根本没进代价链。
+    """
     sources: Dict[str, int] = {}
+    by_op: Dict[str, Dict[str, int]] = {}
     tiles: Dict[Any, int] = {}
-    for path in sorted((genesim / "pim_traces").glob("op_*_GEMM.pim_trace")):
-        trace = load_trace_file(str(path), use_cache=False)
-        source = trace.metadata.get("trace_source", "unknown")
+    for path in sorted((genesim / "pim_traces").glob("op_*.pim_trace")):
+        meta = _trace_metadata(path)
+        source = (meta.get("compile_signature") or {}).get("trace_source", "unknown")
+        op_type = str(meta.get("op_type", "unknown"))
         sources[source] = sources.get(source, 0) + 1
-        pimir_meta = trace.metadata.get("pimir") or {}
+        counts = by_op.setdefault(op_type, {})
+        counts[source] = counts.get(source, 0) + 1
+        pimir_meta = meta.get("pimir") or {}
         if pimir_meta:
             key = (pimir_meta.get("tile_n"), pimir_meta.get("k_iterations"))
             tiles[key] = tiles.get(key, 0) + 1
 
     if not sources:
-        raise StepFailed("没有找到任何 GEMM trace，无法判断来源")
-    print(f"    GEMM trace 来源: {sources}")
+        raise StepFailed("没有找到任何 trace，无法判断来源")
+    print(f"    trace 来源: {sources}")
     if tiles:
         print(f"    (tile_n, k_iterations) 分布: {tiles}")
-    if expect_pimir and sources.get("template"):
+    if sources.get("template"):
+        templated = sorted(op for op, counts in by_op.items() if counts.get("template"))
         raise StepFailed(
-            f"{sources['template']} 个 GEMM 退回了手写模板；"
+            f"{sources['template']} 个算子退回了手写模板（{', '.join(templated)}）；"
             "算子编译器的分块没有进入代价链。"
         )
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -384,6 +520,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-stages", type=int, default=4,
                         help="流水段数：1=纯张量并行，num_dpus=纯流水")
     parser.add_argument("--num-dpus", type=int, default=8)
+    parser.add_argument("--max-requests", type=int, default=None,
+                        help="仿真的请求数上限。默认跟随配置；"
+                             "慢速测试传 1，只要 prefill 与 decode 各一次")
     parser.add_argument("--skip-simulation", action="store_true",
                         help="只验证到 sidecar，不跑仿真（几分钟 vs 十几分钟）")
     parser.add_argument("--ab-compare", action="store_true",
@@ -444,8 +583,9 @@ def main() -> int:
         main_summary = step_e_simulate(
             genesim, config, log_dir, label="pimir",
             results_dir=Path("/tmp/full_pipeline_pimir"),
+            max_requests=args.max_requests,
         )
-        verify_trace_provenance(genesim, expect_pimir=True)
+        # 来源校验在 step_e_simulate 里已经做过，这里不再重扫一遍 trace。
 
         if args.ab_compare:
             ab_config = f"sim_llama2_7b_pp_tp{tp_width}pp{args.num_stages}_ab_global.yaml"
