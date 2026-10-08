@@ -7,6 +7,9 @@
       │
       ├─(A)─> GeneSim model_parser        → 图骨架 IR（semantic_role 标好投影身份）
       │
+      ├─(A2)> refine_ir_with_flagtree     → 精化 pimir 成本 IR（仿真加载的那份，
+      │                                      与图骨架同一次运行、同一套算子编号）
+      │
       ├─(B)─> 图编译器 compile_llama2      → PIMTensorSpec（每个权重的切分与归属）
       │         策略由 --num-stages 决定
       │
@@ -56,6 +59,11 @@ _EXPECTED_ROLES = {
     "gate_proj", "up_proj", "down_proj",
 }
 
+# 仿真配置 `model.ir_path` 指向的精化 IR 文件名（pimir 成本口径），由 (A2) 步产出。
+_PIMIR_IR_NAME = "llama2_7b_pimir.ir"
+# 精化的序列长度口径：与 docs/llama-2.md 第六步、现有产物、仿真 trace 一致。
+_REFINE_SEQ_LEN = "128"
+
 
 class StepFailed(RuntimeError):
     """某一段没达到判据。"""
@@ -102,6 +110,47 @@ def step_a_model_ir(genesim: Path, model_dir: Path, log_dir: Path) -> Path:
         raise StepFailed(f"{len(unlabeled)} 个 GEMM 没有 semantic_role，如 {unlabeled[:5]}")
     print(f"    算子 {len(ir['operators'])} 个，GEMM {len(gemms)} 个，七种投影身份齐全")
     return ir_path
+
+
+def _ir_op_ids(ir_path: Path) -> list[int]:
+    """读出 IR 里按出现顺序的算子编号序列。"""
+    ir = json.loads(ir_path.read_text())
+    return [int(op["op_id"]) for op in ir["operators"]]
+
+
+def step_a2_refine_pimir_ir(genesim: Path, ir_path: Path, log_dir: Path) -> Path:
+    """(A2) 从刚生成的图骨架 IR 精化出仿真要加载的 pimir 成本 IR。
+
+    仿真配置加载的 `models/llama2_7b_pimir.ir` 历来是手动跑
+    `refine_ir_with_flagtree.py` 的产物：图骨架改了结构（"支持全部算子"给
+    注意力补了算子级节点）而没重跑精化时，sidecar 按新编号、仿真 IR 还是旧
+    编号，调度器按 op_id 查不到 pimir_path，注意力算子整批退回手写模板
+    （2026-10-07 的 6144 个模板 trace 就是这么来的）。放进主流程后，图骨架
+    与精化 IR 永远是同一次运行里的同一套编号。
+
+    已存在且编号序列与图骨架一致时跳过重新精化：refine 只回填成本、不改
+    结构，结构一致就是同一份。注意成本口径不在比对范围——工具链重编后
+    想强制重算成本，删掉这份文件再跑即可。
+    """
+    print("\n[A2] 图骨架 IR → 精化 pimir 成本 IR（仿真加载的那份）")
+    pimir_ir = genesim / "models" / _PIMIR_IR_NAME
+    if pimir_ir.is_file() and _ir_op_ids(pimir_ir) == _ir_op_ids(ir_path):
+        print(f"    精化 IR 与图骨架同套编号（{pimir_ir.name}），跳过重新精化")
+        return pimir_ir
+    _run(
+        ["python", "scripts/refine_ir_with_flagtree.py",
+         "--ir", str(ir_path), "--out-ir", str(pimir_ir),
+         "--sidecar", str(genesim / "models" / "llama2_7b_pimir_extensions.json"),
+         "--seq-len", _REFINE_SEQ_LEN, "--ir-level", "pimir"],
+        cwd=genesim, log_path=log_dir / "a2_refine_pimir.log",
+    )
+    if _ir_op_ids(pimir_ir) != _ir_op_ids(ir_path):
+        raise StepFailed(
+            f"精化 IR 的算子编号与图骨架不一致：{pimir_ir} vs {ir_path}。"
+            "refine 应该只回填成本、不改结构，请检查 refine_ir_with_flagtree.py。")
+    print(f"    精化完成：{pimir_ir.name}"
+          f"（{len(_ir_op_ids(pimir_ir))} 个算子，编号与图骨架一致）")
+    return pimir_ir
 
 
 def step_zero_pu_mapping(
@@ -369,6 +418,9 @@ def step_e_simulate(
     # sidecar 与磁盘产物不是一套时，仿真跑出来的数字没有意义，先拦下来，
     # 省掉十几分钟的无效仿真。
     verify_sidecar_freshness(genesim, config_path)
+    # 仿真 IR 与 sidecar 不是同一套算子编号时，注意力算子会整批退回手写
+    # 模板，同样在启动前拦下。
+    verify_sim_ir_matches_sidecar(genesim, config_path)
     # trace 缓存按签名判新旧，但这里要的是"这一轮确实重编过"，所以先清掉。
     traces = genesim / "pim_traces"
     if traces.is_dir():
@@ -479,6 +531,49 @@ def verify_sidecar_freshness(genesim: Path, config: str | Path) -> None:
         raise StepFailed(_stale_sidecar_message(stale))
 
 
+def verify_sim_ir_matches_sidecar(genesim: Path, config: str | Path) -> None:
+    """仿真加载的 IR 与 sidecar 必须是同一套算子编号。
+
+    调度器按 op_id 查 sidecar 里的 pimir_path：精化 IR 是旧结构、sidecar 是
+    新导出时，查不到的算子静默退回手写模板，仿真照样跑完（2026-10-07 的
+    6144 个模板 trace 就是这么来的）。模型入口/出口没有设备算子，本来就不
+    在 sidecar 里，其余算子缺一个都拦在仿真启动前，省十几分钟无效仿真。
+    配置里没有 ir_path 或 sidecar 时没有可对拍的对象，直接返回。
+    """
+    config_text = _config_text(genesim, config)
+    if config_text is None:
+        return
+    import yaml
+    loaded = yaml.safe_load(config_text) or {}
+    ir_rel = (loaded.get("model") or {}).get("ir_path")
+    sidecar_path = _sidecar_of(genesim, config_text)
+    if not ir_rel or sidecar_path is None:
+        return
+    ir_path = genesim / ir_rel
+    if not ir_path.is_file():
+        raise StepFailed(
+            f"配置指向的仿真 IR 不存在：{ir_path}。先跑 (A2) 精化步骤生成"
+            "（scripts/run_full_pipeline.py 主流程已包含这一步）。")
+    if not sidecar_path.is_file():
+        raise StepFailed(f"配置指向的 sidecar 不存在：{sidecar_path}")
+    sidecar_ops = json.loads(sidecar_path.read_text())["operators"]
+    ir = json.loads(ir_path.read_text())
+    missing = [
+        (int(op["op_id"]), str(op["op_type"])) for op in ir["operators"]
+        if op["op_type"] not in ("MODEL_INPUT", "MODEL_OUTPUT")
+        and not (sidecar_ops.get(str(op["op_id"])) or {}).get("pimir_path")
+    ]
+    if missing:
+        kinds = sorted({t for _, t in missing})
+        raise StepFailed(
+            f"{len(missing)} 个算子在 sidecar 里没有 pimir_path（类型 {kinds}，"
+            f"如 op{[i for i, _ in missing[:5]]}）：仿真 IR（{ir_path.name}）与 "
+            f"sidecar（{sidecar_path.name}）不是同一套算子编号。"
+            "精化 IR 多半是图骨架改结构之前生成的旧产物——重跑 "
+            "scripts/run_full_pipeline.py（(A2) 会重新精化），或手动跑 "
+            "genesim/scripts/refine_ir_with_flagtree.py。")
+
+
 def verify_trace_provenance(genesim: Path) -> None:
     """核对每个算子的 trace 来源，避免"跑通了但其实走的是手写模板"。
 
@@ -560,6 +655,7 @@ def main() -> int:
 
     try:
         ir_path = step_a_model_ir(genesim, model_dir, log_dir)
+        step_a2_refine_pimir_ir(genesim, ir_path, log_dir)
         plan_path = None
         if not args.no_pu_mapping:
             plan_path = step_zero_pu_mapping(

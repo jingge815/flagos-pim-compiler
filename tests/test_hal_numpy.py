@@ -324,3 +324,49 @@ def test_llama2_smoke_payload_stays_model_agnostic() -> None:
     backend.copy_to_dpu(0, 0, activation)
 
     assert np.array_equal(backend.copy_from_dpu(0, 0, activation.shape, activation.dtype), activation)
+
+
+def test_concurrent_host_xfers_do_not_steal_each_others_buffer(monkeypatch) -> None:
+    """两个并发 host op 对同一批 DPU 做 push_xfer 时不得互相拿走对方的缓冲区。
+
+    `dpu_prepare_xfer` 登记的缓冲区指针是机器级共享状态：不串行化时，一个
+    host op 登记的指针会被另一个覆盖，push 时把对方的数据写进自己的目标区。
+    测试用 sleep 把竞争窗口拉成必然，再校验两块不相交目标区各自拿到自己的数据。
+    """
+    import time
+
+    import backend.dpu_sdk as dpu_sdk
+    from backend.dpu_sdk import DPU_XFER_TO_DPU
+
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=2, mram_bytes_per_dpu=64))
+
+    real_prepare = dpu_sdk.dpu_prepare_xfer
+
+    def slow_prepare(dpu_set, buffer) -> None:
+        real_prepare(dpu_set, buffer)
+        # 把「登记 → push」之间的窗口拉大：不串行化时对方必定在这里插进来。
+        time.sleep(0.2)
+
+    monkeypatch.setattr(dpu_sdk, "dpu_prepare_xfer", slow_prepare)
+
+    def make_xfer_fn(data: np.ndarray, dst_addr: int):
+        def fn(hal, cmd) -> None:
+            for d in (0, 1):
+                dpu_sdk.dpu_prepare_xfer(hal.dpu_set.dpu(d), data)
+            dpu_sdk.dpu_push_xfer(
+                hal.dpu_set.subset((0, 1)), DPU_XFER_TO_DPU, dst_addr, data.nbytes)
+        return fn
+
+    data_a = np.full((8,), 1.0, dtype=np.float32)
+    data_b = np.full((8,), 2.0, dtype=np.float32)
+    addr_a, addr_b = 0, 32
+    first = backend.submit(Command(1, "host_op", None, {"fn": make_xfer_fn(data_a, addr_a)}))
+    second = backend.submit(Command(2, "host_op", None, {"fn": make_xfer_fn(data_b, addr_b)}))
+    backend.wait(first)
+    backend.wait(second)
+
+    for d in (0, 1):
+        assert np.array_equal(
+            backend.read_local(d, addr_a, data_a.shape, data_a.dtype), data_a)
+        assert np.array_equal(
+            backend.read_local(d, addr_b, data_b.shape, data_b.dtype), data_b)

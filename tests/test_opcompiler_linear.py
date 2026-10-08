@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -554,6 +556,34 @@ def test_compiler_fingerprint_covers_the_loaded_libtriton() -> None:
         digest.update(f"{tool}:{stat.st_size}:{stat.st_mtime_ns}".encode())
     assert driver._compiler_fingerprint() != digest.hexdigest()[:16], (
         "指纹没有覆盖 libtriton.so")
+
+
+def test_cache_key_lock_serializes_processes(tmp_path, monkeypatch) -> None:
+    """同一缓存 key 的两个进程不能同时进入编译区。"""
+    from opcompiler_bridge import driver
+
+    monkeypatch.setattr(driver, "_CACHE_DIR", tmp_path)
+    context = mp.get_context("fork")
+    events = context.Queue()
+
+    def worker(queue):
+        with driver._cache_key_lock("same-key"):
+            queue.put(("start", time.monotonic()))
+            time.sleep(0.12)
+            queue.put(("end", time.monotonic()))
+
+    processes = [context.Process(target=worker, args=(events,)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    records = [events.get(timeout=5) for _ in range(4)]
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+
+    starts = sorted(t for kind, t in records if kind == "start")
+    ends = sorted(t for kind, t in records if kind == "end")
+    assert len(starts) == len(ends) == 2
+    assert starts[1] >= ends[0] - 0.02
 
 
 def test_compile_result_carries_pim_mlir() -> None:

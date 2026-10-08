@@ -110,6 +110,12 @@ class NumpyBackend:
         self._alloc = MRAMAllocator(config.mram_bytes_per_dpu)
         # 每个并发执行的 launch 使用独立的冲突检测器。
         self._tracker_local = threading.local()
+        # host 命令（comm 的 collect/writeback 等）共用机器的 `xfer_buffers`：
+        # `dpu_prepare_xfer` 登记的缓冲区指针是按 DPU 存放的全局状态，两个并发的
+        # host op 对同一台 DPU 做 push_xfer 时会互相拿走对方的缓冲区，把错误的
+        # 数据写进各自不相交的目标区域——区间审计看不见，数值上却是真腐蚀。
+        # host op 在伪硬件上本就当 DMA 引擎语义处理，串行化不改行为。
+        self._host_lock = Lock()
         self._bound_values: dict[str, object] = {}
         self._bound_pos: int | None = None
 
@@ -262,7 +268,8 @@ class NumpyBackend:
             dep.result()
         operation = cmd.payload.get("fn")
         if callable(operation):
-            return operation(self, cmd)
+            with self._host_lock:
+                return operation(self, cmd)
         return None
 
     def wait(self, event: Event, timeout: float | None = None) -> object:

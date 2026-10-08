@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import hashlib
 import os
 import threading
 import re
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -875,6 +877,63 @@ def _parse_signature(
     return symbol, argtypes, by_value
 
 
+def _read_cached_result(
+    so_path: Path, meta_path: Path, pimir_path: Path,
+) -> OpCompileResult | None:
+    """读取一份完整缓存；并发写入留下的半成品视为未命中。"""
+    if (not so_path.is_file() or not meta_path.is_file()
+            or not pimir_path.is_file()):
+        return None
+    try:
+        lines = meta_path.read_text().splitlines()
+        if len(lines) < 2 or not lines[0] or not lines[1]:
+            return None
+        symbol, argtypes_str = lines[0], lines[1]
+        flags = lines[2] if len(lines) > 2 else ""
+        # pim mlir 与 `.so` 一起缓存，命中时直接读回来，成本模型不必重编。
+        cached_pimir = pimir_path.read_text()
+    except (OSError, UnicodeError):
+        return None
+    return OpCompileResult(
+        so_path=str(so_path),
+        symbol=symbol,
+        argtypes=argtypes_str.split(","),
+        by_value=[c == "1" for c in flags.split(",")] if flags else [],
+        pimir=cached_pimir,
+        pimir_path=str(pimir_path) if cached_pimir is not None else None,
+    )
+
+
+@contextmanager
+def _cache_key_lock(key: str):
+    """跨进程串行化同一缓存 key 的编译和缓存读取。"""
+    lock_path = _CACHE_DIR / f"{key}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o664)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_cache_text(path: Path, text: str) -> None:
+    """原子替换缓存文本，避免读者看到半份 meta 或 pim mlir。"""
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(text)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _invalidate_cache(so_path: Path, meta_path: Path, pimir_path: Path) -> None:
+    """删除不完整或被 force 替换的旧三件套，避免新旧文件混用。"""
+    for path in (so_path, meta_path, pimir_path):
+        path.unlink(missing_ok=True)
+
+
 def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileResult:
     """编译算子请求并返回共享库描述，结果按请求参数缓存。"""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -883,23 +942,23 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
     meta_path = _CACHE_DIR / f"{key}.meta"
     pimir_path = _CACHE_DIR / f"{key}.pimir.mlir"
 
-    if not force and so_path.is_file() and meta_path.is_file():
-        lines = meta_path.read_text().splitlines()
-        symbol, argtypes_str = lines[0], lines[1]
-        flags = lines[2] if len(lines) > 2 else ""
-        # pim mlir 与 `.so` 一起缓存，命中时直接读回来，成本模型不必重编。
-        cached_pimir = (
-            pimir_path.read_text() if pimir_path.is_file() else None
-        )
-        return OpCompileResult(
-            so_path=str(so_path),
-            symbol=symbol,
-            argtypes=argtypes_str.split(","),
-            by_value=[c == "1" for c in flags.split(",")] if flags else [],
-            pimir=cached_pimir,
-            pimir_path=str(pimir_path) if cached_pimir is not None else None,
-        )
+    # 锁住整个「检查→编译→发布」事务。不同 key 可以并行；同一 key 的第二个
+    # 进程拿锁后再次检查，直接复用第一份完整产物，不会把旧 meta/pimir 与新 .so
+    # 拼在一起。force 仍表示即使已有缓存也要重编，但重编过程同样不可交错。
+    with _cache_key_lock(key):
+        if not force:
+            cached = _read_cached_result(so_path, meta_path, pimir_path)
+            if cached is not None:
+                return cached
+        _invalidate_cache(so_path, meta_path, pimir_path)
+        return _compile_op_uncached(
+            request, key, so_path, meta_path, pimir_path)
 
+
+def _compile_op_uncached(
+    request: OpCompileRequest, key: str,
+    so_path: Path, meta_path: Path, pimir_path: Path,
+) -> OpCompileResult:
     if request.op in _OPLEVEL_OPS:
         # B 路：整算子级 IR → 融合/展开/校验 → EmitC。没有 DMA 可显式化，
         # 所以不走 A 路那三段；降级 pass 是同一个。
@@ -947,11 +1006,11 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
         c_path.unlink(missing_ok=True)
         so_tmp_path.unlink(missing_ok=True)  # no-op if os.replace already moved it
 
-    meta_path.write_text(
+    _write_cache_text(meta_path,
         f"{symbol}\n{','.join(argtypes)}\n"
         f"{','.join('1' if v else '0' for v in by_value)}")
     # pim mlir 与 `.so` 一起落盘：下次命中缓存时成本模型直接读它，不必重编。
-    pimir_path.write_text(pimir_text)
+    _write_cache_text(pimir_path, pimir_text)
     return OpCompileResult(
         so_path=str(so_path),
         symbol=symbol,

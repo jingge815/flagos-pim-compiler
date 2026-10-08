@@ -83,3 +83,66 @@ def test_limited_config_caps_the_request_count(tmp_path: Path) -> None:
     loaded = yaml.safe_load(out.read_text())
     assert loaded["trace"]["num_requests"] == 1
     assert yaml.safe_load(source.read_text())["trace"]["num_requests"] == 10
+
+
+def _write_fake_sim_setup(tmp_path: Path, *, with_pimir: bool) -> tuple[Path, Path]:
+    """搭一个最小的「仿真 IR + sidecar + 配置」三件套，返回 (假 genesim 根, 配置路径)。"""
+    genesim = tmp_path / "genesim"
+    (genesim / "models").mkdir(parents=True)
+    ir = {
+        "operators": [
+            {"op_id": 0, "op_type": "MODEL_INPUT"},
+            {"op_id": 1, "op_type": "GEMM"},
+            {"op_id": 2, "op_type": "ROPE"},
+            {"op_id": 3, "op_type": "MODEL_OUTPUT"},
+        ]
+    }
+    (genesim / "models" / "sim.ir").write_text(json.dumps(ir))
+    sidecar = {"operators": {"1": {"pimir_path": "/x/1.pimir.mlir"}}}
+    if with_pimir:
+        sidecar["operators"]["2"] = {"pimir_path": "/x/2.pimir.mlir"}
+    (genesim / "models" / "placement.json").write_text(json.dumps(sidecar))
+    config = tmp_path / "sim.yaml"
+    config.write_text(
+        'model:\n  ir_path: "models/sim.ir"\n'
+        'scheduler:\n  compiler_placement_file: "models/placement.json"\n'
+    )
+    return genesim, config
+
+
+def test_verify_sim_ir_matches_sidecar_accepts_matching_pair(tmp_path: Path) -> None:
+    """IR 与 sidecar 同套编号时放行（入口/出口算子本就不在 sidecar 里）。"""
+    from scripts.run_full_pipeline import verify_sim_ir_matches_sidecar
+
+    genesim, config = _write_fake_sim_setup(tmp_path, with_pimir=True)
+    verify_sim_ir_matches_sidecar(genesim, config)
+
+
+def test_verify_sim_ir_matches_sidecar_rejects_stale_ir(tmp_path: Path) -> None:
+    """注意力算子查不到 pimir_path 时必须在仿真启动前报出来。"""
+    from scripts.run_full_pipeline import StepFailed, verify_sim_ir_matches_sidecar
+
+    genesim, config = _write_fake_sim_setup(tmp_path, with_pimir=False)
+    with pytest.raises(StepFailed, match="ROPE"):
+        verify_sim_ir_matches_sidecar(genesim, config)
+
+
+def test_verify_sim_ir_matches_sidecar_skips_without_sidecar(tmp_path: Path) -> None:
+    """配置里没有 compiler_placement_file 时没有可对拍对象，直接返回。"""
+    from scripts.run_full_pipeline import verify_sim_ir_matches_sidecar
+
+    config = tmp_path / "sim.yaml"
+    config.write_text('model:\n  ir_path: "models/sim.ir"\n')
+    verify_sim_ir_matches_sidecar(tmp_path, config)
+
+
+def test_ir_op_ids_reads_the_sequence_in_order(tmp_path: Path) -> None:
+    """编号序列是精化 IR 与图骨架「同套」的判据，顺序不同就算不同。"""
+    from scripts.run_full_pipeline import _ir_op_ids
+
+    a = tmp_path / "a.ir"
+    b = tmp_path / "b.ir"
+    a.write_text(json.dumps({"operators": [{"op_id": 0}, {"op_id": 1}, {"op_id": 2}]}))
+    b.write_text(json.dumps({"operators": [{"op_id": 0}, {"op_id": 2}, {"op_id": 1}]}))
+    assert _ir_op_ids(a) == [0, 1, 2]
+    assert _ir_op_ids(a) != _ir_op_ids(b)
