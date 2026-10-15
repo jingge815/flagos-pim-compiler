@@ -12,6 +12,15 @@ import pytest
 from genesim_bridge.op_classify import ShapePoint, build_recipes
 
 
+def _gpu_available() -> bool:
+    """pimir 级要真实执行 FlagGems 算子，纯 CPU 上捕获不到 kernel。"""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def _passes_available() -> bool:
     try:
         from genesim_bridge.env import assert_pim_passes_available
@@ -467,6 +476,7 @@ def test_absorbed_operator_is_not_billed(tmp_path):
 
 
 @pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")
+@pytest.mark.skipif(not _gpu_available(), reason="pimir 级测量需要 GPU")
 def test_absorbed_operator_is_not_billed_at_pimir_level(tmp_path):
     """pimir 级同样要把被吸收的 silu 系数清零。
 
@@ -497,6 +507,7 @@ def test_absorbed_operator_is_not_billed_at_pimir_level(tmp_path):
         assert op["data_bytes"] == 0, op["data_bytes"]
 
 @pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")
+@pytest.mark.skipif(not _gpu_available(), reason="pimir 级测量需要 GPU")
 def test_fused_gemm_exports_at_pimir_level(tmp_path):
     """带 fused_activation 的 GEMM 在 pimir 级导出不得抛错。
 
@@ -521,6 +532,7 @@ def test_fused_gemm_exports_at_pimir_level(tmp_path):
 
 
 @pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")
+@pytest.mark.skipif(not _gpu_available(), reason="pimir 级测量需要 GPU")
 def test_fused_projection_bills_one_result_traversal_at_pimir_level(tmp_path):
     """pimir 级折激活的主算子搬运 = 未融合主算子 + 一次结果遍历。
 
@@ -815,6 +827,8 @@ def test_absorbed_ops_are_listed_for_the_simulator(tmp_path, ir_level):
     覆盖——pimir 级的被吸收算子走的是「不桥接」分支，不进成本 sidecar，
     只按成本 sidecar 收集会漏掉真实链路上的那一批。
     """
+    if ir_level == "pimir" and not _gpu_available():
+        pytest.skip("pimir 级测量需要 GPU")
     from genesim_bridge.cost_extractor import export_costs_to_genesim
 
     ir_path = tmp_path / "model.ir"

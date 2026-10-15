@@ -21,6 +21,7 @@ _ENV_VARS = {
     "genesim_root": "GENESIM_ROOT",
     "gml_reference_dir": "GML_REFERENCE_DIR",
     "gml_llama2_reference_dir": "GML_LLAMA2_REFERENCE_DIR",
+    "gml_ours_graph": "GML_OURS_GRAPH",
 }
 
 # PIM 编译 pass 使用的默认硬件参数。
@@ -176,6 +177,14 @@ def pim_options() -> dict:
         raw = os.environ.get(_PIM_ENV_VARS[key]) or file_config.get(key) or default
         options[key] = raw if isinstance(default, str) else int(raw)
     return options
+
+
+def gml_ours_graph(*, required: bool = True) -> Path | None:
+    """本机一次 decode-block 导出的 GML 图，供逐节点对拍；没有就跳过。"""
+    path = _configured_path("gml_ours_graph")
+    if path is not None or not required:
+        return path
+    return _resolve("gml_ours_graph")
 
 
 def genesim_root(*, required: bool = True) -> Path | None:

@@ -56,7 +56,8 @@ vim paths.json
   "flagtree_prefix": "/path/to/flagTree",
   "genesim_root": "/path/to/genesim",
   "gml_reference_dir": "/path/to/gml-reference",
-  "gml_llama2_reference_dir": "/path/to/gml-reference/llama2_w4a8_decode_block_0/parser_output"
+  "gml_llama2_reference_dir": "/path/to/gml-reference/llama2_w4a8_decode_block_0/parser_output",
+  "gml_ours_graph": "/path/to/our-decode-block/relay2gml_graph.gml"
 }
 ```
 
@@ -82,17 +83,21 @@ parser 输出），它不在四个安装脚本的产物里，需要单独放置�
 也就是说，**不配这两个键，测试会报错，而导出脚本会悄悄少做两项校验**——后者更隐蔽，
 建议一并配好。
 
+`gml_ours_graph` 是本机一次 decode-block 导出，给逐节点对拍用；不配则相关测试跳过。
+
 需要临时覆盖时，可设置同名环境变量：`PYTORCH_ENV_SCRIPT`、
-`LLAMA2_7B_MODEL_DIR`、`FLAGTREE_PREFIX`、`GENESIM_ROOT`。优先级为环境变量
-高于 `paths.json`。PIM 硬件参数（如 `FLAGTREE_PIM_NUM_DPUS`）也沿用该优先级。
+`LLAMA2_7B_MODEL_DIR`、`FLAGTREE_PREFIX`、`GENESIM_ROOT`、`GML_OURS_GRAPH`。
+优先级为环境变量高于 `paths.json`。PIM 硬件参数（如 `FLAGTREE_PIM_NUM_DPUS`）
+也沿用该优先级。
 查看当前生效路径与参数：
 
 ```bash
 python -c "from genesim_bridge.paths import describe; print(describe())"
 ```
 
-GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 另有一个 `PIM_COMPILER_ROOT`
-环境变量，指向本仓库根目录。
+GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 用 `PIM_COMPILER_ROOT` 指向本仓库
+根目录；未设置时按常见相对布局探测（`../flagOS/flagos-pim-compiler` 或
+`../flagos-pim-compiler`）。
 
 ## 文档
 

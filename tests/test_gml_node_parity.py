@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from genesim_bridge.paths import gml_llama2_reference_dir
+from genesim_bridge.paths import gml_llama2_reference_dir, gml_ours_graph
 
 # 对方产物里的调试副本与工具链痕迹，我方不产。
 _EXEMPT_PREFIXES = ("DEBUG_",)
@@ -33,11 +33,11 @@ _KNOWN_GAPS = {
 }
 
 _REFERENCE = gml_llama2_reference_dir(required=False)
-_OURS = Path("/media/disk/fengjingge/tmp/gml_dbo/relay2gml_graph.gml")
+_OURS = gml_ours_graph(required=False)
 
 pytestmark = pytest.mark.skipif(
     _REFERENCE is None or not (_REFERENCE / "relay2gml_graph.gml").is_file()
-    or not _OURS.is_file(),
+    or _OURS is None or not _OURS.is_file(),
     reason="需要参考产物与一次 decode-block 导出",
 )
 

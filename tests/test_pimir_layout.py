@@ -1111,11 +1111,12 @@ def test_the_simulator_actually_consumes_the_returned_fields() -> None:
     并比对下发意图与实际除数。这里只钉住「那个消费方存在且读这两个键」，它自己
     的行为判据在 GeneSim 仓的 `tests/sim/test_cost_sidecar.py` 里。
     """
-    import inspect
-    from pathlib import Path as _P
+    from genesim_bridge.paths import genesim_root
 
-    scheduler = _P("/media/disk/fengjingge/src/genesim/src/scheduler/"
-                   "gene_sim_scheduler.py")
+    root = genesim_root(required=False)
+    if root is None:
+        pytest.skip("GeneSim 不在位")
+    scheduler = root / "src/scheduler/gene_sim_scheduler.py"
     if not scheduler.is_file():
         pytest.skip("GeneSim 不在位")
     source = scheduler.read_text()

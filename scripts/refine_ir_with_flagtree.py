@@ -18,7 +18,7 @@ genesim 仓的 `scripts/refine_ir_with_flagtree.py` 是同一个入口，但它�
 用法（先 source paths.json 里的 pytorch_env_script）：
 
     python scripts/refine_ir_with_flagtree.py \
-        --ir  /media/disk/fengjingge/src/genesim/models/llama2_7b.ir \
+        --ir  "$GENESIM_ROOT"/models/llama2_7b.ir \
         --out-ir models/llama2_7b_oplevel.ir \
         --sidecar models/llama2_7b_oplevel_extensions.json \
         --seq-len 128 \

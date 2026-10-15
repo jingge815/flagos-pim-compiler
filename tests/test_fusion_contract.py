@@ -206,8 +206,10 @@ def _cpp_fusion_targets() -> set[str]:
 
     from genesim_bridge.paths import flagtree_source
 
-    source = (flagtree_source()
-              / "lib/Dialect/TritonPIM/Transforms/FuseActivation.cpp")
+    root = flagtree_source(required=False)
+    if root is None:
+        pytest.skip("FlagTree 源码树不在位")
+    source = root / "lib/Dialect/TritonPIM/Transforms/FuseActivation.cpp"
     text = source.read_text()
     match = re.search(r"isFusionTarget\(Operation \*op\)\s*\{\s*"
                       r"return\s+isa<([^>]*)>\(op\);", text)
@@ -257,13 +259,6 @@ def test_flagtree_fusion_targets_match_the_contract() -> None:
     设计要求算子编译器侧保持 `Matmul/Conv/Eltwise` 三个，少了 conv 会让
     `pim.conv` 后的激活融不进去。C++ 读不到 Python，所以扫源码核对。
     """
-    import re
-
-    cpp = Path("/media/disk/fengjingge/src/flagOS/flagOS-installers/FlagTree"
-               "/lib/Dialect/TritonPIM/Transforms/FuseActivation.cpp")
-    text = cpp.read_text(encoding="utf-8")
-    match = re.search(r"isFusionTarget[^{]*\{[^}]*isa<([^>]*)>", text, re.S)
-    assert match, "没找到 isFusionTarget 的 isa 列表"
-    ops = {name.strip() for name in match.group(1).split(",")}
+    ops = _cpp_fusion_targets()
     assert ops == {"MatmulOp", "ConvOp", "EltwiseOp"}, (
         f"与设计不一致：{sorted(ops)}")

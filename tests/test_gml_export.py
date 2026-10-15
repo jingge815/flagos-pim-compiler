@@ -440,14 +440,14 @@ def test_k_path_split_input_is_transposed_cache_plane() -> None:
     我方把转置折进 Split 时，入边曾是 `1x32x1024x128`。元素数相同，
     尺寸检查看不见。这条比的是产物上那条边的 dims。
     """
-    from genesim_bridge.paths import gml_llama2_reference_dir
+    from genesim_bridge.paths import gml_llama2_reference_dir, gml_ours_graph
     from scripts.gml_structure_check import field
 
     ref_dir = gml_llama2_reference_dir(required=False)
     if ref_dir is None or not (ref_dir / "relay2gml_graph.gml").is_file():
         pytest.skip("缺少 llama2 GML 参考产物")
-    ours_path = Path("/tmp/rev_db16/relay2gml_graph.gml")
-    if not ours_path.is_file():
+    ours_path = gml_ours_graph(required=False)
+    if ours_path is None or not ours_path.is_file():
         pytest.skip("没有现成的 decode-block 导出，跳过产物对拍")
 
     def k_split_in_dims(text: str) -> list[str]:

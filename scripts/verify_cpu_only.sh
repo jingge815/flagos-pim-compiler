@@ -20,9 +20,16 @@ IMAGE=pim-cputest:22.04
 MODE=${1:-full}
 
 PIM_COMPILER=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-GENESIM=${GENESIM_ROOT:-/media/disk/fengjingge/src/genesim}
-INSTALLED=${FLAGOS_INSTALLED:-/media/disk/fengjingge/src/flagOS/flagOS-installed}
-MODEL_DIR=${LLAMA2_7B_MODEL_DIR:-$INSTALLED/model-inference/models/Llama-2-7b-hf}
+
+_json_path() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' \
+    "$PIM_COMPILER/paths.json" "$1"
+}
+
+GENESIM=${GENESIM_ROOT:-$(_json_path genesim_root)}
+PYTORCH_ENV=${PYTORCH_ENV_SCRIPT:-$(_json_path pytorch_env_script)}
+INSTALLED=${FLAGOS_INSTALLED:-$(cd "$(dirname "$PYTORCH_ENV")/.." && pwd)}
+MODEL_DIR=${LLAMA2_7B_MODEL_DIR:-$(_json_path llama2_7b_model_dir)}
 
 for path in "$PIM_COMPILER" "$GENESIM" "$INSTALLED"; do
   [[ -d $path ]] || { echo "错误：找不到目录 $path" >&2; exit 1; }
@@ -59,7 +66,7 @@ run_in_container() {
     -e HOME=/tmp \
     -e OPCOMPILER_CACHE_DIR=/tmp/opcache \
     -e PIM_COMPILER_ROOT=/work/pim-compiler \
-    -e PYTORCH_ENV_SCRIPT="$INSTALLED/pytorch/env-pytorch.sh" \
+    -e PYTORCH_ENV_SCRIPT="$PYTORCH_ENV" \
     -e LLAMA2_7B_MODEL_DIR="$MODEL_DIR" \
     -e GENESIM_ROOT=/work/genesim \
     "$IMAGE" bash -c "
@@ -67,7 +74,7 @@ run_in_container() {
       mkdir -p /work
       cp -r /src/pim-compiler /work/pim-compiler
       cp -r /src/genesim /work/genesim
-      . '$INSTALLED/pytorch/env-pytorch.sh' >/dev/null 2>&1
+      . '$PYTORCH_ENV' >/dev/null 2>&1
       cd /work/pim-compiler
       $1
     "

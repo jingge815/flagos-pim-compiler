@@ -65,6 +65,20 @@ _PIMIR_IR_NAME = "llama2_7b_pimir.ir"
 _REFINE_SEQ_LEN = "128"
 
 
+def _refine_ir_level() -> str:
+    """没有 GPU 时精化走 B 路。
+
+    pimir 级要真实执行 FlagGems 算子来测量成本，纯 CPU 机器上做不到，会在
+    捕获 kernel 时直接报错。oplevel 是整算子 IR，只编译不执行，纯 CPU 可跑。
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        return "pimir"
+    print("    未检测到 GPU，精化改用 oplevel（只编译不执行）")
+    return "oplevel"
+
+
 class StepFailed(RuntimeError):
     """某一段没达到判据。"""
 
@@ -148,7 +162,7 @@ def step_a2_refine_pimir_ir(
         "python", "scripts/refine_ir_with_flagtree.py",
         "--ir", str(ir_path), "--out-ir", str(pimir_ir),
         "--sidecar", str(genesim / "models" / "llama2_7b_pimir_extensions.json"),
-        "--seq-len", _REFINE_SEQ_LEN, "--ir-level", "pimir",
+        "--seq-len", _REFINE_SEQ_LEN, "--ir-level", _refine_ir_level(),
     ]
     # 放置 sidecar 里带图编译器的融合清单。没有它就按未融合算，会把已被吸收的
     # 激活再计一遍——所以必须在放置导出之后跑，并且把这份 sidecar 传进来。

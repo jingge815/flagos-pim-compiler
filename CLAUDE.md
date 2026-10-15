@@ -5,10 +5,12 @@
 ## 环境
 
 ```bash
-source /media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
 ```
 
 torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 shell 都要先 source**，否则 `import torch` 失败。
+
+站点绝对路径只写在 `paths.json`（可用同名环境变量覆盖）。测试和脚本禁止再写 `/media/disk/...`。
 
 ## 技术方案
 

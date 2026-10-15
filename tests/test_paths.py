@@ -91,3 +91,35 @@ def test_flagtree_nvidia_backend_rejects_ambiguous_python_dirs(monkeypatch, tmp_
 
     with pytest.raises(RuntimeError, match="python3.\\*"):
         paths.flagtree_nvidia_backend()
+
+
+def test_optional_gml_ours_graph_defaults_to_unconfigured(monkeypatch, tmp_path) -> None:
+    _use_config(monkeypatch, tmp_path, {})
+    assert paths.gml_ours_graph(required=False) is None
+
+
+def test_gml_ours_graph_reads_paths_json(monkeypatch, tmp_path) -> None:
+    _use_config(monkeypatch, tmp_path, {"gml_ours_graph": "/customer/ours.gml"})
+    assert paths.gml_ours_graph() == Path("/customer/ours.gml")
+
+
+def test_checked_in_code_has_no_machine_absolute_paths() -> None:
+    """测试和脚本里不得再写本机绝对路径，只允许出现在 paths.json。"""
+    root = Path(__file__).resolve().parent.parent
+    hits = []
+    for base in (
+        "tests", "scripts", "genesim_bridge", "opcompiler_bridge",
+        "gml_bridge", "backend", "graph", "comm", "memory", "runtime",
+        "contracts", "orchestrator", "quant", "examples",
+    ):
+        folder = root / base
+        if not folder.is_dir():
+            continue
+        for path in folder.rglob("*"):
+            if path == Path(__file__).resolve():
+                continue
+            if path.suffix not in {".py", ".sh"} or not path.is_file():
+                continue
+            if "/media/disk/fengjingge" in path.read_text(encoding="utf-8"):
+                hits.append(str(path.relative_to(root)))
+    assert not hits, f"站点绝对路径漏出了 paths.json: {hits}"
