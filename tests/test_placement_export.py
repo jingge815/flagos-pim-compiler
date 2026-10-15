@@ -248,6 +248,136 @@ def test_gemm_device_hint_overwritten_to_pim(annotated_tiny_llama, tmp_path) -> 
         assert str(op_id) not in sidecar["operators"], op_id
 
 
+def test_collectives_lists_only_unexpanded_cross_dpu_edges(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """sidecar 只带 GeneSim 没展开的那两类跨 DPU 边。
+
+    all_reduce 已由 GeneSim 的归约节点覆盖，再写一遍会双计；local_slice
+    留在 DPU 内部，不产生通信。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "sidecar.json",
+    )
+
+    collectives = sidecar["collectives"]
+    kinds = {entry["type"] for entry in collectives}
+    assert kinds <= {"all_gather", "scatter"}, kinds
+    assert kinds == {"all_gather", "scatter"}, kinds
+    for entry in collectives:
+        assert entry["nbytes"] > 0, entry
+        assert entry["dpu_ids"], entry
+        assert entry["dpu_ids"] == sorted(set(entry["dpu_ids"])), entry
+
+
+def test_export_rejects_a_graph_without_input_ids(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """导出序列长度取自 input_ids，缺了就说清缺的是什么。
+
+    没有这个 placeholder 与有它但没带 val 是两种原因，报错混成一句时，
+    现场只能看到「没有 input_ids」，看不出是哪一种。
+    """
+    from copy import deepcopy
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    # fixture 是 module 级的，改它会污染同文件后面的用例，所以在副本上改。
+    renamed = deepcopy(annotated_tiny_llama)
+    for node in renamed.graph.nodes:
+        if node.op == "placeholder" and node.name == "input_ids":
+            node.name = "tokens"
+            break
+    with pytest.raises(ValueError, match="没有 input_ids"):
+        export_placement_to_genesim(
+            renamed, ir_path, tmp_path / "placed.ir", tmp_path / "sc.json",
+        )
+
+    for node in renamed.graph.nodes:
+        if node.op == "placeholder" and node.name == "tokens":
+            node.name = "input_ids"
+            node.meta.pop("val", None)
+            break
+    with pytest.raises(ValueError, match="没有 val"):
+        export_placement_to_genesim(
+            renamed, ir_path, tmp_path / "placed.ir", tmp_path / "sc.json",
+        )
+
+
+def test_only_sequence_shaped_edges_carry_the_export_length(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """只有带序列维的边才记导出长度，整份字节必须能被它整除。
+
+    激活张量的字节在导出时已按序列长度乘过一次，仿真侧要先除回去。
+    token id 与 attention mask 不随 token 数线性变化，记了就会被错除。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    with_seq = [e for e in sidecar["collectives"] if e["seq_len"] is not None]
+    without_seq = [e for e in sidecar["collectives"] if e["seq_len"] is None]
+    assert with_seq and without_seq, (len(with_seq), len(without_seq))
+    for entry in with_seq:
+        assert entry["nbytes"] % entry["seq_len"] == 0, entry
+        assert entry["seq_len"] == 16, entry
+    # token id 是整型、attention mask 的序列维出现两次，两者都不随 token 数
+    # 线性变化，必须被排除。tiny 模型上是 3 条 token id 加 3 条 mask。
+    # 排除靠显式写 null，不是省略键：调度器把缺键当成旧 sidecar 直接报错，
+    # 省略键的边重新导出后仿真仍会在第一条 token id 边上报错。
+    assert len(without_seq) == 6, without_seq
+    assert all(e["seq_len"] is None for e in without_seq), without_seq
+    assert sum(e["nbytes"] for e in without_seq) == 128 * 3 + 1024 * 3
+
+
+def test_kv_writeback_never_enters_the_communication_account(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """片内搬运（KV 写回走的 local_slice）不得进通信项。
+
+    KV 写回已经按搬运字节计入访存，再并进通信会双计。通信账目里只该有
+    真正跨 DPU 的那两类边，逐类与图上的 redistribute 边对账。
+    """
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    on_graph: dict[str, int] = {}
+    seen = set()
+    for node in annotated_tiny_llama.graph.nodes:
+        for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
+            if edge.edge_id in seen:
+                continue
+            seen.add(edge.edge_id)
+            on_graph[edge.type] = on_graph.get(edge.type, 0) + int(edge.nbytes)
+
+    # 图上确实有片内搬运，否则这条断言是空转。
+    assert on_graph.get("local_slice"), on_graph
+    account: dict[str, int] = {}
+    for entry in sidecar["collectives"]:
+        account[entry["type"]] = account.get(entry["type"], 0) + entry["nbytes"]
+
+    assert set(account) == {"all_gather", "scatter"}, account
+    for kind, total in account.items():
+        assert total == on_graph.get(kind), (kind, total, on_graph.get(kind))
+    assert "local_slice" not in account
+
+
 def _two_layer_graph() -> GraphModule:
     """两层的小模型图，用来验证层到流水段的钉死。"""
     sequence_length = 16
@@ -363,6 +493,34 @@ def test_bpath_entries_keep_the_sidecar_shape() -> None:
     assert sidecar["operators"]["0"]["shards"] == [{"dpu_id": 0}]
 
 
+def test_bpath_matmul_ignores_fused_activation() -> None:
+    """放置导出看不到 fused_activation，B 路不得按它分叉。
+
+    该字段只在精化过程内部出现，且注意力矩阵乘不在融合清单里。
+    """
+    import inspect
+
+    from genesim_bridge.op_classify import _attention_matmul_body
+    from genesim_bridge.placement_export import _attach_bpath_pimir, _bpath_pimir
+
+    assert "activation" not in inspect.signature(_bpath_pimir).parameters
+    assert "activation" not in inspect.signature(_attention_matmul_body).parameters
+
+    operators = {
+        0: {"op_id": 0, "op_type": "GEMV_SCORE", "semantic_role": "",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]],
+            "fused_activation": "silu"},
+        1: {"op_id": 1, "op_type": "GEMV_SCORE", "semantic_role": "",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+    }
+    sidecar = {"operators": {}}
+    _attach_bpath_pimir(operators, sidecar)
+    fused = Path(sidecar["operators"]["0"]["pimir_path"]).read_text()
+    plain = Path(sidecar["operators"]["1"]["pimir_path"]).read_text()
+    assert fused == plain
+    assert "act_spec" not in fused
+
+
 def test_bpath_kv_cache_declares_a_cache_big_enough_for_one_write() -> None:
     """KV 缓存的容量要盖得住一次写入，否则整条 B 路导出被 verifier 拦下。
 
@@ -428,6 +586,169 @@ def test_local_shard_widths_follow_each_projection(
 
     assert sidecar["version"] == 3
     assert sidecar["ir_num_operators"] == 11
+
+
+def test_shard_widths_sum_to_the_global_width(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """各分片的本地宽度之和等于全局宽度。
+
+    逐片断言只能证明每个数看着对；分片丢了一片、或者两片重叠，逐片断言
+    照样通过，只有把各片加起来与全局对账才看得出来。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    global_features = {
+        "q_proj": (HIDDEN_SIZE, HIDDEN_SIZE),
+        "k_proj": (HIDDEN_SIZE, HIDDEN_SIZE),
+        "v_proj": (HIDDEN_SIZE, HIDDEN_SIZE),
+        "o_proj": (HIDDEN_SIZE, HIDDEN_SIZE),
+        "gate_proj": (HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        "up_proj": (HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        "down_proj": (INTERMEDIATE_SIZE, HIDDEN_SIZE),
+    }
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    ir = json.loads(ir_path.read_text())
+    role_of = {op["op_id"]: op["semantic_role"] for op in ir["operators"]}
+    checked = 0
+    for raw_op_id, entry in sidecar["operators"].items():
+        shards = entry.get("shards") or []
+        if not shards:
+            continue
+        checked += 1
+        global_in, global_out = global_features[role_of[int(raw_op_id)]]
+        in_sum = sum(s["local_in_features"] for s in shards)
+        out_sum = sum(s["local_out_features"] for s in shards)
+        axis = entry.get("shard_axis")
+        if axis == "output_channel":
+            assert out_sum == global_out, (raw_op_id, entry)
+            assert all(s["local_in_features"] == global_in for s in shards)
+        elif axis == "input_channel":
+            assert in_sum == global_in, (raw_op_id, entry)
+            assert all(s["local_out_features"] == global_out for s in shards)
+        else:
+            # 纯流水线：不切分，单片就是全局。
+            assert len(shards) == 1, (raw_op_id, entry)
+            assert (in_sum, out_sum) == (global_in, global_out), (raw_op_id, entry)
+    assert checked == len(_FIXTURE_GEMM_ROLES), checked
+
+
+def test_tp_width_halves_the_shard_and_spreads_it_across_dpus(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """tp_width 翻倍，单分片宽度减半，且各分片落在不同 DPU 上。
+
+    并行项只认 tp_width：切分宽度决定单分片的形状，也决定分片是否真的分到
+    不同的 DPU 上同时跑。直接喂本地宽度的测试证明不了切分确实缩了半。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    wide = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "wide.ir", tmp_path / "wide.json",
+    )
+    strategy = llama_strategy(
+        NUM_DPUS // 2, num_stages=1,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE, vocab_size=32000, num_layers=1,
+    )
+    narrow_gm = _export_with_strategy(annotated_tiny_llama, strategy)
+    narrow = export_placement_to_genesim(
+        narrow_gm, ir_path,
+        tmp_path / "narrow.ir", tmp_path / "narrow.json",
+        strategy=strategy,
+    )
+
+    checked = 0
+    for raw_op_id, wide_entry in wide["operators"].items():
+        wide_shards = wide_entry.get("shards") or []
+        narrow_shards = narrow["operators"][raw_op_id].get("shards") or []
+        if not wide_shards:
+            continue
+        checked += 1
+        # 宽度减半：tp_width 从 4 收到 2，单分片宽度正好翻倍。
+        for axis in ("local_in_features", "local_out_features"):
+            wide_w = wide_shards[0][axis]
+            narrow_w = narrow_shards[0][axis]
+            if wide_w != narrow_w:
+                assert narrow_w == 2 * wide_w, (raw_op_id, axis, wide_w, narrow_w)
+        # 分片各钉一台 DPU：dpu 数等于分片数，没有两片挤在一台。
+        for entry in (wide_entry, narrow["operators"][raw_op_id]):
+            dpus = [s["dpu_id"] for s in entry["shards"]]
+            assert len(set(dpus)) == len(dpus), (raw_op_id, dpus)
+        assert len(wide_shards) == 2 * len(narrow_shards), raw_op_id
+    assert checked == len(_FIXTURE_GEMM_ROLES), checked
+
+
+def test_tp_width_doubling_shrinks_shard_bytes_within_bound(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """tp_width 放大为 2 倍，单分片搬运字节的下降比例落在 (1, 2]。
+
+    只比本地宽度证明不了字节：未切分一侧的激活在各片重复出现，字节
+    并不严格减半，比例要按字节公式算出来才锁得住。
+    """
+    from genesim_bridge.cost_extractor import ShapePoint, _net_data_bytes
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    wide = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "wide.ir", tmp_path / "wide.json",
+    )
+    strategy = llama_strategy(
+        NUM_DPUS // 2, num_stages=1,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE, vocab_size=32000, num_layers=1,
+    )
+    narrow = export_placement_to_genesim(
+        _export_with_strategy(annotated_tiny_llama, strategy), ir_path,
+        tmp_path / "narrow.ir", tmp_path / "narrow.json", strategy=strategy,
+    )
+
+    ir = json.loads(ir_path.read_text())
+    op_of = {op["op_id"]: op for op in ir["operators"]}
+    point = ShapePoint(tq=1, tp=0)
+    checked = 0
+    for raw_op_id, wide_entry in wide["operators"].items():
+        wide_shards = wide_entry.get("shards") or []
+        narrow_shards = narrow["operators"][raw_op_id].get("shards") or []
+        if not wide_shards:
+            continue
+        op = op_of[int(raw_op_id)]
+        wide_bytes = _net_data_bytes(
+            op, point, 2,
+            (wide_shards[0]["local_in_features"],
+             wide_shards[0]["local_out_features"]),
+        )
+        narrow_bytes = _net_data_bytes(
+            op, point, 2,
+            (narrow_shards[0]["local_in_features"],
+             narrow_shards[0]["local_out_features"]),
+        )
+        ratio = narrow_bytes / wide_bytes
+        assert 1.0 < ratio <= 2.0, (raw_op_id, ratio)
+        checked += 1
+    assert checked == len(_FIXTURE_GEMM_ROLES), checked
+
+
+def _export_with_strategy(gm, strategy):
+    """同一张图按另一个切分宽度重新传播规格。"""
+    from copy import deepcopy
+
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY, SPEC_META_KEY
+
+    fresh = deepcopy(gm)
+    for node in fresh.graph.nodes:
+        node.meta.pop(SPEC_META_KEY, None)
+        node.meta.pop(REDISTRIBUTE_META_KEY, None)
+    propagate_specs(fresh, strategy)
+    return fresh
 
 
 def test_requires_pimir_declares_whether_opcompiler_products_are_carried(
@@ -976,3 +1297,155 @@ def test_the_no_consumer_sidecar_fields_are_registered() -> None:
         write = (re.search(rf'"{name}"\s*:', body)
                  or re.search(rf'\[\s*"{name}"\s*\]\s*=', body))
         assert write, f"{name} 登记了但没有写入点"
+
+
+def test_fused_activations_follow_the_graph(annotated_tiny_llama, tmp_path) -> None:
+    """融合清单来自图上的标记，而不是从模型 IR 的形状猜。
+
+    图编译器折了激活才有条目；没跑融合 pass 的图一份都没有，即使 IR 里
+    gate 投影后紧接 silu。
+    """
+    from graph.fuse_pim import fuse_for_pim
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+
+    unfused = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "unfused.json",
+    )
+    assert unfused["fused_activations"] == []
+
+    fuse_for_pim(annotated_tiny_llama)
+    fused = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "fused.json",
+    )
+    entries = fused["fused_activations"]
+    assert entries, "图上折了激活，sidecar 却没有记录"
+    assert all(entry["activation"] == "silu" for entry in entries)
+    assert {entry["layer"] for entry in entries} == {0}
+    assert all(entry["role"] == "gate_proj" for entry in entries)
+
+
+def test_fused_gate_kernel_carries_the_activation(annotated_tiny_llama, tmp_path) -> None:
+    """图上折了激活的投影，编出的 kernel 必须带上激活属性。
+
+    同形状的两个投影共用一份 kernel：gate 折了 silu、up 没折，编出来却是
+    同一份不带激活的文本。仿真时延取自这份 kernel 的 trace，激活代价因此
+    一分不付，融合只剩「被吸收节点不计费」的收益。
+    """
+    from graph.fuse_pim import fuse_for_pim
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    fuse_for_pim(annotated_tiny_llama)
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "sc.json", measure_kernel_tiles=True,
+    )
+
+    gate = next(
+        op_id for op_id, role in _FIXTURE_GEMM_ROLES if role == "gate_proj")
+    up = next(op_id for op_id, role in _FIXTURE_GEMM_ROLES if role == "up_proj")
+    gate_text = Path(sidecar["operators"][str(gate)]["pimir_path"]).read_text()
+    up_text = Path(sidecar["operators"][str(up)]["pimir_path"]).read_text()
+    assert "act_spec" in gate_text, "折了激活的投影 kernel 里没有激活属性"
+    assert "act_spec" not in up_text, "没折激活的投影不该带激活属性"
+    # 融合只加激活，不得把分块 GEMM 换成相位链：那样计算项归零、字节口径也变。
+    assert "tt.dot" in gate_text, "折了激活的投影丢掉了分块 GEMM"
+    assert "tt.dot" in up_text
+    import sys
+    from genesim_bridge.paths import genesim_root
+    root = str(genesim_root() / "src")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from pim.pim_isa import OPCODE_LUT, OPCODE_MAC, decode_instruction
+    from pim.pimir_trace import compile_from_pimir
+
+    gate_ops = [decode_instruction(raw)["opcode"]
+                for raw in compile_from_pimir(gate_text)]
+    up_ops = [decode_instruction(raw)["opcode"]
+              for raw in compile_from_pimir(up_text)]
+    assert gate_ops.count(OPCODE_MAC) == up_ops.count(OPCODE_MAC) > 0
+    assert gate_ops.count(OPCODE_LUT) == 1
+    assert up_ops.count(OPCODE_LUT) == 0
+
+
+def test_placement_export_prepares_fusion_before_sidecar(annotated_tiny_llama, tmp_path) -> None:
+    """放置导出入口应先运行图融合，sidecar 才能带上融合清单。"""
+    from scripts.export_pp_placement import _fuse_for_placement
+
+    _fuse_for_placement(annotated_tiny_llama)
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "fused.json",
+    )
+    assert sidecar["fused_activations"]
+
+
+def test_kv_operators_are_attributed_to_the_kv_zone(tmp_path) -> None:
+    """读 KV 缓存的注意力算子标成 kv 区，归属来自内存规划的 KV 规格。
+
+    没给 KV 规格就一个都不标：区间归属是图编译器内存决策的一部分。
+    """
+    from memory.kv_layout import KVRegionSpec
+
+    from genesim_bridge.placement_export import _mark_kv_zone
+
+    ir = {
+        "num_layers": 1,
+        "subgraphs": [[0, 1, 2]],
+        "operators": [
+            {"op_id": 0, "op_type": "GEMV_SCORE"},
+            {"op_id": 1, "op_type": "GEMV_CONTEXT"},
+            {"op_id": 2, "op_type": "SOFTMAX"},
+        ],
+    }
+    sidecar = {"operators": {
+        str(op_id): {"op_type": op["op_type"], "shards": []}
+        for op_id, op in enumerate(ir["operators"])
+    }}
+
+    _mark_kv_zone(ir, sidecar, None)
+    assert not [e for e in sidecar["operators"].values() if e.get("zone")]
+
+    kv_specs = {
+        dpu_id: KVRegionSpec(
+            dpu_id=dpu_id, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+            max_seq=16, head_dim=HIDDEN_SIZE // NUM_HEADS, dtype_bytes=2,
+            kv_base=0,
+        )
+        for dpu_id in range(NUM_DPUS)
+    }
+    _mark_kv_zone(ir, sidecar, kv_specs)
+    zoned = {op_id: e for op_id, e in sidecar["operators"].items()
+             if e.get("zone")}
+    assert set(zoned) == {"0", "1"}, zoned
+    assert all(e["zone"] == "kv" for e in zoned.values())
+
+
+def test_a_layer_without_kv_gets_no_zone() -> None:
+    """只持有其它层 KV 的 DPU 不该把这一层的注意力算子标成 kv。"""
+    from memory.kv_layout import KVRegionSpec
+
+    from genesim_bridge.placement_export import _mark_kv_zone
+
+    ir = {
+        "num_layers": 1,
+        "subgraphs": [[0]],
+        "operators": [{"op_id": 0, "op_type": "GEMV_SCORE"}],
+    }
+    sidecar = {"operators": {"0": {"op_type": "GEMV_SCORE", "shards": []}}}
+    kv_specs = {0: KVRegionSpec(
+        dpu_id=0, layers=[7], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=16, head_dim=HIDDEN_SIZE // NUM_HEADS, dtype_bytes=2,
+        kv_base=0,
+    )}
+
+    _mark_kv_zone(ir, sidecar, kv_specs)
+
+    assert "zone" not in sidecar["operators"]["0"]

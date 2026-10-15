@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
              "给了就按其中的本地分片形状测量被放置的算子，不给则全部按模型级"
              "全局形状。B 路不用 FlagGems，本地形状只影响 data_bytes 那一项。",
     )
+    parser.add_argument(
+        "--fusion-from", default=None,
+        help="同一份放置 sidecar 的路径，只用来取融合清单。与 --placement 分开"
+             "是因为形状口径与融合与否互不相干：全局形状的那份精化 IR 同样需要"
+             "知道图编译器折了哪些激活，否则被吸收的节点会被多计一遍。",
+    )
     return parser.parse_args()
 
 
@@ -89,6 +95,10 @@ def main() -> int:
         cross_validate=args.ir_level != "oplevel",
         ir_level=args.ir_level,
         local_shapes=local_shapes,
+        # 融合清单只读 --fusion-from：折没折激活由图编译器决定，与形状口径无关。
+        placement_sidecar=(
+            Path(args.fusion_from) if args.fusion_from else None
+        ),
     )
 
     bridged = len(sidecar["coverage"]["bridged"])

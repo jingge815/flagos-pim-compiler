@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
 from torch.fx import GraphModule
 
-from contracts.graph_meta import DEVICE_DPU, SPEC_META_KEY
+from contracts.graph_meta import (DEVICE_DPU, FUSED_TAIL_META_KEY, REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 
 if TYPE_CHECKING:  # 只为类型标注；运行时不拖进算子编译那条依赖链。
     from contracts.op_contract import PIMHardwareConfig
@@ -46,6 +47,74 @@ _ROLE_TO_WEIGHT_PATTERN = {
 }
 
 
+def _activation_of(weight_node) -> str | None:
+    """权重节点被折进主算子的激活名，没折过就是 None。
+
+    标记打在 linear 节点上，而 linear 是权重节点的用户。
+    """
+    for user in weight_node.users:
+        tail = user.meta.get(FUSED_TAIL_META_KEY)
+        if tail is not None:
+            return tail.activation
+    return None
+
+
+
+
+def _graph_seq_len(gm: GraphModule) -> int:
+    """图导出时用的序列长度，取输入 token 的长度。"""
+    for node in gm.graph.nodes:
+        if node.op == "placeholder" and node.name == "input_ids":
+            value = node.meta.get("val")
+            if value is None:
+                raise ValueError(
+                    "input_ids 没有 val，无法确定导出序列长度"
+                )
+            return int(value.shape[-1])
+    raise ValueError("图上没有 input_ids，无法确定导出序列长度")
+
+
+def _export_seq_len(edge, export_seq_len: int) -> int | None:
+    """边是否按导出序列长度线性计字节；不是时返回 None。
+
+    激活张量恰有一维等于导出序列长度，整份字节里已经乘过它一次，仿真侧
+    要先除回去再按本次 forward 的长度放大。整型张量是 token id，长度是
+    词表位置；序列维出现不止一次的是 attention mask，按平方增长。两者
+    都不随 token 数线性变化。
+    """
+    if not edge.dtype.startswith("float"):
+        return None
+    matching = [size for size in edge.shape if size == export_seq_len]
+    if len(matching) != 1:
+        return None
+    if math.prod(edge.shape) == 0 or int(edge.nbytes) % math.prod(edge.shape):
+        return None
+    return export_seq_len
+
+
+def _fused_activations(gm: GraphModule) -> list[dict]:
+    """图上被折进主算子的激活，按层与投影身份列出。
+
+    只认 `FUSED_TAIL_META_KEY`：权重节点的用户带这个标记，才说明图编译器
+    真的折过。模型 IR 里 gate 投影后接 silu 只是图的形状，不算数。
+    """
+    found = []
+    for role, pattern in _ROLE_TO_WEIGHT_PATTERN.items():
+        for node in gm.graph.nodes:
+            if node.op != "get_attr" or pattern not in node.target:
+                continue
+            # 目标形如 model.model.layers.0.mlp.gate_proj.weight，层号在 layers 后。
+            layer = int(str(node.target).split("layers.")[1].split(".")[0])
+            for user in node.users:
+                tail = user.meta.get(FUSED_TAIL_META_KEY)
+                if tail is None:
+                    continue
+                found.append({
+                    "layer": layer, "role": role, "activation": tail.activation,
+                })
+    return found
+
+
 def _get_attr_node(gm: GraphModule, pattern: str):
     matches = [n for n in gm.graph.nodes if n.op == "get_attr" and pattern in n.target]
     if len(matches) != 1:
@@ -58,7 +127,8 @@ def _measure_kernel_tile_n(
     local_out: int,
     dtype: str,
     hardware: "PIMHardwareConfig | None",
-    cache: Dict[tuple[int, int], tuple[int, str, int | None]],
+    cache: Dict[tuple[int, int, str | None], tuple[int, str, int | None]],
+    activation: str | None = None,
 ) -> tuple[int, str, int | None]:
     """编译一个本地分片形状，返回 `(tile_n, pim mlir 路径)`。
 
@@ -73,7 +143,8 @@ def _measure_kernel_tile_n(
     同一形状只编一次，结果放进 `cache`。第三个返回值是算子编译器回传的
     单台 MRAM 占用（`pim.placed-mram-bytes`），没回传时为 None。
     """
-    key = (local_in, local_out)
+    # 激活也进键：同形状的两个投影一个折激活、一个不折，漏掉就编成同一份。
+    key = (local_in, local_out, activation)
     if key in cache:
         return cache[key]
 
@@ -119,8 +190,27 @@ def _measure_kernel_tile_n(
             f"算子编译没有留下 pim mlir 的落盘路径（本地形状 {local_in}->{local_out}）。"
             "GeneSim 侧要照这份 IR 生成 trace，缺了路径就只能退回手写模板。"
         )
-    cache[key] = (tile_n, str(result.pimir_path), cost.mram_bytes_per_dpu)
+    pimir_path = str(result.pimir_path)
+    if activation:
+        # 激活标在 A 路的 tt.dot 上，不换建模口径：B 路相位链会把乘加循环
+        # 收成一条指令，计算项归零。
+        pimir_path = _annotate_linear_activation(
+            result.pimir, pimir_path, activation)
+    cache[key] = (tile_n, pimir_path, cost.mram_bytes_per_dpu)
     return cache[key]
+
+
+def _annotate_linear_activation(
+    pimir: str, src_path: str, activation: str,
+) -> str:
+    """把激活属性写进 A 路分块 GEMM，返回新文件路径。"""
+    from genesim_bridge.ir_cost import mark_fused_activation
+
+    marked = mark_fused_activation(pimir, activation)
+    out = Path(src_path).with_name(
+        f"{Path(src_path).stem}.{activation}.pimir.mlir")
+    out.write_text(marked)
+    return str(out)
 
 
 def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
@@ -270,6 +360,38 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         entry["pimir_sha256"] = _file_sha256(cache[key])
 
 
+# 读 KV 缓存的算子：attention 的两次矩阵乘，一次读 K、一次读 V。
+_KV_OP_TYPES = ("GEMV_SCORE", "GEMV_CONTEXT")
+
+
+def _mark_kv_zone(ir: dict, sidecar: dict, kv_specs) -> None:
+    """把读 KV 缓存的算子标进 kv 区，没给 KV 规格就一个都不标。
+
+    两层判定：算子范围是读 KV 的两次注意力矩阵乘（`_KV_OP_TYPES`），层号
+    取自内存规划的 KV 规格——哪台 DPU 持有哪一层的 KV 是它定的。
+    """
+    if not kv_specs:
+        return
+    kv_layers = set()
+    for spec in kv_specs.values():
+        kv_layers.update(spec.layers)
+    layer_of = {
+        op_id: layer
+        for layer, group in enumerate(ir.get("subgraphs", []))
+        for op_id in group
+    }
+    for op in ir["operators"]:
+        if op["op_type"] not in _KV_OP_TYPES:
+            continue
+        if layer_of.get(op["op_id"]) not in kv_layers:
+            continue
+        # 只在已有条目上标：区间要靠 pimir 生成的 trace 才消费得到，凭空造
+        # 一条没有 pimir_path 的条目会破坏 sidecar 的契约。
+        entry = sidecar["operators"].get(str(op["op_id"]))
+        if entry is not None:
+            entry["zone"] = "kv"
+
+
 def count_sidecar_classes(sidecar) -> tuple[int, int, dict]:
     """数一份 sidecar 里两类条目各有几条，以及每台 DPU 承担多少 GEMM 分片。
 
@@ -349,6 +471,7 @@ def export_placement_to_genesim(
     measure_kernel_tiles: bool = False,
     dpu_to_cluster: tuple[tuple[int, int], ...] | None = None,
     strategy: "ShardStrategy | None" = None,
+    kv_specs: "Dict[int, Any] | None" = None,
 ) -> Dict[str, Any]:
     """更新 GEMM 的设备提示并输出 IR 文件和代表 DPU 编号。
 
@@ -389,11 +512,40 @@ def export_placement_to_genesim(
         # 与算子无关。GeneSim 侧按它分配，缺失则退回取模换算。
         sidecar["dpu_to_cluster"] = [list(entry) for entry in dpu_to_cluster]
 
+    # GeneSim 只展开了 all_reduce 的收集方向。all_gather 与 scatter 在它的图上
+    # 没有边，通信时延被漏计；all_reduce 再写一遍会和归约节点双计，local_slice
+    # 留在 DPU 内部、不产生通信。
+    collectives = []
+    seen_edges = set()
+    export_seq_len = _graph_seq_len(gm)
+    for node in gm.graph.nodes:
+        for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
+            if edge.edge_id in seen_edges or edge.type not in (
+                "all_gather", "scatter",
+            ):
+                continue
+            seen_edges.add(edge.edge_id)
+            dpus = set()
+            for loc in (edge.src_loc, edge.dst_loc):
+                dpus.update(loc.get("dpus", ()))
+            entry = {
+                "type": edge.type,
+                "nbytes": int(edge.nbytes),
+                "dpu_ids": sorted(dpus),
+            }
+            # 键必须在：调度器把缺 seq_len 当成旧 sidecar 直接报错。不带序列
+            # 维的边显式写 null，仿真侧按常量计，不会被错除。
+            entry["seq_len"] = _export_seq_len(edge, export_seq_len)
+            collectives.append(entry)
+    sidecar["collectives"] = collectives
+    # 融合清单只读图上的标记：没跑融合 pass 就是空，不能从 IR 形状猜。
+    sidecar["fused_activations"] = _fused_activations(gm)
+
     _assert_every_gemm_has_known_role(ir)
 
     # {(local_in, local_out): tile_n}。同一形状只编一次——llama2 的 224 个 GEMM
     # 只有 7 种本地形状，逐个编会白跑 217 次。
-    tile_cache: Dict[tuple[int, int], tuple[int, str]] = {}
+    tile_cache: Dict[tuple[int, int, str | None], tuple[int, str, int | None]] = {}
 
     for layer in range(num_layers):
         gemm_op_ids = [
@@ -465,7 +617,8 @@ def export_placement_to_genesim(
 
             if measure_kernel_tiles:
                 tile_n, pimir_path, placed = _measure_kernel_tile_n(
-                    int(rep_in), int(rep_out), dtype, hardware, tile_cache
+                    int(rep_in), int(rep_out), dtype, hardware, tile_cache,
+                    activation=_activation_of(weight_node),
                 )
                 entry["kernel_tile_n"] = tile_n
                 # 算子编译器回传的单台 MRAM 占用。GeneSim 用它核对常驻容量，
@@ -493,6 +646,9 @@ def export_placement_to_genesim(
 
     # 放在 B 路回填之后：非 GEMM 的条目是那里新建的，之前还没有可钉的对象。
     _pin_unsharded_ops(ir, sidecar, strategy)
+    # 读 KV 缓存的注意力算子标成 kv 区。归属来自内存规划的 KV 规格：哪台
+    # DPU 持有哪一层的 KV 是它定的，不是按算子类型硬猜。
+    _mark_kv_zone(ir, sidecar, kv_specs)
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))

@@ -23,7 +23,7 @@
 
 **第 1 阶段（当前）**：固定 shape 全链路打通，Llama‑2‑7B(HuggingFace获取静态模型)，NumpyBackend 上跑通 prefill + 完整 decode，与单卡 PyTorch 逐元素对齐。
 
-序列变长、代价模型、自动切分、激活区紧凑复用、算子融合、异步 dispatch 属第 2/3 阶段，**当前不实现、不预留抽象**。
+代价模型已进入实现，见 docs/request-ir-cost-20261012.md。序列变长、自动切分、激活区紧凑复用、算子融合、异步 dispatch 属第 2/3 阶段，当前不实现、不预留抽象。
 
 ## 实施步骤（`docs/spec.md:2204` 展开）
 

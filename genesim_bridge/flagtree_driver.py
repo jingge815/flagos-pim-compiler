@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -291,6 +292,23 @@ def capture_kernels(
         LibEntry.run = original
 
 
+@contextmanager
+def _use_gems():
+    """启用 FlagGems 接管 aten 实现。
+
+    覆盖已有 CUDA 核时 PyTorch 会打一条一次性提示，属预期行为，这里压掉。
+    """
+    import flag_gems
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Warning only once for all operators",
+            category=UserWarning,
+        )
+        with flag_gems.use_gems():
+            yield
+
+
 def run_and_capture(
     fn,
     emit_pimir: bool = False,
@@ -310,7 +328,6 @@ def run_and_capture(
     ensure_compile_driver()
 
     import torch
-    import flag_gems
 
     has_gpu = gpu_hardware_present()
 
@@ -318,7 +335,7 @@ def run_and_capture(
         if has_gpu:
             torch.cuda.synchronize()
 
-    with flag_gems.use_gems():
+    with _use_gems():
         fn()
     _sync()
 
@@ -327,7 +344,7 @@ def run_and_capture(
         tile_to_budget=tile_to_budget,
         wram_bytes=wram_bytes,
     ) as captured:
-        with flag_gems.use_gems():
+        with _use_gems():
             fn()
         _sync()
     return list(captured)

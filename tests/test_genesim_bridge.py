@@ -522,7 +522,22 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
     assert pimir["coverage"] == ttir["coverage"]
     assert pimir["pim_options"]["pim_target"]
 
+    # 融合算子的折激活记账挂在 pimir 的写回上，ttir 侧 A 路 kernel 没有
+    # dma_store，两条路径的运算数本来就不是同一口径。
+    fused_ids = set()
+    placement = ir_dir / "llama2_7b_tp2_pp4_placement.json"
+    if placement.is_file():
+        pl = json.loads(placement.read_text())
+        fused_roles = {e["role"] for e in pl.get("fused_activations") or []}
+        for oid, ent in pl.get("operators", {}).items():
+            if ent.get("semantic_role") in fused_roles:
+                fused_ids.add(oid)
+    if placement.is_file():
+        assert fused_ids, "放置 sidecar 有融合清单，对照却一个融合算子都没跳过"
+
     for op_id, entry in pimir["operators"].items():
+        if op_id in fused_ids:
+            continue
         for point in ("prefill", "decode"):
             got = entry["measurements"][point]
             want = ttir["operators"][op_id]["measurements"][point]

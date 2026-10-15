@@ -350,6 +350,62 @@ def _line_operator_flops(line: str) -> float:
     return phases * _tensor_numel(tensors[0][0])
 
 
+# 折进主算子的激活。写出与识别共用这一处：属性只带 kind，给正则消费，
+# 不进 MLIR verifier。跨仓的 pimir_trace 用同一份正则，改这里要两边一起改。
+_FUSED_ACT_SPEC_RE = re.compile(r"activation\s*=\s*#pim\.act_spec<")
+
+
+def fused_act_spec_attr(kind: str) -> str:
+    """写出折进主算子的激活属性，kind 为 silu 这类名字。"""
+    return f"activation = #pim.act_spec<kind = {kind}>"
+
+
+def has_fused_act_spec(text: str) -> bool:
+    """文本是否带折进主算子的激活属性。"""
+    return _FUSED_ACT_SPEC_RE.search(text) is not None
+
+
+def mark_fused_activation(pimir: str, activation: str) -> str:
+    """把激活属性标到 A 路分块 GEMM 的 tt.dot 上，不换建模口径。
+
+    A 路 kernel 由 Triton 生成，带不出激活。属性只带 kind，给正则消费，
+    不进 MLIR verifier。
+    """
+    if "tt.dot" not in pimir:
+        raise RuntimeError(
+            f"A 路产物没有 tt.dot，无法把 {activation} 折进分块 GEMM"
+        )
+    if has_fused_act_spec(pimir):
+        return pimir
+    attr = fused_act_spec_attr(activation)
+    marked, n = re.subn(
+        r"(tt\.dot\b[^:\n]*)(:)",
+        rf"\1{{{attr}}} \2",
+        pimir,
+        count=1,
+    )
+    if n != 1 or not has_fused_act_spec(marked):
+        raise RuntimeError(f"没能在 tt.dot 上标 {activation}")
+    return marked
+
+
+def _fused_activation_bytes(line: str) -> float:
+    """折进主算子的激活所遍历的字节数，取结果张量。
+
+    只计相位链上的 `pim.matmul`：分块 GEMM 的 `tt.dot` 在 K 循环里，结果还是
+    累加器类型，那一次遍历改由写回那一行按 memdesc 计。
+    """
+    if not has_fused_act_spec(line):
+        return 0.0
+    if "tt.dot" in line:
+        return 0.0
+    tensors = _TENSOR_RE.findall(line)
+    if not tensors:
+        return 0.0
+    dims, dtype = tensors[-1]
+    return float(_tensor_numel(dims) * _DTYPE_BYTES.get(dtype, 2))
+
+
 def _line_weight_residency_bytes(line: str) -> float:
     """一行 `pim.matmul` 里**权值侧**的搬运字节数。
 
@@ -503,8 +559,15 @@ def analyze_ir(
     dma_ops = 0
     dma_ops_with_layout = 0
     group_dequant_steps = 0
+    # 折激活只记最后一次写回，与 pimir_trace 取 outer_stores[-1] 同口径。
+    last_fused_store = None
+    if has_fused_act_spec(text):
+        for i, raw in enumerate(text.splitlines()):
+            line = raw.split(" loc(")[0]
+            if _DMA_RE.search(line) and "dma_store" in line:
+                last_fused_store = i
 
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines()):
         line = raw.split(" loc(")[0]  # 移除 loc 注解后匹配指令。
         if len(stack) == 1:
             folder.feed(line)
@@ -516,7 +579,11 @@ def analyze_ir(
             step = folder.resolve(fm.group(3))
             bounds = f"[{fm.group(1)},{fm.group(2)}) step {fm.group(3)}"
             if None not in (lo, hi, step) and step:
-                trip: Optional[float] = max(0.0, (hi - lo) / step)
+                # 最后一趟往往不满：上界不是步长的整数倍时，按整趟计会把不满
+                # 的尾块漏掉。trace 侧按整块累加，所以每一层都向上取整，两条
+                # 路径才用同一口径。
+                trips = -((lo - hi) // step)  # ceil((hi - lo) / step)
+                trip: Optional[float] = float(max(0, trips))
             else:
                 trip = None
                 notes.append(f"循环次数未折叠: {bounds}")
@@ -541,13 +608,24 @@ def analyze_ir(
             continue
 
         f = _line_tile_flops(line) + _line_operator_flops(line)
+        if has_fused_act_spec(line) and "tt.dot" not in line:
+            tensors = _TENSOR_RE.findall(line)
+            if tensors:
+                f += _tensor_numel(tensors[-1][0])
         if f:
             stack[-1]["flops"] += f
+        # ttir 没有搬运账，但仍要给折激活记一次结果趟数，否则同一份文本
+        # 在 ttir 与 pimir 上的运算数对不上。
+        if ir_level == "ttir" and lineno == last_fused_store:
+            desc = _MEMDESC_RE.search(line)
+            if desc:
+                stack[-1]["flops"] += _tensor_numel(desc.group(1))
 
         if ir_level in ("pimir", "oplevel"):
             moved = (_line_movement_bytes(line)
                      + _line_weight_residency_bytes(line)
-                     + _line_phase_movement_bytes(line))
+                     + _line_phase_movement_bytes(line)
+                     + _fused_activation_bytes(line))
             if moved:
                 stack[-1]["dma_bytes"] += moved
             dma_bytes = _line_dma_bytes(line)
@@ -557,6 +635,13 @@ def analyze_ir(
                 # 指针分析确认布局时才记录步长属性。
                 if "elem_stride" in line:
                     dma_ops_with_layout += 1
+                # 折进主算子的激活消费归约之后的写回，只记最后一次。
+                # 不能记在 tt.dot 上：那一行在 K 循环里，结果还是累加器类型。
+                if lineno == last_fused_store:
+                    stack[-1]["dma_bytes"] += dma_bytes
+                    desc = _MEMDESC_RE.search(line)
+                    if desc:
+                        stack[-1]["flops"] += _tensor_numel(desc.group(1))
             group_dequant_steps += _line_group_dequant_steps(line)
             alloc = _WRAM_ALLOC_RE.search(line)
             if alloc:

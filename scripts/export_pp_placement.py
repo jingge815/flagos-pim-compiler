@@ -42,6 +42,7 @@ from graph.strategy import (
     llama_strategy,
     strategy_from_partition_plan,
 )
+from graph.fuse_pim import fuse_for_pim
 from memory.mem_planner import HwBudget
 from runtime.compile import compile_llama2
 
@@ -49,6 +50,11 @@ NUM_DPUS = 8
 NUM_TASKLETS = 4
 PREFILL_SEQ_LEN = 16
 MAX_SEQ = 64
+
+
+def _fuse_for_placement(gm):
+    """给 GeneSim 放置导出图补上融合标记。"""
+    return fuse_for_pim(gm)
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +149,8 @@ def main() -> None:
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
         hw=hw, hardware=hardware,
     )
+    fusion = _fuse_for_placement(compiled.prefill_gm)
+    print(f"GeneSim 代价评估融合: {fusion}")
 
     out_ir = out_dir / f"llama2_7b_{strategy.name}_placed.ir"
     sidecar_path = out_dir / f"llama2_7b_{strategy.name}_placement.json"
@@ -155,6 +163,8 @@ def main() -> None:
         dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,
         # 非 GEMM 算子按所在层钉到该层流水段的第一台 DPU。
         strategy=strategy,
+        # KV 规格决定哪些算子读的是 KV 区，随 sidecar 传给 GeneSim 选每字节周期。
+        kv_specs=compiled.kv_specs,
     )
 
     # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。一个 GEMM 可能切在多台

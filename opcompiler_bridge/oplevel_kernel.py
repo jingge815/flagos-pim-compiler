@@ -148,8 +148,8 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
                    f"groupSize = {group_size}{extra}>")
     act = ""
     if activation:
-        kind = str(activation).lower()
-        act = f", activation = #pim.act_spec<kind = {kind}>"
+        from genesim_bridge.ir_cost import fused_act_spec_attr
+        act = f", {fused_act_spec_attr(str(activation).lower())}"
     if fp16:
         # 没有权值侧，所以 `weightBinding` 与 `stationarity` 都不发：后者一旦
         # 写成 `kv`，verifier 就要求 `weightBinding` 声明

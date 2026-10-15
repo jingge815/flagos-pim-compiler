@@ -321,6 +321,19 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
                                                 out_features)),
         )
 
+    def gemm_silu(point: ShapePoint, in_features: int, out_features: int,
+                  activation: str = "silu") -> OpRecipe:
+        # 与 gemm 同一份配方，只多带激活属性。fp16 那条路没有权值侧，
+        # 投影的权值搬运会整笔丢掉，所以这里不走它。
+        return OpRecipe(
+            source_name="flag_gems.ops.linear",
+            build=_linear(dims, point, in_features, out_features),
+            mnemonic="pim.matmul",
+            pimir=lambda: _module(matmul_kernel(
+                "linear", point.tq, in_features, out_features,
+                activation=activation)),
+        )
+
     def gemv_score(point: ShapePoint) -> OpRecipe:
         # 注意力得分的矩阵乘形状。
         return OpRecipe(
@@ -372,6 +385,7 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
 
     return {
         "GEMM": gemm,
+        "GEMM_SILU": gemm_silu,
         "GEMV_SCORE": gemv_score,
         "SOFTMAX": softmax,
         "GEMV_CONTEXT": gemv_context,

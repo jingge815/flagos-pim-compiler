@@ -118,7 +118,9 @@ def _ir_op_ids(ir_path: Path) -> list[int]:
     return [int(op["op_id"]) for op in ir["operators"]]
 
 
-def step_a2_refine_pimir_ir(genesim: Path, ir_path: Path, log_dir: Path) -> Path:
+def step_a2_refine_pimir_ir(
+    genesim: Path, ir_path: Path, log_dir: Path, placement: Path | None = None,
+) -> Path:
     """(A2) 从刚生成的图骨架 IR 精化出仿真要加载的 pimir 成本 IR。
 
     仿真配置加载的 `models/llama2_7b_pimir.ir` 历来是手动跑
@@ -134,16 +136,27 @@ def step_a2_refine_pimir_ir(genesim: Path, ir_path: Path, log_dir: Path) -> Path
     """
     print("\n[A2] 图骨架 IR → 精化 pimir 成本 IR（仿真加载的那份）")
     pimir_ir = genesim / "models" / _PIMIR_IR_NAME
-    if pimir_ir.is_file() and _ir_op_ids(pimir_ir) == _ir_op_ids(ir_path):
+    fusion_requested = False
+    if placement is not None and Path(placement).is_file():
+        placement_data = json.loads(Path(placement).read_text())
+        fusion_requested = bool(placement_data.get("fused_activations"))
+    if (pimir_ir.is_file() and _ir_op_ids(pimir_ir) == _ir_op_ids(ir_path)
+            and not fusion_requested):
         print(f"    精化 IR 与图骨架同套编号（{pimir_ir.name}），跳过重新精化")
         return pimir_ir
-    _run(
-        ["python", "scripts/refine_ir_with_flagtree.py",
-         "--ir", str(ir_path), "--out-ir", str(pimir_ir),
-         "--sidecar", str(genesim / "models" / "llama2_7b_pimir_extensions.json"),
-         "--seq-len", _REFINE_SEQ_LEN, "--ir-level", "pimir"],
-        cwd=genesim, log_path=log_dir / "a2_refine_pimir.log",
-    )
+    cmd = [
+        "python", "scripts/refine_ir_with_flagtree.py",
+        "--ir", str(ir_path), "--out-ir", str(pimir_ir),
+        "--sidecar", str(genesim / "models" / "llama2_7b_pimir_extensions.json"),
+        "--seq-len", _REFINE_SEQ_LEN, "--ir-level", "pimir",
+    ]
+    # 放置 sidecar 里带图编译器的融合清单。没有它就按未融合算，会把已被吸收的
+    # 激活再计一遍——所以必须在放置导出之后跑，并且把这份 sidecar 传进来。
+    if placement is not None and Path(placement).is_file():
+        # 只取融合清单，不动形状口径：这份精化 IR 按模型级全局形状测，
+        # 而融合与否是图编译器的决策，两种口径都要带上。
+        cmd += ["--fusion-from", str(placement)]
+    _run(cmd, cwd=genesim, log_path=log_dir / "a2_refine_pimir.log")
     if _ir_op_ids(pimir_ir) != _ir_op_ids(ir_path):
         raise StepFailed(
             f"精化 IR 的算子编号与图骨架不一致：{pimir_ir} vs {ir_path}。"
@@ -244,6 +257,31 @@ def check_sidecar_entries(ops: Dict[str, Dict[str, Any]]) -> tuple[int, int]:
     return len(gemm_ops), len(bpath_ops)
 
 
+def fused_kernels_missing_act_spec(sidecar: Dict[str, Any]) -> list[str]:
+    """融合清单非空时，折激活的投影 kernel 必须带 act_spec。
+
+    旧产物把同形状的 gate 与 up 编成同一份不带激活的 kernel，仿真时延取自
+    那份 trace，激活一分不付。
+    """
+    from genesim_bridge.ir_cost import has_fused_act_spec
+
+    fused_roles = {entry["role"] for entry in sidecar.get("fused_activations") or []}
+    if not fused_roles:
+        return []
+    missing = []
+    seen = set()
+    for entry in sidecar.get("operators", {}).values():
+        if entry.get("semantic_role") not in fused_roles:
+            continue
+        path = entry.get("pimir_path")
+        if not path or path in seen or not Path(path).is_file():
+            continue
+        seen.add(path)
+        if not has_fused_act_spec(Path(path).read_text()):
+            missing.append(path)
+    return missing
+
+
 def step_bcd_export(
     num_stages: int, num_dpus: int, log_dir: Path,
     *, plan_path: Optional[Path] = None,
@@ -336,6 +374,12 @@ def step_bcd_export(
                 f"  方案: {declared}\n  sidecar: {carried}"
             )
         print(f"    Cluster 映射已随 sidecar 回传，与方案一致（{len(carried)} 项）")
+    stale_fused = fused_kernels_missing_act_spec(sidecar)
+    if stale_fused:
+        raise StepFailed(
+            "融合清单非空，但折激活的投影 kernel 没有 act_spec："
+            f"{stale_fused[:3]}。按当前代码重跑放置导出。"
+        )
     return sidecar_path
 
 
@@ -655,15 +699,16 @@ def main() -> int:
 
     try:
         ir_path = step_a_model_ir(genesim, model_dir, log_dir)
-        step_a2_refine_pimir_ir(genesim, ir_path, log_dir)
         plan_path = None
         if not args.no_pu_mapping:
             plan_path = step_zero_pu_mapping(
                 genesim, ir_path, args.num_stages, args.num_dpus, log_dir
             )
-        step_bcd_export(
+        placement = step_bcd_export(
             args.num_stages, args.num_dpus, log_dir, plan_path=plan_path
         )
+        # 精化放在放置导出之后：融合清单随放置 sidecar 一起去，先跑就没有它。
+        step_a2_refine_pimir_ir(genesim, ir_path, log_dir, placement=placement)
 
         if args.skip_simulation:
             print("\n跳过仿真（--skip-simulation）。到 sidecar 为止的链路已验证。")

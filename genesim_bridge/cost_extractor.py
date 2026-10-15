@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .flagtree_driver import lower_oplevel_to_pimir, run_and_capture
-from .ir_cost import analyze_ir
+from .ir_cost import analyze_ir, mark_fused_activation
 from .op_classify import (
     UNCOVERED_OP_TYPES,
     OpRecipe,
@@ -66,7 +66,15 @@ def _measure(
             in_features, out_features = local_features
         else:
             in_features, out_features = gemm_features(op_dict)
-        recipe = recipes["GEMM"](point, in_features, out_features)
+        # 激活折进主算子时走带激活的配方：单独的 silu 已被吸收、不再发射，
+        # 省掉的中间搬运只有这条配方能体现。
+        if op_dict.get("fused_activation"):
+            recipe = recipes["GEMM_SILU"](
+                point, in_features, out_features,
+                activation=op_dict["fused_activation"],
+            )
+        else:
+            recipe = recipes["GEMM"](point, in_features, out_features)
     else:
         recipe = recipes[op_type](point)
 
@@ -113,6 +121,9 @@ def _measure(
     pim_kernels: List[Dict[str, Any]] = []
     for cap in captured:
         text = cap.pimir if pimir else cap.ttir
+        # A 路 kernel 本身不带激活：图编译器折了的，标到 tt.dot 上再计费。
+        if pimir and op_dict.get("fused_activation") and text:
+            text = mark_fused_activation(text, op_dict["fused_activation"])
         cost = analyze_ir(text, cap.name, cap.grid, cap.arg_values, ir_level=ir_level)
         total_flops += cost.flops
         dtype = cost.dtype
@@ -212,6 +223,78 @@ def _pim_kernel_dict(cost) -> Dict[str, Any]:
     }
 
 
+def _fused_pairs(sidecar_path: Optional[Path]) -> set:
+    """放置 sidecar 里图编译器折过的 (层号, 投影身份, 激活名)。
+
+    没有这份清单就按未融合处理：融合与否是图编译器的决策，不能从模型 IR
+    里 gate 投影后接不接 silu 猜出来。
+    """
+    if sidecar_path is None:
+        return set()
+    data = json.loads(Path(sidecar_path).read_text())
+    return {
+        (entry["layer"], entry["role"], entry["activation"])
+        for entry in data.get("fused_activations", [])
+    }
+
+
+def _layer_of(ir: Dict[str, Any]) -> Dict[int, int]:
+    """每个算子所在的层，取自按层分组的 subgraphs。"""
+    layers = {}
+    for layer, group in enumerate(ir.get("subgraphs", [])):
+        for op_id in group:
+            layers[op_id] = layer
+    return layers
+
+
+def _mark_fused_activations(ir: Dict[str, Any], fused: set) -> None:
+    """按放置 sidecar 的融合清单把激活折进主算子。
+
+    清单按层、投影身份与激活名给出，层号从 subgraphs 的分组对上。同一层里
+    该身份的投影折上紧接其后、同名的激活。清单为空时什么都不做。
+    """
+    if not fused:
+        return
+    by_id = {op["op_id"]: op for op in ir["operators"]}
+    layer_of = _layer_of(ir)
+    dependencies = ir.get("dependencies", [])
+    for layer, role, activation in sorted(fused):
+        matches = []
+        for edge in dependencies:
+            src = by_id.get(edge["src_op_id"])
+            dst = by_id.get(edge["dst_op_id"])
+            if (src is None or dst is None
+                    or layer_of.get(src["op_id"]) != layer
+                    or src.get("semantic_role") != role
+                    or dst.get("op_type") != activation.upper()):
+                continue
+            inputs = [item["src_op_id"] for item in dependencies
+                      if item["dst_op_id"] == dst["op_id"]]
+            if inputs == [src["op_id"]]:
+                matches.append((src, dst))
+
+        if len(matches) != 1:
+            raise ValueError(
+                f"融合清单指定 layer={layer} role={role!r} activation={activation!r}，"
+                f"应恰好匹配一个以该投影为唯一输入的激活，实际 {len(matches)} 个"
+            )
+        src, dst = matches[0]
+        if src.get("fused_activation"):
+            raise ValueError(
+                f"layer={layer} role={role!r} 的投影已带融合激活"
+            )
+        src["fused_activation"] = activation
+        # 节点留在图里，只是不再单独计费，覆盖统计仍能看到这个算子。
+        dst["absorbed"] = True
+
+
+def _strip_fusion_markers(ir: Dict[str, Any]) -> None:
+    """去掉算子上的融合标记，精化 IR 只保留 GeneSim 认识的字段。"""
+    for op in ir["operators"]:
+        op.pop("fused_activation", None)
+        op.pop("absorbed", None)
+
+
 def _resolve_dim(dim: Any, point: ShapePoint) -> int:
     """把 GeneSim 的符号维度代入具体值。"""
     if isinstance(dim, int):
@@ -238,6 +321,9 @@ def _net_data_bytes(
         # GEMM 的形状是 [Tq, in] -> [Tq, out]，Tq 由 shape point 决定。
         tq = _resolve_dim("Tq", point)
         total = tq * in_features + tq * out_features + in_features * out_features
+        # 折进主算子的激活按读加写两份补，与独立节点同口径。
+        if op_dict.get("fused_activation"):
+            total += tq * out_features
         return float(total * element_bytes)
 
     total = 0
@@ -250,6 +336,11 @@ def _net_data_bytes(
     if op_dict["op_type"] == "GEMM":
         in_features, out_features = gemm_features(op_dict)
         total += in_features * out_features  # 权重大小与 Tq 无关。
+        # 折进主算子的激活按独立节点的口径补读加写两份。只补一份写回的话，
+        # 融合侧会比未融合少掉那份读，算子数更多的 IR 反而更贵。
+        if op_dict.get("fused_activation"):
+            tq = _resolve_dim("Tq", point)
+            total += tq * out_features
 
     return float(total * element_bytes)
 
@@ -364,6 +455,7 @@ def export_costs_to_genesim(
     cross_validate: bool = True,
     ir_level: str = "pimir",
     local_shapes: Optional[Dict[int, Tuple[int, int]]] = None,
+    placement_sidecar: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """更新 GeneSim 成本系数，并写入 IR 文件和 sidecar 文件。
 
@@ -409,23 +501,40 @@ def export_costs_to_genesim(
         sidecar["pim_options"] = pim_options()
 
     recipe_types = set(build_recipes(dims))
+    # 融合清单来自放置 sidecar：图编译器折过的才折，没给清单就按未融合计。
+    _mark_fused_activations(ir, _fused_pairs(placement_sidecar))
     for op in ir["operators"]:
         op_type = op["op_type"]
         op_id = op["op_id"]
 
         # B 路桥接四类逐元素/归约算子，只要它有 `pimir`；A 路一律留在模板里。
         bridged_here = ir_level == "oplevel" and op_type in recipe_types
-        if op_type in UNCOVERED_OP_TYPES and not bridged_here:
+        if (op_type in UNCOVERED_OP_TYPES and not bridged_here) or (
+            op.get("absorbed") and op_type not in recipe_types
+        ):
             sidecar["coverage"]["template"].append(op_id)
+            # 没桥接的算子不测量，但被吸收的仍要清掉模板系数，否则原样留在 IR 里
+            # 被 GeneSim 照计。
+            if op.get("absorbed"):
+                op["flops_coeffs"] = {}
+                op["data_bytes_coeffs"] = {}
+                op["flops"] = 0.0
+                op["data_bytes"] = 0.0
+                op["arith_intensity"] = 0.0
             continue
+        # 被折进主算子的节点仍测量，供覆盖统计与对照，但搬运不再重复计入：
+        # 主算子的配方已经带上激活，这里再计一次就是双计。
+        absorbed = bool(op.get("absorbed"))
 
         # 本地分片形状进缓存键：同一个全局形状在不同流水段/切分宽度下可能对应
         # 不同的本地形状，漏掉它会让后面的算子错误复用前面的测量结果。
+        # 融合状态也进键：同形状的投影一个折激活、一个不折，漏掉就会互相污染。
         local_features = local_shapes.get(op_id)
         key = (op_type,
                tuple(tuple(s) for s in op["input_shapes"]),
                tuple(tuple(s) for s in op["output_shapes"]),
-               local_features)
+               local_features,
+               op.get("fused_activation"))
         if key not in cache:
             cache[key] = (
                 _measure(op, prefill_point, dims, ir_level, local_features),
@@ -437,6 +546,10 @@ def export_costs_to_genesim(
         template_bytes = dict(op.get("data_bytes_coeffs", {}))
 
         flops_coeffs, data_coeffs, fit_mode = _fit_coeffs(op, prefill, decode, seq_len)
+        # 被折进主算子的节点不再单独计费：GeneSim 读的就是这两份系数。
+        # 测量结果仍留在 sidecar 里供对照。
+        if absorbed:
+            flops_coeffs, data_coeffs = {}, {}
         op["flops_coeffs"] = flops_coeffs
         op["data_bytes_coeffs"] = data_coeffs
         # 系数为空时使用零值标量。
@@ -480,6 +593,8 @@ def export_costs_to_genesim(
                     "out_features": prefill.local_features[1],
                 }
             ),
+            # 被折进主算子的节点：搬运已由主算子计过，汇总时跳过这一笔。
+            "absorbed": absorbed,
         }
 
     if cross_validate:
@@ -488,10 +603,34 @@ def export_costs_to_genesim(
         )
 
     Path(out_ir_path).parent.mkdir(parents=True, exist_ok=True)
+    # 被吸收的算子编号取自 IR 上的标记，取完才能清掉：pimir 级下这些算子
+    # 不进成本 sidecar，只能从这里拿。
+    absorbed_ops = sorted(
+        op["op_id"] for op in ir["operators"] if op.get("absorbed")
+    )
+    # 融合标记只在导出过程内部使用，写进精化 IR 会让 GeneSim 的
+    # Operator.from_dict 因未知字段抛 TypeError。
+    _strip_fusion_markers(ir)
     Path(out_ir_path).write_text(json.dumps(ir, indent=2))
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
     Path(sidecar_path).write_text(json.dumps(sidecar, indent=2))
+    # 回写到放置 sidecar：仿真侧按它跳过这些算子的 trace。系数清零只改导出量，
+    # PIM 时延取自 trace 周期，不跳过 trace 融合就进不了仿真。
+    _record_absorbed_ops(placement_sidecar, absorbed_ops)
     return sidecar
+
+
+def _record_absorbed_ops(sidecar_path: Optional[Path], absorbed_ops: list) -> None:
+    """把被吸收的算子编号写回放置 sidecar 的 `absorbed_ops`。
+
+    没有放置 sidecar 时无处可写，直接跳过：融合清单本来就来自它，缺它时
+    不会有被吸收的算子。
+    """
+    if sidecar_path is None:
+        return
+    data = json.loads(Path(sidecar_path).read_text())
+    data["absorbed_ops"] = list(absorbed_ops)
+    Path(sidecar_path).write_text(json.dumps(data, indent=2))
 
 
 def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint,
@@ -506,7 +645,11 @@ def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint,
     recipes = build_recipes(dims)
     if op_type == "GEMM":
         in_f, out_f = gemm_features(op)
-        recipe = recipes["GEMM"](point, in_f, out_f)
+        if op.get("fused_activation"):
+            recipe = recipes["GEMM_SILU"](
+                point, in_f, out_f, activation=op["fused_activation"])
+        else:
+            recipe = recipes["GEMM"](point, in_f, out_f)
     else:
         recipe = recipes[op_type](point)
     if ir_level == "oplevel" and recipe.mnemonic:
