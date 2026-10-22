@@ -1166,3 +1166,44 @@ def test_no_operator_carries_an_attribute_its_ods_does_not_declare():
     assert not residue, (
         f"这些 op 挂了 ODS 没声明的属性：{ {k: sorted(v) for k, v in residue.items()} }。"
         "裸属性没人读、verifier 也不查，改它不会改变任何产物。")
+
+
+def test_autotune_drops_tiles_over_the_wram_budget(monkeypatch) -> None:
+    """抓 pim mlir 时，矩阵乘的 autotune 只能在放得进 WRAM 的分块里选。
+
+    FlagGems 在 4090 上给 M=128、N=11008 选了 128x256x64：暂存 115200 B，超过
+    65536 B 预算，`pim-explicit-dma` 直接报错，`refine_ir_with_flagtree.py` 中断。
+    """
+    pytest.importorskip("flag_gems")
+    import triton
+    from flag_gems.utils.libentry import LibTuner
+
+    from genesim_bridge.flagtree_driver import _autotune_within_wram, _tile_fits
+
+    assert not _tile_fits((128, 256, 64), 65536)
+    assert _tile_fits((64, 128, 32), 65536)
+
+    seen = []
+    monkeypatch.setattr(LibTuner, "run", lambda self, *a, **k: seen.append(list(self.configs)))
+
+    class FakeTuner:
+        __name__ = "linear_kernel"
+        strategy = None
+
+        def __init__(self, configs):
+            self.configs = configs
+
+        def _set_configs_and_strategy(self, configs, strategy):
+            self.configs = configs
+
+    big = triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64})
+    small = triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32})
+    other = triton.Config({"BLOCK_SIZE": 1024})
+
+    with _autotune_within_wram(65536):
+        LibTuner.run(FakeTuner([big, small]))
+        LibTuner.run(FakeTuner([other]))
+        with pytest.raises(RuntimeError, match="没有放得进"):
+            LibTuner.run(FakeTuner([big]))
+    assert seen[0] == [small]
+    assert seen[1] == [other], "不是矩阵乘分块的候选不该被动"

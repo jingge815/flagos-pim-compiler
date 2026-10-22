@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -309,6 +310,64 @@ def _use_gems():
             yield
 
 
+_TILE_KEY = re.compile(r"^(?:BLOCK|TILE)(?:_SIZE)?_([MNK])$")
+# 抓到的矩阵乘都是 fp16 操作数、f32 累加器（见 op_classify 的配方）。
+_OPERAND_BYTES = 2
+_ACCUM_BYTES = 4
+
+
+def _tile_of(config) -> Optional[Tuple[int, int, int]]:
+    """从 autotune 候选里读出 (M, N, K) 分块；不是矩阵乘分块就返回 None。"""
+    dims = {}
+    for name, value in config.kwargs.items():
+        match = _TILE_KEY.match(name)
+        if match:
+            dims[match.group(1)] = int(value)
+    if set(dims) != {"M", "N", "K"}:
+        return None
+    return dims["M"], dims["N"], dims["K"]
+
+
+def _tile_fits(tile: Tuple[int, int, int], wram_bytes: int) -> bool:
+    """分块的 WRAM 暂存能否放进预算：输入、权重、偏置按操作数宽度，输出按累加器宽度。"""
+    m, n, k = tile
+    staged = (m * k + k * n + n) * _OPERAND_BYTES + m * n * _ACCUM_BYTES
+    return staged <= wram_bytes
+
+
+@contextmanager
+def _autotune_within_wram(wram_bytes: int):
+    """让 FlagGems 的矩阵乘 autotune 只在放得进 WRAM 的分块里选。
+
+    FlagGems 在 GPU 上 autotune，会选出 128x256x64 这类 GPU 最快的分块。grid 切分的
+    内核 `pim-tile-to-budget` 不重切（v0.0.6），超预算的分块到 `pim-explicit-dma`
+    直接报错。所以在抓内核前先把超预算的候选去掉。换了候选列表，FlagGems 的
+    autotune 缓存表名也跟着换，不会复用旧表里超预算的最优分块。
+    """
+    from flag_gems.utils.libentry import LibTuner
+
+    original = LibTuner.run
+
+    def run(self, *args, **kwargs):
+        if getattr(self, "_pim_wram_filter", None) != wram_bytes:
+            tiles = [_tile_of(c) for c in self.configs]
+            if all(t is not None for t in tiles):
+                kept = [c for c, t in zip(self.configs, tiles) if _tile_fits(t, wram_bytes)]
+                if not kept:
+                    raise RuntimeError(
+                        f"{self.__name__} 没有放得进 {wram_bytes} B WRAM 的 autotune 分块："
+                        f"{sorted(set(tiles))}")
+                self._set_configs_and_strategy(kept, self.strategy)
+            self._pim_wram_filter = wram_bytes
+        return original(self, *args, **kwargs)
+
+    LibTuner.run = run
+    try:
+        yield
+    finally:
+        LibTuner.run = original
+
+
 def run_and_capture(
     fn,
     emit_pimir: bool = False,
@@ -335,16 +394,24 @@ def run_and_capture(
         if has_gpu:
             torch.cuda.synchronize()
 
-    with _use_gems():
-        fn()
-    _sync()
+    # 要按真实预算出 pim mlir 时，预热之前就收紧候选：预热会把选中的内核缓存下来。
+    if emit_pimir and tile_to_budget:
+        budget = wram_bytes if wram_bytes is not None else pim_options()["pim_wram_bytes"]
+        tuning = _autotune_within_wram(budget)
+    else:
+        tuning = nullcontext()
 
-    with capture_kernels(
-        emit_pimir=emit_pimir,
-        tile_to_budget=tile_to_budget,
-        wram_bytes=wram_bytes,
-    ) as captured:
+    with tuning:
         with _use_gems():
             fn()
         _sync()
+
+        with capture_kernels(
+            emit_pimir=emit_pimir,
+            tile_to_budget=tile_to_budget,
+            wram_bytes=wram_bytes,
+        ) as captured:
+            with _use_gems():
+                fn()
+            _sync()
     return list(captured)
