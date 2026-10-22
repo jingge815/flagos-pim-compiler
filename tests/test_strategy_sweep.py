@@ -114,6 +114,69 @@ def test_every_strategy_decodes_the_same_tokens_as_single_card_pytorch(
     assert generated == hf_reference
 
 
+@pytest.mark.parametrize("strategy", _strategies(), ids=lambda s: s.name)
+def test_every_strategy_kv_region_matches_hf_cache(strategy, small_llama, compiled_by_strategy) -> None:
+    """张量并行下 KV 区也要和 HF cache 对上，不能只比对 token。
+
+    每台 DPU 都拿到完整 Q/K/V 副本，但 KV 按头切在各 owner 上。所有 DPU
+    同时写同一行会互相覆盖：注意力当时用的是刚写完的本地副本，token 对得上，
+    跑完后 cache 里留下的却是最后一次写入。
+    """
+    from memory.kv_layout import PIMStaticKVCache
+
+    compiled = compiled_by_strategy[strategy.name]
+    _, hardware = _hw_and_hardware()
+    backend = NumpyBackend(NumpyBackendConfig(
+        num_dpus=NUM_DPUS, mram_bytes_per_dpu=hardware.mram_bytes_per_dpu,
+    ))
+    register_all(backend)
+    load_weights(compiled, backend)
+    compiled.state.valid_len = 0
+    run_decode_loop(
+        compiled.prefill.plan, compiled.decode.plan, backend,
+        prompt_ids=torch.arange(PREFILL_SEQ_LEN, dtype=torch.long),
+        max_new_tokens=DECODE_STEPS, eos_id=-1, state=compiled.state,
+        sample_fn=lambda logits: int(np.argmax(logits)),
+        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
+        decode_output_cmd_id=compiled.decode.output_cmd_id,
+        causal_mask_of=causal_mask_of,
+    )
+
+    prompt = torch.arange(PREFILL_SEQ_LEN, dtype=torch.long)
+    with torch.no_grad():
+        out = small_llama(input_ids=prompt.unsqueeze(0), use_cache=True)
+        past = out.past_key_values
+        nxt = int(out.logits[0, -1].argmax())
+        for _ in range(DECODE_STEPS - 1):
+            out = small_llama(
+                input_ids=torch.tensor([[nxt]]), past_key_values=past, use_cache=True
+            )
+            past = out.past_key_values
+            nxt = int(out.logits[0, -1].argmax())
+
+    cache = PIMStaticKVCache(backend, compiled.kv_specs, wram_budget_bytes=2**20)
+    total_len = compiled.state.valid_len
+    assert total_len == PREFILL_SEQ_LEN + DECODE_STEPS - 1
+    for layer in range(NUM_LAYERS):
+        ref_k = past.layers[layer].keys
+        ref_v = past.layers[layer].values
+        owners = [(d, s) for d, s in compiled.kv_specs.items() if layer in s.layers]
+        assert owners, f"{strategy.name} layer{layer} 没有任何 DPU 持有 KV"
+        for dpu_id, spec in owners:
+            for head in spec.kv_heads:
+                K_tile, V_tile = cache.read_tile(layer, dpu_id, head, 0, total_len)
+                ref_k_h = ref_k[0, head].detach().numpy().astype(np.float32)
+                ref_v_h = ref_v[0, head].detach().numpy().astype(np.float32)
+                assert np.allclose(K_tile.astype(np.float32), ref_k_h, rtol=2e-2, atol=3e-2), (
+                    f"{strategy.name} layer{layer} dpu{dpu_id} head{head} K 区不匹配: "
+                    f"max diff {np.abs(K_tile.astype(np.float32) - ref_k_h).max()}"
+                )
+                assert np.allclose(V_tile.astype(np.float32), ref_v_h, rtol=2e-2, atol=3e-2), (
+                    f"{strategy.name} layer{layer} dpu{dpu_id} head{head} V 区不匹配: "
+                    f"max diff {np.abs(V_tile.astype(np.float32) - ref_v_h).max()}"
+                )
+
+
 def test_cross_stage_edge_count_grows_with_stage_count(compiled_by_strategy) -> None:
     """跨 stage 的通信边分两类，各自的条数都要钉住。
 

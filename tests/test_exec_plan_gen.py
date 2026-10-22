@@ -588,3 +588,19 @@ def test_every_dpu_tensor_command_carries_a_layout_field() -> None:
             f"{node_name} 的命令没带排布字段")
         seen += 1
     assert seen, "这张图上没有 DPU 张量命令，用例失去意义"
+
+
+def test_later_writer_waits_for_earlier_writer_of_same_range() -> None:
+    """后写同一区间的命令必须等前一个写者。
+
+    decode 图里 host 广播（cmd 39）和 DPU 上的 `to_2`（cmd 33）写同一块激活
+    缓冲。原先只记读后写和写后读，不记写后写：`to_2` 慢一步就把广播结果盖掉，
+    张量并行下某台 DPU 的 K 行随机出错。
+    """
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    first = builder.append("launch", 3, {}, [], [Access(("dpu", 3), 100, 4)], [])
+    other = builder.append("launch", 2, {}, [], [Access(("dpu", 2), 100, 4)], [])
+    later = builder.append("host_slice", None, {}, [], [
+        Access(("dpu", 3), 96, 64), Access(("dpu", 2), 200, 8)], [])
+    assert first.id in later.waits
+    assert other.id not in later.waits

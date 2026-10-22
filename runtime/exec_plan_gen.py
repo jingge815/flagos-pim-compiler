@@ -213,6 +213,8 @@ class _PlanBuilder:
     def append(self, op: str, dpu_id: int | None, payload: dict,
                reads: list[Access], writes: list[Access], waits: list[int],
                num_tasklets: int = 1) -> Command:
+        # 写后写：等所有写过同一区间的旧命令，否则旧写者晚跑会覆盖新值。
+        waits = waits + _deps_of(writes, self.writers)
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
                        reads=reads, writes=writes, waits=sorted(set(waits)),
                        num_tasklets=num_tasklets)
