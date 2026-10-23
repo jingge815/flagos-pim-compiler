@@ -1,8 +1,10 @@
 {
-  "pytorch_env_script": "/media/disk/fengjingge/src/flagOS/flagOS-installed/pytorch/env-pytorch.sh",
-  "llama2_7b_model_dir": "/media/disk/fengjingge/src/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf",
-  "flagtree_prefix": "/media/disk/fengjingge/src/flagOS/flagOS-installed/flagTree",
-  "genesim_root": "/media/disk/fengjingge/src/genesim",
-  "gml_reference_dir": "/media/disk/fengjingge/src/xinfangzhou-resource",
-  "gml_llama2_reference_dir": "/media/disk/fengjingge/src/xinfangzhou-resource/model_layers_0_decode_v2/parser_output/tvmgen_default_nprm_main_0/runtime_files"
+  "_comment": "入库模板。站点绝对路径写到 paths.local.json（不入库），或用同名环境变量覆盖。",
+  "pytorch_env_script": null,
+  "llama2_7b_model_dir": null,
+  "flagtree_prefix": null,
+  "genesim_root": null,
+  "gml_reference_dir": null,
+  "gml_llama2_reference_dir": null,
+  "gml_ours_graph": null
 }

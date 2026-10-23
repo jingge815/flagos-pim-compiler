@@ -11,7 +11,9 @@ from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
 # 本仓库根目录。
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# 入库的模板配置，以及每台机器各自的覆盖配置（后者覆盖前者，不入库）。
 _CONFIG_FILE = REPO_ROOT / "paths.json"
+_LOCAL_CONFIG_FILE = REPO_ROOT / "paths.local.json"
 
 # 配置键对应的环境变量。
 _ENV_VARS = {
@@ -44,16 +46,24 @@ _PIM_ENV_VARS = {
 }
 
 
-def _load_file_config() -> dict:
-    if not _CONFIG_FILE.is_file():
+def _read_config_file(config_file: Path) -> dict:
+    """读取一个配置文件，不存在时返回空字典。"""
+    if not config_file.is_file():
         return {}
     try:
-        data = json.loads(_CONFIG_FILE.read_text())
+        data = json.loads(config_file.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{_CONFIG_FILE} 解析失败: {exc}") from exc
+        raise RuntimeError(f"{config_file} 解析失败: {exc}") from exc
     if not isinstance(data, dict):
-        raise RuntimeError(f"{_CONFIG_FILE} 顶层必须是 JSON object")
+        raise RuntimeError(f"{config_file} 顶层必须是 JSON object")
     return data
+
+
+def _load_file_config() -> dict:
+    """读取模板与本地覆盖配置并合并，本地覆盖优先。"""
+    merged = _read_config_file(_CONFIG_FILE)
+    merged.update(_read_config_file(_LOCAL_CONFIG_FILE))
+    return merged
 
 
 def _configured_path(key: str) -> Path | None:
@@ -65,7 +75,8 @@ def _configured_path(key: str) -> Path | None:
     if file_value is None:
         return None
     if not isinstance(file_value, str) or not file_value.strip():
-        raise RuntimeError(f"{_CONFIG_FILE} 的 {key} 必须是非空字符串")
+        raise RuntimeError(
+            f"{_LOCAL_CONFIG_FILE.name} / {_CONFIG_FILE.name} 的 {key} 必须是非空字符串")
     return Path(file_value)
 
 
@@ -75,7 +86,8 @@ def _resolve(key: str) -> Path:
     if path is not None:
         return path
     raise RuntimeError(
-        f"未配置站点路径 {key}。请在 {_CONFIG_FILE} 设置 {key}，"
+        f"未配置站点路径 {key}。请在 {_LOCAL_CONFIG_FILE}"
+        f"（由 {_CONFIG_FILE} 复制）设置 {key}，"
         f"或设置环境变量 {_ENV_VARS[key]}。"
     )
 
@@ -204,12 +216,14 @@ def genesim_models_dir(*, required: bool = True) -> Path | None:
 def describe() -> str:
     """返回当前生效的路径与 PIM 参数来源，供报错信息与调试使用。"""
     file_config = _load_file_config()
+    local_config = _read_config_file(_LOCAL_CONFIG_FILE)
 
     def source_of(key: str, env_var: str, default_name: str | None = None) -> str:
         if os.environ.get(env_var):
             return f"环境变量 {env_var}"
         if file_config.get(key):
-            return f"配置文件 {_CONFIG_FILE.name}"
+            source = _LOCAL_CONFIG_FILE.name if local_config.get(key) else _CONFIG_FILE.name
+            return f"配置文件 {source}"
         if default_name is not None:
             return f"内置默认值 {default_name}"
         return "未配置"

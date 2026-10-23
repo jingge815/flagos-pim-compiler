@@ -5,12 +5,12 @@
 ## 环境
 
 ```bash
-source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
+source "$(python3 -c 'import json; print(json.load(open("paths.local.json"))["pytorch_env_script"])')"
 ```
 
 torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 shell 都要先 source**，否则 `import torch` 失败。
 
-站点绝对路径只写在 `paths.json`（可用同名环境变量覆盖）。测试和脚本禁止再写 `/media/disk/...`。
+站点绝对路径写在 `paths.local.json`（由入库模板 `paths.json` 复制，已被 gitignore；同名环境变量优先级最高）。测试和脚本禁止再写 `/media/disk/...`。
 
 ## 技术方案
 

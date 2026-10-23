@@ -22,8 +22,17 @@ MODE=${1:-full}
 PIM_COMPILER=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 _json_path() {
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' \
-    "$PIM_COMPILER/paths.json" "$1"
+  python3 - "$PIM_COMPILER" "$1" <<'PY'
+import json, sys
+from pathlib import Path
+root, key = Path(sys.argv[1]), sys.argv[2]
+value = None
+for name in ("paths.json", "paths.local.json"):
+    config = root / name
+    if config.is_file():
+        value = json.loads(config.read_text()).get(key, value)
+print(value)
+PY
 }
 
 GENESIM=${GENESIM_ROOT:-$(_json_path genesim_root)}

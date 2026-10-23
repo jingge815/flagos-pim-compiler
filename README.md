@@ -42,11 +42,12 @@
 
 ### 站点相关路径
 
-本仓以根目录的 `paths.json` 作为随代码交付的站点配置。甲方拿到代码后，先把
-`/path/to/...` 占位路径改为自己的实际路径：
+本仓根目录的 `paths.json` 是入库模板；站点路径写到 `paths.local.json`（已被
+gitignore）。甲方拿到代码后先复制再改：
 
 ```bash
-vim paths.json
+cp paths.json paths.local.json
+vim paths.local.json
 ```
 
 ```json
@@ -64,7 +65,7 @@ vim paths.json
 配置完成后加载 PyTorch 环境并运行测试：
 
 ```bash
-source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
+source "$(python3 -c 'import json; print(json.load(open("paths.local.json"))["pytorch_env_script"])')"
 python -m pytest tests/ -x -q
 ```
 
@@ -87,7 +88,7 @@ parser 输出），它不在四个安装脚本的产物里，需要单独放置�
 
 需要临时覆盖时，可设置同名环境变量：`PYTORCH_ENV_SCRIPT`、
 `LLAMA2_7B_MODEL_DIR`、`FLAGTREE_PREFIX`、`GENESIM_ROOT`、`GML_OURS_GRAPH`。
-优先级为环境变量高于 `paths.json`。PIM 硬件参数（如 `FLAGTREE_PIM_NUM_DPUS`）
+优先级为环境变量 > `paths.local.json` > `paths.json` 模板。PIM 硬件参数（如 `FLAGTREE_PIM_NUM_DPUS`）
 也沿用该优先级。
 查看当前生效路径与参数：
 

@@ -34,6 +34,7 @@ def _unconfigure_reference(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.delenv("GML_REFERENCE_DIR", raising=False)
     monkeypatch.delenv("GML_LLAMA2_REFERENCE_DIR", raising=False)
     monkeypatch.setattr(paths, "_CONFIG_FILE", tmp_path / "no-such-paths.json")
+    monkeypatch.setattr(paths, "_LOCAL_CONFIG_FILE", tmp_path / "no-such-paths.local.json")
 
 
 def _small_model() -> LlamaForCausalLM:
