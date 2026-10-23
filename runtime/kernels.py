@@ -1216,12 +1216,18 @@ def _compiled_split_heads(shape: tuple[int, ...], axis: int, num_heads: int, *, 
 _SDPA_KV = None
 
 
-def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
+def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype,
+                 multi_slot_specs: dict | None = None) -> dict | None:
     """把一个注意力节点要用的设备侧 KV 区域整理成可进命令 payload 的形式。
 
     编译期算好、烘进命令，而不是让内核去查全局：三种切分策略连着编译时，
     模块级的那份会被后一次覆盖，前面那些 plan 再执行就用了**别人**的 KV
     规格——实测解码结果因此错成另一个 token。
+
+    `multi_slot_specs` 非空时为 dict[dpu_id → list[KVRegionSpec]]，payload 里
+    改存 per-slot 的偏移列表（`k_offs_by_slot`/`v_offs_by_slot`），内核运行时
+    按 `hal.bound_slot_id` 索引。单 slot 时退回旧格式（`k_off`/`v_off`），
+    兼容现有测试和无多 slot 路径。
     """
     layer = layer_of_node.get(node.name)
     if layer is None:
@@ -1232,13 +1238,19 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
             continue
         for head in spec.kv_heads:
             row = spec.head_dim * spec.dtype_bytes
-            heads.append({
+            entry: dict = {
                 "head": int(head),
                 "dpu": int(dpu_id),
-                "k_off": int(spec.kv_off[(layer, head, "k")]),
-                "v_off": int(spec.kv_off[(layer, head, "v")]),
                 "row": int(row),
-            })
+            }
+            if multi_slot_specs is not None:
+                slots = multi_slot_specs[dpu_id]
+                entry["k_offs_by_slot"] = [int(s.kv_off[(layer, head, "k")]) for s in slots]
+                entry["v_offs_by_slot"] = [int(s.kv_off[(layer, head, "v")]) for s in slots]
+            else:
+                entry["k_off"] = int(spec.kv_off[(layer, head, "k")])
+                entry["v_off"] = int(spec.kv_off[(layer, head, "v")])
+            heads.append(entry)
     if not heads:
         return None
     return {
@@ -1332,16 +1344,24 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     num_heads, tq = q.shape[1], q.shape[2]
 
     pos = hal.bound_pos if hal.bound_pos is not None else 0
+    slot_id = getattr(hal, '_bound_slot_id', 0)
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
+        # 支持 per-slot 偏移列表（多请求并发）和旧的单偏移格式。
+        if "k_offs_by_slot" in entry:
+            k_off = entry["k_offs_by_slot"][slot_id]
+            v_off = entry["v_offs_by_slot"][slot_id]
+        else:
+            k_off = entry["k_off"]
+            v_off = entry["v_off"]
         for t in range(tq):
             row = pos + t
-            _kv_row_write(hal, owner, entry["k_off"], row,
+            _kv_row_write(hal, owner, k_off, row,
                           np.ascontiguousarray(k[0, head, t], np_dtype), max_seq,
                           ctx=_ctx_of(cmd))
-            _kv_row_write(hal, owner, entry["v_off"], row,
+            _kv_row_write(hal, owner, v_off, row,
                           np.ascontiguousarray(v[0, head, t], np_dtype), max_seq,
                           ctx=_ctx_of(cmd))
 
@@ -1351,8 +1371,14 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
-        k_hist = hal.read_local(owner, entry["k_off"], (max_seq, head_dim), np_dtype)
-        v_hist = hal.read_local(owner, entry["v_off"], (max_seq, head_dim), np_dtype)
+        if "k_offs_by_slot" in entry:
+            k_off = entry["k_offs_by_slot"][slot_id]
+            v_off = entry["v_offs_by_slot"][slot_id]
+        else:
+            k_off = entry["k_off"]
+            v_off = entry["v_off"]
+        k_hist = hal.read_local(owner, k_off, (max_seq, head_dim), np_dtype)
+        v_hist = hal.read_local(owner, v_off, (max_seq, head_dim), np_dtype)
         # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
         # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
         graph_mask = args[3] if len(args) > 3 else None

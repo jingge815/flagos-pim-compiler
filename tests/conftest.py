@@ -3,8 +3,21 @@ from datetime import datetime
 from pathlib import Path
 import time
 
+import pytest
+import torch
+
 
 _REPORT_STATE = None
+# 会话开始时的梯度开关。有的用例会在 module 级 fixture 里关掉它又不恢复，
+# 之后的 torch.export 会导出另一张图。
+_INITIAL_GRAD = None
+
+
+@pytest.fixture(autouse=True)
+def _restore_grad_mode():
+    """每个用例结束后把梯度开关恢复成会话开始时的状态。"""
+    yield
+    torch.set_grad_enabled(_INITIAL_GRAD)
 
 
 @dataclass
@@ -16,7 +29,8 @@ class TestResult:
 
 
 def pytest_sessionstart(session):
-    global _REPORT_STATE
+    global _REPORT_STATE, _INITIAL_GRAD
+    _INITIAL_GRAD = torch.is_grad_enabled()
     root = Path(session.config.rootpath)
     out_dir = root / "test-results"
     out_dir.mkdir(parents=True, exist_ok=True)

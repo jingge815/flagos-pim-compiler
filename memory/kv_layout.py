@@ -164,6 +164,52 @@ def kv_specs_from_strategy(
     return specs
 
 
+def kv_specs_multi_slot(
+    base_specs: dict[int, KVRegionSpec],
+    num_slots: int,
+    align: int,
+) -> dict[int, list[KVRegionSpec]]:
+    """把单 slot 的 KVRegionSpec 复制 num_slots 份，每份 kv_base 顺序偏移。
+
+    返回 dict[dpu_id → list[slot_id → KVRegionSpec]]，slot 间地址不重叠。
+    """
+    if num_slots < 1:
+        raise ValueError(f"num_slots 必须 >= 1，got {num_slots}")
+    result: dict[int, list[KVRegionSpec]] = {}
+    for dpu_id, base_spec in base_specs.items():
+        # 先建好单 slot 布局，获得 kv_allocated_bytes 作为步长。
+        built = build_kv_layout(
+            KVRegionSpec(
+                dpu_id=base_spec.dpu_id,
+                layers=list(base_spec.layers),
+                kv_heads=list(base_spec.kv_heads),
+                q_heads_by_kv=dict(base_spec.q_heads_by_kv),
+                max_seq=base_spec.max_seq,
+                head_dim=base_spec.head_dim,
+                dtype_bytes=base_spec.dtype_bytes,
+                kv_base=base_spec.kv_base,
+            ),
+            align,
+        )
+        slot_step = built.kv_allocated_bytes
+        slots: list[KVRegionSpec] = []
+        for i in range(num_slots):
+            slot_spec = KVRegionSpec(
+                dpu_id=base_spec.dpu_id,
+                layers=list(base_spec.layers),
+                kv_heads=list(base_spec.kv_heads),
+                q_heads_by_kv=dict(base_spec.q_heads_by_kv),
+                max_seq=base_spec.max_seq,
+                head_dim=base_spec.head_dim,
+                dtype_bytes=base_spec.dtype_bytes,
+                kv_base=base_spec.kv_base + i * slot_step,
+            )
+            build_kv_layout(slot_spec, align)
+            slots.append(slot_spec)
+        result[dpu_id] = slots
+    return result
+
+
 def _k_proj_spec_of_layer(gm, layer: int) -> PIMTensorSpec:
     """取某一层 self_attn.k_proj.weight 的 PIMTensorSpec（KV 按 head 切的依据）。"""
     from contracts.graph_meta import SPEC_META_KEY
