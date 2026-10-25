@@ -167,7 +167,7 @@ def test_the_compiled_set_is_what_the_docs_claim() -> None:
         "linear", "softmax", "mask", "gather", "eltwise",
         "matmul", "convert", "transpose", "reshape", "concat",
         "normalize", "rope", "lut", "kv_cache", "split_heads",
-        "reduce",
+        "reduce", "paged_attn",
     }, f"实际调用编译器的算子集合变了：{sorted(called)}"
 
 

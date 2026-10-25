@@ -39,6 +39,7 @@ from opcompiler_bridge.oplevel_kernel import (
     mask_kernel,
     matmul_kernel,
     normalize_kernel,
+    paged_attn_kernel,
     reshape_kernel,
     rope_kernel,
     softmax_kernel,
@@ -637,6 +638,46 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
         elem = {"float16": "f16", "float32": "f32"}.get(request.dtype, "i8")
         body = kv_cache_kernel("kernel", value_shape, cache_elems,
                                indexed=bool(request.group_size), elem=elem)
+        return _module_text(body, request)
+
+    if request.op == "paged_attn":
+        # arg_shapes=[q 形状, (缓存元素数,), (块表表项数,)]。q 是一个头的
+        # `(tokens, head_dim)`：每个头单独调一次，内核缓存才能在头之间共用。
+        if len(request.arg_shapes) != 3:
+            raise ValueError(
+                f"paged_attn 契约要求 arg_shapes=[(tokens, head_dim), "
+                f"(缓存元素数,), (块表表项数,)]，收到 {request.arg_shapes!r}")
+        q_shape = tuple(request.arg_shapes[0])
+        if len(q_shape) != 2:
+            raise ValueError(f"paged_attn 的 q 必须是二维，收到 {q_shape!r}")
+        cache_elems = int(tuple(request.arg_shapes[1])[0])
+        max_blocks = int(tuple(request.arg_shapes[2])[0])
+        slot_tokens = request.slot_tokens
+        slot_elems = request.slot_elems
+        if slot_tokens is None or slot_elems is None or request.scale is None:
+            raise ValueError(
+                "paged_attn 需要 slot_tokens / slot_elems / scale 三个字段")
+        if slot_tokens <= 0 or slot_elems <= 0:
+            raise ValueError(
+                f"槽几何必须是正数，收到 slot_tokens={slot_tokens}, "
+                f"slot_elems={slot_elems}")
+        if slot_elems % slot_tokens:
+            raise ValueError(
+                f"槽元素数 {slot_elems} 不是槽 token 数 {slot_tokens} 的整数倍")
+        row_elems = slot_elems // slot_tokens
+        if row_elems % q_shape[1]:
+            raise ValueError(
+                f"一槽一行 {row_elems} 个元素装不下 head_dim {q_shape[1]} 的整头")
+        if cache_elems % slot_elems:
+            raise ValueError(
+                f"缓存 {cache_elems} 个元素不是槽长 {slot_elems} 的整数倍")
+        # 内核里的地址是 i32 元素偏移：槽号乘槽长再加平面偏移，最坏接近两倍。
+        # 超出就编不下来——静默回绕会把读写落到池子之外。
+        if cache_elems > 2**30:
+            raise ValueError(
+                f"槽池 {cache_elems} 个元素超出 paged_attn 的 i32 寻址范围")
+        body = paged_attn_kernel("kernel", q_shape, cache_elems, max_blocks,
+                                 slot_tokens, slot_elems, request.scale)
         return _module_text(body, request)
 
     if request.op == "split_heads":

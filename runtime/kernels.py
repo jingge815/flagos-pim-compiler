@@ -1231,7 +1231,10 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
             continue
         dpus[int(dpu_id)] = {
             "bt_base": int(spec.block_table_base),
+            "slots_base": int(spec.slots_base),
             "slot_bytes": int(spec.slot_bytes),
+            # 槽池的元素数：`pim.paged_attn` 用它除出物理槽总数。
+            "cache_elems": int(spec.pool_slots * spec.slot_bytes // spec.dtype_bytes),
             "max_blocks": int(spec.blocks_per_request),
         }
         for head in spec.kv_heads:
@@ -1319,9 +1322,10 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.scaled_dot_product_attention` 的 DPU 内核。
 
     `compile_llama2` 不拆头，导出的图里 SDPA 仍是一个节点，所以 Llama 的
-    执行计划走这里。KV 按块表逐块读写：先逐块算 QKᵀ 填分数矩阵，逐行
-    mask + softmax，再逐块算 PV 累加。K/V 历史都不会拼成整条连续数组
-    （见 `_iter_kv_blocks`），峰值只多驻留一个块。
+    执行计划走这里。每个头交给 `_paged_attention`：块表地址直接进内核，
+    由它在设备上逐物理槽算完 QK / softmax / PV；内核编不出来时才回退
+    主机两遍（逐块算 QKᵀ 填分数矩阵、逐行 mask + softmax、逐块 PV 累加）。
+    两条路径都不把 K/V 历史拼成整条连续数组（见 `_iter_kv_blocks`）。
     """
     info = cmd.payload.get("sdpa")
     if info is None:
@@ -1372,7 +1376,6 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
                           np.ascontiguousarray(v[0, head, t], np_dtype),
                           plane_elems, ctx=_ctx_of(cmd))
 
-    hist_len = pos + num_tokens
     out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
     # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
     # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
@@ -1381,45 +1384,139 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
-        geo = geometry[owner]
-        table = block_tables[owner]
-
-        # 第一遍：逐物理块算 QKᵀ，把分数填进预分配矩阵，不拼 KV 历史。
-        # 按 query 整批算（M=tq）是关键：逐 query 逐块重读 K 会把 K 的读放大
-        # tq 倍；整批仍只读一遍，与改动前是同一份流量。
-        scores = np.empty((tq, hist_len), dtype=np.float32)
-        for start, rows, k_block in _iter_kv_blocks(
-                hal, owner, entry["k_off"], geo, table, hist_len,
-                head_dim, slot_tokens, np_dtype):
-            scores[:, start:start + rows] = (
-                matmul(q[0, head], k_block.T).astype(np.float32) * scale)
-
-        # 掩码与 softmax 仍逐行，与改动前逐元素同一口径：`pim.mask` 一次、
-        # `pim.softmax` 一次。全局 softmax 要看整行分数，所以分数矩阵仍按行
-        # 保留——它是 O(tq·hist)，不含 KV 的 head_dim 那一维。
-        weights = np.empty((tq, hist_len), dtype=np.float16)
-        for t in range(tq):
-            # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史，
-            # 而图上的掩码只覆盖当前 query，短一截时补零会把历史位置当成可见，
-            # 结果就错了。长度对不上就退回按位置重算。
-            if graph_mask is not None and graph_mask.shape[-1] == hist_len:
-                row = graph_mask.reshape(-1, hist_len)
-                mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
-            else:
-                # 补齐的 query 行（t >= hist_len）只算不用，掩码按全部可见处理。
-                mask = (prefill_mask(min(t + 1, hist_len), hist_len) if tq > 1
-                        else decode_mask(hist_len - 1, hist_len))
-                mask_row = mask[min(t, hist_len - 1)] if tq > 1 else mask
-            weights[t] = softmax(add_mask(scores[t], mask_row).astype(np.float32))
-
-        # 第二遍：逐物理块算 PV，f32 累加后合并；V 历史同样不落地。
-        acc = np.zeros((tq, head_dim), dtype=np.float32)
-        for start, rows, v_block in _iter_kv_blocks(
-                hal, owner, entry["v_off"], geo, table, hist_len,
-                head_dim, slot_tokens, np_dtype):
-            acc += matmul(weights[:, start:start + rows], v_block).astype(np.float32)
-        out[0, head] = acc
+        out[0, head] = _paged_attention(
+            hal, owner, entry, geometry[owner], block_tables[owner],
+            q[0, head], pos, num_tokens, head_dim, slot_tokens, np_dtype,
+            graph_mask, scale, ctx=_ctx_of(cmd))
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
+
+
+def _paged_attention(hal, owner: int, entry: dict, geo: dict,
+                     table: np.ndarray, q_head: np.ndarray, pos: int,
+                     num_tokens: int, head_dim: int, slot_tokens: int,
+                     np_dtype: np.dtype, graph_mask, scale: float, *,
+                     ctx: _OpContext | None = None) -> np.ndarray:
+    """一个头的注意力：融合内核优先，主机两遍兜底。
+
+    融合路径把槽池与块表的指针直接交给 `pim.paged_attn`，逻辑块到物理槽的
+    解析在设备上做。图上传来的掩码只在长度与 KV 历史一致时才有意义，而融合
+    内核的可见性按位置算，所以那种情况下走主机路径。
+    """
+    tq = q_head.shape[0]
+    hist_len = pos + num_tokens
+    uses_graph_mask = graph_mask is not None and graph_mask.shape[-1] == hist_len
+    dtype_bytes = np_dtype.itemsize
+    slot_elems = int(geo["slot_bytes"]) // dtype_bytes
+    num_blocks = -(-hist_len // slot_tokens)
+    # 表只有 max_blocks 项：多了就是执行器漏了步骤，读下去会拿到池里的垃圾。
+    if num_blocks > int(geo["max_blocks"]):
+        raise RuntimeError(
+            f"历史长度 {hist_len} 需要 {num_blocks} 个块，块表只有 {geo['max_blocks']} 项")
+    # 融合内核的相位链按 fp16 落盘，f32 的 KV（只有测试会造）走主机路径。
+    fn = None
+    if np_dtype == np.dtype(np.float16) and not uses_graph_mask:
+        fn = _compiled_paged_attn(
+            (tq, head_dim), int(geo["cache_elems"]), int(geo["max_blocks"]),
+            slot_tokens, slot_elems, float(scale), ctx=ctx)
+    if fn is not None:
+        record_route("paged_attn", "hit")
+        out = np.zeros((tq, head_dim), dtype=np_dtype)
+        q_head = np.ascontiguousarray(q_head, np_dtype)
+        base = hal.raw_mram_ptr(owner)
+        # 内核的缓存基址是槽池起点，而 `k_off`/`v_off` 是块表之前的绝对地址。
+        fn(ctypes.c_void_p(q_head.ctypes.data),
+           ctypes.c_void_p(base + geo["slots_base"]),
+           ctypes.c_void_p(base + geo["bt_base"]),
+           ctypes.c_int32((entry["k_off"] - geo["slots_base"]) // dtype_bytes),
+           ctypes.c_int32((entry["v_off"] - geo["slots_base"]) // dtype_bytes),
+           ctypes.c_int32(pos), ctypes.c_int32(num_blocks),
+           ctypes.c_int32(num_tokens),
+           ctypes.c_void_p(out.ctypes.data))
+        return out
+    record_route("paged_attn", "fallback")
+    return _host_paged_attention(
+        hal, owner, entry, geo, table, q_head, tq, pos, hist_len, head_dim,
+        slot_tokens, np_dtype, graph_mask, scale)
+
+
+def _host_paged_attention(hal, owner: int, entry: dict, geo: dict,
+                          table: np.ndarray, q_head: np.ndarray, tq: int,
+                          pos: int, hist_len: int, head_dim: int,
+                          slot_tokens: int, np_dtype: np.dtype,
+                          graph_mask, scale: float) -> np.ndarray:
+    """主机镜像：逐块算 QKᵀ、逐行掩码与 softmax、逐块 PV 累加。
+
+    与融合内核逐元素同一口径（`matmul` 落 f16、`add_mask` 加法、`softmax`
+    五相、每块 PV 落 f16 后在 f32 里累加），判据见 `test_kernels` 的对拍。
+    """
+    # 第一遍：逐物理块算 QKᵀ，把分数填进预分配矩阵，不拼 KV 历史。
+    # 按 query 整批算（M=tq）是关键：逐 query 逐块重读 K 会把 K 的读放大
+    # tq 倍；整批仍只读一遍，与改动前是同一份流量。
+    scores = np.empty((tq, hist_len), dtype=np.float32)
+    for start, rows, k_block in _iter_kv_blocks(
+            hal, owner, entry["k_off"], geo, table, hist_len,
+            head_dim, slot_tokens, np_dtype):
+        scores[:, start:start + rows] = (
+            matmul(q_head, k_block.T).astype(np.float32) * scale)
+
+    # 掩码与 softmax 仍逐行，与改动前逐元素同一口径：`pim.mask` 一次、
+    # `pim.softmax` 一次。全局 softmax 要看整行分数，所以分数矩阵仍按行
+    # 保留——它是 O(tq·hist)，不含 KV 的 head_dim 那一维。
+    weights = np.empty((tq, hist_len), dtype=np.float16)
+    for t in range(tq):
+        # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史，
+        # 而图上的掩码只覆盖当前 query，短一截时补零会把历史位置当成可见，
+        # 结果就错了。长度对不上就退回按位置重算。
+        if graph_mask is not None and graph_mask.shape[-1] == hist_len:
+            row = graph_mask.reshape(-1, hist_len)
+            mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
+        else:
+            # 补齐的 query 行（t >= hist_len）只算不用，掩码按全部可见处理。
+            mask = (prefill_mask(min(t + 1, hist_len), hist_len) if tq > 1
+                    else decode_mask(hist_len - 1, hist_len))
+            mask_row = mask[min(t, hist_len - 1)] if tq > 1 else mask
+        weights[t] = softmax(add_mask(scores[t], mask_row).astype(np.float32))
+
+    # 第二遍：逐物理块算 PV，f32 累加后合并；V 历史同样不落地。
+    acc = np.zeros((tq, head_dim), dtype=np.float32)
+    for start, rows, v_block in _iter_kv_blocks(
+            hal, owner, entry["v_off"], geo, table, hist_len,
+            head_dim, slot_tokens, np_dtype):
+        acc += matmul(weights[:, start:start + rows], v_block).astype(np.float32)
+    return acc
+
+
+def _compiled_paged_attn(q_shape: tuple[int, int], cache_elems: int,
+                         max_blocks: int, slot_tokens: int, slot_elems: int,
+                         scale: float, *, ctx: _OpContext | None = None):
+    """按一个头的几何编一个 `pim.paged_attn`；工具链不在位时返回 None。
+
+    内核的输入是槽池与块表的裸指针，所以缓存键只需形状与槽几何——同一台
+    DPU 上所有层、所有头、所有步共用同一个内核，层与头的差别只是调用时
+    给的 `k_off` / `v_off`。
+    """
+    key = (ctx, "paged_attn", q_shape, cache_elems, max_blocks,
+           slot_tokens, slot_elems, scale)
+    if key in _COMPILED_KERNEL_CACHE:
+        return _COMPILED_KERNEL_CACHE[key]
+
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import (
+        ToolchainUnavailable, compile_op, load_kernel)
+
+    try:
+        result = compile_op(OpCompileRequest(
+            op="paged_attn",
+            arg_shapes=[q_shape, (cache_elems,), (max_blocks,)],
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
+            slot_tokens=slot_tokens, slot_elems=slot_elems, scale=scale,
+        ))
+    except ToolchainUnavailable:
+        _COMPILED_KERNEL_CACHE[key] = None
+        return None
+    fn = load_kernel(result)
+    _COMPILED_KERNEL_CACHE[key] = fn
+    return fn
 
 
 def _iter_kv_blocks(hal, owner: int, plane_off: int, geo: dict,

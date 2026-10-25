@@ -278,7 +278,9 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
                         "head_dim": 8, "slot_tokens": 4,
                         "heads": [{"head": 0, "dpu": 0, "row": 8 * 4,
                                    "k_off": slots_base, "v_off": slots_base + 128}],
-                        "dpus": {0: {"bt_base": block_table_base, "slot_bytes": 256,
+                        "dpus": {0: {"bt_base": block_table_base,
+                                     "slots_base": slots_base,
+                                     "slot_bytes": 256, "cache_elems": 64,
                                      "max_blocks": 1}}}})
 
     causal_out = run(causal)
@@ -327,7 +329,10 @@ def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
                 "heads": [{"head": 0, "dpu": 0, "row": head_dim * 4,
                            "k_off": slots_base,
                            "v_off": slots_base + plane_stride}],
-                "dpus": {0: {"bt_base": bt_base, "slot_bytes": slot_bytes,
+                "dpus": {0: {"bt_base": bt_base, "slots_base": slots_base,
+                             "slot_bytes": slot_bytes,
+                             # 3 个物理槽，f32 下每槽 128/4 = 32 个元素。
+                             "cache_elems": 3 * slot_bytes // 4,
                              "max_blocks": n_tokens // slot_tokens}}}})
 
     concatenations = []
@@ -351,6 +356,81 @@ def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
     weights = np.exp(masked.astype(np.float32))
     weights /= weights.sum(-1, keepdims=True)
     assert np.allclose(identity[0, 0], weights @ v[0, 0], atol=0.05)
+
+
+def test_sdpa_fused_paged_attn_matches_the_host_path(monkeypatch) -> None:
+    """块表进内核的融合路径与主机两遍逐元素一致，且都与 numpy 参考相符。
+
+    块表乱序（逻辑块 0 → 物理槽 2）时必须按同一顺序读：内核自己解析
+    块表，主机路径也按同一张表 gather。
+    """
+    from types import SimpleNamespace
+
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout, write_block_table
+
+    head_dim, slot_tokens, max_seq = 8, 4, 8
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=max_seq, head_dim=head_dim, dtype_bytes=2,
+        kv_base=8192, slot_tokens=slot_tokens), align=8, pool_slots=3)
+
+    rng = np.random.default_rng(11)
+    q = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    k = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    v = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    info = km.sdpa_kv_info(SimpleNamespace(name="n"), {0: spec}, {"n": 0},
+                           np.dtype(np.float16))
+
+    def run(force_host: bool):
+        backend = NumpyBackend(
+            NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+        register_all(backend)
+        write_block_table(spec, backend, [2, 0])
+        if force_host:
+            monkeypatch.setattr(km, "_compiled_paged_attn", lambda *a, **kw: None)
+        km.reset_route_counts()
+        out = _run(backend,
+                   str(torch.ops.aten.scaled_dot_product_attention.default),
+                   ["tensor"] * 3, [q.shape, k.shape, v.shape], [q, k, v],
+                   q.shape, dtype="float16", extra_payload={"sdpa": info})
+        return out, km.route_counts()
+
+    fused, routes = run(force_host=False)
+    host, _ = run(force_host=True)
+    assert routes.get(("paged_attn", "hit"), 0) > 0, (
+        "融合内核没有被调用：工具链不在位或编译失败")
+    assert np.array_equal(fused, host), "融合路径与主机路径不是逐元素一致"
+
+    scale = 1.0 / np.sqrt(head_dim)
+    scores = (q[0, 0].astype(np.float32) @ k[0, 0].T.astype(np.float32)) * scale
+    masked = scores + np.triu(
+        np.full((max_seq, max_seq), -np.inf, dtype=np.float32), k=1)
+    weights = np.exp(masked - masked.max(-1, keepdims=True))
+    weights /= weights.sum(-1, keepdims=True)
+    assert np.allclose(fused[0, 0], weights @ v[0, 0].astype(np.float32),
+                       atol=0.05)
+
+
+def test_paged_attention_rejects_history_longer_than_the_block_table() -> None:
+    """块表项不够时直接报错：再多读会拿到槽池里的垃圾槽号。"""
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout
+
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=8, head_dim=8, dtype_bytes=2,
+        kv_base=8192, slot_tokens=4), align=8, pool_slots=3)
+    geo = {"slots_base": spec.slots_base, "bt_base": spec.block_table_base,
+           "slot_bytes": spec.slot_bytes, "max_blocks": spec.blocks_per_request,
+           "cache_elems": spec.pool_slots * spec.slot_bytes // spec.dtype_bytes}
+    entry = {"head": 0, "dpu": 0, "row": 0, "k_off": spec.slots_base,
+             "v_off": spec.slots_base + 2 * spec.slot_bytes}
+
+    with pytest.raises(RuntimeError, match="块表只有 2 项"):
+        km._paged_attention(None, 0, entry, geo, np.zeros(2, np.int32),
+                            np.zeros((1, 8), np.float16), 8, 1, 8, 4,
+                            np.dtype(np.float16), None, 0.35)
 
 
 def test_view_ops_reach_the_compiler(monkeypatch) -> None:

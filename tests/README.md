@@ -78,7 +78,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 默认集里仍会实际加载 7B 权重或反复真编译，单跑很慢：
 
 - 真实 7B：`test_executor_llama2_7b`、`test_strategy_llama2_7b`、`test_spec_prop_llama2_7b`、`test_comm_llama2_7b`、`test_kv_layout_llama2_7b`、`test_mem_planner_llama2_7b`、`test_natural_prompt_llama2_7b`、`test_concurrency_llama2_7b`、`test_opcompiler_e2e_llama2_7b`、`test_oplevel_emitter_live`、`test_phase_source`（live 段）、`test_gml_depends_on_opcompiler`（live 段）。
-- 大量真编译：`test_opcompiler_ops.py`（58 条全部 `force=True`）、`test_opcompiler_linear.py`、`test_pimir_layout.py`（约 34 次 `triton-opt` 子进程）、`test_three_path_generation.py`（17 个算子各编一次）。
+- 大量真编译：`test_opcompiler_ops.py`（59 条全部 `force=True`）、`test_opcompiler_linear.py`、`test_pimir_layout.py`（约 34 次 `triton-opt` 子进程）、`test_three_path_generation.py`（18 个算子各编一次）。
 
 只改某个模块时，优先单文件或 `-k` 定向跑。
 
@@ -110,7 +110,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_mem_layout.py` | 16 | 显式步幅、`align_up` 全仓唯一实现、`elem_strides/align_bytes` 有真实生产方 | 无 | 常见是又复制了一份 `align_up`，报错直接给 `文件:行号` |
 | `test_stride_parity.py` | 39 | 排布规则搬家后数值不变、`orchestrator/` 不再保留重复实现 | 无 | `contracts/mem_layout.py` 公式；`orchestrator/` 是否重新写了本地实现 |
 | `test_no_bypass.py` | 8 | 生产代码不得绕过 `dtype_bytes` 自行推导 dtype/字节宽 | 无 | 报错给出违规行号；白名单只允许 `graph/spec_prop.py` 与两个函数级例外 |
-| `test_three_path_coverage.py` | 3 | 每个算子都同时有 numpy 对拍、GeneSim mnemonic、GML op_type 三条路径 | 无（扫源码） | 报 `{op: ["genesim","gml"]}`；看 `contracts/op_semantics.OP_SEMANTICS` 与两个 opcompiler 测试文件 |
+| `test_three_path_coverage.py` | 3 | 每个算子都同时有 numpy 对拍、GeneSim mnemonic、GML op_type 三条路径（`paged_attn` 只有 numpy 一条，按归属表免除另两条） | 无（扫源码） | 报 `{op: ["genesim","gml"]}`；看 `contracts/op_semantics.OP_SEMANTICS`、`_GENESIM_COVERED_BY`/`_NO_GML` 与两个 opcompiler 测试文件 |
 | `test_flagtree_ods_hygiene.py` | 7 | 本仓 emitter 字段名/模块属性名与 FlagTree ODS/C++ 逐项对齐，无孤儿属性 | FlagTree 源码 | 字段顺序看 `contracts/mlir_layout.py` 与 `PIMAttrDefs.td`；`-rs` 看是否因源码缺失而 SKIP |
 
 ### 4.3 图切分、策略、传播
@@ -160,7 +160,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | --- | ---: | --- | --- | --- |
 | `test_dpu_sdk.py` | 17 | 厂商 SDK numpy 镜像：DPU 枚举、地址空间隔离、broadcast/prepare/push 契约 | 无 | 先区分语义回归与错误文案变化（大量 `pytest.raises(match=...)`） |
 | `test_hal_numpy.py` | 20 | 异步 HAL：submit/wait/query、同 DPU 串行、DMA 快照、tasklet hazard | 无 | 时序类用例在慢机器上可能抖动；buffer 互抢查 host 路径是否加锁 |
-| `test_kernels.py` | 18 | 白名单内核数值、tasklet 行切分、编译内核路由、多块乱序块表的按块注意力 | 部分需 `triton-opt` + gcc | `mask/alias/view` 红先查工具链与 `.opcompiler_cache`；路由红查 `runtime/kernels.py`；注意力红查 `_iter_kv_blocks` 是否仍按块表查槽 |
+| `test_kernels.py` | 20 | 白名单内核数值、tasklet 行切分、编译内核路由、多块乱序块表的按块注意力、融合 `pim.paged_attn` 与主机两遍逐元素相等、块表装不下历史时报错 | 部分需 `triton-opt` + gcc | `mask/alias/view` 红先查工具链与 `.opcompiler_cache`；路由红查 `runtime/kernels.py`；注意力红查 `_iter_kv_blocks` 是否仍按块表查槽；`paged_attn` 红先看 `record_route("paged_attn", …)` 走的是 hit 还是 fallback |
 | `test_exec_plan_gen.py` | 27 | 命令间 RAW/WAR/WAW、redistribute 落地、硬件参数、NumpyBackend 数值 | 小模型（1 条） | WAR 用例 `resolved==0` = 键不匹配导致 WAR 被丢；数值红先核对权重写入偏移 |
 | `test_runtime_compiled_coverage.py` | 24 | 哪些内核真的走到算子编译器（打桩 + 一次真编译）、编译集合清单、退回计数 | 一次真编译 | 集合断言失败需同步文档与实现；`fallback` 计数查 `runtime/kernels.py` 的 route 记录 |
 | `test_runtime_files.py` | 23 | `.bin` 字节宽度/命名、与 GML 引用交叉校验、零填充分类 | 无 | 「引用了没写盘」看文件名生成侧；「写了没引用」看 `contracts/gml_names.py` |
@@ -196,7 +196,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 
 | 文件 | 用例 | 验证内容 | 依赖 | 失败优先查 |
 | --- | ---: | --- | --- | --- |
-| `test_opcompiler_ops.py` | 58 | B 路整算子：IR→EmitC→C→`.so`，ctypes 跑起来与 numpy 镜像逐元素对拍；ABI；路由不退回镜像 | PASS + gcc | 先看 `.opcompiler_cache/<key>.pimir.mlir`、`.so`、`.meta`；数值红再按算子定位 |
+| `test_opcompiler_ops.py` | 59 | B 路整算子：IR→EmitC→C→`.so`，ctypes 跑起来与 numpy 镜像逐元素对拍；ABI；路由不退回镜像 | PASS + gcc | 先看 `.opcompiler_cache/<key>.pimir.mlir`、`.so`、`.meta`；数值红再按算子定位 |
 | `test_opcompiler_linear.py` | 32 | A 路 linear：数值、分块规则、编译指纹、跨进程锁、别名契约 | PASS（1 条需 CUDA） | 数值/分块/缓存指纹；`test_k_alias` 的「不一致」是设计信号 |
 | `test_opcompiler_e2e_llama2_7b.py` | 4 | **7B** 三策略 decode 的 token 与 HF 完全一致，编译内核无 fallback | 7B + PASS | 先看打印的逐形状误差表与 `route_counts()`；monkeypatch 必须在 `register_all` 之前 |
 | `test_oplevel_emitter.py` | 11 | FX 图 → 整算子 pim MLIR 的形状口径、分派、相位数、跳过规则 | 无 | 打印 `report.text`；`report.skipped` 多 = 形状或 DQ spec 不符 |
@@ -206,7 +206,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_phase_source.py` | 14 | pass 顺序、`cross_check` 双向对拍、真实图端到端（live 段） | 部分 7B + PASS | `cross_check` 失败打印 `PhaseMismatch`（算子值 vs 静态值） |
 | `test_phase_data.py` | 60 | DQ 四相 / Softmax 五相公式与参考逐字节对拍及数学自洽 | LREF（无跳过保护） | 失败先看对应节点 `*_phase_*.bin`；Softmax p1–p4 与参考本就不同，勿误判 |
 | `test_pimir_layout.py` | 97 | 四维决策写进 pimir：`#pim.tasklet_tiled`、`#pim.placement`、DMA 地址/步幅、回传消费 | PASS | 先打印 `compile_op(..., force=True).pimir`；shard 编码丢失查 A 路 `flatten_shard_dim` |
-| `test_three_path_generation.py` | 19 | 17 个算子真实产出可加载 `.so` + GeneSim IR + GML op_type | PASS + gcc | 相对误差 >0.05 按算子名定位；重编入口 `opcompiler_bridge/driver.py::compile_op` |
+| `test_three_path_generation.py` | 20 | 18 个算子真实产出可加载 `.so` + GeneSim IR + GML op_type | PASS + gcc | 相对误差 >0.05 按算子名定位；重编入口 `opcompiler_bridge/driver.py::compile_op` |
 
 > 已知缺口：`test_gml_depends_on_opcompiler.py::test_changing_an_opcompiler_phase_value_changes_gml` 缺少 `@requires_live`。未配置 7B 时它会 **ERROR**（`未配置站点路径 llama2_7b_model_dir`）而不是 SKIP，属测试自身问题。
 
@@ -214,7 +214,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 
 | 文件 | 用例 | 验证内容 | 依赖 | 失败优先查 |
 | --- | ---: | --- | --- | --- |
-| `test_genesim_bridge.py` | 51 | TTIR/PIMIR 的 flops、DMA/WRAM、本地分片、系数拟合、mnemonic 覆盖、ODS 卫生 | 部分 PASS / GS | `genesim_bridge/ir_cost.py`、`cost_extractor.py`、`op_classify.py`；`pass 可能没生效` 先验 PIM pass |
+| `test_genesim_bridge.py` | 52 | TTIR/PIMIR 的 flops、DMA/WRAM、本地分片、系数拟合、mnemonic 覆盖、ODS 卫生 | 部分 PASS / GS | `genesim_bridge/ir_cost.py`、`cost_extractor.py`、`op_classify.py`；`pass 可能没生效` 先验 PIM pass；`进程内 libtriton 比方言源码旧` = 重建 FlagTree 后没同步 `.so`，跑 `0-install-flagtree.sh` |
 | `test_genesim_simulation.py` | 6 | GeneSim 端到端慢速冒烟 + 流水线参数/IR-sidecar 契约 | GS（1 条 slow） | 无 `summary.json` = GeneSim 未装或仿真崩溃；slow 用例会写真实 `genesim/results/` |
 | `test_ir_cost.py` | 1 | `#pim.phase_spec<... bytes=N>` 计入 `mram_traffic_bytes` | 无 | `genesim_bridge/ir_cost.py` 的 phase_spec 解析 |
 | `test_ir_cost_eval.py` | 30 | 融合成本可核算、导出时被吸收节点清零、ttir/pimir 口径一致、IR 可被 GeneSim 读回 | 部分 PASS / GPU / GS | 看 `out.ir`、成本 sidecar、放置 sidecar 的 `fused_activations/absorbed_ops` |
@@ -304,7 +304,7 @@ python -m pytest tests/test_x.py -q --tb=long   # 完整回溯
    - `tests/test_mem_planner.py::_two_appendix_a_graphs/_kv_specs` — 被 mem_layout 复用；`tests/kv_helpers.py` 的 `write_row/read_rows` 被 KV 相关用例复用；
    - `tests/test_comm_plan.py` 的 spec/edge 工厂 — 被 comm_lowering 复用；
    - `tests/test_placement_export.py::annotated_tiny_llama` — 被 spec_prop 的拆头用例复用。
-4. **新增算子要同步三处**：`contracts/op_semantics.OP_SEMANTICS`、`graph/partition.RULE_TABLE`、`runtime/kernels._KERNELS`；并补 `test_three_path_coverage` 要求的三路覆盖（numpy 对拍、GeneSim mnemonic、GML op_type）。
+4. **新增算子要同步三处**：`contracts/op_semantics.OP_SEMANTICS`、`graph/partition.RULE_TABLE`、`runtime/kernels._KERNELS`；并补 `test_three_path_coverage` 要求的三路覆盖（numpy 对拍、GeneSim mnemonic、GML op_type）。只有运行时一侧调用的算子（如 `paged_attn`）不进 `RULE_TABLE`，在 `_GENESIM_COVERED_BY` / `_NO_GML` 里写明归属。新增 `has_kernel` 算子还要在 `test_genesim_bridge` 补成本计费，否则 flops 按 0 计。
 5. **基线表是刻意的**：`test_stride_parity` 的 `FROZEN_*`、`test_op_semantics` 的 `OLD_*`、`test_verify_layers` 的 `-30.75` 哨兵，改动数值前先确认是「有意变更」而非「顺手重算」。
 6. **依赖外部资源的测试必须用 `skipif(required=False)`**；不要用 `@pytest.mark.slow` 掩盖普通依赖。
 7. **`assert_node_matches_ref.py` 目前是 0 字节空文件**。CLAUDE.md 提到的「逐节点对拍器」实际由各测试内的辅助函数承担（如 `test_three_path_generation._assert_matches_numpy`、`test_opcompiler_ops._call`、`test_gml_export._nodes_by_op`）。新增逐节点对拍逻辑时，建议放在具体测试文件内，避免再造一个空壳。

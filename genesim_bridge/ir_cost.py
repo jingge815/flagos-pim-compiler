@@ -71,6 +71,8 @@ _OPLEVEL_CANONICAL = {
     # 的成本会静默变成 0——展开后每相各计一遍，少一相就是少 4096 个元素。
     "pim.kantor": "pim.kantor",
     "pim.fpsu_scale": "pim.fpsu_scale",
+    # 分页注意力不展开成相位链，成本按 QK + softmax + PV 三段估。
+    "pim.paged_attn": "pim.paged_attn",
 }
 # 每个**元素**的浮点运算量。整算子（未展开）按相数计：展开成相位链之后每一相
 # 各自计一遍，两边同量级，sidecar 不会因为"还没展开"就少一大截。
@@ -152,6 +154,8 @@ _DATPATH_RE = re.compile(r"#pim\.datapath<([^>]*)>")
 _GROUP_ACCUM_RE = re.compile(r"groupDequantAccum\s*=\s*(true|false)")
 _GROUP_SIZE_RE = re.compile(r"groupSize\s*=\s*(\d+)")
 _SCF_FOR_RE = re.compile(r"scf\.for\s+%\S+\s*=\s*(\S+)\s+to\s+(\S+)\s+step\s+(\S+)")
+# `pim.paged_attn` 的槽长写在属性上：一个物理槽容纳多少个历史 token。
+_SLOT_TOKENS_RE = re.compile(r"slotTokens\s*=\s*(\d+)")
 _SSA_RE = re.compile(r"^\s*(%[\w#]+)\s*=\s*(\S+)(.*)$")
 
 
@@ -345,6 +349,18 @@ def _line_operator_flops(line: str) -> float:
         m, k = shapes[0]
         n = shapes[1][1]
         return 2.0 * m * k * n
+
+    if mnemonic == "pim.paged_attn":
+        # q 是 `(tokens, head_dim)`，块表长度 × 槽长就是历史长度的上界
+        # （编译期不知道本步实际读了几个块，按满长计）。
+        shapes = [[int(d) for d in dims.split("x")] for dims, _ in tensors]
+        slot_tokens = _SLOT_TOKENS_RE.search(line)
+        if slot_tokens is None or len(shapes) < 2:
+            return 0.0
+        tokens, head_dim = shapes[0][:2]
+        hist = shapes[1][0] * int(slot_tokens.group(1))
+        # QKᵀ 与 PV 各 `2·tokens·hist·head_dim`，softmax 每元素约五相。
+        return 4.0 * tokens * hist * head_dim + 5.0 * tokens * hist
 
     phases = 1.0 if _PHASES_ATTR_RE.search(line) else _OPLEVEL_FLOPS_PER_ELEMENT[mnemonic]
     return phases * _tensor_numel(tensors[0][0])

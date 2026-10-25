@@ -7,7 +7,7 @@
 本表的条目按「算子名」建立，四份视图全部由它派生：
 `oplevel_ops()` / `mnemonics()` / `aten_to_gml()` / `role_to_gml()`。
 
-两类条目的区别只在 `has_kernel` / `is_mnemonic`：有内核入口的（15 个）参与
+两类条目的区别只在 `has_kernel` / `is_mnemonic`：有内核入口的（17 个）参与
 前两个视图；GML 独有的类型（Gemm、四种 Eltwise、池化、Conv）只提供 GML 名，
 供 `aten_to_gml()` 用。
 """
@@ -67,6 +67,10 @@ OP_SEMANTICS: tuple[OpSemantics, ...] = (
                 note="由 quant_pass 插入，aten 图里没有"),
     OpSemantics("kv_cache", "KV_Cache_DMA", has_kernel=True, is_mnemonic=True,
                 note="由 kv_dma_pass 插入，aten 图里没有（图用 use_cache=False 导出）"),
+    # 分页注意力：由运行时按 SDPA 节点下发，aten 图里仍是一个
+    # scaled_dot_product_attention，没有独立的图节点。
+    OpSemantics("paged_attn", None, has_kernel=True, is_mnemonic=False,
+                note="运行时按 SDPA 节点调用；GML 侧折进 MatMul/Softmax 链"),
     OpSemantics("gather", "Gather", has_kernel=True, is_mnemonic=True,
                 aten_targets=("embedding.default",)),
     OpSemantics("transpose", "Transpose", has_kernel=True, is_mnemonic=True,

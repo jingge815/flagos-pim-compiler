@@ -1391,6 +1391,67 @@ def test_reduce_mean_matches_numpy() -> None:
     np.testing.assert_allclose(got, ref, rtol=1e-2, atol=1e-2)
 
 
+def _dot_f16(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """f32 顺序累加、落 f16 的矩阵乘，与 EmitC 的累加顺序一致。"""
+    out = np.zeros((a.shape[0], b.shape[1]), dtype=np.float16)
+    for i in range(a.shape[0]):
+        for j in range(b.shape[1]):
+            total = np.float32(0)
+            for k in range(a.shape[1]):
+                total = np.float32(total + np.float32(a[i, k]) * np.float32(b[k, j]))
+            out[i, j] = total
+    return out
+
+
+def test_paged_attn_matches_the_phase_chain() -> None:
+    """分页注意力：内核自己在设备上查块表、逐槽算 QK / softmax / PV。
+
+    参考按镜像逐步复现：分数落 f16、掩码是一次加法、softmax 是五相链、
+    PV 每块落 f16。块表乱序（逻辑块 0 → 物理槽 1）时也必须按表取值。
+    """
+    tokens, head_dim, slot_tokens = 4, 16, 16
+    plane = slot_tokens * head_dim
+    slot_elems = 2 * plane            # 一个槽里 k、v 各一段
+    pool_slots, max_blocks = 4, 2
+    scale = 1.0 / np.sqrt(head_dim)
+
+    request = OpCompileRequest(
+        op="paged_attn",
+        arg_shapes=[(tokens, head_dim), (pool_slots * slot_elems,), (max_blocks,)],
+        hardware=_HARDWARE, dtype="float16",
+        slot_tokens=slot_tokens, slot_elems=slot_elems, scale=scale,
+    )
+    result = compile_op(request, force=True)
+    fn = load_kernel(result)
+    assert result.by_value == [False, False, False, True, True, True, True, True, False]
+
+    rng = np.random.default_rng(5)
+    q = (rng.standard_normal((tokens, head_dim)) * 0.5).astype(np.float16)
+    cache = (rng.standard_normal(pool_slots * slot_elems) * 0.5).astype(np.float16)
+    table = np.array([1, 3], dtype=np.int32)
+
+    out = np.zeros((tokens, head_dim), dtype=np.float16)
+    fn(q.ctypes.data_as(ctypes.c_void_p),
+       cache.ctypes.data_as(ctypes.c_void_p),
+       table.ctypes.data_as(ctypes.c_void_p),
+       ctypes.c_int32(0), ctypes.c_int32(plane),      # kOff / vOff
+       ctypes.c_int32(0), ctypes.c_int32(1),          # pos / 本步 token 数
+       ctypes.c_int32(tokens),
+       out.ctypes.data_as(ctypes.c_void_p))
+
+    base = int(table[0]) * slot_elems
+    kb = cache[base:base + plane].reshape(slot_tokens, head_dim)[:tokens]
+    vb = cache[base + plane:base + 2 * plane].reshape(slot_tokens, head_dim)[:tokens]
+    scores = (_dot_f16(q, np.ascontiguousarray(kb.T)).astype(np.float32)
+              * np.float32(scale))
+    weights = np.empty((tokens, tokens), dtype=np.float16)
+    for t in range(tokens):
+        mask = np.where(np.arange(tokens) <= t, 0.0, -np.inf).astype(np.float32)
+        weights[t] = mirrors.softmax(mirrors.mask(scores[t], mask))
+    ref = _dot_f16(weights, vb)
+    np.testing.assert_array_equal(out, ref)
+
+
 def test_convert_int64_matches_numpy() -> None:
     """int64 转 fp32 要编得出内核，并且与 numpy 逐元素一致。"""
     request = OpCompileRequest(
