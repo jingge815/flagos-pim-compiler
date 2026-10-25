@@ -147,12 +147,12 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_comm_plan.py` | 15 | all_reduce/all_gather/all_to_all/scatter/local_slice 的段展开、DMA 批序列、成本模型 | 无 | `comm/plan.py`；乱序分片看 `global_range`，多维按行展开 |
 | `test_comm_lowering.py` | 9 | 通信原语在 `DmaEngine` 上的数值结果、非零 `mram_offset`、host staging | 无 | 先怀疑地址是否漏加基址、dtype、host 中转顺序 |
 | `test_comm_llama2_7b.py` | 8 | **7B** 通信计划结构（2×层数条 all_reduce、logits all_gather、scatter）与数值 | 7B | 结构不符查 `propagate_specs` 与 `llama_shard_config`；数值容差已放宽到 fp16 口径 |
-| `test_kv_layout.py` | 15 | `kv_off` 精确偏移、head 归属、运行时追加/分块读回、掩码与注意力 | 无 | 偏移按手算整数核对；运行时看 pos 上界与 WRAM 预算 |
-| `test_kv_layout_llama2_7b.py` | 3 | **7B** KV 分片跟随 k/v_proj placement，16 MiB/DPU 精确布局 | 7B | `graph/spec_prop.py` 的 k_proj 切分规则或 `align=1024` |
+| `test_kv_layout.py` | 12 | 槽几何与 `kv_off` 精确偏移、页表补齐/越界、head 归属、注意力数值 | 无 | 偏移按手算整数核对；页表乱了查 `build_kv_layout` / `write_page_table` |
+| `test_kv_layout_llama2_7b.py` | 3 | **7B** KV 分片跟随 k/v_proj placement，槽池 16 MiB/DPU 精确布局 | 7B | `graph/spec_prop.py` 的 k_proj 切分规则或 `align` |
+| `test_kv_slots.py` | 6 | 槽几何精确值、页表乱序映射、短 prompt 按需分配、池耗尽/复用、请求间不相交 | 无 | `memory/kv_layout.py::build_kv_layout`、`runtime/executor.py` 的槽池 |
 | `test_mem_planner.py` | 18 | 三区 offset、跨图权重共享、激活贪心复用不别名、内核 tile 计入容量 | 无 | 最危险是「同 step 读写别名」；打印 `plan.weight/act_prefill/act_decode/total` |
 | `test_mem_planner_llama2_7b.py` | 9 | **7B** 两图内存规划、容量、地址可用、落地偏移贯通到通信 `dst_addr` | 7B | `dst_addr` 不符 = mem planner 回填与 `comm.plan` 的 itemsize/基址口径不一致 |
-| `test_multi_slot_kv.py` | 4 | 多 slot 地址不重叠、总量线性增长、非法 `num_slots` | 无 | `memory/kv_layout.py::kv_specs_multi_slot`、`plan_dpu` |
-| `test_slot_isolation.py` | 3 | slot_id 端到端隔离与透传（HAL/executor） | 无 | KV 地址漏加 slot 偏移，或 `execute_plan`/`bind_inputs` 没透传 |
+| `test_slot_isolation.py` | 3 | 两请求页表隔离、`request_slot` 端到端透传（HAL/executor） | 无 | 页表串了查 `_write_page_tables`，透传断了查 `execute_plan`/`bind_inputs` |
 
 ### 4.6 后端、内核、执行计划与执行器
 
@@ -167,7 +167,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_runtime_files_phases.py` | 18 | 新增 bin 族与 **LREF** 逐文件字节对拍 | LREF | 字节数不符查 group_size/dtype；非平局差异 = scale 算错而非舍入 |
 | `test_executor_llama2_7b.py` | 2 | **7B** 整图 prefill logits 与贪心 token 对齐单卡 PyTorch | 7B | 依次查权重分片写入、SDPA KV 偏移、kernel 镜像 |
 | `test_concurrency_llama2_7b.py` | 2 | **7B** 独立 launch 时间重叠、有 waits 的 launch 真等待 | 7B | 串行化查 DPU 线程池/异步 HAL；打印命令 `id/waits/op` |
-| `test_multi_request_decode.py` | 3 | 多 slot 并发解码与单路一致、slot 复用、容量溢出报错 | 小模型 | KV 地址重叠或 `slot_id` 未透传下游 |
+| `test_multi_request_decode.py` | 4 | 多请求并发解码与单路一致、`slot_tokens=2` 与整段一致、槽复用、容量溢出报错 | 小模型 | 页表映射错或 `request_slot` 未透传下游 |
 | `test_natural_prompt_llama2_7b.py` | 1 | **7B** 自然语言 prompt 的逐 token 生成与 HF `generate` 一致 | 7B | 失败会打印 `route_counts()`；出现主机退回说明某算子未注册 |
 | `test_vllm_executor.py` | 1 | vLLM 引擎经 `PIMExecutor` 跑两个并发请求 | vLLM + CUDA | 环境变量必须在 `import vllm` 前设置；worker 崩溃看 `backend/vllm_worker.py` |
 
@@ -301,7 +301,7 @@ python -m pytest tests/test_x.py -q --tb=long   # 完整回溯
 3. **跨文件复用的 helper 是隐式契约**，改名前先全局搜索：
    - `tests/test_partition.py::_export_random_llama`、`_FixedMaskLlama` — 被 spec_prop/dtype/placement/fuse/gml 等多组复用；
    - `tests/test_spec_prop.py::_appendix_a_graph/_appendix_a_config` — 被 exec_plan_gen/mem_planner/mem_layout 复用；
-   - `tests/test_mem_planner.py::_two_appendix_a_graphs/_kv_specs` — 被 mem_layout/multi_slot_kv 复用；
+   - `tests/test_mem_planner.py::_two_appendix_a_graphs/_kv_specs` — 被 mem_layout 复用；`tests/kv_helpers.py` 的 `write_row/read_rows` 被 KV 相关用例复用；
    - `tests/test_comm_plan.py` 的 spec/edge 工厂 — 被 comm_lowering 复用；
    - `tests/test_placement_export.py::annotated_tiny_llama` — 被 spec_prop 的拆头用例复用。
 4. **新增算子要同步三处**：`contracts/op_semantics.OP_SEMANTICS`、`graph/partition.RULE_TABLE`、`runtime/kernels._KERNELS`；并补 `test_three_path_coverage` 要求的三路覆盖（numpy 对拍、GeneSim mnemonic、GML op_type）。

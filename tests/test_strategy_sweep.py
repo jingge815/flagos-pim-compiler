@@ -19,6 +19,7 @@ from memory.mem_planner import HwBudget
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
 from runtime.executor import run_decode_loop
 from runtime.kernels import register_all
+from tests.kv_helpers import read_rows
 
 NUM_DPUS = 4
 NUM_LAYERS = 4
@@ -99,15 +100,12 @@ def test_every_strategy_decodes_the_same_tokens_as_single_card_pytorch(
     ))
     register_all(backend)
     load_weights(compiled, backend)
-    compiled.state.valid_len = 0
 
     generated = run_decode_loop(
-        compiled.prefill.plan, compiled.decode.plan, backend,
+        compiled, backend,
         prompt_ids=torch.arange(PREFILL_SEQ_LEN, dtype=torch.long),
-        max_new_tokens=DECODE_STEPS, eos_id=-1, state=compiled.state,
+        max_new_tokens=DECODE_STEPS, eos_id=-1,
         sample_fn=lambda logits: int(np.argmax(logits)),
-        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-        decode_output_cmd_id=compiled.decode.output_cmd_id,
         causal_mask_of=causal_mask_of,
     )
 
@@ -122,8 +120,6 @@ def test_every_strategy_kv_region_matches_hf_cache(strategy, small_llama, compil
     同时写同一行会互相覆盖：注意力当时用的是刚写完的本地副本，token 对得上，
     跑完后 cache 里留下的却是最后一次写入。
     """
-    from memory.kv_layout import PIMStaticKVCache
-
     compiled = compiled_by_strategy[strategy.name]
     _, hardware = _hw_and_hardware()
     backend = NumpyBackend(NumpyBackendConfig(
@@ -131,14 +127,11 @@ def test_every_strategy_kv_region_matches_hf_cache(strategy, small_llama, compil
     ))
     register_all(backend)
     load_weights(compiled, backend)
-    compiled.state.valid_len = 0
     run_decode_loop(
-        compiled.prefill.plan, compiled.decode.plan, backend,
+        compiled, backend,
         prompt_ids=torch.arange(PREFILL_SEQ_LEN, dtype=torch.long),
-        max_new_tokens=DECODE_STEPS, eos_id=-1, state=compiled.state,
+        max_new_tokens=DECODE_STEPS, eos_id=-1,
         sample_fn=lambda logits: int(np.argmax(logits)),
-        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-        decode_output_cmd_id=compiled.decode.output_cmd_id,
         causal_mask_of=causal_mask_of,
     )
 
@@ -154,9 +147,7 @@ def test_every_strategy_kv_region_matches_hf_cache(strategy, small_llama, compil
             past = out.past_key_values
             nxt = int(out.logits[0, -1].argmax())
 
-    cache = PIMStaticKVCache(backend, compiled.kv_specs, wram_budget_bytes=2**20)
-    total_len = compiled.state.valid_len
-    assert total_len == PREFILL_SEQ_LEN + DECODE_STEPS - 1
+    total_len = PREFILL_SEQ_LEN + DECODE_STEPS - 1
     for layer in range(NUM_LAYERS):
         ref_k = past.layers[layer].keys
         ref_v = past.layers[layer].values
@@ -164,7 +155,8 @@ def test_every_strategy_kv_region_matches_hf_cache(strategy, small_llama, compil
         assert owners, f"{strategy.name} layer{layer} 没有任何 DPU 持有 KV"
         for dpu_id, spec in owners:
             for head in spec.kv_heads:
-                K_tile, V_tile = cache.read_tile(layer, dpu_id, head, 0, total_len)
+                K_tile = read_rows(backend, spec, 0, layer, head, "k", total_len)
+                V_tile = read_rows(backend, spec, 0, layer, head, "v", total_len)
                 ref_k_h = ref_k[0, head].detach().numpy().astype(np.float32)
                 ref_v_h = ref_v[0, head].detach().numpy().astype(np.float32)
                 assert np.allclose(K_tile.astype(np.float32), ref_k_h, rtol=2e-2, atol=3e-2), (

@@ -69,11 +69,12 @@ def _backend_with_weights(compiled, hardware) -> NumpyBackend:
     return backend
 
 
-def _compile(model, hw, hardware, num_slots):
+def _compile(model, hw, hardware, num_request_slots, kv_slot_tokens=MAX_SEQ):
     strategy = llama_strategies(NUM_DPUS, **STRATEGY_KWARGS)[0]
     return compile_llama2(
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN,
-        max_seq=MAX_SEQ, hw=hw, hardware=hardware, num_slots=num_slots,
+        max_seq=MAX_SEQ, hw=hw, hardware=hardware,
+        num_request_slots=num_request_slots, kv_slot_tokens=kv_slot_tokens,
     )
 
 
@@ -82,7 +83,7 @@ def test_two_requests_match_individual_runs(small_model, hw_and_hardware) -> Non
     hw, hardware = hw_and_hardware
     compiled = _compile(small_model, hw, hardware, NUM_SLOTS)
     backend = _backend_with_weights(compiled, hardware)
-    table = RequestTable(NUM_SLOTS)
+    table = RequestTable(NUM_SLOTS, compiled.kv_pool_slots)
     table.add_request("a", PROMPT_A)
     table.add_request("b", PROMPT_B)
 
@@ -98,14 +99,10 @@ def test_two_requests_match_individual_runs(small_model, hw_and_hardware) -> Non
 
     # 单独运行同一 prompt 作为参考（单 slot 路径）。
     for request_id, prompt in (("a", PROMPT_A), ("b", PROMPT_B)):
-        compiled.state.valid_len = 0
         ref = run_decode_loop(
-            compiled.prefill.plan, compiled.decode.plan, backend,
+            compiled, backend,
             prompt_ids=torch.tensor(prompt), max_new_tokens=MAX_NEW_TOKENS,
-            eos_id=-1, state=compiled.state, sample_fn=_greedy,
-            prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-            decode_output_cmd_id=compiled.decode.output_cmd_id,
-            causal_mask_of=causal_mask_of,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
         )
         assert generated[request_id] == ref, (
             f"请求 {request_id} 多路生成 {generated[request_id]} 与单独运行 {ref} 不一致")
@@ -116,9 +113,9 @@ def test_freed_slot_can_be_reused(small_model, hw_and_hardware) -> None:
     hw, hardware = hw_and_hardware
     compiled = _compile(small_model, hw, hardware, NUM_SLOTS)
     backend = _backend_with_weights(compiled, hardware)
-    table = RequestTable(NUM_SLOTS)
+    table = RequestTable(NUM_SLOTS, compiled.kv_pool_slots)
     slot = table.add_request("a", PROMPT_A)
-    used_slot = slot.slot_id
+    used_slot = slot.request_slot
 
     for _ in range(MAX_NEW_TOKENS):
         run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
@@ -126,25 +123,36 @@ def test_freed_slot_can_be_reused(small_model, hw_and_hardware) -> None:
 
     table.free_slot("a")
     reused = table.add_request("c", PROMPT_B)
-    assert reused.slot_id == used_slot, "释放的 slot 应被重新分配"
+    assert reused.request_slot == used_slot, "释放的请求槽应被重新分配"
     for _ in range(MAX_NEW_TOKENS):
         run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
     second = list(reused.generated)
 
-    compiled.state.valid_len = 0
     ref = run_decode_loop(
-        compiled.prefill.plan, compiled.decode.plan, backend,
+        compiled, backend,
         prompt_ids=torch.tensor(PROMPT_B), max_new_tokens=MAX_NEW_TOKENS,
-        eos_id=-1, state=compiled.state, sample_fn=_greedy,
-        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-        decode_output_cmd_id=compiled.decode.output_cmd_id,
-        causal_mask_of=causal_mask_of,
+        eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
     )
-    assert second == ref, f"复用 slot 后生成 {second} 与单独运行 {ref} 不一致"
+    assert second == ref, f"复用请求槽后生成 {second} 与单独运行 {ref} 不一致"
+
+
+def test_multi_block_decode_matches_single_block(small_model, hw_and_hardware) -> None:
+    """slot_tokens=2 的多块页表解码与单块（slot_tokens=max_seq）逐 token 一致。"""
+    hw, hardware = hw_and_hardware
+    generated = []
+    for slot_tokens in (MAX_SEQ, 2):
+        compiled = _compile(small_model, hw, hardware, 1, kv_slot_tokens=slot_tokens)
+        backend = _backend_with_weights(compiled, hardware)
+        generated.append(run_decode_loop(
+            compiled, backend,
+            prompt_ids=torch.tensor(PROMPT_A), max_new_tokens=MAX_NEW_TOKENS,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
+        ))
+    assert generated[0] == generated[1]
 
 
 def test_request_table_rejects_overflow() -> None:
-    table = RequestTable(1)
+    table = RequestTable(1, 1)
     table.add_request("a", PROMPT_A)
-    with pytest.raises(RuntimeError, match="slot"):
+    with pytest.raises(RuntimeError, match="请求槽"):
         table.add_request("b", PROMPT_B)

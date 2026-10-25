@@ -268,7 +268,7 @@ def plan_dpu(
     hw: HwBudget,
     *,
     kernel_mram_bytes: int = 0,
-    num_slots: int = 1,
+    num_request_slots: int = 1,
 ) -> DPUPlan:
     """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
 
@@ -276,15 +276,15 @@ def plan_dpu(
     （`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。它与三区占的是同一
     块 MRAM，所以算进容量判据。默认 0 = 没有回传可用，判据退回只看三区，
     与改动前逐字节等价。
-    `num_slots` 为静态并发请求槽数，KV 区总字节乘以 num_slots。
+    `num_request_slots` 为并发请求槽数，页表按它分区、物理槽池按它预留。
     """
     weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
 
     kv_spec = kv_specs[dpu_id]
     kv_spec.kv_base = off
-    build_kv_layout(kv_spec, hw.align)
+    build_kv_layout(kv_spec, hw.align, num_request_slots=num_request_slots)
     kv_base = off
-    off += kv_spec.kv_allocated_bytes * max(1, num_slots)
+    off += kv_spec.kv_allocated_bytes
 
     act_base = off
     prefill_tensors = transient_tensors(prefill_nodes, dpu_id)

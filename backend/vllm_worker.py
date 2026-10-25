@@ -3,10 +3,11 @@
 分工：vLLM 负责 HTTP/调度/连续批处理，本模块负责把每步的
 `SchedulerOutput` 翻译成 PIM 的逐请求执行。核心约束：
 
-- MRAM 地址硬件绑定，做不了 PagedAttention。编译期预留 `num_slots` 个
-  请求槽，每个槽独占一段 KV 区域，并发上限 = `num_slots`。
-- vLLM 的 block 只是账面数字：`num_gpu_blocks = num_slots * 每槽块数`，
-  真正决定并发的是 `max_num_seqs = num_slots`，slot 由 `RequestTable` 自行分配。
+- KV 分成固定大小的物理槽，每槽容纳 `block_size` 个 token；请求通过
+  DPU MRAM 里的页表间接寻址。编译期预留 `max_num_seqs` 个请求槽和对应
+  块数的槽池，并发上限 = `max_num_seqs`。
+- vLLM 的 block 只是账面数字：`num_gpu_blocks = max_num_seqs * 每请求块数`，
+  真正决定并发的是 `max_num_seqs`，物理槽由 `RequestTable` 自行分配。
 - 采样固定为贪心（argmax）；温度等采样参数不生效。
 """
 
@@ -43,7 +44,8 @@ class PIMWorker(WorkerBase):
                  distributed_init_method="", is_driver_worker=True) -> None:
         super().__init__(vllm_config, local_rank, rank,
                          distributed_init_method, is_driver_worker)
-        self.num_slots = int(self.scheduler_config.max_num_seqs)
+        self.num_request_slots = int(self.scheduler_config.max_num_seqs)
+        self.kv_slot_tokens = int(self.cache_config.block_size)
         self.max_seq = int(self.model_config.max_model_len)
         # prefill 图是静态导出的，prompt 右侧补齐到这个长度再执行。
         self.prefill_seq_len = int(
@@ -96,10 +98,11 @@ class PIMWorker(WorkerBase):
         self.compiled = compile_llama2(
             model, strategy, prefill_seq_len=self.prefill_seq_len,
             max_seq=self.max_seq, hw=hw, hardware=hardware,
-            num_slots=self.num_slots,
+            num_request_slots=self.num_request_slots,
+            kv_slot_tokens=self.kv_slot_tokens,
         )
         load_weights(self.compiled, self.hal)
-        self.table = RequestTable(self.num_slots)
+        self.table = RequestTable(self.num_request_slots, self.compiled.kv_pool_slots)
 
     # ---- KV 缓存记账 ----
 
@@ -115,21 +118,22 @@ class PIMWorker(WorkerBase):
         )}
 
     def determine_available_memory(self) -> int:
-        """报告 num_slots 个满长请求的记账字节数，使块数正好够槽数用。"""
+        """报告 num_request_slots 个满长请求的记账字节数，使块数正好够槽池用。"""
         spec = next(iter(self.get_kv_cache_spec().values()))
-        return self.blocks_per_slot() * self.num_slots * spec.page_size_bytes
+        return self.blocks_per_slot() * self.num_request_slots * spec.page_size_bytes
 
     def blocks_per_slot(self) -> int:
-        """一个槽按调度器的块尺寸记账所需的块数。"""
-        return -(-self.max_seq // self.cache_config.block_size)
+        """一个请求按调度器的块尺寸记账所需的块数。"""
+        return -(-self.max_seq // self.kv_slot_tokens)
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """KV 已在编译期静态分配，这里只校验 vLLM 记下的块数与预期一致。"""
-        expected = self.blocks_per_slot() * self.num_slots
+        expected = self.blocks_per_slot() * self.num_request_slots
         if kv_cache_config.num_blocks != expected:
             raise RuntimeError(
                 f"vLLM 分配 {kv_cache_config.num_blocks} 个 block，"
-                f"预期 {expected}（{self.num_slots} 槽 × {self.blocks_per_slot()}）")
+                f"预期 {expected}（{self.num_request_slots} 请求槽 × "
+                f"{self.blocks_per_slot()}）")
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """块数校验已在 `initialize_from_config` 完成，这里无需再分配。"""

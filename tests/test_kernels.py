@@ -268,13 +268,19 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
     def run(mask):
         backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
         register_all(backend)
+        page_table_base, slots_base = 1 << 16, 1 << 17
+        backend.write_local(0, page_table_base, np.zeros((1,), dtype=np.int32))
         return _run(backend, sdpa_name, ["tensor"] * 4,
                     [q.shape, k.shape, v.shape, mask.shape],
                     [q, k, v, mask], q.shape, dtype="float32",
                     extra_payload={"sdpa": {
-                        "np_dtype": "float32", "layer": 0, "max_seq": 4,
-                        "head_dim": 8, "heads": [{"head": 0, "dpu": 0,
-                        "k_off": 1 << 18, "v_off": 1 << 19, "row": 8 * 4}]}})
+                        "np_dtype": "float32", "layer": 0,
+                        "head_dim": 8, "slot_tokens": 4,
+                        "heads": [{"head": 0, "dpu": 0, "row": 8 * 4,
+                                   "k_off": slots_base, "v_off": slots_base + 128}],
+                        "dpus": {0: {"pt_base": page_table_base, "pt_stride": 64,
+                                     "slots_base": slots_base, "slot_bytes": 256,
+                                     "blocks": 1}}}})
 
     causal_out = run(causal)
     blocked_out = run(blocked)

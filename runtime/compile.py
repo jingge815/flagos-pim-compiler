@@ -16,10 +16,9 @@ from contracts.unified_ir import STAGE_PLANNED, mark_stage
 from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
-from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy, kv_specs_multi_slot
+from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy
 from memory.mem_planner import DPUPlan, HwBudget, plan_dpu
 from runtime.exec_plan_gen import CompiledPlan, build_execution_plan
-from runtime.executor import DecodeState
 
 
 @dataclass
@@ -35,12 +34,11 @@ class CompiledModel:
     mem_plans: dict[int, DPUPlan]
     prefill: CompiledPlan
     decode: CompiledPlan
-    state: DecodeState
     hw: HwBudget
     hardware: PIMHardwareConfig
-    num_slots: int = 1
-    # 多 slot 时 dict[dpu_id → list[slot_id → KVRegionSpec]]，单 slot 时为 None
-    multi_slot_kv_specs: dict | None = None
+    num_request_slots: int = 1
+    kv_slot_tokens: int = 16
+    kv_pool_slots: int = 0
     prefill_seq_len: int = 0
 
 
@@ -205,7 +203,8 @@ def compile_llama2(
     hardware: PIMHardwareConfig,
     kv_dtype_bytes: int = 2,
     dtype: torch.dtype = torch.float16,
-    num_slots: int = 1,
+    num_request_slots: int = 1,
+    kv_slot_tokens: int = 16,
 ) -> CompiledModel:
     """编译 Llama 的两张图，返回共享内存蓝图的命令计划。"""
     cfg = model.config
@@ -230,6 +229,7 @@ def compile_llama2(
         head_dim=head_dim,
         max_seq=max_seq,
         dtype_bytes=kv_dtype_bytes,
+        slot_tokens=kv_slot_tokens,
     )
 
     prefill_nodes = list(prefill_gm.graph.nodes)
@@ -241,9 +241,15 @@ def compile_llama2(
                                          hardware=hardware)
     mem_plans = {
         dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
-                         kernel_mram_bytes=kernel_mram, num_slots=num_slots)
+                         kernel_mram_bytes=kernel_mram,
+                         num_request_slots=num_request_slots)
         for dpu_id in strategy.dpu_ids
     }
+
+    pool_slots = {spec.pool_slots for spec in kv_specs.values()}
+    if len(pool_slots) != 1:
+        raise ValueError(f"各 DPU 的物理槽数不一致: {pool_slots}")
+    kv_pool_slots = pool_slots.pop()
     # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
     # 两张图的 mram_offset 都已回填。
     mark_stage(prefill_gm, STAGE_PLANNED)
@@ -257,13 +263,6 @@ def compile_llama2(
         pending_prefill.update(plan.pending_readers_prefill)
         pending_decode.update(plan.pending_readers_decode)
 
-    # 多 slot 时构建所有 slot 的 KV 规格，供 sdpa payload 存 per-slot 偏移。
-    # 必须在 plan_dpu 之后：那一步把 KV 区挪到权重区末尾并回填 kv_base。
-    multi_slot_specs = None
-    if num_slots > 1:
-        multi_slot_specs = kv_specs_multi_slot(kv_specs, num_slots=num_slots, align=hw.align)
-
-    state = DecodeState(valid_len=0)
     np_dtype = np.dtype(np.float16 if dtype == torch.float16 else np.float32)
 
     # 注意力不再是主机回调：那段计算搬进了设备内核
@@ -278,8 +277,7 @@ def compile_llama2(
         def sdpa_info_of(node):
             if "scaled_dot_product_attention" not in str(node.target):
                 return None
-            return sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype,
-                                 multi_slot_specs=multi_slot_specs)
+            return sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype)
 
         return sdpa_info_of
 
@@ -302,11 +300,11 @@ def compile_llama2(
         mem_plans=mem_plans,
         prefill=prefill,
         decode=decode,
-        state=state,
         hw=hw,
         hardware=hardware,
-        num_slots=num_slots,
-        multi_slot_kv_specs=multi_slot_specs,
+        num_request_slots=num_request_slots,
+        kv_slot_tokens=kv_slot_tokens,
+        kv_pool_slots=kv_pool_slots,
         prefill_seq_len=prefill_seq_len,
     )
 

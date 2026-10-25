@@ -21,13 +21,13 @@ from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement
+from memory.kv_layout import kv_specs_from_placement, write_page_table
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime import kernels as kernels_mod
 from runtime.kernels import sdpa_kv_info
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, execute_plan
+from runtime.executor import execute_plan
 from tests.test_partition import _FixedMaskLlama
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -68,6 +68,7 @@ def llama2_instrumented_run():
     kv_specs = kv_specs_from_placement(
         k_proj.meta[SPEC_META_KEY], layers=list(range(cfg.num_hidden_layers)), num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
+        slot_tokens=16,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
@@ -79,14 +80,14 @@ def llama2_instrumented_run():
         dma_align=64,
     )
     nodes = list(gm.graph.nodes)
-    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw) for d in range(NUM_DPUS)}
+    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw, num_request_slots=1)
+             for d in range(NUM_DPUS)}
 
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
     pending = {}
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
 
-    state = DecodeState(valid_len=0)
     sdpa_layer = sdpa_layer_map(gm)
 
     def sdpa_info_of(node):
@@ -120,8 +121,12 @@ def llama2_instrumented_run():
         backend.register_kernel(name, wrap(entry.mirror))
 
     write_weight_shards(gm, plans, backend)
+    for spec in kv_specs.values():
+        write_page_table(spec, backend, 0, list(range(spec.blocks_per_request)))
 
-    events = execute_plan(compiled.plan, backend, values={"input_ids": input_ids, "causal_mask": causal_mask}, pos=state.valid_len)
+    events = execute_plan(compiled.plan, backend,
+                          values={"input_ids": input_ids, "causal_mask": causal_mask},
+                          pos=0, num_tokens=SEQ_LEN)
     backend.wait(events[compiled.output_cmd_id])
 
     return compiled, intervals

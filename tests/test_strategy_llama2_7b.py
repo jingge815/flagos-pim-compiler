@@ -16,11 +16,11 @@ from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.strategy import llama_strategies
-from memory.kv_layout import PIMStaticKVCache
 from memory.mem_planner import HwBudget
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
 from runtime.executor import run_decode_loop
 from runtime.kernels import register_all
+from tests.kv_helpers import read_rows
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
 NUM_DPUS = 8
@@ -112,15 +112,12 @@ def _run_strategy(model, strategy):
     ))
     register_all(backend)
     load_weights(compiled, backend)
-    compiled.state.valid_len = 0
 
     generated = run_decode_loop(
-        compiled.prefill.plan, compiled.decode.plan, backend,
+        compiled, backend,
         prompt_ids=torch.arange(PREFILL_SEQ_LEN, dtype=torch.long),
-        max_new_tokens=DECODE_STEPS, eos_id=-1, state=compiled.state,
+        max_new_tokens=DECODE_STEPS, eos_id=-1,
         sample_fn=lambda logits: int(np.argmax(logits)),
-        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-        decode_output_cmd_id=compiled.decode.output_cmd_id,
         causal_mask_of=causal_mask_of,
     )
     return generated, backend, compiled
@@ -149,9 +146,7 @@ def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
     _, backend, compiled = _run_strategy_cached(run_cache, llama2_model, strategy)
 
     kv_specs = compiled.kv_specs
-    cache = PIMStaticKVCache(backend, kv_specs, wram_budget_bytes=2**20)
-    total_len = compiled.state.valid_len
-    assert total_len == PREFILL_SEQ_LEN + DECODE_STEPS - 1
+    total_len = PREFILL_SEQ_LEN + DECODE_STEPS - 1
 
     for layer in (0, 15, 31):  # 首/中/末层抽查，覆盖不同 stage
         ref_k = ref_past.layers[layer].keys
@@ -160,7 +155,8 @@ def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
         assert owners, f"策略 {strategy.name}: layer{layer} 没有任何 DPU 持有 KV"
         for dpu_id, spec in owners:
             for head in spec.kv_heads:
-                K_tile, V_tile = cache.read_tile(layer, dpu_id, head, 0, total_len)
+                K_tile = read_rows(backend, spec, 0, layer, head, "k", total_len)
+                V_tile = read_rows(backend, spec, 0, layer, head, "v", total_len)
                 ref_k_h = ref_k[0, head].numpy().astype(np.float32)
                 ref_v_h = ref_v[0, head].numpy().astype(np.float32)
                 assert np.allclose(

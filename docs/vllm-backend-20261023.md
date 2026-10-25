@@ -1,5 +1,11 @@
 # vLLM 执行后端接入（2026-10-23）
 
+> **后续变更（2026-10-24）**：本文描述的「静态槽分区 / 多槽 KV」已被
+> 「固定大小槽 + 页表间接寻址」取代，`num_slots`、`multi_slot_kv_specs`、
+> `slot_id`、`kv_specs_multi_slot()` 等名称均已过时。新设计见
+> `docs/kv-slots-20261024.md`；vLLM 侧参数改为 `num_request_slots`
+> （= `max_num_seqs`）与 `kv_slot_tokens`（= `cache_config.block_size`）。
+
 ## 目标
 
 把 PIM 静态编译后端接到 vLLM V1 引擎上：vLLM 负责 HTTP、调度和连续批处理，PIM 负责执行。
@@ -7,17 +13,21 @@
 
 ## 核心约束
 
-MRAM 地址由硬件绑定，没有虚拟地址层，做不了 PagedAttention。替代方案是**静态槽分区**：
+MRAM 地址由硬件绑定，没有虚拟地址层，做不了 PagedAttention。替代方案是
+**固定大小槽 + 页表间接寻址**（早期版本是「一个请求独占一整段连续 MRAM」，
+已被取代）：
 
 | 项目 | vLLM 常规做法 | PIM 做法 |
 | --- | --- | --- |
-| 并发单元 | 分页 block，运行期自由拼接 | 编译期预留 `num_slots` 个槽 |
-| KV 位置 | 由 block 表动态映射 | 每槽独占一段连续 MRAM，编译期定死 |
-| 并发上限 | 由显存决定 | 等于 `num_slots`（= `max_num_seqs`） |
+| 并发单元 | 分页 block，运行期自由拼接 | 固定 `slot_tokens` 的物理槽，运行期分配 |
+| KV 位置 | 由 block 表动态映射 | 每请求页表把逻辑块映射到物理槽 |
+| 并发上限 | 由显存决定 | 预留 `num_request_slots` 个请求槽 |
 | 改并发 | 改配置即可 | 必须重新编译 |
 
-vLLM 看到的 block 只是账面数字：每槽按调度器块尺寸记 `ceil(max_seq / block_size)` 个 block，
-总 block 数正好等于 `num_slots × 每槽块数`，真正限制并发的是 `max_num_seqs = num_slots`。
+vLLM 看到的 block 是账面数字：每个请求按调度器块尺寸记
+`ceil(max_seq / block_size)` 个 block，物理槽池大小等于
+`num_request_slots × 每请求块数`。槽几何、地址公式与页表布局见
+`docs/kv-slots-20261024.md`。
 
 ## 改动清单
 
@@ -25,17 +35,17 @@ vLLM 看到的 block 只是账面数字：每槽按调度器块尺寸记 `ceil(m
 
 | 文件 | 改动 |
 | --- | --- |
-| `memory/kv_layout.py` | 新增 `kv_specs_multi_slot()`：把单槽 KV 规格复制 `num_slots` 份，步长取单槽已分配字节数 |
-| `memory/mem_planner.py` | `plan_dpu()` 新增 `num_slots` 参数，KV 区按槽数放大 |
+| `memory/kv_layout.py` | `build_kv_layout()` 规划页表区与固定大小槽池；`write_page_table()` 写逻辑块映射 |
+| `memory/mem_planner.py` | `plan_dpu()` 新增 `num_request_slots` 参数，KV 区按页表 + 槽池整体计入 |
 
 ### 执行层
 
 | 文件 | 改动 |
 | --- | --- |
-| `backend/hal_numpy.py` | `bind_inputs()` 新增 `slot_id`，暴露 `bound_slot_id` 属性 |
-| `runtime/kernels.py` | `sdpa_kv_info()` 可输出 `k_offs_by_slot` / `v_offs_by_slot`；`sdpa_kernel` 按当前槽取 KV 偏移 |
-| `runtime/executor.py` | `execute_plan()` 透传 `slot_id`；新增 `RequestSlot`、`RequestTable`、`step_request()`；`run_one_step()` 改为每请求只走一步 |
-| `runtime/compile.py` | `compile_llama2()` 新增 `num_slots`；`CompiledModel` 新增 `num_slots`、`multi_slot_kv_specs`、`prefill_seq_len` |
+| `backend/hal_numpy.py` | `bind_inputs()` 新增 `request_slot`、`num_tokens`，暴露同名属性 |
+| `runtime/kernels.py` | `sdpa_kv_info()` 输出槽几何与页表地址；`sdpa_kernel` 读页表后按物理槽读写 KV |
+| `runtime/executor.py` | `execute_plan()` 透传 `request_slot` / `num_tokens`；新增 `KVSlotPool`、`KVBlockTable`、`RequestSlot`、`RequestTable`、`step_request()` |
+| `runtime/compile.py` | `compile_llama2()` 新增 `num_request_slots`、`kv_slot_tokens`；`CompiledModel` 新增对应字段与 `kv_pool_slots` |
 
 ### vLLM 适配层（新增）
 
@@ -59,7 +69,7 @@ vLLM 调度器 ──SchedulerOutput──▶ PIMWorker.execute_model
             RequestTable       slot.reset()        step_request()
                                                        │
                                                        ▼
-                                      prefill 图 / decode 图（含 slot_id）
+                                      prefill 图 / decode 图（含 request_slot）
                                                        │
                                                        ▼
                                                    NumpyBackend
@@ -72,28 +82,30 @@ vLLM 调度器 ──SchedulerOutput──▶ PIMWorker.execute_model
 
 ### `RequestSlot`
 
-单个请求的状态：`slot_id`、`valid_len`、`prompt_ids`、`generated`、`is_prefill_done`。
+单个请求的状态：`request_slot`、`blocks`（逻辑块 → 物理槽）、`valid_len`、
+`prompt_ids`、`generated`、`is_prefill_done`。
 
 ### `RequestTable`
 
-管理 `num_slots` 个槽的借还。`add_request()` 在槽满时直接抛 `RuntimeError`；
-`reset()` 供被抢占的请求按全量 token 重放 prefill。
+管理 `num_request_slots` 个请求槽和共享物理槽池的借还。`add_request()` 在槽满时
+直接抛 `RuntimeError`；`reset()` 供被抢占的请求按全量 token 重放 prefill。
 
 ### `CompiledModel` 新增字段
 
 | 字段 | 含义 |
 | --- | --- |
-| `num_slots` | 编译期预留的请求槽数 |
-| `multi_slot_kv_specs` | `dpu_id → 槽号 → KV 规格`；单槽时为 `None` |
+| `num_request_slots` | 编译期预留的请求槽数 |
+| `kv_slot_tokens` | 一个物理槽容纳的 token 数（= `block_size`） |
+| `kv_pool_slots` | 物理槽总数 |
 | `prefill_seq_len` | prefill 图固定的序列长度 |
 
 ## 关键实现细节
 
-1. **多槽 KV 规格必须在 `plan_dpu()` 之后构建。** `plan_dpu()` 会把 KV 区挪到权重区末尾
-   并回填 `kv_base`；提前构建会让每槽偏移指向权重区，破坏权重。
-2. **块尺寸跟随 vLLM。** worker 上报的 `FullAttentionSpec.block_size` 等于
-   `cache_config.block_size`（CUDA 平台默认 16），每槽块数为 `ceil(max_seq / block_size)`。
-   这样调度器算出的总 block 数正好够 `num_slots` 个满长请求。
+1. **槽几何必须在 `plan_dpu()` 里构建。** `plan_dpu()` 会把 KV 区挪到权重区末尾并回填
+   `kv_base`，页表区和槽池地址都从这里推导；提前构建会指向权重区。
+2. **块尺寸跟随 vLLM。** `kv_slot_tokens` 等于 `cache_config.block_size`
+   （CUDA 平台默认 16），每请求块数为 `ceil(max_seq / block_size)`。
+   这样调度器算出的总 block 数正好够 `num_request_slots` 个满长请求。
 3. **不支持分块 prefill。** 静态图一次跑完整个 prompt；若调度器把 prompt 拆到多步，
    worker 直接抛错。服务端应把 `--max-num-batched-tokens` 设到至少
    `并发数 × 最长 prompt`。短 prompt 右侧补齐到 `PIM_PREFILL_SEQ_LEN`，补齐位被因果掩码屏蔽。
@@ -126,9 +138,9 @@ vLLM 0.14 的 `--model` 默认值是 `Qwen/Qwen3-0.6B`，必须显式指定本�
 
 | 测试文件 | 数量 | 验证点 |
 | --- | --- | --- |
-| `tests/test_multi_slot_kv.py` | 4 | 槽间偏移不重叠、总字节数按槽数放大、非法槽数报错 |
-| `tests/test_slot_isolation.py` | 3 | 写一个槽不影响另一个槽、`slot_id` 透传 |
-| `tests/test_multi_request_decode.py` | 3 | 两路并发生成与单独运行逐 token 一致、槽可复用、槽满报错 |
+| `tests/test_kv_slots.py` | 6 | 槽几何、页表乱序映射、池耗尽与复用、未分配项报错 |
+| `tests/test_slot_isolation.py` | 3 | 两请求页表互不重叠、`request_slot` 透传 |
+| `tests/test_multi_request_decode.py` | 4 | 两路并发生成与单独运行一致、`slot_tokens=2` 与整段一致、槽满报错 |
 | `tests/test_vllm_executor.py` | 1 | vLLM 引擎经 `PIMExecutor` 跑通两个并发请求 |
 
 另外用微型模型做过一次 HTTP 冒烟：启动 `serve_pim.py` 后并发发两个

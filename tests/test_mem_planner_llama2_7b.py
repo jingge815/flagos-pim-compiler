@@ -17,8 +17,9 @@ from contracts.graph_meta import SPEC_META_KEY
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import PIMStaticKVCache, kv_specs_from_placement
+from memory.kv_layout import kv_specs_from_placement, write_page_table
 from memory.mem_planner import HwBudget, format_mem_plan, plan_dpu
+from tests.kv_helpers import read_rows, write_row
 from tests.test_partition import _FixedMaskLlama
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -81,6 +82,7 @@ def kv_specs(llama2_two_graphs):
         max_seq=MAX_SEQ,
         dtype_bytes=KV_DTYPE_BYTES,
         kv_base=0,
+        slot_tokens=16,
     )
 
 
@@ -179,23 +181,24 @@ def test_weight_offset_is_a_real_usable_address_on_numpy_backend(llama2_two_grap
 
 
 def test_kv_region_lands_at_planned_kv_base_and_stays_usable(kv_specs, plans, hw_budget) -> None:
-    """验证规划的 KV 区起点可用于缓存读写。"""
+    """验证规划的 KV 区起点可用于页表与槽读写。"""
     dpu_id = 0
     spec = kv_specs[dpu_id]
     assert spec.kv_base == plans[dpu_id].kv_base
-    assert all(off >= spec.kv_base for off in spec.kv_off.values())
-    assert max(spec.kv_off.values()) + MAX_SEQ * spec.head_dim * spec.dtype_bytes == plans[dpu_id].act_base
+    assert spec.page_table_base == plans[dpu_id].kv_base
+    # 页表区 + 全部物理槽正好铺满 KV 区。
+    assert spec.slots_base + spec.pool_slots * spec.slot_bytes == plans[dpu_id].act_base
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw_budget.mram_bytes))
-    cache = PIMStaticKVCache(backend, kv_specs, wram_budget_bytes=2**20)
     rng = np.random.default_rng(0)
     head = spec.kv_heads[0]
     k = rng.standard_normal(spec.head_dim).astype(np.float16)
     v = rng.standard_normal(spec.head_dim).astype(np.float16)
-    cache.update(0, 0, {d: {h: k for h in s.kv_heads} for d, s in kv_specs.items()},
-                 {d: {h: v for h in s.kv_heads} for d, s in kv_specs.items()})
-    K_tile, V_tile = cache.read_tile(0, dpu_id, head, 0, 1)
-    assert np.array_equal(K_tile[0], k) and np.array_equal(V_tile[0], v)
+    write_page_table(spec, backend, 0, list(range(spec.blocks_per_request)))
+    for which, row in (("k", k), ("v", v)):
+        write_row(backend, spec, 0, 0, head, which, 0, row)
+    assert np.array_equal(read_rows(backend, spec, 0, 0, head, "k", 1)[0], k)
+    assert np.array_equal(read_rows(backend, spec, 0, 0, head, "v", 1)[0], v)
 
 
 def test_format_mem_plan_printable(plans, hw_budget) -> None:

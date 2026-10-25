@@ -179,16 +179,13 @@ def test_compiled_linear_end_to_end_matches_hf_generate(
     ))
     register_all(backend, use_compiled_linear=True)
     load_weights(compiled, backend)
-    compiled.state.valid_len = 0
 
     prompt_ids = torch.tensor(prompt_ids_list, dtype=torch.long)
     generated = run_decode_loop(
-        compiled.prefill.plan, compiled.decode.plan, backend,
+        compiled, backend,
         prompt_ids=prompt_ids, max_new_tokens=DECODE_STEPS,
-        eos_id=tokenizer.eos_token_id, state=compiled.state,
+        eos_id=tokenizer.eos_token_id,
         sample_fn=lambda logits: int(np.argmax(logits)),
-        prefill_output_cmd_id=compiled.prefill.output_cmd_id,
-        decode_output_cmd_id=compiled.decode.output_cmd_id,
         causal_mask_of=causal_mask_of,
     )
 

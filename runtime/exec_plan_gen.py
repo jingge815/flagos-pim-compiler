@@ -26,7 +26,6 @@ _REDISTRIBUTE_OP = {
 }
 _REDISTRIBUTE_FN = {"all_reduce": all_reduce, "all_gather": all_gather, "all_to_all": all_to_all}
 
-KvAccessFn = Callable[[Node], "tuple[list[Access], list[Access]] | None"]
 HostHandlerFn = Callable[[Node], "Callable | None"]
 
 
@@ -327,7 +326,6 @@ def build_execution_plan(
     pending_readers: dict[tuple, list[str]],
     *,
     hardware: PIMHardwareConfig,
-    kv_access_of: KvAccessFn | None = None,
     host_handler_of: HostHandlerFn | None = None,
     sdpa_info_of: "Callable[[Node], dict | None] | None" = None,
     num_tasklets: int = 4,
@@ -395,12 +393,6 @@ def build_execution_plan(
                     if arg_spec is not None and arg_spec.device == DEVICE_DPU and dpu_id in arg_spec.shard_map:
                         reads.append(_node_access(arg, dpu_id, _placed_width(
                             arg, placed_elem_bytes)))
-                if kv_access_of is not None:
-                    hook = kv_access_of(node)
-                    kv_reads, kv_writes = hook if hook is not None else ([], [])
-                else:
-                    kv_reads, kv_writes = [], []
-                reads = reads + kv_reads
                 write = _node_access(node, dpu_id, _placed_width(
                     node, placed_elem_bytes))
                 waits = _deps_of(reads, builder.writers)
@@ -462,7 +454,7 @@ def build_execution_plan(
                         payload["sdpa"] = info
                 cmd = builder.append(
                     "launch", dpu_id, payload,
-                    reads, [write] + kv_writes, waits,
+                    reads, [write], waits,
                     num_tasklets=num_tasklets,
                 )
                 # 登记本节点为输入地址读者。

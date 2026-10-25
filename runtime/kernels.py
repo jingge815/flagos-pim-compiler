@@ -12,7 +12,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from memory.kv_layout import PIMStaticKVCache, decode_mask, prefill_mask
+from memory.kv_layout import decode_mask, prefill_mask
 from runtime import kernels_pim
 
 
@@ -1211,79 +1211,74 @@ def _compiled_split_heads(shape: tuple[int, ...], axis: int, num_heads: int, *, 
     return fn
 
 
-# SDPA 的设备内核要 KV 缓存与层号，两者都是编译期才知道的，由
-# `configure_sdpa_kv` 注入。
-_SDPA_KV = None
-
-
-def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype,
-                 multi_slot_specs: dict | None = None) -> dict | None:
-    """把一个注意力节点要用的设备侧 KV 区域整理成可进命令 payload 的形式。
+def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
+    """把一个注意力节点要用的 KV 槽几何整理成可进命令 payload 的形式。
 
     编译期算好、烘进命令，而不是让内核去查全局：三种切分策略连着编译时，
     模块级的那份会被后一次覆盖，前面那些 plan 再执行就用了**别人**的 KV
     规格——实测解码结果因此错成另一个 token。
 
-    `multi_slot_specs` 非空时为 dict[dpu_id → list[KVRegionSpec]]，payload 里
-    改存 per-slot 的偏移列表（`k_offs_by_slot`/`v_offs_by_slot`），内核运行时
-    按 `hal.bound_slot_id` 索引。单 slot 时退回旧格式（`k_off`/`v_off`），
-    兼容现有测试和无多 slot 路径。
+    `k_off`/`v_off` 是物理槽 0 中的绝对地址；运行时由页表把逻辑块映射到
+    物理槽，再按 `k_off + s * slot_bytes` 定位。
     """
     layer = layer_of_node.get(node.name)
     if layer is None:
         return None
     heads = []
+    dpus: dict[int, dict] = {}
     for dpu_id, spec in sorted(kv_specs.items()):
         if layer not in spec.layers:
             continue
+        dpus[int(dpu_id)] = {
+            "pt_base": int(spec.page_table_base),
+            "pt_stride": int(spec.page_table_stride),
+            "slots_base": int(spec.slots_base),
+            "slot_bytes": int(spec.slot_bytes),
+            "blocks": int(spec.blocks_per_request),
+        }
         for head in spec.kv_heads:
-            row = spec.head_dim * spec.dtype_bytes
-            entry: dict = {
+            heads.append({
                 "head": int(head),
                 "dpu": int(dpu_id),
-                "row": int(row),
-            }
-            if multi_slot_specs is not None:
-                slots = multi_slot_specs[dpu_id]
-                entry["k_offs_by_slot"] = [int(s.kv_off[(layer, head, "k")]) for s in slots]
-                entry["v_offs_by_slot"] = [int(s.kv_off[(layer, head, "v")]) for s in slots]
-            else:
-                entry["k_off"] = int(spec.kv_off[(layer, head, "k")])
-                entry["v_off"] = int(spec.kv_off[(layer, head, "v")])
-            heads.append(entry)
+                "row": int(spec.head_dim * spec.dtype_bytes),
+                "k_off": int(spec.kv_off[(layer, head, "k")]),
+                "v_off": int(spec.kv_off[(layer, head, "v")]),
+            })
     if not heads:
         return None
+    first = next(iter(kv_specs.values()))
     return {
         "layer": int(layer),
-        "max_seq": int(next(iter(kv_specs.values())).max_seq),
-        "head_dim": int(next(iter(kv_specs.values())).head_dim),
+        "head_dim": int(first.head_dim),
         "np_dtype": str(np_dtype),
+        "slot_tokens": int(first.slot_tokens),
         "heads": heads,
+        "dpus": dpus,
     }
 
 
-def _kv_row_write(hal, owner: int, base: int, slot_index: int,
-                  row: np.ndarray, max_seq: int,
+def _kv_row_write(hal, owner: int, base: int, row_index: int,
+                  row: np.ndarray, plane_elems: int,
                   ctx: _OpContext | None = None) -> None:
     """把一行 K 或 V 写进缓存：走 `pim.kv_cache` 的散写相，不再直连 HAL。
 
     散写的目的行由**索引**给出（校验器要求 scatter 必须有 indices，`pos` 不是
-    目的地），所以缓存基址传区域头、行号传 `slot_index`，落点与直写
-    `base + slot*head_dim` 一致。
+    目的地），所以缓存基址传区域头、行号传 `row_index`（块内行号），落点与直写
+    `base + row_index*head_dim` 一致。
 
     编译不出来（工具链缺失）才回退 `hal.write_local`——回退口径与其它
     `_compiled_*` 一致，只挡工具链缺失这一种。
     """
     row = np.ascontiguousarray(row)
-    fn = _compiled_kv_cache(tuple(row.shape), max_seq * row.shape[-1],
+    fn = _compiled_kv_cache(tuple(row.shape), plane_elems,
                             row.dtype, ctx=ctx)
     if fn is None:
         record_route("kv_cache", "fallback")
-        hal.write_local(owner, base + slot_index * row.nbytes, row)
+        hal.write_local(owner, base + row_index * row.nbytes, row)
         return
     record_route("kv_cache", "hit")
     slot = np.zeros((1,), dtype=np.int16)
-    slot[0] = slot_index
+    slot[0] = row_index
     fn(ctypes.c_void_p(row.ctypes.data),
        ctypes.c_void_p(hal.raw_mram_ptr(owner) + base),
        ctypes.c_int32(0),
@@ -1334,9 +1329,8 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
         raise RuntimeError(
             "注意力命令里没有 KV 区域信息；build_execution_plan 要传 sdpa_info_of")
     np_dtype = np.dtype(info["np_dtype"])
-    layer = int(info["layer"])
-    max_seq = int(info["max_seq"])
     head_dim = int(info["head_dim"])
+    slot_tokens = int(info["slot_tokens"])
 
     args = _read_tensor_args(hal, dpu_id, cmd)
     q, k, v = args[0], args[1], args[2]
@@ -1344,41 +1338,58 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     num_heads, tq = q.shape[1], q.shape[2]
 
     pos = hal.bound_pos if hal.bound_pos is not None else 0
-    slot_id = getattr(hal, '_bound_slot_id', 0)
+    request_slot = hal.bound_request_slot
+    num_tokens = hal.bound_num_tokens if hal.bound_num_tokens is not None else tq
+    num_tokens = min(num_tokens, tq)
+
+    # 每个 owner 读一次页表，后续按逻辑块查物理槽。
+    geometry: dict[int, dict] = info["dpus"]
+    page_tables = {
+        owner: hal.read_local(
+            owner, geo["pt_base"] + request_slot * geo["pt_stride"],
+            (geo["blocks"],), np.int32)
+        for owner, geo in geometry.items()
+    }
+
+    def physical_slot(owner: int, block: int) -> int:
+        slot = int(page_tables[owner][block])
+        if slot < 0:
+            raise RuntimeError(
+                f"dpu{owner} 页表项 block={block} 未分配（request_slot={request_slot}）")
+        return slot
+
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
-        # 支持 per-slot 偏移列表（多请求并发）和旧的单偏移格式。
-        if "k_offs_by_slot" in entry:
-            k_off = entry["k_offs_by_slot"][slot_id]
-            v_off = entry["v_offs_by_slot"][slot_id]
-        else:
-            k_off = entry["k_off"]
-            v_off = entry["v_off"]
-        for t in range(tq):
-            row = pos + t
-            _kv_row_write(hal, owner, k_off, row,
-                          np.ascontiguousarray(k[0, head, t], np_dtype), max_seq,
-                          ctx=_ctx_of(cmd))
-            _kv_row_write(hal, owner, v_off, row,
-                          np.ascontiguousarray(v[0, head, t], np_dtype), max_seq,
-                          ctx=_ctx_of(cmd))
+        geo = geometry[owner]
+        plane_elems = slot_tokens * head_dim
+        for t in range(num_tokens):
+            position = pos + t
+            block, row_index = divmod(position, slot_tokens)
+            slot = physical_slot(owner, block)
+            base = entry["k_off"] + slot * geo["slot_bytes"]
+            _kv_row_write(hal, owner, base, row_index,
+                          np.ascontiguousarray(k[0, head, t], np_dtype),
+                          plane_elems, ctx=_ctx_of(cmd))
+            base = entry["v_off"] + slot * geo["slot_bytes"]
+            _kv_row_write(hal, owner, base, row_index,
+                          np.ascontiguousarray(v[0, head, t], np_dtype),
+                          plane_elems, ctx=_ctx_of(cmd))
 
-    valid_len = pos + tq
+    hist_len = pos + num_tokens
     out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
-        if "k_offs_by_slot" in entry:
-            k_off = entry["k_offs_by_slot"][slot_id]
-            v_off = entry["v_offs_by_slot"][slot_id]
-        else:
-            k_off = entry["k_off"]
-            v_off = entry["v_off"]
-        k_hist = hal.read_local(owner, k_off, (max_seq, head_dim), np_dtype)
-        v_hist = hal.read_local(owner, v_off, (max_seq, head_dim), np_dtype)
+        geo = geometry[owner]
+        k_hist = _gather_kv_history(hal, owner, entry["k_off"], geo,
+                                    page_tables[owner], hist_len, head_dim,
+                                    slot_tokens, np_dtype)
+        v_hist = _gather_kv_history(hal, owner, entry["v_off"], geo,
+                                    page_tables[owner], hist_len, head_dim,
+                                    slot_tokens, np_dtype)
         # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
         # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
         graph_mask = args[3] if len(args) > 3 else None
@@ -1388,19 +1399,38 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
             # 只是调用点在注意力里。
             scores = matmul(k_hist, q[0, head, t][:, None]).reshape(-1)
             scores = scores.astype(np.float32) * scale
-            # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史
-            # （长 max_seq），而图上的掩码只覆盖当前 query，短一截时补零
-            # 会把历史位置当成可见，结果就错了。长度对不上就退回按位置重算。
+            # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史，
+            # 而图上的掩码只覆盖当前 query，短一截时补零会把历史位置当成可见，
+            # 结果就错了。长度对不上就退回按位置重算。
             if graph_mask is not None and graph_mask.shape[-1] == scores.shape[0]:
                 row = graph_mask.reshape(-1, graph_mask.shape[-1])
                 mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
             else:
-                mask = (prefill_mask(t + 1, max_seq) if tq > 1
-                        else decode_mask(valid_len - 1, max_seq))
-                mask_row = mask[t] if tq > 1 else mask
+                # 补齐的 query 行（t >= hist_len）只算不用，掩码按全部可见处理。
+                mask = (prefill_mask(min(t + 1, hist_len), hist_len) if tq > 1
+                        else decode_mask(hist_len - 1, hist_len))
+                mask_row = mask[min(t, hist_len - 1)] if tq > 1 else mask
             weights = softmax(add_mask(scores, mask_row).astype(np.float32))
             out[0, head, t] = matmul(weights[None, :], v_hist).reshape(-1)
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
+
+
+def _gather_kv_history(hal, owner: int, plane_off: int, geo: dict,
+                       page_table: np.ndarray, n_tokens: int, head_dim: int,
+                       slot_tokens: int, np_dtype) -> np.ndarray:
+    """按页表把逻辑块逐个换成物理槽读取，拼成前 `n_tokens` 行的历史。"""
+    parts = []
+    for block in range(len(page_table)):
+        start = block * slot_tokens
+        if start >= n_tokens:
+            break
+        rows = min(slot_tokens, n_tokens - start)
+        slot = int(page_table[block])
+        if slot < 0:
+            raise RuntimeError(f"dpu{owner} 页表项 block={block} 未分配")
+        offset = plane_off + slot * geo["slot_bytes"]
+        parts.append(hal.read_local(owner, offset, (rows, head_dim), np_dtype))
+    return np.concatenate(parts, axis=0)
 
 
 def unsqueeze_kernel(hal, dpu_id: int, cmd) -> None:

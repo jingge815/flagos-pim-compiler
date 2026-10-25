@@ -118,7 +118,8 @@ class NumpyBackend:
         self._host_lock = Lock()
         self._bound_values: dict[str, object] = {}
         self._bound_pos: int | None = None
-        self._bound_slot_id: int = 0
+        self._bound_request_slot: int = 0
+        self._bound_num_tokens: int | None = None
 
     def reset_events(self) -> None:
         """清空本次执行的命令事件表，保留各 DPU 的执行顺序。"""
@@ -280,11 +281,13 @@ class NumpyBackend:
         return event.future.done()
 
     def bind_inputs(self, values: dict[str, object], *, pos: int | None = None,
-                    slot_id: int = 0) -> None:
-        """绑定本次计划执行的占位符值、可选 KV 写入位置和请求槽编号。"""
+                    request_slot: int = 0,
+                    num_tokens: int | None = None) -> None:
+        """绑定本次计划执行的占位符值、KV 写入位置、请求槽和真实 token 数。"""
         self._bound_values = values
         self._bound_pos = pos
-        self._bound_slot_id = slot_id
+        self._bound_request_slot = request_slot
+        self._bound_num_tokens = num_tokens
 
     def bound_value(self, name: str) -> object:
         """取本次绑定的某个 placeholder 值（`exec_plan_gen._resolve_value` 用）。"""
@@ -296,9 +299,14 @@ class NumpyBackend:
         return self._bound_pos
 
     @property
-    def bound_slot_id(self) -> int:
-        """取本次 `bind_inputs` 绑定的 `slot_id`（多请求并发时选 KV 区用）。"""
-        return self._bound_slot_id
+    def bound_request_slot(self) -> int:
+        """取本次 `bind_inputs` 绑定的请求槽编号（读哪一份页表用）。"""
+        return self._bound_request_slot
+
+    @property
+    def bound_num_tokens(self) -> int | None:
+        """取本次 `bind_inputs` 绑定的真实 token 数（限制 KV 写入行数）。"""
+        return self._bound_num_tokens
 
     def result_of(self, cmd_id: int) -> object:
         """返回指定命令的执行结果。"""
