@@ -1318,9 +1318,10 @@ def _compiled_kv_cache(value_shape: tuple[int, ...], cache_elems: int,
 def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.scaled_dot_product_attention` 的 DPU 内核。
 
-    拆头之后这条不再是主路径：QKᵀ、掩码、softmax、PV 各自是设备命令。
-    留着是因为没拆头的图（直接 `build_execution_plan`、不经 `compile_llama2`）
-    仍会遇到整体 SDPA 节点，那时 KV 缓存的读写还在这里。
+    `compile_llama2` 不拆头，导出的图里 SDPA 仍是一个节点，所以 Llama 的
+    执行计划走这里。KV 按块表逐块读写：先逐块算 QKᵀ 填分数矩阵，逐行
+    mask + softmax，再逐块算 PV 累加。K/V 历史都不会拼成整条连续数组
+    （见 `_iter_kv_blocks`），峰值只多驻留一个块。
     """
     info = cmd.payload.get("sdpa")
     if info is None:
@@ -1373,47 +1374,62 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
 
     hist_len = pos + num_tokens
     out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
+    # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
+    # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
+    graph_mask = args[3] if len(args) > 3 else None
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
         geo = geometry[owner]
-        k_hist = _gather_kv_history(hal, owner, entry["k_off"], geo,
-                                    block_tables[owner], hist_len, head_dim,
-                                    slot_tokens, np_dtype)
-        v_hist = _gather_kv_history(hal, owner, entry["v_off"], geo,
-                                    block_tables[owner], hist_len, head_dim,
-                                    slot_tokens, np_dtype)
-        # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
-        # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
-        graph_mask = args[3] if len(args) > 3 else None
+        table = block_tables[owner]
+
+        # 第一遍：逐物理块算 QKᵀ，把分数填进预分配矩阵，不拼 KV 历史。
+        # 按 query 整批算（M=tq）是关键：逐 query 逐块重读 K 会把 K 的读放大
+        # tq 倍；整批仍只读一遍，与改动前是同一份流量。
+        scores = np.empty((tq, hist_len), dtype=np.float32)
+        for start, rows, k_block in _iter_kv_blocks(
+                hal, owner, entry["k_off"], geo, table, hist_len,
+                head_dim, slot_tokens, np_dtype):
+            scores[:, start:start + rows] = (
+                matmul(q[0, head], k_block.T).astype(np.float32) * scale)
+
+        # 掩码与 softmax 仍逐行，与改动前逐元素同一口径：`pim.mask` 一次、
+        # `pim.softmax` 一次。全局 softmax 要看整行分数，所以分数矩阵仍按行
+        # 保留——它是 O(tq·hist)，不含 KV 的 head_dim 那一维。
+        weights = np.empty((tq, hist_len), dtype=np.float16)
         for t in range(tq):
-            # 三段各自走设备算子，不在这一处现算：`pim.matmul` 两次、`pim.mask`
-            # 一次、`pim.softmax` 一次。它们的数值口径与单测对拍的那条完全一样，
-            # 只是调用点在注意力里。
-            scores = matmul(k_hist, q[0, head, t][:, None]).reshape(-1)
-            scores = scores.astype(np.float32) * scale
             # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史，
             # 而图上的掩码只覆盖当前 query，短一截时补零会把历史位置当成可见，
             # 结果就错了。长度对不上就退回按位置重算。
-            if graph_mask is not None and graph_mask.shape[-1] == scores.shape[0]:
-                row = graph_mask.reshape(-1, graph_mask.shape[-1])
+            if graph_mask is not None and graph_mask.shape[-1] == hist_len:
+                row = graph_mask.reshape(-1, hist_len)
                 mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
             else:
                 # 补齐的 query 行（t >= hist_len）只算不用，掩码按全部可见处理。
                 mask = (prefill_mask(min(t + 1, hist_len), hist_len) if tq > 1
                         else decode_mask(hist_len - 1, hist_len))
                 mask_row = mask[min(t, hist_len - 1)] if tq > 1 else mask
-            weights = softmax(add_mask(scores, mask_row).astype(np.float32))
-            out[0, head, t] = matmul(weights[None, :], v_hist).reshape(-1)
+            weights[t] = softmax(add_mask(scores[t], mask_row).astype(np.float32))
+
+        # 第二遍：逐物理块算 PV，f32 累加后合并；V 历史同样不落地。
+        acc = np.zeros((tq, head_dim), dtype=np.float32)
+        for start, rows, v_block in _iter_kv_blocks(
+                hal, owner, entry["v_off"], geo, table, hist_len,
+                head_dim, slot_tokens, np_dtype):
+            acc += matmul(weights[:, start:start + rows], v_block).astype(np.float32)
+        out[0, head] = acc
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
 
 
-def _gather_kv_history(hal, owner: int, plane_off: int, geo: dict,
-                       block_table: np.ndarray, n_tokens: int, head_dim: int,
-                       slot_tokens: int, np_dtype) -> np.ndarray:
-    """按块表把逻辑块逐个换成物理槽读取，拼成前 `n_tokens` 行的历史。"""
-    parts = []
+def _iter_kv_blocks(hal, owner: int, plane_off: int, geo: dict,
+                    block_table: np.ndarray, n_tokens: int, head_dim: int,
+                    slot_tokens: int, np_dtype):
+    """按逻辑块顺序逐块读出 K 或 V 的一段，不拼成整条历史。
+
+    物理槽由块表间接给出，只读到覆盖 `n_tokens` 为止，表尾的 `-1` 不会被读。
+    调用方逐块算完即丢，峰值只占一个块。
+    """
     for block in range(len(block_table)):
         start = block * slot_tokens
         if start >= n_tokens:
@@ -1423,8 +1439,7 @@ def _gather_kv_history(hal, owner: int, plane_off: int, geo: dict,
         if slot < 0:
             raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
         offset = plane_off + slot * geo["slot_bytes"]
-        parts.append(hal.read_local(owner, offset, (rows, head_dim), np_dtype))
-    return np.concatenate(parts, axis=0)
+        yield start, rows, hal.read_local(owner, offset, (rows, head_dim), np_dtype)
 
 
 def unsqueeze_kernel(hal, dpu_id: int, cmd) -> None:

@@ -287,6 +287,72 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
         "全遮挡掩码与因果掩码给出了同一个结果：图上的掩码没被用到")
 
 
+def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
+    """多块且块表乱序时注意力正确，且全程不拼接 KV 历史。
+
+    物理槽按块表散落，逻辑顺序只有块表知道；两次运行（顺序 / 乱序块表）
+    必须给出同一个结果，并与 numpy 因果注意力对拍。`np.concatenate` 被监视：
+    改回「先 gather 再算」的实现会立刻被这条断言抓住。
+    """
+    rng = np.random.default_rng(7)
+    n_tokens, head_dim, slot_tokens = 6, 4, 2
+    q = rng.standard_normal((1, 1, n_tokens, head_dim)).astype(np.float32)
+    k = rng.standard_normal((1, 1, n_tokens, head_dim)).astype(np.float32)
+    v = rng.standard_normal((1, 1, n_tokens, head_dim)).astype(np.float32)
+
+    bt_base, slots_base = 1 << 16, 1 << 17
+    plane_stride = 64
+    slot_bytes = 2 * plane_stride
+
+    def run(block_table):
+        backend = NumpyBackend(
+            NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+        register_all(backend)
+        backend.write_local(0, bt_base, np.asarray(block_table, dtype=np.int32))
+        for position in range(n_tokens):
+            block, row = divmod(position, slot_tokens)
+            slot = block_table[block]
+            for plane_off, source in ((slots_base, k),
+                                      (slots_base + plane_stride, v)):
+                backend.write_local(
+                    0, plane_off + slot * slot_bytes + row * head_dim * 4,
+                    np.ascontiguousarray(source[0, 0, position]))
+        return _run(
+            backend, str(torch.ops.aten.scaled_dot_product_attention.default),
+            ["tensor"] * 3, [q.shape, k.shape, v.shape], [q, k, v],
+            q.shape, dtype="float32",
+            extra_payload={"sdpa": {
+                "np_dtype": "float32", "layer": 0,
+                "head_dim": head_dim, "slot_tokens": slot_tokens,
+                "heads": [{"head": 0, "dpu": 0, "row": head_dim * 4,
+                           "k_off": slots_base,
+                           "v_off": slots_base + plane_stride}],
+                "dpus": {0: {"bt_base": bt_base, "slot_bytes": slot_bytes,
+                             "max_blocks": n_tokens // slot_tokens}}}})
+
+    concatenations = []
+    real_concat = np.concatenate
+
+    def spy(*args, **kwargs):
+        concatenations.append(args)
+        return real_concat(*args, **kwargs)
+
+    monkeypatch.setattr(np, "concatenate", spy)
+    identity = run([0, 1, 2])
+    shuffled = run([2, 0, 1])
+    assert not concatenations, "sdpa 仍在拼接 KV 历史"
+    assert np.array_equal(identity, shuffled), "乱序块表给出了不同结果"
+
+    # numpy 因果注意力参考；设备 softmax 走 LUT，留一点容差。
+    scale = 1.0 / np.sqrt(head_dim)
+    scores = (q[0, 0] @ k[0, 0].T) * scale
+    masked = scores + np.triu(
+        np.full((n_tokens, n_tokens), -np.inf, dtype=np.float32), k=1)
+    weights = np.exp(masked.astype(np.float32))
+    weights /= weights.sum(-1, keepdims=True)
+    assert np.allclose(identity[0, 0], weights @ v[0, 0], atol=0.05)
+
+
 def test_view_ops_reach_the_compiler(monkeypatch) -> None:
     """transpose / reshape / concat 必须真的调 `compile_op`。
 

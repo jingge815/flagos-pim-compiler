@@ -60,8 +60,26 @@ DPU `d`、逻辑块 `b = position // slot_tokens`、块内行 `t = position % sl
 block_table = hal.read_local(owner, bt_base, (max_blocks,), np.int32)
 ```
 
-历史 gather（`_gather_kv_history`）仍按逻辑块逐块查表，只在 `start < hist_len`
-时才读。
+历史读取不再 gather 成整条：`_iter_kv_blocks` 按逻辑块逐块查表，只在
+`start < hist_len` 时才读，调用方逐块算完即丢。
+
+## 注意力按块计算（两遍）
+
+`sdpa_kernel` 不再用 `np.concatenate` 把分块的 K/V 拼成连续历史，而是按块
+两遍计算。两遍都以整批 query（`M = tq`）为单位算，所以 K/V 各自仍只读一遍，
+流量与 gather 版相同，峰值只多一个块的驻留：
+
+```
+第一遍（K）：逐逻辑块 s = q_batch @ K_blockᵀ        -> scores[tq, hist_len]
+掩码 + softmax：仍逐行调用 `pim.mask` / `pim.softmax`（与改动前逐元素同一口径）
+第二遍（V）：逐逻辑块 acc += weights[:, block] @ V_block -> (tq, head_dim)
+```
+
+为什么不写成单遍 flash 式在线 softmax：在线合并需要独立的设备 `exp` 原语，
+而当前的 `pim.softmax` 是「求最大值 → LUT 取指数 → 求和 → LUT 取倒数 →
+逐元素乘」五相链，不会单独输出每块的 max/sum。绕开它去主机上算 `np.exp`
+会改变对拍口径，所以先保留两遍版本；分数矩阵只有 `O(tq·hist)`，不含
+`head_dim` 那一维。
 
 ## 全局块表缓冲
 
@@ -121,7 +139,7 @@ step_request
 | `memory/kv_layout.py` | `page_table_*` → `block_table_*`；`build_kv_layout(..., pool_slots=None)`；`write_page_table` → `write_block_table` |
 | `memory/mem_planner.py` | `plan_dpu(..., kv_pool_slots=None)` |
 | `runtime/compile.py` | `compile_llama2(..., kv_pool_slots=None)`；默认值与一致性检查改按显式池大小 |
-| `runtime/kernels.py` | SDPA payload `dpus` 改为 `{bt_base, slot_bytes, max_blocks}`；每 owner 读一次块表 |
+| `runtime/kernels.py` | SDPA payload `dpus` 改为 `{bt_base, slot_bytes, max_blocks}`；每 owner 读一次块表；`_gather_kv_history` → `_iter_kv_blocks`，注意力按块两遍计算 |
 | `runtime/executor.py` | `execute_plan` 删除 `request_slot`；`_write_page_tables` → `_write_block_table` |
 | `backend/hal_numpy.py` | 删除 `request_slot` 绑定与 `bound_request_slot` |
 | `backend/vllm_worker.py` | `PIM_KV_POOL_SLOTS`；`determine_available_memory` 按池大小记账 |
@@ -133,7 +151,7 @@ step_request
 | `tests/test_kv_slots.py` | 块表几何；默认池 = 满长单请求块数；乱序映射；长→短请求重写后表尾为 -1；块号越界/表太长报错；池只够一个请求时第二个满长请求耗尽；重写块表切换目标 |
 | `tests/test_kv_layout.py` | `block_table_bytes` 精确值；`write_block_table` 补齐与校验；注意力数值与 torch 对拍 |
 | `tests/test_slot_isolation.py` | 两请求物理槽不相交、块表重写切换；`bind_inputs` / `execute_plan` 的 `pos`、`num_tokens` 透传 |
-| `tests/test_kernels.py` | 手工 SDPA payload 新格式 + 块表写入 |
+| `tests/test_kernels.py` | 手工 SDPA payload 新格式 + 块表写入；多块乱序块表的按块注意力与 numpy 参考对拍，并监视 `np.concatenate` 不得被调用 |
 | `tests/test_mem_planner*.py`、`tests/test_kv_layout_llama2_7b.py` | 规划字段改名、块表缓冲 + 池正好铺满 KV 区 |
 | `tests/test_executor_llama2_7b.py`、`tests/test_concurrency_llama2_7b.py`、`tests/test_strategy_*.py` | 写 identity 块表后整图执行、KV 与 HF cache 对拍 |
 | `tests/test_multi_request_decode.py`、`tests/test_vllm_executor.py` | 两路生成与单独运行一致、vLLM 引擎跑通 |
@@ -148,6 +166,9 @@ step_request
 ## 当前不足
 
 - 多请求仍串行执行（`NumpyBackend` 的 `bind_inputs`/events 是实例全局）。
+- 注意力已按块读写，但仍是 host 编排：编译出的 `pim.matmul` / `pim.softmax`
+  吃的是主机指针，块仍需从 MRAM 拷到主机。真正的「设备内按页遍历」要新增
+  一个读块表、在设备上循环物理槽的融合算子（`pim.paged_attn`），目前没有。
 - 没有物理槽共享、前缀缓存和写时复制。
 - vLLM 调度器给出的 `block_ids` 尚未消费，块表由 PIM 自己的分配器维护。
 - 改 `kv_pool_slots` 或 `kv_slot_tokens` 必须重新编译。

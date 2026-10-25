@@ -160,7 +160,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | --- | ---: | --- | --- | --- |
 | `test_dpu_sdk.py` | 17 | 厂商 SDK numpy 镜像：DPU 枚举、地址空间隔离、broadcast/prepare/push 契约 | 无 | 先区分语义回归与错误文案变化（大量 `pytest.raises(match=...)`） |
 | `test_hal_numpy.py` | 20 | 异步 HAL：submit/wait/query、同 DPU 串行、DMA 快照、tasklet hazard | 无 | 时序类用例在慢机器上可能抖动；buffer 互抢查 host 路径是否加锁 |
-| `test_kernels.py` | 17 | 白名单内核数值、tasklet 行切分、编译内核路由 | 部分需 `triton-opt` + gcc | `mask/alias/view` 红先查工具链与 `.opcompiler_cache`；路由红查 `runtime/kernels.py` |
+| `test_kernels.py` | 18 | 白名单内核数值、tasklet 行切分、编译内核路由、多块乱序块表的按块注意力 | 部分需 `triton-opt` + gcc | `mask/alias/view` 红先查工具链与 `.opcompiler_cache`；路由红查 `runtime/kernels.py`；注意力红查 `_iter_kv_blocks` 是否仍按块表查槽 |
 | `test_exec_plan_gen.py` | 27 | 命令间 RAW/WAR/WAW、redistribute 落地、硬件参数、NumpyBackend 数值 | 小模型（1 条） | WAR 用例 `resolved==0` = 键不匹配导致 WAR 被丢；数值红先核对权重写入偏移 |
 | `test_runtime_compiled_coverage.py` | 24 | 哪些内核真的走到算子编译器（打桩 + 一次真编译）、编译集合清单、退回计数 | 一次真编译 | 集合断言失败需同步文档与实现；`fallback` 计数查 `runtime/kernels.py` 的 route 记录 |
 | `test_runtime_files.py` | 23 | `.bin` 字节宽度/命名、与 GML 引用交叉校验、零填充分类 | 无 | 「引用了没写盘」看文件名生成侧；「写了没引用」看 `contracts/gml_names.py` |
