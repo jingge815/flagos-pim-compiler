@@ -148,8 +148,7 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     )
     prefill_nodes = list(prefill_gm.graph.nodes)
     decode_nodes = list(decode_gm.graph.nodes)
-    plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw,
-                         num_request_slots=1)
+    plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw)
              for d in range(NUM_DPUS)}
 
     prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}

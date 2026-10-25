@@ -1218,7 +1218,7 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
     模块级的那份会被后一次覆盖，前面那些 plan 再执行就用了**别人**的 KV
     规格——实测解码结果因此错成另一个 token。
 
-    `k_off`/`v_off` 是物理槽 0 中的绝对地址；运行时由页表把逻辑块映射到
+    `k_off`/`v_off` 是物理槽 0 中的绝对地址；运行时由块表把逻辑块映射到
     物理槽，再按 `k_off + s * slot_bytes` 定位。
     """
     layer = layer_of_node.get(node.name)
@@ -1230,11 +1230,9 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
         if layer not in spec.layers:
             continue
         dpus[int(dpu_id)] = {
-            "pt_base": int(spec.page_table_base),
-            "pt_stride": int(spec.page_table_stride),
-            "slots_base": int(spec.slots_base),
+            "bt_base": int(spec.block_table_base),
             "slot_bytes": int(spec.slot_bytes),
-            "blocks": int(spec.blocks_per_request),
+            "max_blocks": int(spec.blocks_per_request),
         }
         for head in spec.kv_heads:
             heads.append({
@@ -1338,24 +1336,20 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     num_heads, tq = q.shape[1], q.shape[2]
 
     pos = hal.bound_pos if hal.bound_pos is not None else 0
-    request_slot = hal.bound_request_slot
     num_tokens = hal.bound_num_tokens if hal.bound_num_tokens is not None else tq
     num_tokens = min(num_tokens, tq)
 
-    # 每个 owner 读一次页表，后续按逻辑块查物理槽。
+    # 每个 owner 读一次块表，后续按逻辑块查物理槽。
     geometry: dict[int, dict] = info["dpus"]
-    page_tables = {
-        owner: hal.read_local(
-            owner, geo["pt_base"] + request_slot * geo["pt_stride"],
-            (geo["blocks"],), np.int32)
+    block_tables = {
+        owner: hal.read_local(owner, geo["bt_base"], (geo["max_blocks"],), np.int32)
         for owner, geo in geometry.items()
     }
 
     def physical_slot(owner: int, block: int) -> int:
-        slot = int(page_tables[owner][block])
+        slot = int(block_tables[owner][block])
         if slot < 0:
-            raise RuntimeError(
-                f"dpu{owner} 页表项 block={block} 未分配（request_slot={request_slot}）")
+            raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
         return slot
 
     for entry in info["heads"]:
@@ -1385,10 +1379,10 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
             continue
         geo = geometry[owner]
         k_hist = _gather_kv_history(hal, owner, entry["k_off"], geo,
-                                    page_tables[owner], hist_len, head_dim,
+                                    block_tables[owner], hist_len, head_dim,
                                     slot_tokens, np_dtype)
         v_hist = _gather_kv_history(hal, owner, entry["v_off"], geo,
-                                    page_tables[owner], hist_len, head_dim,
+                                    block_tables[owner], hist_len, head_dim,
                                     slot_tokens, np_dtype)
         # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
         # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
@@ -1416,18 +1410,18 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
 
 
 def _gather_kv_history(hal, owner: int, plane_off: int, geo: dict,
-                       page_table: np.ndarray, n_tokens: int, head_dim: int,
+                       block_table: np.ndarray, n_tokens: int, head_dim: int,
                        slot_tokens: int, np_dtype) -> np.ndarray:
-    """按页表把逻辑块逐个换成物理槽读取，拼成前 `n_tokens` 行的历史。"""
+    """按块表把逻辑块逐个换成物理槽读取，拼成前 `n_tokens` 行的历史。"""
     parts = []
-    for block in range(len(page_table)):
+    for block in range(len(block_table)):
         start = block * slot_tokens
         if start >= n_tokens:
             break
         rows = min(slot_tokens, n_tokens - start)
-        slot = int(page_table[block])
+        slot = int(block_table[block])
         if slot < 0:
-            raise RuntimeError(f"dpu{owner} 页表项 block={block} 未分配")
+            raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
         offset = plane_off + slot * geo["slot_bytes"]
         parts.append(hal.read_local(owner, offset, (rows, head_dim), np_dtype))
     return np.concatenate(parts, axis=0)

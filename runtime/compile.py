@@ -205,8 +205,14 @@ def compile_llama2(
     dtype: torch.dtype = torch.float16,
     num_request_slots: int = 1,
     kv_slot_tokens: int = 16,
+    kv_pool_slots: int | None = None,
 ) -> CompiledModel:
-    """编译 Llama 的两张图，返回共享内存蓝图的命令计划。"""
+    """编译 Llama 的两张图，返回共享内存蓝图的命令计划。
+
+    `num_request_slots` 只做 host 侧并发上限记账；设备侧只认一份全局块表缓冲和
+    `kv_pool_slots` 个物理槽。`kv_pool_slots` 为空时取 `num_request_slots` 个满长
+    请求的块数（与改动前的槽池容量一致）。
+    """
     cfg = model.config
     prefill_gm = export_annotated_graph(
         model, prefill_seq_len,
@@ -239,17 +245,20 @@ def compile_llama2(
     # 三区，与改动前逐字节等价。
     kernel_mram = peak_kernel_mram_bytes(prefill_nodes + decode_nodes,
                                          hardware=hardware)
+    if kv_pool_slots is None:
+        blocks_per_request = -(-max_seq // kv_slot_tokens)
+        kv_pool_slots = num_request_slots * blocks_per_request
     mem_plans = {
         dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
                          kernel_mram_bytes=kernel_mram,
-                         num_request_slots=num_request_slots)
+                         kv_pool_slots=kv_pool_slots)
         for dpu_id in strategy.dpu_ids
     }
 
     pool_slots = {spec.pool_slots for spec in kv_specs.values()}
-    if len(pool_slots) != 1:
-        raise ValueError(f"各 DPU 的物理槽数不一致: {pool_slots}")
-    kv_pool_slots = pool_slots.pop()
+    if pool_slots != {kv_pool_slots}:
+        raise ValueError(
+            f"各 DPU 的物理槽数 {pool_slots} 与 kv_pool_slots={kv_pool_slots} 不一致")
     # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
     # 两张图的 mram_offset 都已回填。
     mark_stage(prefill_gm, STAGE_PLANNED)

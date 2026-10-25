@@ -1,4 +1,4 @@
-"""验证固定大小槽的几何、页表间接寻址和槽池分配。"""
+"""验证固定大小槽的几何、全局块表间接寻址和槽池容量。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
-from memory.kv_layout import KVRegionSpec, build_kv_layout, write_page_table
+from memory.kv_layout import KVRegionSpec, build_kv_layout, write_block_table
 from runtime.executor import KVBlockTable, KVSlotPool, RequestSlot
 from tests.kv_helpers import read_rows, write_row
 
@@ -26,7 +26,7 @@ def _backend() -> NumpyBackend:
     return NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=2**16))
 
 
-def _spec(kv_base: int = 1024, num_request_slots: int = 2) -> KVRegionSpec:
+def _spec(kv_base: int = 1024, pool_slots: int | None = None) -> KVRegionSpec:
     spec = KVRegionSpec(
         dpu_id=0,
         layers=[0],
@@ -38,29 +38,37 @@ def _spec(kv_base: int = 1024, num_request_slots: int = 2) -> KVRegionSpec:
         kv_base=kv_base,
         slot_tokens=SLOT_TOKENS,
     )
-    return build_kv_layout(spec, ALIGN, num_request_slots=num_request_slots)
+    return build_kv_layout(spec, ALIGN, pool_slots=pool_slots)
 
 
 def test_slot_geometry_exact() -> None:
-    """槽、页表和槽池的几何按公式精确计算。"""
-    spec = _spec(kv_base=1024, num_request_slots=2)
+    """槽、块表缓冲和槽池的几何按公式精确计算。"""
+    spec = _spec(kv_base=1024, pool_slots=6)
     assert spec.slot_tokens == 2
     assert spec.slot_bytes == 2 * 1 * 1 * 64 == 128
     assert spec.blocks_per_request == 3
     assert spec.pool_slots == 6
-    assert spec.page_table_base == 1024
-    assert spec.page_table_stride == 64
-    assert spec.slots_base == 1024 + 2 * 64 == 1152
-    assert spec.kv_allocated_bytes == 2 * 64 + 6 * 128 == 896
-    assert spec.kv_off == {(0, 0, "k"): 1152, (0, 0, "v"): 1216}
+    assert spec.block_table_base == 1024
+    assert spec.block_table_bytes == 64
+    assert spec.slots_base == 1024 + 64 == 1088
+    assert spec.kv_allocated_bytes == 64 + 6 * 128 == 832
+    assert spec.kv_off == {(0, 0, "k"): 1088, (0, 0, "v"): 1152}
 
 
-def test_indirect_addressing_follows_page_table() -> None:
-    """页表把逻辑块映射到任意物理槽，按逻辑顺序 gather 与物理布局无关。"""
+def test_default_pool_fits_one_full_length_request() -> None:
+    """不传 pool_slots 时池大小取满长单请求的块数。"""
+    spec = _spec()
+    assert spec.blocks_per_request == 3
+    assert spec.pool_slots == 3
+    assert spec.kv_allocated_bytes == 64 + 3 * 128 == 448
+
+
+def test_indirect_addressing_follows_block_table() -> None:
+    """块表把逻辑块映射到任意物理槽，按逻辑顺序 gather 与物理布局无关。"""
     hal = _backend()
     spec = _spec()
     block_table = [2, 0, 1]  # 逻辑块 0/1/2 -> 物理槽 2/0/1
-    write_page_table(spec, hal, request_slot=0, block_table=block_table)
+    write_block_table(spec, hal, block_table)
 
     expected = []
     for position in range(MAX_SEQ):
@@ -70,8 +78,7 @@ def test_indirect_addressing_follows_page_table() -> None:
         write_row(hal, spec, physical_slot, layer=0, head=0, which="k",
                   row_index=position % SLOT_TOKENS, row=row)
 
-    got = read_rows(hal, spec, request_slot=0, layer=0, head=0, which="k",
-                    n_tokens=MAX_SEQ)
+    got = read_rows(hal, spec, layer=0, head=0, which="k", n_tokens=MAX_SEQ)
     assert np.array_equal(got, np.stack(expected))
 
     # 物理槽 2 收到的是逻辑块 0（前两个 token），不是物理顺序的第一块。
@@ -79,6 +86,47 @@ def test_indirect_addressing_follows_page_table() -> None:
         0, spec.kv_off[(0, 0, "k")] + 2 * spec.slot_bytes,
         (SLOT_TOKENS, HEAD_DIM), np.float32)
     assert np.array_equal(physical_two, np.stack(expected[:SLOT_TOKENS]))
+
+
+def test_short_request_clears_tail_of_long_block_table() -> None:
+    """长请求后写入短请求的块表，表尾必须整段补 -1，不能继承旧物理槽。"""
+    hal = _backend()
+    spec = _spec(pool_slots=6)
+    write_block_table(spec, hal, [2, 0, 1])
+    write_block_table(spec, hal, [4])
+
+    entries = hal.read_local(0, spec.block_table_base,
+                             (spec.blocks_per_request,), np.int32)
+    assert entries.tolist() == [4, -1, -1]
+
+    write_row(hal, spec, 4, layer=0, head=0, which="k", row_index=0,
+              row=np.full(HEAD_DIM, 9.0))
+    assert np.array_equal(read_rows(hal, spec, layer=0, head=0, which="k",
+                                    n_tokens=1)[0], np.full(HEAD_DIM, 9.0))
+
+
+def test_block_table_rejects_out_of_pool_and_too_long() -> None:
+    """块号必须落在池内；块表不能超过缓冲表项数。"""
+    hal = _backend()
+    spec = _spec(pool_slots=6)
+    with pytest.raises(ValueError, match="越界"):
+        write_block_table(spec, hal, [spec.pool_slots])
+    with pytest.raises(ValueError, match="超过"):
+        write_block_table(spec, hal, [0] * (spec.blocks_per_request + 1))
+
+
+def test_pool_sized_for_one_request_exhausts_on_second_long_request() -> None:
+    """池只够一个满长请求时，第二个请求申请同样多块会耗尽。"""
+    spec = _spec()
+    assert spec.pool_slots == spec.blocks_per_request
+    pool = KVSlotPool(spec.pool_slots)
+    first = KVBlockTable(pool)
+    first.ensure(spec.blocks_per_request)
+    assert first.slots == [0, 1, 2]
+
+    second = KVBlockTable(pool)
+    with pytest.raises(RuntimeError, match="耗尽"):
+        second.ensure(spec.blocks_per_request)
 
 
 def test_short_prompt_allocates_only_needed_blocks() -> None:
@@ -116,34 +164,35 @@ def test_pool_exhaustion_and_reset_reuse() -> None:
     assert slot.blocks.slots
 
 
-def test_two_requests_map_to_disjoint_physical_slots() -> None:
-    """两个请求的页表指向不相交的物理槽，写入互不污染。"""
+def test_rewriting_block_table_switches_target_request() -> None:
+    """设备侧只有一份块表缓冲：重写块表即切换读到的请求，物理槽互不相交。"""
     hal = _backend()
-    spec = _spec(num_request_slots=2)
+    spec = _spec(pool_slots=6)
     pool = KVSlotPool(spec.pool_slots)
-    slots = []
-    for request_slot in (0, 1):
-        blocks = KVBlockTable(pool)
-        blocks.ensure(2)
-        write_page_table(spec, hal, request_slot, blocks.slots)
-        slots.append(blocks.slots)
-    assert set(slots[0]).isdisjoint(slots[1])
+    first = KVBlockTable(pool)
+    first.ensure(1)
+    second = KVBlockTable(pool)
+    second.ensure(1)
+    assert set(first.slots).isdisjoint(second.slots)
 
-    for request_slot, value in ((0, 7.0), (1, 3.0)):
-        write_row(hal, spec, slots[request_slot][0], layer=0, head=0,
-                  which="k", row_index=0, row=np.full(HEAD_DIM, value))
+    write_row(hal, spec, first.slots[0], layer=0, head=0, which="k",
+              row_index=0, row=np.full(HEAD_DIM, 7.0))
+    write_row(hal, spec, second.slots[0], layer=0, head=0, which="k",
+              row_index=0, row=np.full(HEAD_DIM, 3.0))
 
-    first = read_rows(hal, spec, request_slot=0, layer=0, head=0, which="k", n_tokens=1)
-    second = read_rows(hal, spec, request_slot=1, layer=0, head=0, which="k", n_tokens=1)
-    assert np.array_equal(first[0], np.full(HEAD_DIM, 7.0))
-    assert np.array_equal(second[0], np.full(HEAD_DIM, 3.0))
+    write_block_table(spec, hal, first.slots)
+    assert np.array_equal(read_rows(hal, spec, 0, 0, "k", 1)[0],
+                          np.full(HEAD_DIM, 7.0))
+
+    write_block_table(spec, hal, second.slots)
+    assert np.array_equal(read_rows(hal, spec, 0, 0, "k", 1)[0],
+                          np.full(HEAD_DIM, 3.0))
 
 
-def test_unallocated_page_table_entry_raises() -> None:
-    """页表项为 -1 时读历史直接抛错，不读垃圾数据。"""
+def test_unallocated_block_table_entry_raises() -> None:
+    """块表项为 -1 时读历史直接抛错，不读垃圾数据。"""
     hal = _backend()
     spec = _spec()
-    write_page_table(spec, hal, request_slot=0, block_table=[0])
+    write_block_table(spec, hal, [0])
     with pytest.raises(RuntimeError, match="未分配"):
-        read_rows(hal, spec, request_slot=0, layer=0, head=0, which="k",
-                  n_tokens=3)
+        read_rows(hal, spec, layer=0, head=0, which="k", n_tokens=3)

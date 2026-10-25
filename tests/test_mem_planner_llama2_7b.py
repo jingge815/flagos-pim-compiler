@@ -17,7 +17,7 @@ from contracts.graph_meta import SPEC_META_KEY
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement, write_page_table
+from memory.kv_layout import kv_specs_from_placement, write_block_table
 from memory.mem_planner import HwBudget, format_mem_plan, plan_dpu
 from tests.kv_helpers import read_rows, write_row
 from tests.test_partition import _FixedMaskLlama
@@ -185,8 +185,8 @@ def test_kv_region_lands_at_planned_kv_base_and_stays_usable(kv_specs, plans, hw
     dpu_id = 0
     spec = kv_specs[dpu_id]
     assert spec.kv_base == plans[dpu_id].kv_base
-    assert spec.page_table_base == plans[dpu_id].kv_base
-    # 页表区 + 全部物理槽正好铺满 KV 区。
+    assert spec.block_table_base == plans[dpu_id].kv_base
+    # 块表缓冲 + 全部物理槽正好铺满 KV 区。
     assert spec.slots_base + spec.pool_slots * spec.slot_bytes == plans[dpu_id].act_base
 
     backend = NumpyBackend(NumpyBackendConfig(num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw_budget.mram_bytes))
@@ -194,11 +194,11 @@ def test_kv_region_lands_at_planned_kv_base_and_stays_usable(kv_specs, plans, hw
     head = spec.kv_heads[0]
     k = rng.standard_normal(spec.head_dim).astype(np.float16)
     v = rng.standard_normal(spec.head_dim).astype(np.float16)
-    write_page_table(spec, backend, 0, list(range(spec.blocks_per_request)))
+    write_block_table(spec, backend, list(range(spec.blocks_per_request)))
     for which, row in (("k", k), ("v", v)):
         write_row(backend, spec, 0, 0, head, which, 0, row)
-    assert np.array_equal(read_rows(backend, spec, 0, 0, head, "k", 1)[0], k)
-    assert np.array_equal(read_rows(backend, spec, 0, 0, head, "v", 1)[0], v)
+    assert np.array_equal(read_rows(backend, spec, 0, head, "k", 1)[0], k)
+    assert np.array_equal(read_rows(backend, spec, 0, head, "v", 1)[0], v)
 
 
 def test_format_mem_plan_printable(plans, hw_budget) -> None:

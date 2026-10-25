@@ -19,7 +19,7 @@ from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement, write_page_table
+from memory.kv_layout import kv_specs_from_placement, write_block_table
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
@@ -90,7 +90,7 @@ def llama2_compiled_plan():
         dma_align=64,
     )
     nodes = list(gm.graph.nodes)
-    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw, num_request_slots=1)
+    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw)
              for d in range(NUM_DPUS)}
 
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
@@ -124,7 +124,7 @@ def llama2_executed(llama2_compiled_plan):
     register_all(backend)
     write_weight_shards(gm, plans, backend)
     for spec in kv_specs.values():
-        write_page_table(spec, backend, 0, list(range(spec.blocks_per_request)))
+        write_block_table(spec, backend, list(range(spec.blocks_per_request)))
 
     events = execute_plan(
         compiled.plan,

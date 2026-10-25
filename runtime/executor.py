@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from contracts.exec_plan import ExecutionPlan
-from memory.kv_layout import write_page_table
+from memory.kv_layout import write_block_table
 
 
 class KVSlotPool:
@@ -56,7 +56,7 @@ class RequestSlot:
     """单个并发请求的状态。"""
 
     request_id: str
-    request_slot: int
+    request_slot: int          # host 侧并发记账，不参与设备寻址。
     blocks: KVBlockTable
     valid_len: int = 0
     prompt_ids: list[int] = field(default_factory=list)
@@ -74,7 +74,7 @@ class RequestSlot:
 
 
 class RequestTable:
-    """管理多请求并发状态，每请求独立的请求槽、页表和块表。"""
+    """管理多请求并发状态：共享物理槽池，设备侧共用一份块表缓冲。"""
 
     def __init__(self, num_request_slots: int, kv_pool_slots: int) -> None:
         self._num_request_slots = num_request_slots
@@ -137,6 +137,9 @@ def step_request(
     每次调用只产生一个 token，与 vLLM 一次 `execute_model` 一步的语义一致。
     `pad_to` 非空时把 prompt 右侧补齐到该长度，适配静态导出的 prefill 图；
     补齐位置不写 KV（`num_tokens` 只算真实 prompt），也不参与采样。
+
+    共享块表缓冲依赖串行：`execute_plan` 等本计划全部命令结束才返回，
+    下一步覆盖块表时不会有上一步的内核还在读表。
     """
     if sample_fn is None:
         sample_fn = lambda logits: int(np.argmax(logits))
@@ -146,7 +149,7 @@ def step_request(
         seq_len = pad_to if pad_to is not None else prompt_len
         ids = list(slot.prompt_ids) + [pad_id] * (seq_len - prompt_len)
         slot.blocks.ensure(_blocks_for(prompt_len, compiled.kv_slot_tokens))
-        _write_page_tables(compiled, hal, slot)
+        _write_block_table(compiled, hal, slot)
         events = execute_plan(
             compiled.prefill.plan, hal,
             values={
@@ -155,7 +158,6 @@ def step_request(
                 "position_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
             },
             pos=0,
-            request_slot=slot.request_slot,
             num_tokens=prompt_len,
         )
         logits = hal.wait(events[compiled.prefill.output_cmd_id])
@@ -165,7 +167,7 @@ def step_request(
     else:
         total_len = slot.valid_len + 1
         slot.blocks.ensure(_blocks_for(total_len, compiled.kv_slot_tokens))
-        _write_page_tables(compiled, hal, slot)
+        _write_block_table(compiled, hal, slot)
         events = execute_plan(
             compiled.decode.plan, hal,
             values={
@@ -174,7 +176,6 @@ def step_request(
                 "position_ids": torch.tensor([[slot.valid_len]], dtype=torch.long),
             },
             pos=slot.valid_len,
-            request_slot=slot.request_slot,
             num_tokens=1,
         )
         logits = hal.wait(events[compiled.decode.output_cmd_id])
@@ -195,7 +196,7 @@ def run_one_step(
 ) -> list[tuple[str, list[int]]]:
     """对表中每个活跃请求各执行一步，返回刚生成完毕的 (request_id, tokens)。
 
-    串行逐 slot 执行，每 slot 使用独立的 valid_len、请求槽和页表。
+    串行逐 slot 执行，每步先把本请求的块表写进共享缓冲。
     """
     results: list[tuple[str, list[int]]] = []
     for slot in table.active_slots():
@@ -207,12 +208,11 @@ def run_one_step(
 
 
 def execute_plan(plan: ExecutionPlan, hal, *, values: dict[str, object] | None = None,
-                 pos: int | None = None, request_slot: int = 0,
+                 pos: int | None = None,
                  num_tokens: int | None = None) -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。"""
     hal.reset_events()
-    hal.bind_inputs(values or {}, pos=pos, request_slot=request_slot,
-                    num_tokens=num_tokens)
+    hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
     events: dict[int, object] = {}
     for cmd in plan.commands:
         for w in cmd.waits:
@@ -254,10 +254,10 @@ def _blocks_for(n_tokens: int, slot_tokens: int) -> int:
     return -(-n_tokens // slot_tokens)
 
 
-def _write_page_tables(compiled, hal, slot: RequestSlot) -> None:
-    """把本请求的块表写进每台 DPU 对应请求槽的页表区。"""
+def _write_block_table(compiled, hal, slot: RequestSlot) -> None:
+    """把本请求的块表覆盖进每台 DPU 的同一块表缓冲。"""
     for spec in compiled.kv_specs.values():
-        write_page_table(spec, hal, slot.request_slot, slot.blocks.slots)
+        write_block_table(spec, hal, slot.blocks.slots)
 
 
 def _as_batch_tensor(ids: list[int]):

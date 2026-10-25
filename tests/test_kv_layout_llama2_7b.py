@@ -22,7 +22,7 @@ from memory.kv_layout import (
     format_kv_layout,
     kv_bytes,
     kv_specs_from_placement,
-    write_page_table,
+    write_block_table,
 )
 from tests.kv_helpers import read_rows, write_row
 from tests.test_partition import _FixedMaskLlama
@@ -117,7 +117,7 @@ def test_kv_bytes_and_slot_geometry_llama2(kv_specs) -> None:
         assert spec.slot_bytes == 2 * 32 * 4 * PLANE_STRIDE == 2**20  # 1 MiB
         assert spec.blocks_per_request == MAX_SEQ // SLOT_TOKENS == 16
         assert spec.pool_slots == 16
-        assert spec.page_table_stride == 1024
+        assert spec.block_table_bytes == 1024
         assert spec.kv_allocated_bytes == 1024 + 16 * 2**20
         assert len(spec.kv_off) == 32 * 4 * 2
         assert all(off % 1024 == 0 for off in spec.kv_off.values())
@@ -132,7 +132,7 @@ def test_kv_runtime_smoke_on_numpy_backend(kv_specs) -> None:
     rng = np.random.default_rng(0)
     ref = {}
     for dpu_id, spec in kv_specs.items():
-        write_page_table(spec, backend, 0, list(range(spec.blocks_per_request)))
+        write_block_table(spec, backend, list(range(spec.blocks_per_request)))
     for pos in range(3):
         for layer in (0, 31):
             for dpu_id, spec in kv_specs.items():
@@ -144,8 +144,8 @@ def test_kv_runtime_smoke_on_numpy_backend(kv_specs) -> None:
                     ref[(layer, dpu_id, head, pos)] = (k, v)
     for (layer, dpu_id, head, pos), (k, v) in ref.items():
         spec = kv_specs[dpu_id]
-        K_row = read_rows(backend, spec, 0, layer, head, "k", pos + 1)[pos]
-        V_row = read_rows(backend, spec, 0, layer, head, "v", pos + 1)[pos]
+        K_row = read_rows(backend, spec, layer, head, "k", pos + 1)[pos]
+        V_row = read_rows(backend, spec, layer, head, "v", pos + 1)[pos]
         assert np.array_equal(K_row, k) and np.array_equal(V_row, v)
         raw = backend.read_local(dpu_id, spec.kv_off[(layer, head, "k")] + pos * ROW_BYTES,
                                  (HEAD_DIM,), np.float16)

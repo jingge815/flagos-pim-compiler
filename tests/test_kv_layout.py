@@ -1,4 +1,4 @@
-"""验证 KV 槽布局、页表读写和掩码。"""
+"""验证 KV 槽布局、块表读写和掩码。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from memory.kv_layout import (
     kv_bytes,
     kv_specs_from_placement,
     prefill_mask,
-    write_page_table,
+    write_block_table,
 )
 from tests.kv_helpers import read_rows, write_row
 
@@ -103,14 +103,14 @@ def test_kv_bytes_lower_bound() -> None:
 
 
 def test_build_kv_layout_offsets_exact() -> None:
-    """槽 0 内的绝对地址和页表/槽池几何。"""
+    """槽 0 内的绝对地址和块表/槽池几何。"""
     spec = build_kv_layout(_spec(0, kv_base=1024), align=64)
     assert spec.slot_tokens == SLOT_TOKENS
     assert spec.slot_bytes == SLOT_BYTES == 1024
     assert spec.blocks_per_request == BLOCKS == 4
     assert spec.pool_slots == 4
-    # 4 个页表项 × 4B 对齐到 64。
-    assert spec.page_table_stride == 64
+    # 4 个块表项 × 4B 对齐到 64。
+    assert spec.block_table_bytes == 64
     assert spec.slots_base == 1024 + 64 == 1088
     assert spec.kv_allocated_bytes == 64 + 4 * 1024 == 4160
     assert spec.kv_off == {
@@ -121,7 +121,7 @@ def test_build_kv_layout_offsets_exact() -> None:
     }
     assert max(spec.kv_off.values()) + PLANE_STRIDE == spec.slots_base + spec.slot_bytes
 
-    # 对齐放大后，每个平面和页表步长都是 1024。
+    # 对齐放大后，每个平面和块表缓冲都是 1024。
     padded = build_kv_layout(_spec(0, kv_base=1024), align=1024)
     assert padded.kv_off[(0, 0, "k")] == 1024 + 1024 == 2048
     assert padded.slot_bytes == 2 * 2 * 2 * 1024 == 8192
@@ -132,7 +132,7 @@ def test_build_kv_layout_offsets_exact() -> None:
 def test_kv_region_spec_crud_and_rebuild() -> None:
     """KVRegionSpec 可初始化/读/写/增/删/改：dataclass 字段可变，改完重建布局即可。"""
     spec = build_kv_layout(_spec(0, kv_base=0), align=64)
-    assert spec.kv_off[(0, 0, "k")] == 64  # 读：页表区之后是槽池
+    assert spec.kv_off[(0, 0, "k")] == 64  # 读：块表缓冲之后是槽池
     spec.kv_base = 2048                   # 改：基址平移
     build_kv_layout(spec, align=64)
     assert spec.kv_off[(0, 0, "k")] == 2112 and spec.kv_allocated_bytes == 4160
@@ -148,9 +148,9 @@ def test_kv_region_spec_crud_and_rebuild() -> None:
     del broken.q_heads_by_kv[1]           # 破坏契约：kv head 1 无 q 映射
     with pytest.raises(ValueError):
         build_kv_layout(broken, align=64)
-    with pytest.raises(ValueError):       # slot_tokens 必须为正
+    with pytest.raises(ValueError):       # 池装不下一个满长请求
         build_kv_layout(_spec(0, kv_base=0, kv_heads=(0,), layers=(0,)), align=64,
-                        num_request_slots=0)
+                        pool_slots=0)
 
 
 def test_kv_specs_from_placement_mha() -> None:
@@ -200,23 +200,24 @@ def test_kv_specs_from_placement_rejects_incomplete_or_overlapping_heads() -> No
                                 head_dim=2, max_seq=16, dtype_bytes=2, kv_base=0)
 
 
-def test_write_page_table_pads_and_validates() -> None:
-    """页表写入按块表填值、不足补 -1，越界请求槽直接抛错。"""
+def test_write_block_table_pads_and_validates() -> None:
+    """块表按映射填值、不足补 -1；块号越界和表太长直接抛错。"""
     hal = _backend()
-    spec = build_kv_layout(_spec(0, kv_base=0), align=64, num_request_slots=2)
-    write_page_table(spec, hal, request_slot=1, block_table=[5, 2])
-    entries = hal.read_local(0, spec.page_table_base + spec.page_table_stride,
+    spec = build_kv_layout(_spec(0, kv_base=0), align=64, pool_slots=8)
+    write_block_table(spec, hal, [5, 2])
+    entries = hal.read_local(0, spec.block_table_base,
                              (spec.blocks_per_request,), np.int32)
     assert entries.tolist() == [5, 2, -1, -1]
     with pytest.raises(ValueError):
-        write_page_table(spec, hal, request_slot=2, block_table=[0])
+        write_block_table(spec, hal, [spec.pool_slots])
     with pytest.raises(ValueError):
-        write_page_table(spec, hal, request_slot=0, block_table=[0] * 5)
+        write_block_table(spec, hal, [0] * 5)
 
 
 def test_format_kv_layout_printable() -> None:
     text = format_kv_layout(_specs())
     assert "dpu0" in text and "slot_tokens=4" in text and "pool_slots=4" in text
+    assert "block_table_bytes=64" in text and "max_full_len_requests=1" in text
     assert "kv_heads=[0..1]" in text
 
 
@@ -253,7 +254,7 @@ IDENTITY_TABLE = list(range(BLOCKS))  # 逻辑块 b -> 物理槽 b
 
 def _write_step(hal, specs, rng, layer: int, pos: int,
                 ref: dict[int, list]) -> None:
-    """按 identity 页表写入一个位置的所有 head。"""
+    """按 identity 块表写入一个位置的所有 head。"""
     for dpu_id, spec in specs.items():
         for head in spec.kv_heads:
             k, v = _random_kv(rng)
@@ -271,11 +272,11 @@ def _host_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
 
 
 def test_attention_decode_matches_torch() -> None:
-    """按页表逐块 gather 的 KV 注意力与 Torch 参考一致。"""
+    """按块表逐块 gather 的 KV 注意力与 Torch 参考一致。"""
     hal = _backend()
     specs = _specs()
     for spec in specs.values():
-        write_page_table(spec, hal, 0, IDENTITY_TABLE)
+        write_block_table(spec, hal, IDENTITY_TABLE)
     rng = np.random.default_rng(2)
     layer = 1
     kv_ref: dict[int, list] = {}
@@ -288,8 +289,8 @@ def test_attention_decode_matches_torch() -> None:
         scale = 1.0 / np.sqrt(HEAD_DIM)
         for dpu_id, spec in specs.items():
             for head in spec.kv_heads:
-                K = read_rows(hal, spec, 0, layer, head, "k", valid_len + 1)
-                V = read_rows(hal, spec, 0, layer, head, "v", valid_len + 1)
+                K = read_rows(hal, spec, layer, head, "k", valid_len + 1)
+                V = read_rows(hal, spec, layer, head, "v", valid_len + 1)
                 out = _host_softmax(K @ q_by_head[head] * scale + mask) @ V
                 K_ref = torch.tensor(np.stack([k for k, _ in kv_ref[head]]))
                 V_ref = torch.tensor(np.stack([v for _, v in kv_ref[head]]))
@@ -299,11 +300,11 @@ def test_attention_decode_matches_torch() -> None:
 
 
 def test_attention_prefill_matches_torch() -> None:
-    """prefill：按页表 gather 的满历史 + prefill_mask 与 torch 因果参考一致。"""
+    """prefill：按块表 gather 的满历史 + prefill_mask 与 torch 因果参考一致。"""
     hal = _backend()
     specs = _specs()
     for spec in specs.values():
-        write_page_table(spec, hal, 0, IDENTITY_TABLE)
+        write_block_table(spec, hal, IDENTITY_TABLE)
     rng = np.random.default_rng(3)
     layer, prompt_len = 0, 5
     kv_ref: dict[int, list] = {}
@@ -314,8 +315,8 @@ def test_attention_prefill_matches_torch() -> None:
     for dpu_id, spec in specs.items():
         for head in spec.kv_heads:
             Q = rng.standard_normal((prompt_len, HEAD_DIM)).astype(np.float32)
-            K = read_rows(hal, spec, 0, layer, head, "k", prompt_len)
-            V = read_rows(hal, spec, 0, layer, head, "v", prompt_len)
+            K = read_rows(hal, spec, layer, head, "k", prompt_len)
+            V = read_rows(hal, spec, layer, head, "v", prompt_len)
             out = _host_softmax(Q @ K.T * scale + mask) @ V
             K_ref = torch.tensor(np.stack([k for k, _ in kv_ref[head]]))
             V_ref = torch.tensor(np.stack([v for _, v in kv_ref[head]]))

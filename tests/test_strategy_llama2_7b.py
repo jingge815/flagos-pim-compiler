@@ -155,8 +155,8 @@ def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
         assert owners, f"策略 {strategy.name}: layer{layer} 没有任何 DPU 持有 KV"
         for dpu_id, spec in owners:
             for head in spec.kv_heads:
-                K_tile = read_rows(backend, spec, 0, layer, head, "k", total_len)
-                V_tile = read_rows(backend, spec, 0, layer, head, "v", total_len)
+                K_tile = read_rows(backend, spec, layer, head, "k", total_len)
+                V_tile = read_rows(backend, spec, layer, head, "v", total_len)
                 ref_k_h = ref_k[0, head].numpy().astype(np.float32)
                 ref_v_h = ref_v[0, head].numpy().astype(np.float32)
                 assert np.allclose(
