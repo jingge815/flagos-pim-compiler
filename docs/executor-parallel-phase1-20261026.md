@@ -106,7 +106,7 @@ Phase 0a 行为。
 | `tests/test_hal_numpy.py` | 不同上下文可复用命令 id；`bound_pos/result_of` 各读各的；同 DPU 不同泳道可并发、默认泳道仍串行 |
 | `tests/test_parallel_requests.py` | 4 请求并发 token 逐字等于单跑（`kv_slot_tokens∈{max_seq,2}`）；混合 prefill/decode；5 次确定性；块表窗口独立 |
 | `tests/test_parallel_overlap.py` | 同 DPU 上两窗口 launch 区间真重叠；后提交窗口的越级；窗口 1 内核与窗口 0 host 命令重叠 |
-| `tests/test_concurrency_llama2_7b.py`（slow，未在本机整跑） | 7B 两请求并发 token 与单跑一致 + 同 DPU 跨窗口重叠 |
+| `tests/test_concurrency_llama2_7b.py`（slow，真实 7B/8 DPU，本地 344s 通过） | 7B 两请求并发 token 与单跑一致 + 同 DPU 跨窗口重叠 |
 
 `test_parallel_overlap` 的关键判据不是「有重叠」，而是**越级**：后提交的
 窗口 1 命令要在更早提交的窗口 0 命令结束前就在同一 DPU 上开始。这排除了
