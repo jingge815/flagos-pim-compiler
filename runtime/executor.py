@@ -210,13 +210,15 @@ def run_one_step(
 def execute_plan(plan: ExecutionPlan, hal, *, values: dict[str, object] | None = None,
                  pos: int | None = None,
                  num_tokens: int | None = None) -> dict[int, object]:
-    """执行计划并返回按命令编号索引的事件。"""
+    """执行计划并返回按命令编号索引的事件。
+
+    命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
+    自己的依赖完成，主线程不必逐条前置等待，否则提交无法提前、DPU 排不满。
+    """
     hal.reset_events()
     hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
     events: dict[int, object] = {}
     for cmd in plan.commands:
-        for w in cmd.waits:
-            hal.wait(events[w])
         events[cmd.id] = hal.submit(cmd)
     # 等待当前计划的全部命令。
     for event in events.values():

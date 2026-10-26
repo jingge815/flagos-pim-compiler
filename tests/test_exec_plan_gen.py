@@ -604,3 +604,31 @@ def test_later_writer_waits_for_earlier_writer_of_same_range() -> None:
         Access(("dpu", 3), 96, 64), Access(("dpu", 2), 200, 8)], [])
     assert first.id in later.waits
     assert other.id not in later.waits
+
+
+def test_repeated_writer_of_same_range_only_leaves_the_last_one_as_dep() -> None:
+    """同一区间被反复写时，读者只等最后一个写者。
+
+    decode 图里每层复用同一块激活缓冲，若把整串历史写者都列进 waits，
+    一个命令的依赖能从十几条涨到几百条。写者生成时已经等过前一个写者，
+    顺序由这条链保证，所以读者只留最后一个。
+    """
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    writes = [Access(("dpu", 0), 64, 16)]
+    w0 = builder.append("launch", 0, {}, [], writes, [])
+    w1 = builder.append("launch", 0, {}, [], writes, [])
+    w2 = builder.append("launch", 0, {}, [], writes, [])
+    assert w1.waits == [w0.id]
+    assert w2.waits == [w1.id]
+
+    raw = exec_plan_gen_module._deps_of([Access(("dpu", 0), 64, 16)], builder.writers)
+    assert raw == [w2.id]
+
+
+def test_overlapping_but_not_identical_writes_are_all_kept() -> None:
+    """区间只部分重叠时不能省：它们各自的等待链不保证相互覆盖。"""
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    lo = builder.append("launch", 0, {}, [], [Access(("dpu", 0), 0, 16)], [])
+    hi = builder.append("launch", 0, {}, [], [Access(("dpu", 0), 8, 16)], [])
+    raw = exec_plan_gen_module._deps_of([Access(("dpu", 0), 0, 24)], builder.writers)
+    assert set(raw) == {lo.id, hi.id}

@@ -50,8 +50,20 @@ def overlap(a: Access, b: Access) -> bool:
 
 
 def _deps_of(reads: list[Access], writers: dict[tuple, list[tuple[Access, int]]]) -> list[int]:
-    """返回与读区间相交的历史写命令。"""
-    return [cid for a in reads for (wa, cid) in writers.get(a.loc, []) if overlap(a, wa)]
+    """返回与读区间相交的历史写命令。
+
+    同一地址区间被反复写（各层复用激活缓冲）时，后写者生成时已经等过前写者，
+    所以只留最后一个写者；前面那些沿等待链传递，不必重复列出。
+    """
+    last: dict[tuple, int] = {}
+    for a in reads:
+        for wa, cid in writers.get(a.loc, []):
+            if not overlap(a, wa):
+                continue
+            key = (wa.loc, wa.offset, wa.length)
+            if cid > last.get(key, -1):
+                last[key] = cid
+    return list(last.values())
 
 
 def _war_waits(
