@@ -110,7 +110,7 @@ def test_multi_dpu_request_writes_the_field() -> None:
 
 
 def test_single_dpu_request_keeps_the_text_unchanged() -> None:
-    """没有切分决策时，文本与改动前逐字节相同（编码与硬件属性都不出现）。"""
+    """没有切分决策时不发布局编码与 DPU 属性，只多分块要读的三个预算属性。"""
     from opcompiler_bridge.driver import _make_oplevel_mlir
 
     from opcompiler_bridge.oplevel_kernel import normalize_kernel
@@ -118,9 +118,14 @@ def test_single_dpu_request_keeps_the_text_unchanged() -> None:
     text = _make_oplevel_mlir(_request(shard=None))
     assert "tasklet_tiled" not in text
     assert "pim.num-dpus" not in text
-    # 模块头就是改动前那一句，正文是内核原样输出 —— 一字未加
+    # 正文是内核原样输出；模块头只多 B 路分块读的预算属性。
     body = normalize_kernel("kernel", 2048, 4096, 4096)
-    assert text == f'module attributes {{pim.target = "pim:v1"}} {{\n{body}\n}}\n'
+    hw = _request(shard=None).hardware
+    head = (f'pim.target = "pim:v1", '
+            f'"pim.wram-bytes" = {hw.wram_bytes_per_dpu} : i64, '
+            f'"pim.mram-bytes" = {hw.mram_bytes_per_dpu} : i64, '
+            f'"pim.dma-align" = {hw.dma_align} : i64')
+    assert text == f'module attributes {{{head}}} {{\n{body}\n}}\n'
 
 
 

@@ -90,10 +90,13 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         note="跨 DPU 的通信需求，每条含源 / 目标 DPU 集与字节数"),
     MetaKeySpec(
         FUSED_TAIL_META_KEY, (DIM_OP_SEMANTICS,), "FusedTail",
-        producer="graph.fuse:fuse_graph | graph.fuse_pim:fuse_for_pim",
+        producer="graph.fuse:fuse_graph | graph.fuse_pim:fuse_for_pim "
+                 "| graph.opt_passes:fuse_linear_activation",
         consumers=("gml_bridge.from_fx", "gml_bridge.export",
-                   "opcompiler_bridge.oplevel_emitter"),
-        note="融合后 node.target 不变而语义已变，靠此键表达"),
+                   "opcompiler_bridge.oplevel_emitter",
+                   "runtime.exec_plan_gen"),
+        note="融合后 node.target 不变而语义已变，靠此键表达。"
+             "执行路径只读 activation 字段，下发进编译请求"),
     MetaKeySpec(
         ROPE_META_KEY, (DIM_OP_SEMANTICS,), "RopeMatch",
         producer="graph.fuse_rope:fuse_rope",

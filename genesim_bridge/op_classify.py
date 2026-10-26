@@ -323,15 +323,15 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
 
     def gemm_silu(point: ShapePoint, in_features: int, out_features: int,
                   activation: str = "silu") -> OpRecipe:
-        # 与 gemm 同一份配方，只多带激活属性。fp16 那条路没有权值侧，
-        # 投影的权值搬运会整笔丢掉，所以这里不走它。
+        # 与 gemm 同一份配方，激活发成矩阵乘唯一用户的独立 pim.lut，由算子层
+        # 融合折回。fp16 那条路没有权值侧，投影的权值搬运会整笔丢掉，所以不走它。
         return OpRecipe(
             source_name="flag_gems.ops.linear",
             build=_linear(dims, point, in_features, out_features),
             mnemonic="pim.matmul",
             pimir=lambda: _module(matmul_kernel(
                 "linear", point.tq, in_features, out_features,
-                activation=activation)),
+                trailing_activation=activation)),
         )
 
     def gemv_score(point: ShapePoint) -> OpRecipe:

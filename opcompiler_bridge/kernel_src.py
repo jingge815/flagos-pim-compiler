@@ -25,11 +25,13 @@ def linear_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ACTIVATION: tl.constexpr = "none",
 ):
     """计算 `y = x @ w.T`，其中输入形状为 `(M, K)` 和 `(N, K)`。
 
     三个维度都按分块遍历。最后一块可能不满，用掩码丢掉越界的元素，
-    这样维度不必被分块整除，也不必是 2 的幂。
+    这样维度不必被分块整除，也不必是 2 的幂。`ACTIVATION` 是折进主算子的
+    尾部激活，写在累加器上、存回之前，与图编译器折进节点的语义一致。
     """
     for m0 in range(0, M, BLOCK_M):
         offs_m = m0 + tl.arange(0, BLOCK_M)
@@ -46,6 +48,12 @@ def linear_kernel(
                 x_blk = tl.load(x_ptr + x_off, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
                 w_blk = tl.load(w_ptr + w_off, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
                 acc = tl.dot(x_blk, tl.trans(w_blk), acc, allow_tf32=False)
+            if ACTIVATION == "silu":
+                acc = acc * tl.sigmoid(acc)
+            if ACTIVATION == "relu":
+                acc = tl.maximum(acc, 0.0)
+            if ACTIVATION == "sigmoid":
+                acc = tl.sigmoid(acc)
             o_off = offs_m[:, None] * N + offs_n[None, :]
             tl.store(out_ptr + o_off, acc.to(out_ptr.dtype.element_ty),
                      mask=mask_m[:, None] & mask_n[None, :])
@@ -72,14 +80,19 @@ def pick_blocks(K: int, N: int, M: int = 1) -> tuple[int, int, int]:
     )
 
 
-def make_kernel_launcher(M: int, K: int, N: int):
-    """返回固定 M、K、N 的 Triton 内核启动函数。"""
+def make_kernel_launcher(M: int, K: int, N: int, activation: str | None = None):
+    """返回固定 M、K、N 的 Triton 内核启动函数。
+
+    `activation` 是折进主算子的尾部激活（silu、relu、sigmoid），写进内核的
+    `ACTIVATION` 常量，没有时不折。
+    """
     block_m, block_n, block_k = pick_blocks(K, N, M)
 
     def launch(x, w, out):
         return linear_kernel[(1,)](
             x, w, out, M=M, K=K, N=N,
             BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+            ACTIVATION=activation or "none",
             num_stages=NUM_STAGES,
         )
 

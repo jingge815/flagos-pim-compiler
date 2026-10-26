@@ -45,9 +45,9 @@ def test_every_feedback_field_has_a_producer_and_a_consumer() -> None:
     仍然成立的同类例子是 `VpuParamsAttr` —— 只在 ODS 与手写测试里出现，
     全仓 `.cpp` 零引用。
 
-    「消费方」认属性读取（`fb.wram_bytes_used`）。回传值当前只在 A 路
-    （过 `-pim-tile-to-budget`）非空，B 路全 None 走静态分支 —— 所以判据是
-    「代码里有读取点」，不是「每次跑都读到非空值」。
+    「消费方」认属性读取（`fb.wram_bytes_used`）。回传值只在过了
+    `-pim-tile-to-budget` 且真的切开时非空，其余全 None 走静态分支 —— 所以
+    判据是「代码里有读取点」，不是「每次跑都读到非空值」。
     """
     root = Path(__file__).parent.parent
     src = "\n".join("\n".join(_code_lines(p.read_text(encoding="utf-8")))

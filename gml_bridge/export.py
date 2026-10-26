@@ -24,6 +24,7 @@ from contracts.gml_quant import GML_VERSION
 from contracts.graph_meta import FUSED_TAIL_META_KEY
 from contracts.unified_ir import STAGE_FUSED, mark_stage
 from graph.fuse import fuse_graph
+from graph.opt_passes import optimize_graph
 from graph.fuse_pim import fuse_for_pim
 from graph.fuse_rope import ROPE_META_KEY, fuse_rope
 from graph.kv_dma_pass import insert_kv_dma_and_split
@@ -139,6 +140,10 @@ def fuse_for_gml(gm: GraphModule) -> FusionReport:
        插 DQ 的规则依赖逐头角色（matmul1 不插、matmul2 插），KV 写回的位置
        判据依赖拆头留下的头下标标记。
     """
+    # 通用优化在专用融合之前跑折叠、CSE、DCE，它们不改变专用规则要匹配的
+    # 模式；融合与分块不跑——融合换出的闭包不可发射，分块会改掉 GML 按整块
+    # 算子编码的 contraction 与缓冲名，两者都只服务执行路径。
+    optimize_graph(gm, tile=False)
     fuse_rope(gm)
     pim_report = fuse_for_pim(gm)
     fusions = fuse_graph(gm) + pim_report.total

@@ -118,13 +118,16 @@ class LayoutFeedback:
     是同一口径。
 
     `pim.tile-*` 与 `pim.wram-bytes-used` 是 `-pim-tile-to-budget` 的产出
-    （FlagTree `TileToBudget.cpp`），只有走过那条 pass 的 A 路模块头才带；
-    B 路（图编译器手写整算子级 IR）没有 tile 可切，全字段为 None。
+    （FlagTree `TileToBudget.cpp`），走过那条 pass 的 A 路模块头会带；
+    B 路超预算的整算子 `pim.matmul` 写 `pim.tile-*` 与 `pim.tile-wram-bytes`，
+    后者作为 B 路的 WRAM 用量。模块内各矩阵乘的 tile 或字节数不同时模块头
+    不写，tile 与用量都是 None。没走分块的模块也是 None。
     """
 
     # 实际切出的 tile 形状 `(m, n)`，来自 `pim.tile-m` / `pim.tile-n`。
     tile_shape: tuple[int, ...] | None = None
-    # 这个 tile 实际占的 WRAM 字节数（`pim.wram-bytes-used`）。
+    # 这个 tile 实际占的 WRAM 字节数。A 路取 `pim.wram-bytes-used`，
+    # B 路没有显式 DMA，取 `pim.tile-wram-bytes`。
     wram_bytes_used: int | None = None
     # 单台 DPU 的 WRAM 预算（`pim.wram-bytes`）。与上一个成对才能判是否超限。
     wram_bytes_budget: int | None = None
@@ -145,7 +148,7 @@ class LayoutFeedback:
 # 回传载体的属性名。FlagTree 侧写入点见 `TileToBudget.cpp`；
 # 名字在两个仓之间是契约，本仓只负责读回来，登记在此避免各处再写一遍字面量。
 LAYOUT_FEEDBACK_ATTRS = (
-    "pim.tile-m", "pim.tile-n", "pim.wram-bytes-used",
+    "pim.tile-m", "pim.tile-n", "pim.wram-bytes-used", "pim.tile-wram-bytes",
     "pim.wram-bytes", "pim.mram-bytes",
 )
 
@@ -285,7 +288,8 @@ def layout_feedback_of_module(mlir_text: str) -> LayoutFeedback:
     m, n = attrs.get("pim.tile-m"), attrs.get("pim.tile-n")
     return LayoutFeedback(
         tile_shape=None if m is None or n is None else (m, n),
-        wram_bytes_used=attrs.get("pim.wram-bytes-used"),
+        wram_bytes_used=attrs.get("pim.wram-bytes-used",
+                                  attrs.get("pim.tile-wram-bytes")),
         wram_bytes_budget=attrs.get("pim.wram-bytes"),
         mram_bytes=attrs.get("pim.mram-bytes"),
     )

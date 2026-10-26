@@ -934,6 +934,81 @@ def _two_linears_around(activation) -> "object":
     return torch.export.export(M().to(torch.float16), (example,)).module()
 
 
+def _fusion_target_chain(*tail):
+    """`linear -> <尾部链> -> output`：GML 专用融合的典型形态。"""
+    import torch
+    from torch.fx import Graph, GraphModule
+
+    from contracts.unified_ir import STAGE_PARTITIONED, mark_stage
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.placeholder("w")
+    b = graph.placeholder("b")
+    n = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    vals = {x: torch.ones(2, 4), w: torch.ones(8, 4), b: torch.ones(2, 8),
+            n: torch.empty(2, 8)}
+    for t in tail:
+        args = (n, b) if t in (torch.ops.aten.add.Tensor,
+                               torch.ops.aten.mul.Tensor) else (n,)
+        n = graph.call_function(t, args)
+        vals[n] = torch.empty(2, 8)
+    graph.output(n)
+    gm = GraphModule({}, graph)
+    for node, val in vals.items():
+        node.meta["val"] = val
+    mark_stage(gm, STAGE_PARTITIONED)
+    return gm
+
+
+def test_fuse_for_gml_keeps_fusion_target_chain_intact() -> None:
+    """GML 路不能把「主算子 + 尾部激活」吃成通用融合的闭包。
+
+    通用融合换出的合并节点是普通 Python 闭包，`from_fx` 不认它，整段
+    计算会从产物里静默消失（只剩 Gemm）。这条链必须留给 `fuse_graph`
+    折成带 contraction 的 EltwiseAdd。
+    """
+    import torch
+
+    from gml_bridge.export import fuse_for_gml
+
+    gm = _fusion_target_chain(torch.ops.aten.add.Tensor,
+                              torch.ops.aten.relu.default)
+    fuse_for_gml(gm)
+    targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+    assert not any(getattr(t, "__name__", "").startswith("fused")
+                   for t in targets), targets
+
+    nodes, _, _, _ = convert(gm)
+    eltwise = [n for n in nodes if n.fields.get("op_type") == "EltwiseAdd"]
+    assert eltwise, [n.fields.get("op_type") for n in nodes]
+    (add_node,) = eltwise
+    names = [name for name, _block in add_node.contraction]
+    assert "fused_Relu_act" in names, add_node.contraction
+
+
+def test_fuse_for_gml_keeps_plain_elementwise_chain() -> None:
+    """GML 路不跑通用融合：`mul -> add` 必须保持两个节点。
+
+    两个节点 GML 都能独立表达（EltwiseMul + EltwiseAdd），保持原样只是
+    少融合一次；合成闭包则与激活链一样整段蒸发。
+    """
+    import torch
+
+    from gml_bridge.export import fuse_for_gml
+
+    gm = _fusion_target_chain(torch.ops.aten.mul.Tensor,
+                              torch.ops.aten.add.Tensor)
+    fuse_for_gml(gm)
+    targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
+    assert not any(getattr(t, "__name__", "").startswith("fused")
+                   for t in targets), targets
+
+    nodes, _, _, _ = convert(gm)
+    op_types = {n.fields.get("op_type") for n in nodes}
+    assert {"EltwiseMul", "EltwiseAdd"} <= op_types, op_types
+
+
 def test_an_unfused_activation_is_not_silently_dropped() -> None:
     """没折进主算子的激活必须报错，不能从产物里消失。
 

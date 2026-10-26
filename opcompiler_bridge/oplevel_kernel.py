@@ -103,8 +103,12 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
                   nmu_mode: str = "floating_point",
                   scale_mode: str = "floating_point",
                   sf_multiplier: int = 1,
-                  fp16: bool = False) -> str:
+                  fp16: bool = False,
+                  trailing_activation: str | None = None) -> str:
     """整算子矩阵乘，可带按组反量化累加。
+
+    `trailing_activation` 给了就把激活发成矩阵乘唯一用户的独立 `pim.lut`，
+    由算子层 `-pim-fuse-activation` 折回矩阵乘；`activation` 则是直接写进属性。
 
     **不压平**：`[M, K] x [K, N]` 的三维就是矩阵单元乘的那两维，压掉任一维
     就不再是矩阵乘。`fp16=False`（默认）时两个操作数都是 i8——int4 权值按
@@ -150,6 +154,13 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
     if activation:
         from genesim_bridge.ir_cost import fused_act_spec_attr
         act = f", {fused_act_spec_attr(str(activation).lower())}"
+    if activation and trailing_activation:
+        raise ValueError("activation 与 trailing_activation 只能给一个")
+    # 独立激活接在矩阵乘结果后面，形状与结果相同。
+    lut = ""
+    if trailing_activation:
+        lut = (f"\n    %z = pim.lut %y {{kind = #pim.activation<"
+               f"{str(trailing_activation).lower()}>}} : {out_ty} -> {out_ty}")
     if fp16:
         # 没有权值侧，所以 `weightBinding` 与 `stationarity` 都不发：后者一旦
         # 写成 `kv`，verifier 就要求 `weightBinding` 声明
@@ -158,7 +169,7 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
         return f"""  tt.func @{func}(%a: {a_ty}, %w: {w_ty}) {{
     %y = pim.matmul %a, %w
        {{datapath = {datapath}{act}}}
-       : {a_ty}, {w_ty} -> {out_ty}
+       : {a_ty}, {w_ty} -> {out_ty}{lut}
     tt.return
   }}"""
     if group_size is None:
@@ -166,7 +177,7 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
     %y = pim.matmul %a, %w
        {{datapath = {datapath}, weightBinding = {binding},
         stationarity = #pim.stationarity<weight>{act}}}
-       : {a_ty}, {w_ty} -> {out_ty}
+       : {a_ty}, {w_ty} -> {out_ty}{lut}
     tt.return
   }}"""
     scale_ty = _tensor((k // group_size, n), _F16)
@@ -174,7 +185,7 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
     %y = pim.matmul %a, %w scales %s
        {{datapath = {datapath}, weightBinding = {binding},
         stationarity = #pim.stationarity<weight>{act}}}
-       : {a_ty}, {w_ty} scales {scale_ty} -> {out_ty}
+       : {a_ty}, {w_ty} scales {scale_ty} -> {out_ty}{lut}
     tt.return
   }}"""
 
@@ -332,13 +343,26 @@ def lut_kernel(func: str, shape: tuple[int, ...], kind: str,
 
 
 def eltwise_kernel(func: str, shape: tuple[int, ...], kind: str,
-                   dtype: str = _F16) -> str:
+                   dtype: str = _F16, trailing_activation: str | None = None) -> str:
     """逐元素二元运算。两槽形态打印与旧糖一致，成本抽取按 mnemonic 计数。
 
     两侧同类型，fp16 与 fp32 各有一种内核形态；`dtype` 是 MLIR 类型名。
     RMSNorm 链的 eps 加法与门控乘都在 fp32 域。
+
+    `trailing_activation` 给了就把激活发成主算子唯一用户的独立 `pim.lut`，
+    不写进主算子的属性。算子层融合按这个形态判定，写进属性就没东西可折。
     """
     ty = _tensor(shape, dtype)
+    if trailing_activation:
+        act = str(trailing_activation).lower()
+        return f"""  tt.func @{func}(%a: {ty}, %b: {ty}) {{
+    %y = pim.eltwise %a, %b
+       {{kind = #pim.eltwise<{kind}>,
+         datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>}}
+       : {ty}, {ty} -> {ty}
+    %z = pim.lut %y {{kind = #pim.activation<{act}>}} : {ty} -> {ty}
+    tt.return
+  }}"""
     return f"""  tt.func @{func}(%a: {ty}, %b: {ty}) {{
     %y = pim.eltwise %a, %b
        {{kind = #pim.eltwise<{kind}>,

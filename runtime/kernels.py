@@ -117,10 +117,21 @@ def _write_result(hal, dpu_id: int, cmd, result: np.ndarray) -> None:
     hal.write_local(dpu_id, cmd.writes[0].offset, np.ascontiguousarray(result, dtype=dtype))
 
 
+# 折进 linear 的尾部激活，种类与 contracts.fusion_contract.LINEAR_TAIL_ACTIVATIONS 一致。
+_LINEAR_TAIL = {
+    "silu": lambda y: y / (1.0 + np.exp(-y)),
+    "relu": lambda y: np.maximum(y, 0.0),
+    "sigmoid": lambda y: 1.0 / (1.0 + np.exp(-y)),
+}
+
+
 def linear_kernel(hal, dpu_id: int, cmd) -> None:
-    """计算 ``aten.linear(x, w)``。"""
+    """计算 ``aten.linear(x, w)``，带尾部激活时在写回前补上。"""
     x, w = _read_tensor_args(hal, dpu_id, cmd)
     y = x.astype(np.float32) @ w.astype(np.float32).T
+    activation = cmd.payload.get("activation")
+    if activation is not None:
+        y = _LINEAR_TAIL[activation](y)
     _write_result(hal, dpu_id, cmd, y)
 
 
@@ -221,9 +232,10 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
             f"cmd.num_tasklets ({cmd.num_tasklets}) must match hardware.num_tasklets ({hardware.num_tasklets})"
         )
     num_tasklets = hardware.num_tasklets
-    # 键包含数据类型、tasklet 数和硬件配置。
+    # 键包含数据类型、tasklet 数和硬件配置；activation 变了要重编。
     ctx = _ctx_of(cmd)
-    key = (ctx, "linear", arg_shapes, dtype, tuple(hardware.to_payload().items()))
+    key = (ctx, "linear", arg_shapes, dtype, cmd.payload.get("activation"),
+           tuple(hardware.to_payload().items()))
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         # 锁内检查编译缓存。
@@ -236,6 +248,7 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
                         dtype=dtype, num_tasklets=num_tasklets, shard=ctx.shard,
                         elem_strides=ctx.elem_strides,
                         mram_offset=ctx.mram_offset, align_bytes=ctx.align_bytes,
+                        activation=cmd.payload.get("activation"),
                     )
                 )
                 fn = load_kernel(result)
@@ -324,8 +337,10 @@ def _eltwise(kind: str, numpy_op):
                 return
         record_route("eltwise", "fallback")
         y_value = y.astype(np.float32) if isinstance(y, np.ndarray) else y
+        x_value = x.astype(np.float32) if isinstance(x, np.ndarray) else x
+        # 两个操作数都可能是标量（部分和在这台不存在时按 0 传），结果铺满输出形状。
         _write_result(hal, dpu_id, cmd,
-                      numpy_op(x.astype(np.float32), y_value))
+                      np.broadcast_to(numpy_op(x_value, y_value), out_shape))
 
     return kernel
 
@@ -1150,8 +1165,10 @@ def concat_kernel(hal, dpu_id: int, cmd) -> None:
     out_shape = list(tensors[0].shape)
     out_shape[axis] = sum(t.shape[axis] for t in tensors)
     out = np.zeros(tuple(out_shape), dtype=np.float16)
-    ptrs = [ctypes.c_void_p(np.ascontiguousarray(t, np.float16).ctypes.data)
-            for t in tensors]
+    # 转换出的数组要留住引用：非 float16 输入会复制一份临时数组，只取指针时
+    # 它立刻被回收，各段指针落到同一块复用的内存上。
+    halves = [np.ascontiguousarray(t, np.float16) for t in tensors]
+    ptrs = [ctypes.c_void_p(h.ctypes.data) for h in halves]
     fn(*ptrs, ctypes.c_void_p(out.ctypes.data))
     _write_result(hal, dpu_id, cmd, out)
 
@@ -1537,6 +1554,8 @@ _KERNELS = {
     str(torch.ops.aten.unsqueeze.default): KernelEntry(unsqueeze_kernel),
     str(torch.ops.aten.to.dtype): KernelEntry(convert_kernel),
     str(torch.ops.aten.to.dtype_layout): KernelEntry(convert_kernel),
+    # 分块把低精度提升到 float32 用的是这个，与 to.dtype 一样只换元素类型。
+    str(torch.ops.aten._to_copy.default): KernelEntry(convert_kernel),
 }
 # 下面这些 aten 目标 **故意不在表里**：它们仍在主机侧口径里，放进这张表
 # 就是按构造永不执行的死代码。反向闭合测试

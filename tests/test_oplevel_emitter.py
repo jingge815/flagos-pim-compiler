@@ -58,6 +58,65 @@ def _add_node(graph: Graph, name: str, shape: tuple[int, ...]):
     return node
 
 
+def test_unfused_eltwise_activation_emits_standalone_lut() -> None:
+    """带融合标记的逐元素主算子，B 路把激活发成独立的 pim.lut。
+
+    发射端不预写 activation，算子层融合才有东西可折。
+    """
+    from contracts.graph_meta import FUSED_TAIL_META_KEY
+    from contracts.ir_payloads import FusedTail
+
+    def build(g):
+        lhs = _add_node(g, "lhs", (1, 16))
+        rhs = _add_node(g, "rhs", (1, 16))
+        main = _add_node(g, "residual", (1, 16))
+        main.target = torch.ops.aten.add.Tensor
+        main.args = (lhs, rhs)
+        act = _add_node(g, "act_relu", (1, 16))
+        act.target = torch.ops.aten.relu.default
+        act.args = (main,)
+        main.meta[FUSED_TAIL_META_KEY] = FusedTail(
+            activation="relu", pool=None, nodes=[act])
+
+    report = emit_oplevel_mlir(_graph_with(build))
+    assert "pim.eltwise" in report.text, report.text
+    assert "activation =" not in report.text.split("pim.eltwise")[1].split("pim.lut")[0], report.text
+    assert "pim.lut" in report.text, report.text
+    assert "#pim.activation<relu>" in report.text, report.text
+
+
+def test_unfused_activation_survives_full_b_path() -> None:
+    """独立激活的发射产物跑完默认 B 路：LUT 折进 eltwise，降到 C 有实现。
+
+    算子层融合把 LUT 折回主算子的 activation 属性，契约校验通过，
+    `-pim-lower-to-emitc` 按 relu 补上 C 实现。
+    """
+    from contracts.graph_meta import FUSED_TAIL_META_KEY
+    from contracts.ir_payloads import FusedTail
+    from opcompiler_bridge.driver import _run_oplevel_triton_opt
+
+    def build(g):
+        lhs = _add_node(g, "lhs", (1, 16))
+        rhs = _add_node(g, "rhs", (1, 16))
+        main = _add_node(g, "residual", (1, 16))
+        main.target = torch.ops.aten.add.Tensor
+        main.args = (lhs, rhs)
+        act = _add_node(g, "act_relu", (1, 16))
+        act.target = torch.ops.aten.relu.default
+        act.args = (main,)
+        main.meta[FUSED_TAIL_META_KEY] = FusedTail(
+            activation="relu", pool=None, nodes=[act])
+
+    report = emit_oplevel_mlir(_graph_with(build))
+    assert "pim.lut" in report.text, "发射端应产出独立的 pim.lut"
+
+    pimir, emitc = _run_oplevel_triton_opt(report.text)
+    # 融合发生：LUT 消失，activation 落位，契约校验已通过（没抛即过）。
+    assert "pim.lut" not in pimir, pimir
+    assert "activation = #pim.act_spec<kind = relu>" in pimir, pimir
+    assert "pim_lut_relu" in emitc, "降级侧没有 relu 的 C 实现"
+
+
 def test_module_declares_pim_target() -> None:
     """必须带 `pim.target`，否则 11008 这类宽度会被 2 的幂检查拒。
 
@@ -232,3 +291,152 @@ def test_an_unfused_graph_is_rejected_at_the_entry() -> None:
 
     with pytest.raises(ValueError, match="要求图已达到阶段"):
         emit_oplevel_mlir(gm)
+
+
+def test_real_llama_b_path_fuses_every_gate_activation() -> None:
+    """真实小模型走默认 B 路，算子层融合在每层门控投影上都真实触发。
+
+    发射器按图上的主算子与尾部激活发 `pim.matmul` 加独立 `pim.lut`，
+    `-pim-fuse-activation` 把激活折回去。融合前 LUT 数等于层数，融合后
+    LUT 为 0、带 activation 的矩阵乘等于层数。
+    """
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from gml_bridge.export import fuse_for_gml
+    from graph.partition import partition_graph
+    from opcompiler_bridge.phase_source import _run_passes, opcompiler_available
+    from runtime.compile import export_annotated_graph
+
+    if not opcompiler_available():
+        pytest.skip("triton-opt 没有相位展开 pass")
+    layers = 2
+    cfg = LlamaConfig(vocab_size=128, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=layers, num_attention_heads=4,
+                      num_key_value_heads=4, max_position_embeddings=64)
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(cfg).eval()
+    gm = export_annotated_graph(model, 1, torch.tensor([[0]]),
+                                dtype=torch.float32)
+    partition_graph(gm)
+    fuse_for_gml(gm)
+
+    report = emit_oplevel_mlir(gm)
+    assert report.text.count("pim.lut") == layers, \
+        "发射器没有把门控激活发成独立 pim.lut，B 路融合没有对象"
+    assert "activation = #pim.act_spec" not in report.text, \
+        "发射端不该预先写好 activation，否则算子层融合只是空跑"
+    expanded = _run_passes(report.text)
+    matmuls = [line for line in expanded.splitlines() if "pim.matmul" in line]
+    fused = expanded.count("activation = #pim.act_spec<kind = silu>")
+    assert fused == layers, (fused, matmuls)
+
+
+def _tail_graph(main_target, main_args, main_shape, *, main_kwargs=None,
+                arg_shapes=(), pool=None):
+    """主算子加 relu 尾部的最小图，实参按给定形状造成占位节点。"""
+    from contracts.graph_meta import FUSED_TAIL_META_KEY
+    from contracts.ir_payloads import FusedTail
+
+    def build(g):
+        nodes = []
+        for i, shape in enumerate(arg_shapes):
+            nodes.append(_add_node(g, f"in{i}", shape))
+        args = tuple(nodes[a] if isinstance(a, int) else a for a in main_args)
+        main = _add_node(g, "main", main_shape)
+        main.target = main_target
+        main.args = args
+        main.kwargs = main_kwargs or {}
+        act = _add_node(g, "act_relu", main_shape)
+        act.target = torch.ops.aten.relu.default
+        act.args = (main,)
+        main.meta[FUSED_TAIL_META_KEY] = FusedTail(
+            activation="relu", pool=pool, nodes=[act])
+
+    return _graph_with(build)
+
+
+def test_fused_addmm_is_skipped_not_misread() -> None:
+    """addmm 的实参是 (bias, x, w)，pim.matmul 表达不了 bias，要跳过而不是把 bias 当 x。"""
+    gm = _tail_graph(torch.ops.aten.addmm.default, (0, 1, 2), (2, 8),
+                     arg_shapes=[(8,), (2, 4), (4, 8)])
+    report = emit_oplevel_mlir(gm)
+    assert "pim.matmul" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_linear_with_bias_is_skipped() -> None:
+    """带 bias 的 linear 发成 pim.matmul 会丢掉 bias，要跳过。"""
+    gm = _tail_graph(torch.ops.aten.linear.default, (0, 1, 2), (2, 8),
+                     arg_shapes=[(2, 4), (8, 4), (8,)])
+    report = emit_oplevel_mlir(gm)
+    assert "pim.matmul" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_linear_with_keyword_bias_is_skipped() -> None:
+    """bias 按关键字传入时同样表达不了，要跳过而不是丢掉 bias。"""
+    gm = _tail_graph(torch.ops.aten.linear.default, (0, 1), (2, 8),
+                     arg_shapes=[(2, 4), (8, 4), (8,)])
+    main = next(n for n in gm.graph.nodes if n.name == "main")
+    main.kwargs = {"bias": next(n for n in gm.graph.nodes if n.name == "in2")}
+    report = emit_oplevel_mlir(gm)
+    assert "pim.matmul" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_linear_with_explicit_none_bias_still_emits() -> None:
+    """`linear(x, w, None)` 没有 bias，照常发 pim.matmul 加独立 pim.lut。"""
+    gm = _tail_graph(torch.ops.aten.linear.default, (0, 1, None), (2, 8),
+                     arg_shapes=[(2, 4), (8, 4)])
+    report = emit_oplevel_mlir(gm)
+    assert "pim.matmul" in report.text and "pim.lut" in report.text, report.text
+    assert "main" not in report.skipped
+
+
+def test_fused_linear_with_pool_is_skipped() -> None:
+    """尾部带池化时 pim.matmul 加 pim.lut 表达不了池化，要跳过。"""
+    gm = _tail_graph(torch.ops.aten.linear.default, (0, 1), (2, 8),
+                     arg_shapes=[(2, 4), (8, 4)], pool="global_average")
+    report = emit_oplevel_mlir(gm)
+    assert "pim.matmul" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_mm_keeps_operand_shapes() -> None:
+    """mm 的实参是 (x, w)，K 取 x 的末维，发出的两个操作数形状与图一致。"""
+    gm = _tail_graph(torch.ops.aten.mm.default, (0, 1), (2, 8),
+                     arg_shapes=[(2, 4), (4, 8)])
+    report = emit_oplevel_mlir(gm)
+    assert "tensor<2x4xi8>, tensor<4x8xi8>" in report.text, report.text
+
+
+@pytest.mark.parametrize("main_args, arg_shapes, kwargs", [
+    pytest.param((0, 2.0), [(2, 8)], {}, id="scalar"),
+    pytest.param((0, 1), [(2, 8), (1, 8)], {}, id="broadcast"),
+    pytest.param((0, 1), [(2, 8), (2, 8)], {"alpha": 2}, id="alpha"),
+])
+def test_fused_eltwise_that_two_same_shape_slots_cannot_express_is_skipped(
+        main_args, arg_shapes, kwargs) -> None:
+    """标量、广播或 alpha 不为 1 的 add 发成两个同形操作数会改掉计算，要跳过。"""
+    gm = _tail_graph(torch.ops.aten.add.Tensor, main_args, (2, 8),
+                     main_kwargs=kwargs, arg_shapes=arg_shapes)
+    report = emit_oplevel_mlir(gm)
+    assert "pim.eltwise" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_eltwise_with_pool_is_skipped() -> None:
+    """逐元素主算子尾部带池化时同样跳过，并记进 skipped。"""
+    gm = _tail_graph(torch.ops.aten.add.Tensor, (0, 1), (2, 8),
+                     arg_shapes=[(2, 8), (2, 8)], pool="max")
+    report = emit_oplevel_mlir(gm)
+    assert "pim.eltwise" not in report.text, report.text
+    assert "main" in report.skipped
+
+
+def test_fused_eltwise_with_two_same_shape_operands_still_emits() -> None:
+    """两个同形节点操作数、alpha 缺省的 add 照常发 pim.eltwise 加独立 pim.lut。"""
+    gm = _tail_graph(torch.ops.aten.add.Tensor, (0, 1), (2, 8),
+                     arg_shapes=[(2, 8), (2, 8)])
+    report = emit_oplevel_mlir(gm)
+    assert "pim.eltwise" in report.text and "pim.lut" in report.text, report.text

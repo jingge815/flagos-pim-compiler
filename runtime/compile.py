@@ -13,6 +13,7 @@ from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.pim_tensor_spec import RedistributeEdge
 from contracts.unified_ir import STAGE_PLANNED, mark_stage
+from graph.opt_passes import fuse_linear_activation, optimize_graph
 from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
@@ -102,7 +103,8 @@ def _q_proj_layer_of(node) -> int:
         seen.add(cur)
         if cur.op == "get_attr" and "q_proj.weight" in str(cur.target):
             return int(str(cur.target).split(".")[3])
-        stack.extend(a for a in cur.args if hasattr(a, "name"))
+        # 分块后投影输出是 cat 的列表参数，要连列表里的节点一起回溯。
+        stack.extend(cur.all_input_nodes)
     raise ValueError(f"未能从 {node.name} 回溯到 q_proj 权重")
 
 
@@ -128,7 +130,7 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
     from contracts.ir_payloads import placement_of_module
     from contracts.op_contract import OpCompileRequest
     from opcompiler_bridge.driver import compile_op
-    from runtime.exec_plan_gen import _shard_decision_of
+    from runtime.exec_plan_gen import _fused_activation_of, _shard_decision_of
     from runtime.kernels import _compiled_linear_supports
 
     peak = 0
@@ -156,7 +158,9 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
             x_shape = tuple(x_spec.shard_map[dpu_id].local_shape)
             w_shape = tuple(w_spec.shard_map[dpu_id].local_shape)
             dtype = spec.dtype or "float16"
-            key = (x_shape, w_shape, dtype)
+            # 折进 linear 的尾部激活一起下发，A 路融合才有对象可折。
+            activation = _fused_activation_of(node)
+            key = (x_shape, w_shape, dtype, activation)
             if key in seen:
                 continue
             seen.add(key)
@@ -168,7 +172,8 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
                     op="linear", arg_shapes=[x_shape, w_shape],
                     hardware=hardware, dtype=dtype,
                     num_tasklets=hardware.num_tasklets,
-                    shard=None if raw is None else DpuShard.from_payload(raw)))
+                    shard=None if raw is None else DpuShard.from_payload(raw),
+                    activation=activation))
             except (RuntimeError, ValueError):
                 # 这是**探测**，不是编译：拿不到就跳过这个形状，绝不让它打断
                 # 整个 compile_llama2。三种拿不到的情形都走这里：
@@ -212,8 +217,22 @@ def compile_llama2(
         model, 1, torch.tensor([[0]], dtype=torch.long), dtype=dtype
     )
 
+    # 切分传播看到的必须是优化后的图，否则分块拆出的子节点没有布局。
+    # 没有流水并行时各层在同一组 DPU 上，各层重复的形状类算子可以合并。
+    single_stage = strategy.num_stages == 1
+    optimize_graph(prefill_gm, wram_bytes=hardware.wram_bytes_per_dpu,
+                   tp_width=strategy.tp_width, merge_shape_ops=single_stage)
+    optimize_graph(decode_gm, wram_bytes=hardware.wram_bytes_per_dpu,
+                   tp_width=strategy.tp_width, merge_shape_ops=single_stage)
+
     prefill_edges = propagate_specs(prefill_gm, strategy)
     decode_edges = propagate_specs(decode_gm, strategy)
+
+    # 门控 silu 折进 linear，A 路编译内核按 activation 参数算。必须放在
+    # 切分传播之后：部分和的 gate 投影（行切）经 silu 会直接报错，传播
+    # 通过说明这里的 linear 输出都不是部分和。
+    fuse_linear_activation(prefill_gm, prefill_edges)
+    fuse_linear_activation(decode_gm, decode_edges)
 
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     kv_specs = kv_specs_from_strategy(

@@ -256,9 +256,11 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
             raise ValueError(
                 f"edge {edge.edge_id} local_slice 的目标必须是 Shard，"
                 f"收到 {edge.dst_spec.placement}")
-        if set(edge.src_spec.shard_map) != set(edge.dst_spec.shard_map):
+        # 目标可以只是源的一部分台：行切权重的 K 段只落在部分台上，激活也只
+        # 切给这些台。每台仍只从自己的副本里取。
+        if not set(edge.dst_spec.shard_map) <= set(edge.src_spec.shard_map):
             raise ValueError(
-                f"edge {edge.edge_id} local_slice 的源/目标 DPU 集必须相同")
+                f"edge {edge.edge_id} local_slice 的目标台必须都持有源副本")
         segs = []
         for dpu_id, d_detail, g, local, length in _spec_runs(edge.dst_spec):
             s_detail = edge.src_spec.shard_map[dpu_id]

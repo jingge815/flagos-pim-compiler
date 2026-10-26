@@ -365,30 +365,6 @@ def has_fused_act_spec(text: str) -> bool:
     return _FUSED_ACT_SPEC_RE.search(text) is not None
 
 
-def mark_fused_activation(pimir: str, activation: str) -> str:
-    """把激活属性标到 A 路分块 GEMM 的 tt.dot 上，不换建模口径。
-
-    A 路 kernel 由 Triton 生成，带不出激活。属性只带 kind，给正则消费，
-    不进 MLIR verifier。
-    """
-    if "tt.dot" not in pimir:
-        raise RuntimeError(
-            f"A 路产物没有 tt.dot，无法把 {activation} 折进分块 GEMM"
-        )
-    if has_fused_act_spec(pimir):
-        return pimir
-    attr = fused_act_spec_attr(activation)
-    marked, n = re.subn(
-        r"(tt\.dot\b[^:\n]*)(:)",
-        rf"\1{{{attr}}} \2",
-        pimir,
-        count=1,
-    )
-    if n != 1 or not has_fused_act_spec(marked):
-        raise RuntimeError(f"没能在 tt.dot 上标 {activation}")
-    return marked
-
-
 def _fused_activation_bytes(line: str) -> float:
     """折进主算子的激活所遍历的字节数，取结果张量。
 
@@ -569,8 +545,9 @@ def analyze_ir(
 
     for lineno, raw in enumerate(text.splitlines()):
         line = raw.split(" loc(")[0]  # 移除 loc 注解后匹配指令。
-        if len(stack) == 1:
-            folder.feed(line)
+        # 循环体里的常量也要收：分块后内层循环的边界定义在外层循环体内。
+        # 循环变量本身不是常量，依赖它的值折不出，不会被误折。
+        folder.feed(line)
 
         fm = _SCF_FOR_RE.search(line)
         if fm:

@@ -50,6 +50,8 @@ from graph.quant_pass import DQ_META_KEY
 from graph.split_heads import HEAD_INDEX_META_KEY, HEAD_ROLE_META_KEY, ROLE_SOFTMAX
 from opcompiler_bridge.oplevel_kernel import (
     dynamic_quant_kernel,
+    eltwise_kernel,
+    lut_kernel,
     matmul_kernel,
     normalize_kernel,
     rope_kernel,
@@ -287,20 +289,24 @@ def _emit_normalize(node: FxNode) -> tuple[str, EmittedOp] | None:
 
 
 def _emit_fused_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
-    """带尾部激活的矩阵乘 -> `pim.matmul {activation}`。
+    """带尾部激活的矩阵乘 -> `pim.matmul` 加独立 `pim.lut`。
 
-    这一类**不产出相位**（矩阵乘是单相），发它是为了让
-    `-pim-fuse-activation` 有东西可校验：图编译器已经把激活折进主算子了，
-    所以我方直接发带 `activation` 属性的 `pim.matmul`，pass 跑过应该
-    「无事可做」——它是幂等的，已带 `activation` 的算子会跳过。
-
-    验收就是跑 pass 前后 `activation` 属性个数不变：相等说明两边的融合口径
-    一致；变多说明我方漏折了某处（pass 替我们补上），变少则是 pass 不认我方
-    的表达。
+    矩阵乘是单相，不产出相位。激活按图上真实拓扑发成矩阵乘的唯一用户，
+    由算子层 `-pim-fuse-activation` 折回矩阵乘，两层融合口径由
+    activation 计数核对：折完后带 activation 的矩阵乘数应等于图层融合数。
     """
     tail = node.meta[FUSED_TAIL_META_KEY]
     kind = str(tail.activation).lower()
-    if kind not in _ACTIVATION_KINDS:
+    if kind not in _ACTIVATION_KINDS or tail.pool is not None:
+        return None
+    # pim.matmul 只有 x、w 两个操作数：带 bias 的 linear 与 addmm 表达不了，不发。
+    # bias 可以按位置或关键字传入，显式写 None 的也算没有 bias。
+    target = str(node.target)
+    if "linear" in target:
+        bias = node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")
+        if len(node.args) > 3 or bias is not None:
+            return None
+    elif "aten.mm" not in target:
         return None
 
     out_shape = _shape_of(node)
@@ -309,17 +315,63 @@ def _emit_fused_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
     # 压成 [M, N]：矩阵乘的前导维在目标格式里同样是压平的。
     n = out_shape[-1]
     m = _numel(out_shape) // n
-    # 权重宽度取激活输入的末维；取不到就不发（宁可少发也不猜）。
-    src = node.args[0] if node.args else None
-    src_shape = _shape_of(src)
+    # 收缩维取激活输入的末维；取不到就不发（宁可少发也不猜）。
+    src_shape = _shape_of(node.args[0])
     if src_shape is None:
         return None
     k = src_shape[-1]
 
     func = f"{_sanitize(node.name)}__matmul"
     # 文本只此一处：转调 `matmul_kernel`，否则图路径与 driver 路径会各说各话。
-    body = matmul_kernel(func, m, k, n, activation=kind)
+    # 激活发成独立 pim.lut，由算子层融合折回矩阵乘，B 路融合才有真实对象。
+    body = matmul_kernel(func, m, k, n, trailing_activation=kind)
     return body, EmittedOp(func=func, kind="fused_matmul", fx_name=node.name,
+                           expected_phases=0)
+
+
+# 逐元素主算子到 pim.eltwise 的运算种类。其余逐元素算子不在 B 路的覆盖里。
+_ELTWISE_KINDS = {
+    "add.Tensor": "add",
+    "sub.Tensor": "sub",
+    "mul.Tensor": "mul",
+}
+
+
+def _eltwise_kind(node: FxNode) -> str | None:
+    """节点对应的 pim.eltwise 种类；不是逐元素主算子就返回 None。"""
+    text = str(node.target)
+    marker = "aten."
+    pos = text.find(marker)
+    name = text[pos + len(marker):] if pos >= 0 else ""
+    return _ELTWISE_KINDS.get(name)
+
+
+def _emit_unfused_activation(node: FxNode) -> tuple[str, EmittedOp] | None:
+    """带尾部激活的逐元素主算子 -> `pim.eltwise` 加独立 `pim.lut`。
+
+    与矩阵乘同一口径：图层把激活记在主算子的融合标记上，这里按标记把激活
+    发成主算子的唯一用户，由算子层 `-pim-fuse-activation` 折回主算子。
+    """
+    tail = node.meta[FUSED_TAIL_META_KEY]
+    if len(tail.nodes) != 1 or tail.pool is not None:
+        return None
+    activation = tail.nodes[0]
+    kind = _eltwise_kind(node)
+    if kind is None or not isinstance(activation, FxNode):
+        return None
+    shape = _shape_of(node)
+    if shape is None or _shape_of(activation) != shape:
+        return None
+    # pim.eltwise 只有两个同形操作数：标量、广播与 alpha 都表达不了，不发。
+    if (len(node.args) != 2 or node.kwargs.get("alpha", 1) != 1
+            or any(_shape_of(arg) != shape for arg in node.args)):
+        return None
+
+    func = f"{_sanitize(node.name)}__eltwise"
+    # 激活与主算子放在同一个函数里：融合按「主算子的唯一用户是 pim.lut」判定，
+    # 分开两个函数就看不到这条使用关系。
+    body = eltwise_kernel(func, shape, kind, trailing_activation=tail.activation)
+    return body, EmittedOp(func=func, kind="eltwise", fx_name=node.name,
                            expected_phases=0)
 
 
@@ -374,9 +426,12 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
             candidates.append(_emit_dq(node))
         if not candidates and _is_softmax(node):
             candidates.append(_emit_softmax(node))
-        # 带尾部激活的矩阵乘：不产相位，发它是给 -pim-fuse-activation 校验用。
+        # 带尾部激活的主算子：激活一律发成独立 pim.lut，由算子层融合折回。
         if not candidates and FUSED_TAIL_META_KEY in node.meta:
-            candidates.append(_emit_fused_matmul(node))
+            if _eltwise_kind(node) is not None:
+                candidates.append(_emit_unfused_activation(node))
+            else:
+                candidates.append(_emit_fused_matmul(node))
         # RMSNorm：单相，发它是为了把 vpuParams 读回 GML，而不是由图编译器写死。
         if not candidates and RMS_NORM_META_KEY in node.meta:
             candidates.append(_emit_normalize(node))

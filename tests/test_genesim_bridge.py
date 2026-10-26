@@ -1166,3 +1166,171 @@ def test_no_operator_carries_an_attribute_its_ods_does_not_declare():
     assert not residue, (
         f"这些 op 挂了 ODS 没声明的属性：{ {k: sorted(v) for k, v in residue.items()} }。"
         "裸属性没人读、verifier 也不查，改它不会改变任何产物。")
+
+
+def test_autotune_drops_tiles_over_the_wram_budget(monkeypatch) -> None:
+    """抓 pim mlir 时，矩阵乘的 autotune 只能在放得进 WRAM 的分块里选。
+
+    FlagGems 在 4090 上给 M=128、N=11008 选了 128x256x64：暂存 115200 B，超过
+    65536 B 预算，`pim-explicit-dma` 直接报错，`refine_ir_with_flagtree.py` 中断。
+    """
+    pytest.importorskip("flag_gems")
+    import triton
+    from flag_gems.utils.libentry import LibTuner
+
+    from genesim_bridge.flagtree_driver import _autotune_within_wram, _tile_fits
+
+    assert not _tile_fits((128, 256, 64), 65536, 8)
+    assert _tile_fits((64, 128, 32), 65536, 8)
+
+    seen = []
+    monkeypatch.setattr(LibTuner, "run", lambda self, *a, **k: seen.append(list(self.configs)))
+
+    class FakeTuner:
+        __name__ = "linear_kernel"
+        strategy = None
+
+        def __init__(self, configs):
+            self.configs = configs
+
+        def _set_configs_and_strategy(self, configs, strategy):
+            self.configs = configs
+
+    big = triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64})
+    small = triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32})
+    other = triton.Config({"BLOCK_SIZE": 1024})
+
+    with _autotune_within_wram(65536, 8):
+        LibTuner.run(FakeTuner([big, small]))
+        LibTuner.run(FakeTuner([other]))
+        with pytest.raises(RuntimeError, match="没有放得进"):
+            LibTuner.run(FakeTuner([big]))
+    assert seen[0] == [small]
+    assert seen[1] == [other], "不是矩阵乘分块的候选不该被动"
+
+
+def _dot_kernel(m: int, n: int, k: int) -> str:
+    """一块 m×k 乘 k×n 的 tt.dot 内核，可见分块就是整块。"""
+    return f"""module {{
+  tt.func public @k(%a_ptr: !tt.ptr<f16>, %w_ptr: !tt.ptr<f16>) {{
+    %ao = arith.constant dense<0> : tensor<{m}x{k}xi32>
+    %bo = arith.constant dense<0> : tensor<{n}x{k}xi32>
+    %ap = tt.splat %a_ptr : !tt.ptr<f16> -> tensor<{m}x{k}x!tt.ptr<f16>>
+    %aa = tt.addptr %ap, %ao : tensor<{m}x{k}x!tt.ptr<f16>>, tensor<{m}x{k}xi32>
+    %bp = tt.splat %w_ptr : !tt.ptr<f16> -> tensor<{n}x{k}x!tt.ptr<f16>>
+    %ba = tt.addptr %bp, %bo : tensor<{n}x{k}x!tt.ptr<f16>>, tensor<{n}x{k}xi32>
+    %a = tt.load %aa : tensor<{m}x{k}x!tt.ptr<f16>>
+    %w = tt.load %ba : tensor<{n}x{k}x!tt.ptr<f16>>
+    %wt = tt.trans %w {{order = array<i32: 1, 0>}} : tensor<{n}x{k}xf16> -> tensor<{k}x{n}xf16>
+    %acc = arith.constant dense<0.000000e+00> : tensor<{m}x{n}xf32>
+    %d = tt.dot %a, %wt, %acc : tensor<{m}x{k}xf16> * tensor<{k}x{n}xf16> -> tensor<{m}x{n}xf32>
+    tt.return
+  }}
+}}
+"""
+
+
+@pytest.mark.parametrize("tile, wram, dma", [
+    ((64, 128, 32), 65536, 8),   # 都放得下
+    ((64, 128, 32), 45056, 8),   # 正好等于工作集，分块 pass 原样保留
+    ((64, 128, 32), 45055, 8),   # 差 1 字节
+    ((16, 16, 1), 65536, 64),    # 字节数很小，但输入块 32 字节不按 64 对齐
+])
+def test_autotune_filter_agrees_with_tile_pass(tile, wram, dma) -> None:
+    """autotune 过滤与 `-pim-tile-to-budget` 对同一个分块的结论必须一致。
+
+    分块 pass 判「原样放得下」用 `fitsBudget`：输入、权重按操作数宽度，输出按
+    累加器宽度，每块各自按 DMA 对齐。过滤用另一套口径时，两边会对同一个候选
+    给出不同结论。
+    """
+    from opcompiler_bridge.driver import _run_passes, _triton_opt
+
+    if not _triton_opt().is_file():
+        pytest.skip("没有 triton-opt")
+    from genesim_bridge.flagtree_driver import _tile_fits
+
+    m, n, k = tile
+    try:
+        out = _run_passes(_triton_opt(), _dot_kernel(m, n, k), [
+            f"-convert-triton-to-pim=target=pim:v1 num-dpus=1 num-tasklets=1 "
+            f"wram-bytes={wram} mram-bytes=4294967296 dma-align={dma}",
+            "-pim-tile-to-budget"], "分块")
+        kept = all(f'"pim.tile-{d}" = {v} : i64' in out
+                   for d, v in zip("mnk", tile))
+    except RuntimeError:
+        kept = False
+    assert _tile_fits(tile, wram, dma) == kept
+
+
+@pytest.mark.skipif(not _pim_passes_available(),
+                    reason="当前 triton 没有 PIM pass")
+@pytest.mark.parametrize("activation", ["silu", "relu"])
+def test_fused_gemm_recipe_is_fused_by_the_operator_compiler(activation):
+    """B 路融合 GEMM 配方发独立 pim.lut，由 b_path_passes 里的融合折回。
+
+    配方预写 activation 时融合只是空跑，GeneSim 拿到的融合成本就不是
+    算子编译器产出的。
+    """
+    from genesim_bridge.flagtree_driver import lower_oplevel_to_pimir
+
+    recipe = build_recipes({"hidden_size": 64, "head_dim": 16, "num_heads": 4,
+                            "ffn_dim": 128})["GEMM_SILU"](
+        ShapePoint(tq=4, tp=0), 64, 128, activation=activation)
+    source = recipe.pimir()
+    assert source.count("pim.lut") == 1, "配方没有发独立的 pim.lut"
+    assert "#pim.act_spec" not in source, "配方不该预写 activation"
+    lowered = lower_oplevel_to_pimir(source)
+    assert "pim.lut" not in lowered
+    assert lowered.count(f"#pim.act_spec<kind = {activation}>") == 1
+
+
+@pytest.mark.skipif(not _pim_passes_available(),
+                    reason="当前 triton 没有 PIM pass")
+def test_pimir_fused_gemm_is_fused_by_the_operator_compiler(monkeypatch):
+    """A 路融合 GEMM 的 pimir 由 FlagTree 的 -pim-fuse-activation 折出。
+
+    事后用正则往 tt.dot 上贴属性不算融合：禁掉贴属性的路径后，测量仍要
+    拿到带 activation 的 tt.dot，且激活链已被折掉。
+    """
+    import torch
+
+    import genesim_bridge.cost_extractor as ce
+
+    if not torch.cuda.is_available():
+        pytest.skip("pimir 级测量需要 GPU")
+    if hasattr(ce, "mark_fused_activation"):
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("融合 GEMM 还在用正则贴激活属性")
+        monkeypatch.setattr(ce, "mark_fused_activation", refuse)
+    captured = {}
+    original = ce.analyze_ir
+
+    def spy(text, *args, **kwargs):
+        captured.setdefault("texts", []).append(text)
+        return original(text, *args, **kwargs)
+
+    monkeypatch.setattr(ce, "analyze_ir", spy)
+    op = {"op_type": "GEMM", "fused_activation": "silu",
+          "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 128]]}
+    ce._measure(op, ShapePoint(tq=4, tp=0),
+                {"hidden_size": 64, "head_dim": 16, "num_heads": 4,
+                 "ffn_dim": 128}, "pimir")
+    (text,) = captured["texts"]
+    assert "activation = #pim.act_spec<kind = silu>" in text
+    assert "math.exp" not in text, "silu 链没有被算子编译器折掉"
+
+
+def test_ttir_gemm_measures_the_same_linear_kernel_as_pimir():
+    """ttir 级 GEMM 与 pimir 级测同一个本仓 linear 内核，两路才逐算子可比。
+
+    以前 ttir 侧抓 FlagGems 的 linear_kernel：decode 按 BLOCK_M=32 填充，
+    运算数是手推的 32 倍，与 pimir 侧对不上。
+    """
+    import genesim_bridge.cost_extractor as ce
+
+    op = {"op_type": "GEMM", "input_shapes": [["Tq", 64]],
+          "output_shapes": [["Tq", 128]]}
+    dims = {"hidden_size": 64, "head_dim": 16, "num_heads": 4, "ffn_dim": 128}
+    m = ce._measure(op, ShapePoint(tq=1, tp=4), dims, "ttir")
+    assert m.kernel_ids == ["linear_kernel@grid[1]"], m.kernel_ids
+    assert m.flops == 2 * 1 * 64 * 128, m.flops

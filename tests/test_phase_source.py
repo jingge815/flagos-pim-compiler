@@ -146,22 +146,22 @@ def test_rms_norm_vpu_params_come_from_the_opcompiler(
 
 
 @requires_live
-def test_fusion_is_idempotent_on_real_graph(phase_source_of_real_graph) -> None:
-    """`-pim-fuse-activation` 跑前跑后 `activation` 个数不变。
+def test_fusion_count_matches_across_layers_on_real_graph(phase_source_of_real_graph) -> None:
+    """两层融合口径一致：发射的独立 `pim.lut` 全部被算子层折回主算子。
 
-    图编译器已经把激活折进主算子了，所以这一遍应该无事可做。个数变多说明
-    我方漏折了某处（pass 替我们补上），变少说明 pass 不认我方的表达——
-    两种都是口径不一致，要查。
+    发射端不预写 activation，激活按图上拓扑发成独立 LUT；`-pim-fuse-activation`
+    折完后，带 activation 的算子数必须等于发射的 LUT 数，且不再剩独立 LUT。
     """
     import re
 
     source = phase_source_of_real_graph
     pattern = r"activation = #pim\.act_spec"
-    before = len(re.findall(pattern, source.mlir))
+    luts = len(re.findall(r"pim\.lut %y", source.mlir))
+    assert len(re.findall(pattern, source.mlir)) == 0, "发射端不该预写 activation"
     after = len(re.findall(pattern, source.expanded))
-    assert before == after, f"融合口径不一致: 发射 {before} 个，展开后 {after} 个"
+    assert after == luts, f"融合口径不一致: 发射 LUT {luts} 个，折入 {after} 个"
     # gate_proj 的 SiLU 至少要有一个，否则这条校验是空转。
-    assert before >= 1
+    assert luts >= 1
 
 
 @requires_live

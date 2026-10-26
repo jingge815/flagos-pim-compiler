@@ -522,3 +522,330 @@ def test_split_head_graph_has_rules_for_every_device_op() -> None:
         assert spec is not None, f"{node.name} 没有拿到布局规格"
         assert spec.device == "dpu", f"{node.name} 落到了 {spec.device}"
     assert edges is not None
+
+
+def test_weight_slice_keeps_the_weight_shard() -> None:
+    """切权重得到的片段保持权重的切分布局，而不是变成复制。
+
+    分块沿输出特征维切开 linear 的权重。视图规则会把切片输出判成复制，
+    下游 linear 只接受按列或按行切分的权重，于是整条编译失败。
+    """
+    from graph.strategy import ShardStrategy
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("up_proj_weight")
+    part = graph.call_function(torch.ops.aten.slice.Tensor, (w, 0, 0, 32))
+    out = graph.call_function(torch.ops.aten.linear.default, (x, part))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("up_proj_weight", torch.empty(64, 64))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 4, 64)
+    w.meta["val"] = torch.empty(64, 64)
+    part.meta["val"] = torch.empty(32, 64)
+    out.meta["val"] = torch.empty(1, 4, 32)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("up_proj_weight", "col"),))
+
+    propagate_specs(gm, strategy)
+
+    spec = part.meta[SPEC_META_KEY]
+    assert spec.placement.kind == "Shard", spec.placement
+    assert spec.placement.dim == 0, spec.placement
+
+
+def _slice_ranges(node):
+    """每台 DPU 在这个切片上持有的全局区间。"""
+    spec = node.meta[SPEC_META_KEY]
+    return {dpu: (det.start_idx, det.end_idx)
+            for dpu, det in spec.shard_map.items()}
+
+
+def test_weight_slice_ranges_follow_the_sliced_span() -> None:
+    """按列切的权重被沿行切开后，每台只保留与自己持有区间的交集。
+
+    权重按连续的行段分给各台，一台拿不到别人的行。分块再沿行切开时，
+    每段只落在持有这些行的台上，而不是把每段的行重新对半。352 行两台各
+    持 176 行，176 之前的段全在第一台，之后的全在第二台。
+    """
+    from graph.opt_passes import optimize_graph
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("gate_proj_weight")
+    out = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("gate_proj_weight", torch.empty(352, 64, dtype=torch.float16))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 8, 64, dtype=torch.float16)
+    w.meta["val"] = torch.empty(352, 64, dtype=torch.float16)
+    out.meta["val"] = torch.empty(1, 8, 352, dtype=torch.float16)
+    partition_graph(gm)
+    optimize_graph(gm, wram_bytes=4096, tp_width=2)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("gate_proj_weight", "col"),))
+
+    propagate_specs(gm, strategy)
+
+    # 每台持有的全局行段，取自权重本身的切分。
+    held = {dpu: (det.start_idx, det.end_idx)
+            for dpu, det in w.meta[SPEC_META_KEY].shard_map.items()}
+    assert held == {0: (0, 176), 1: (176, 352)}, held
+    # 只看直接切权重行的切片。归约维切片和嵌套切片的起点会和它重复，
+    # 用起点当键会把行切片的区间覆盖掉。
+    slices = [n for n in gm.graph.nodes
+              if n.target is torch.ops.aten.slice.Tensor and int(n.args[1]) == 0
+              and n.args[0].op == "get_attr"]
+    ranges = {}
+    for node in slices:
+        start = int(node.args[2])
+        ranges[start] = _slice_ranges(node)
+    # 行被切成 16 一段。每段只落在持有这些行的台上：176 之前全在第一台，
+    # 之后全在第二台，没有一段被重新对半。
+    assert len(ranges) == 352 // 16
+    assert ranges[0] == {0: (0, 16)}, ranges[0]
+    assert ranges[176 - 16] == {0: (160, 176)}, ranges[176 - 16]
+    assert ranges[176] == {1: (176, 192)}, ranges[176]
+    assert ranges[352 - 16] == {1: (336, 352)}, ranges[352 - 16]
+
+
+def test_weight_slice_rows_split_evenly_inside_each_span() -> None:
+    """按列切的权重被沿行切开后，每台只持有落在自己行段里的那些行。
+
+    352 行两台各持 176 行。分块按 16 行一段切开，176 之前的段全在第一台，
+    之后的全在第二台。把每段对半会分给没有这些行的台。
+    """
+    from graph.opt_passes import optimize_graph
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("gate_proj_weight")
+    out = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("gate_proj_weight", torch.empty(352, 64, dtype=torch.float16))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 8, 64, dtype=torch.float16)
+    w.meta["val"] = torch.empty(352, 64, dtype=torch.float16)
+    out.meta["val"] = torch.empty(1, 8, 352, dtype=torch.float16)
+    partition_graph(gm)
+    optimize_graph(gm, wram_bytes=4096, tp_width=2)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("gate_proj_weight", "col"),))
+
+    propagate_specs(gm, strategy)
+
+    # 只看沿切分轴（行）的切片，归约维切片的起点会和行切片重复。
+    slices = [n for n in gm.graph.nodes
+              if n.target is torch.ops.aten.slice.Tensor and int(n.args[1]) == 0
+              and n.meta[SPEC_META_KEY].placement.kind == "Shard"]
+    rows = {}
+    for node in slices:
+        start = int(node.args[2])
+        spec = node.meta[SPEC_META_KEY]
+        rows[start] = {dpu: det.local_shape[0] for dpu, det in spec.shard_map.items()}
+    # 每段 16 行，且整段落在持有它的那一台，不与另一台对半。
+    assert rows[0] == {0: 16}, rows[0]
+    assert rows[160] == {0: 16}, rows[160]
+    assert rows[176] == {1: 16}, rows[176]
+    assert rows[336] == {1: 16}, rows[336]
+
+
+def test_nested_weight_slice_keeps_the_shard() -> None:
+    """权重先按输出特征切、再按归约维切时，第二刀仍然保持切分。
+
+    两维同时切会产生切片套切片。第二刀的源是第一刀而不是 `get_attr`，
+    按「源必须是 get_attr」判定会把它当成普通视图判成复制，linear 随后
+    因为拿到复制的权重而报不支持的布局。归约维不是切分轴，切完每台
+    持有的行不变，只是变短。
+    """
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("gate_proj_weight")
+    outer = graph.call_function(torch.ops.aten.slice.Tensor, (w, 0, 0, 8))
+    inner = graph.call_function(torch.ops.aten.slice.Tensor, (outer, 1, 0, 4))
+    out = graph.call_function(torch.ops.aten.linear.default, (x, inner))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("gate_proj_weight", torch.empty(16, 8))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 2, 4)
+    w.meta["val"] = torch.empty(16, 8)
+    outer.meta["val"] = torch.empty(8, 8)
+    inner.meta["val"] = torch.empty(8, 4)
+    out.meta["val"] = torch.empty(1, 2, 8)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("gate_proj_weight", "col"),))
+
+    propagate_specs(gm, strategy)
+
+    spec = inner.meta[SPEC_META_KEY]
+    assert spec.placement == Placement("Shard", 0), spec.placement
+    # 第一刀取了前 8 行，整段落在持有 [0,8) 的第一台上。
+    assert _slice_ranges(inner) == {0: (0, 8)}, _slice_ranges(inner)
+    for det in spec.shard_map.values():
+        # 归约维被切短到 4，持有的行数不变。
+        assert det.local_shape == (8, 4), det.local_shape
+
+
+def test_weight_slice_on_the_shard_axis_clips_to_its_span() -> None:
+    """切片切的就是切分轴时，每台只保留与切片区间的交集。
+
+    按行切沿权重第 1 维分片，两台各持有 2048 列。切片取第 1024 到 3072 列，
+    横跨两台的分界：每台只持有其中落在自己分片里的 1024 列。照搬整块权重的
+    切分会让每台各拿 1024 列且都从第 0 列算起，两台拿到同一批列。
+    """
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("down_proj_weight")
+    part = graph.call_function(torch.ops.aten.slice.Tensor, (w, 1, 1024, 3072))
+    out = graph.call_function(torch.ops.aten.linear.default, (x, part))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("down_proj_weight", torch.empty(2048, 4096))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 4, 2048)
+    w.meta["val"] = torch.empty(2048, 4096)
+    part.meta["val"] = torch.empty(2048, 2048)
+    out.meta["val"] = torch.empty(1, 4, 2048)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("down_proj_weight", "row"),))
+
+    propagate_specs(gm, strategy)
+
+    spec = part.meta[SPEC_META_KEY]
+    assert spec.placement == Placement("Shard", 1), spec.placement
+    assert _slice_ranges(part) == {0: (1024, 2048), 1: (2048, 3072)}
+    for det in spec.shard_map.values():
+        assert det.local_shape == (2048, 1024), det.local_shape
+
+
+def test_tiled_row_sharded_weight_propagates() -> None:
+    """按行切的权重被分块切开后，拼接结果仍能传播。
+
+    行切的 linear 产出部分和，视图规则拒绝部分和输入。分块沿特征维
+    切开再拼回时，每段要先归约成复制，拼接才成立。
+    """
+    from graph.strategy import ShardStrategy
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("down_proj_weight")
+    part = graph.call_function(torch.ops.aten.slice.Tensor, (w, 0, 0, 32))
+    tile = graph.call_function(torch.ops.aten.linear.default, (x, part))
+    out = graph.call_function(torch.ops.aten.cat.default, ([tile], -1))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("down_proj_weight", torch.empty(64, 64))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 4, 64)
+    w.meta["val"] = torch.empty(64, 64)
+    part.meta["val"] = torch.empty(32, 64)
+    tile.meta["val"] = torch.empty(1, 4, 32)
+    out.meta["val"] = torch.empty(1, 4, 32)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("down_proj_weight", "row"),))
+
+    propagate_specs(gm, strategy)
+
+    assert out.meta[SPEC_META_KEY].placement.kind == "Replicate"
+
+
+def test_cat_of_aligned_column_shards_stays_sharded() -> None:
+    """沿拼接维切分且切分对齐的几段拼接后，每台只拼自己的列，不先聚成副本。
+
+    权重按列切成两台各 6 行，沿行切成三段 [0:4)、[4:8)、[8:12)：第一段整段
+    在第一台、中段跨分界、第三段整段在第二台。三段拼接后每台持有的列正好
+    是完整输出的连续一半，不需要先各聚成完整副本再拼。
+    """
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("w")
+    parts = []
+    for start, end in ((0, 4), (4, 8), (8, 12)):
+        sliced = graph.call_function(torch.ops.aten.slice.Tensor, (w, 0, start, end))
+        parts.append(graph.call_function(torch.ops.aten.linear.default, (x, sliced)))
+    cat = graph.call_function(torch.ops.aten.cat.default, (parts, 2))
+    graph.output(cat)
+    mod = torch.nn.Module()
+    mod.register_buffer("w", torch.empty(12, 4))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 2, 4)
+    w.meta["val"] = torch.empty(12, 4)
+    for node in gm.graph.nodes:
+        if node.target is torch.ops.aten.slice.Tensor:
+            node.meta["val"] = torch.empty(4, 4)
+        elif node.target is torch.ops.aten.linear.default:
+            node.meta["val"] = torch.empty(1, 2, 4)
+    cat.meta["val"] = torch.empty(1, 2, 12)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("w", "col"),))
+
+    edges = propagate_specs(gm, strategy)
+
+    spec = cat.meta[SPEC_META_KEY]
+    assert spec.placement == Placement("Shard", 2), spec.placement
+    assert _slice_ranges(cat) == {0: (0, 6), 1: (6, 12)}, _slice_ranges(cat)
+    gathered = [e for e in edges if e.dst == cat.name and e.type == "all_gather"]
+    assert not gathered, f"切分对齐的拼接仍聚合了 {[e.src for e in gathered]}"
+
+
+def test_two_axis_tile_propagates_without_all_gather() -> None:
+    """两维同时切时，拼接结果保持切分，不再退回全聚合。
+
+    预算小到必须同时切输出特征维和归约维。权重按列切成两台，每段 linear
+    的输出应跟着权重行走，沿特征维拼回后每台只持有自己的列。用归约维的
+    切片起点去减行号会得到负区间，传播直接报错；退回全聚合则会给拼接
+    插入 all_gather，把分块省下的通信加倍搬回来。
+    """
+    from graph.opt_passes import optimize_graph
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("gate_proj_weight")
+    out = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    graph.output(out)
+    mod = torch.nn.Module()
+    mod.register_buffer("gate_proj_weight", torch.empty(64, 64, dtype=torch.float16))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 4, 64, dtype=torch.float16)
+    w.meta["val"] = torch.empty(64, 64, dtype=torch.float16)
+    out.meta["val"] = torch.empty(1, 4, 64, dtype=torch.float16)
+    partition_graph(gm)
+    # 预算 256 字节时 M、N、K 都要切，必然出现切片套切片。
+    # 浮点按提升到 float32 后的宽度计，128 字节已经没有任何切法压得进。
+    optimize_graph(gm, wram_bytes=256, tp_width=2)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("gate_proj_weight", "col"),))
+
+    edges = propagate_specs(gm, strategy)
+
+    cats = [n for n in gm.graph.nodes if n.target is torch.ops.aten.cat.default]
+    assert cats, "两维切分应产生拼接"
+    # 沿输出特征维拼回的那一层，结果应保持切分。
+    feature_cats = [n for n in cats
+                    if int(n.args[1]) == n.meta["val"].ndim - 1]
+    assert feature_cats, "没有沿特征维的拼接"
+    for cat in feature_cats:
+        spec = cat.meta[SPEC_META_KEY]
+        assert spec.placement.kind == "Shard", spec.placement
+        for det in spec.shard_map.values():
+            assert det.start_idx >= 0, det
+    gathered = [e for e in edges
+                if e.dst in {c.name for c in feature_cats} and e.type == "all_gather"]
+    assert not gathered, f"两维切分的拼接退回了全聚合 {[e.src for e in gathered]}"

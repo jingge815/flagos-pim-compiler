@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict
 from torch.fx import GraphModule
 
 from contracts.graph_meta import (DEVICE_DPU, FUSED_TAIL_META_KEY, REDISTRIBUTE_META_KEY, SPEC_META_KEY)
+from graph.spec_prop import _consumers_through_slices
 
 if TYPE_CHECKING:  # 只为类型标注；运行时不拖进算子编译那条依赖链。
     from contracts.op_contract import PIMHardwareConfig
@@ -50,9 +51,9 @@ _ROLE_TO_WEIGHT_PATTERN = {
 def _activation_of(weight_node) -> str | None:
     """权重节点被折进主算子的激活名，没折过就是 None。
 
-    标记打在 linear 节点上，而 linear 是权重节点的用户。
+    标记打在 linear 节点上。分块后权重先经切片、类型转换才到 linear 子块，要穿过它们找。
     """
-    for user in weight_node.users:
+    for user in _consumers_through_slices(weight_node):
         tail = user.meta.get(FUSED_TAIL_META_KEY)
         if tail is not None:
             return tail.activation
@@ -95,7 +96,7 @@ def _export_seq_len(edge, export_seq_len: int) -> int | None:
 def _fused_activations(gm: GraphModule) -> list[dict]:
     """图上被折进主算子的激活，按层与投影身份列出。
 
-    只认 `FUSED_TAIL_META_KEY`：权重节点的用户带这个标记，才说明图编译器
+    只认 `FUSED_TAIL_META_KEY`：权重的 linear 消费者带这个标记，才说明图编译器
     真的折过。模型 IR 里 gate 投影后接 silu 只是图的形状，不算数。
     """
     found = []
@@ -105,12 +106,11 @@ def _fused_activations(gm: GraphModule) -> list[dict]:
                 continue
             # 目标形如 model.model.layers.0.mlp.gate_proj.weight，层号在 layers 后。
             layer = int(str(node.target).split("layers.")[1].split(".")[0])
-            for user in node.users:
-                tail = user.meta.get(FUSED_TAIL_META_KEY)
-                if tail is None:
-                    continue
+            # 分块后一块权重对应多个子块，激活相同，只记一条。
+            activation = _activation_of(node)
+            if activation is not None:
                 found.append({
-                    "layer": layer, "role": role, "activation": tail.activation,
+                    "layer": layer, "role": role, "activation": activation,
                 })
     return found
 
@@ -164,6 +164,8 @@ def _measure_kernel_tile_n(
         hardware=hw,
         dtype=dtype,
         num_tasklets=hw.num_tasklets,
+        # 激活随请求下发，由算子层 -pim-fuse-activation 折进 tt.dot。
+        activation=activation,
     )
     result = compile_op(request)
     if not result.pimir:
@@ -191,26 +193,8 @@ def _measure_kernel_tile_n(
             "GeneSim 侧要照这份 IR 生成 trace，缺了路径就只能退回手写模板。"
         )
     pimir_path = str(result.pimir_path)
-    if activation:
-        # 激活标在 A 路的 tt.dot 上，不换建模口径：B 路相位链会把乘加循环
-        # 收成一条指令，计算项归零。
-        pimir_path = _annotate_linear_activation(
-            result.pimir, pimir_path, activation)
     cache[key] = (tile_n, pimir_path, cost.mram_bytes_per_dpu)
     return cache[key]
-
-
-def _annotate_linear_activation(
-    pimir: str, src_path: str, activation: str,
-) -> str:
-    """把激活属性写进 A 路分块 GEMM，返回新文件路径。"""
-    from genesim_bridge.ir_cost import mark_fused_activation
-
-    marked = mark_fused_activation(pimir, activation)
-    out = Path(src_path).with_name(
-        f"{Path(src_path).stem}.{activation}.pimir.mlir")
-    out.write_text(marked)
-    return str(out)
 
 
 def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:

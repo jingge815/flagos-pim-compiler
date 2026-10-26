@@ -4,7 +4,7 @@
 
     融合后的 FX 图
       → oplevel_emitter.emit_oplevel_mlir   整算子级 PIM MLIR
-      → triton-opt -pim-fuse-activation -pim-expand-phases -pim-verify-gml-contract
+      → triton-opt <b_path_passes()>                顺序的真源在 pipeline.py
       → phase_plan.parse_phase_plans        {函数名: PhasePlan}
       → 本模块按 FX 节点名重新索引          {FX 节点名: {kind: PhasePlan}}
 
@@ -38,8 +38,11 @@ from opcompiler_bridge.phase_plan import PhasePlan, parse_phase_plans
 # `-pim-fuse-activation` 认的 `pim.matmul + pim.lut` 模式就不在了；
 # 而 `-pim-verify-gml-contract` 查的是跨属性的不变量（相位数连续、
 # DQ 相 1/2 扇出读相 0），展开前那些相位链根本不存在。
-PASS_PIPELINE = ("-pim-fuse-activation", "-pim-expand-phases",
-                 "-pim-verify-gml-contract")
+from opcompiler_bridge.pipeline import b_path_passes
+
+# 顺序的真源在 pipeline.py：先融合再展开，优化作用于展开后的相位链，最后校验。
+# 不分块：GML 按整块算子编码，与图层 GML 路关分块是同一个例外。
+PASS_PIPELINE = tuple(p for p in b_path_passes() if p != "-pim-tile-to-budget")
 
 
 # 模块级 RTL 版本属性。FlagTree 侧的名字是 `pim.rtl-version`（Dialect.h 的

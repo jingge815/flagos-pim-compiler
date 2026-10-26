@@ -140,22 +140,33 @@ def _redistribute_edges_landing_on(dpu_nodes: list[Node], dpu_id: int) -> dict[i
 def redistribute_landing_tensors(
     dpu_nodes: list[Node], dpu_id: int, node_step: dict[Node, int], edge_step: dict[int, int]
 ) -> list[TransientTensor]:
-    """返回落在指定 DPU 的重分布缓冲及其生命周期。"""
-    tensors: list[TransientTensor] = []
+    """返回落在指定 DPU 的重分布缓冲及其生命周期。
+
+    同一份源张量搬到同一组 DPU 只发一条边（spec_prop 的 `_append_edge`
+    去重），这条边挂在每个消费者上。落地缓冲只有一块，生命周期必须并到
+    最后一个读者、读者集合取全部；按消费者各记一份会让缓冲被提前复用，
+    后面的消费者读到覆盖后的数据。
+    """
+    merged: dict[int, TransientTensor] = {}
     for node in dpu_nodes:
         for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
             if edge.dst_loc.get("device") != DEVICE_DPU or dpu_id not in edge.dst_loc.get("dpus", []):
                 continue
+            entry = merged.get(edge.edge_id)
+            if entry is not None:
+                entry.last_read_at = max(entry.last_read_at, node_step[node])
+                entry.readers.append(node.name)
+                continue
             detail = edge.dst_spec.shard_map[dpu_id]
             itemsize = dtype_bytes(edge.dtype)
-            tensors.append(TransientTensor(
+            merged[edge.edge_id] = TransientTensor(
                 name=f"redist_dst:e{edge.edge_id}",
                 size=bytes_of(detail.local_shape, itemsize, detail.elem_strides),
                 produced_at=edge_step[edge.edge_id],
                 last_read_at=node_step[node],
                 readers=[node.name],
-            ))
-    return tensors
+            )
+    return list(merged.values())
 
 
 def transient_tensors(dpu_nodes: list[Node], dpu_id: int) -> list[TransientTensor]:

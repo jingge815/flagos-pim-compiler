@@ -871,6 +871,51 @@ def test_graph_and_driver_emit_the_same_rope_and_matmul_text() -> None:
     assert "-> tensor<8x64xi8>" in fused
 
 
+@pytest.mark.parametrize("shape, group, fp16", [
+    (((16, 128), (128, 8)), 64, False),
+    (((12, 96), (96, 6)), None, False),
+    (((8, 32), (32, 16)), None, True),
+])
+def test_tiled_matmul_matches_untiled(shape, group, fp16) -> None:
+    """B 路超预算的矩阵乘分块后编成 C，与不分块逐元素相同，与镜像一致。
+
+    分块只改循环结构，同一个输出元素的累加顺序不变，所以必须逐位相等。
+    预算压到 1024 字节，确认分块确实触发，`tile` 属性落在算子上。
+    """
+    (m, k), (_, n) = shape
+    dtype = "float16" if fp16 else "int8"
+    small = dataclasses.replace(_HARDWARE, wram_bytes_per_dpu=1024)
+    tiled = OpCompileRequest(op="matmul", arg_shapes=list(shape),
+                             hardware=small, dtype=dtype, group_size=group)
+    plain = dataclasses.replace(tiled, hardware=_HARDWARE)
+    tiled_result = compile_op(tiled, force=True)
+    plain_result = compile_op(plain, force=True)
+    assert "tile = array<i64:" in tiled_result.pimir, tiled_result.pimir
+    assert "tile = array" not in plain_result.pimir
+
+    rng = np.random.default_rng(13)
+    if fp16:
+        a = rng.standard_normal((m, k)).astype(np.float16)
+        w = rng.standard_normal((k, n)).astype(np.float16)
+        inputs, out_dtype = (a, w), np.float16
+    else:
+        a = rng.integers(-8, 8, size=(m, k)).astype(np.int8)
+        w = rng.integers(-8, 8, size=(k, n)).astype(np.int8)
+        inputs, out_dtype = (a, w), np.int8
+        if group:
+            scales = rng.uniform(0.05, 0.6, size=(k // group, n)).astype(np.float16)
+            inputs = (a, w, scales)
+    got = _call(load_kernel(tiled_result), *inputs, out_shape=(m, n),
+                out_dtype=out_dtype)
+    ref = _call(load_kernel(plain_result), *inputs, out_shape=(m, n),
+                out_dtype=out_dtype)
+    assert np.array_equal(got, ref), f"分块后差 {int((got != ref).sum())} 个元素"
+    if not fp16:
+        mirror = mirrors.matmul(a, w, group_size=group,
+                                scales=inputs[2] if group else 1.0)
+        assert np.array_equal(got, mirror)
+
+
 def test_unknown_op_name_is_refused_with_a_readable_error() -> None:
     """名字不认识要在这里就说清楚，不能落进 A 路去解包 `arg_shapes[1]`。
 
@@ -1424,3 +1469,105 @@ def test_fallback_is_recorded(monkeypatch) -> None:
     counts = km.route_counts()
     assert counts.get(("softmax", "fallback"), 0) >= 1, counts
     assert counts.get(("softmax", "hit"), 0) == 0, counts
+
+
+# 融合 pass 放得进主算子的激活 → 闭式参照。两张表必须一致：融合放行、
+# 降级却没有 C 时，错误会从独立 pim.lut 挪到主算子上。
+_FUSABLE_ACTIVATIONS = {
+    "relu": lambda x: np.maximum(x, 0.0),
+    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
+    "tanh": np.tanh,
+    "gelu": lambda x: 0.5 * x * (1.0 + np.tanh(
+        np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3))),
+    "exp": np.exp,
+    "sqrt": lambda x: np.sqrt(np.abs(x)),
+    "reciprocal": lambda x: 1.0 / x,
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_FUSABLE_ACTIVATIONS))
+def test_fused_eltwise_activation_lowers_to_c(kind) -> None:
+    """eltwise 后接独立 pim.lut：B 路折进主算子，降到 C 后与闭式一致。"""
+    import ctypes
+
+    from opcompiler_bridge.driver import _run_oplevel_triton_opt, _translate_to_c
+    from opcompiler_bridge.oplevel_kernel import eltwise_kernel
+
+    body = eltwise_kernel("kernel", (2, 8), "add", trailing_activation=kind)
+    pimir, emitc = _run_oplevel_triton_opt(
+        f'module attributes {{pim.target = "pim:v1"}} {{\n{body}\n}}\n')
+    assert "pim.lut" not in pimir, f"{kind} 没有折进 eltwise"
+    assert f"#pim.act_spec<kind = {kind}" in pimir
+
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        c_path = Path(tmp) / "k.c"
+        so_path = Path(tmp) / "k.so"
+        c_path.write_text("#include <stdint.h>\n#include <stdlib.h>\n"
+                          "#include <math.h>\n#include <stdbool.h>\n"
+                          + _translate_to_c(emitc))
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", str(so_path),
+                        str(c_path), "-lm"], check=True)
+        fn = ctypes.CDLL(str(so_path)).kernel
+        rng = np.random.default_rng(7)
+        a = (rng.standard_normal((2, 8)) + 1.5).astype(np.float16)
+        b = (rng.standard_normal((2, 8)) * 0.5).astype(np.float16)
+        if kind in ("sqrt", "reciprocal"):
+            b = np.abs(b) + np.float16(0.5)
+            a = np.abs(a) + np.float16(0.5)
+        got = _call(fn, a, b, out_shape=(2, 8)).astype(np.float32)
+    s = a.astype(np.float32) + b.astype(np.float32)
+    ref = _FUSABLE_ACTIVATIONS[kind](s)
+    np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
+
+
+def test_fused_leaky_relu_keeps_its_slope_in_c() -> None:
+    """leaky_relu 的 alpha 随属性折进主算子，C 里按这个斜率算。"""
+    import ctypes
+    import subprocess
+    import tempfile
+
+    from opcompiler_bridge.driver import _run_oplevel_triton_opt, _translate_to_c
+
+    ty = "tensor<2x8xf16>"
+    text = f'''module attributes {{pim.target = "pim:v1"}} {{
+  tt.func @kernel(%a: {ty}, %b: {ty}) {{
+    %y = pim.eltwise %a, %b
+       {{kind = #pim.eltwise<add>,
+         datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>}}
+       : {ty}, {ty} -> {ty}
+    %z = pim.lut %y {{kind = #pim.activation<leaky_relu>, alpha = 0.25 : f64}} : {ty} -> {ty}
+    tt.return
+  }}
+}}
+'''
+    pimir, emitc = _run_oplevel_triton_opt(text)
+    assert "pim.lut" not in pimir
+    with tempfile.TemporaryDirectory() as tmp:
+        c_path, so_path = Path(tmp) / "k.c", Path(tmp) / "k.so"
+        c_path.write_text("#include <stdint.h>\n#include <stdlib.h>\n"
+                          "#include <math.h>\n#include <stdbool.h>\n"
+                          + _translate_to_c(emitc))
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", str(so_path),
+                        str(c_path), "-lm"], check=True)
+        fn = ctypes.CDLL(str(so_path)).kernel
+        rng = np.random.default_rng(9)
+        a = rng.standard_normal((2, 8)).astype(np.float16)
+        b = rng.standard_normal((2, 8)).astype(np.float16)
+        got = _call(fn, a, b, out_shape=(2, 8)).astype(np.float32)
+    s = a.astype(np.float32) + b.astype(np.float32)
+    np.testing.assert_allclose(got, np.where(s > 0, s, 0.25 * s),
+                               rtol=2e-3, atol=2e-3)
+
+
+def test_gelu_gate_matmul_lowers_to_c() -> None:
+    """gelu 在门控激活表里：矩阵乘后接 gelu 走 B 路要能折进并编出 C。"""
+    from opcompiler_bridge.driver import _run_oplevel_triton_opt
+    from opcompiler_bridge.oplevel_kernel import matmul_kernel
+
+    body = matmul_kernel("kernel", 4, 64, 64, trailing_activation="gelu")
+    pimir, emitc = _run_oplevel_triton_opt(
+        f'module attributes {{pim.target = "pim:v1"}} {{\n{body}\n}}\n')
+    assert "pim.lut" not in pimir
+    assert "#pim.act_spec<kind = gelu" in pimir
+    assert "pim_lut_gelu" in emitc

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .flagtree_driver import lower_oplevel_to_pimir, run_and_capture
-from .ir_cost import analyze_ir, mark_fused_activation
+from .ir_cost import analyze_ir
 from .op_classify import (
     UNCOVERED_OP_TYPES,
     OpRecipe,
@@ -80,6 +80,9 @@ def _measure(
 
     if ir_level == "oplevel":
         return _measure_oplevel(recipe, op_dict, point, local_features)
+    if op_type == "GEMM":
+        return _measure_gemm_linear(op_dict, point, in_features, out_features,
+                                    local_features, ir_level)
 
     if recipe.build is None:
         raise ValueError(
@@ -121,9 +124,6 @@ def _measure(
     pim_kernels: List[Dict[str, Any]] = []
     for cap in captured:
         text = cap.pimir if pimir else cap.ttir
-        # A 路 kernel 本身不带激活：图编译器折了的，标到 tt.dot 上再计费。
-        if pimir and op_dict.get("fused_activation") and text:
-            text = mark_fused_activation(text, op_dict["fused_activation"])
         cost = analyze_ir(text, cap.name, cap.grid, cap.arg_values, ir_level=ir_level)
         total_flops += cost.flops
         dtype = cost.dtype
@@ -144,6 +144,52 @@ def _measure(
         notes=notes,
         mram_traffic_bytes=total_mram if pimir else None,
         pim_kernels=pim_kernels,
+        local_features=local_features,
+    )
+
+
+def _measure_gemm_linear(
+    op_dict: dict,
+    point: ShapePoint,
+    in_features: int,
+    out_features: int,
+    local_features: Optional[Tuple[int, int]],
+    ir_level: str,
+) -> Measurement:
+    """A 路 GEMM：用本仓 linear 内核测量，与放置导出同一口径。
+
+    ttir 与 pimir 两级测同一个内核，两路才逐算子可比。折进主算子的激活随
+    编译请求下发，由算子层 `-pim-fuse-activation` 折进 tt.dot。
+    """
+    from contracts.op_contract import OpCompileRequest, PIMHardwareConfig
+    from opcompiler_bridge.driver import _make_ttir, compile_op
+
+    opts = pim_options()
+    hardware = PIMHardwareConfig(
+        num_dpus=opts["pim_num_dpus"], num_tasklets=opts["pim_num_tasklets"],
+        mram_bytes_per_dpu=opts["pim_mram_bytes"],
+        wram_bytes_per_dpu=opts["pim_wram_bytes"], dma_align=opts["pim_dma_align"])
+    request = OpCompileRequest(
+        op="linear", arg_shapes=[(point.tq, in_features), (out_features, in_features)],
+        hardware=hardware, dtype="float16", num_tasklets=hardware.num_tasklets,
+        activation=op_dict.get("fused_activation"))
+    pimir = ir_level == "pimir"
+    if pimir:
+        result = compile_op(request)
+        text = result.pimir if result.pimir is not None else Path(result.pimir_path).read_text()
+    else:
+        text = _make_ttir(request)
+    cost = analyze_ir(text, "linear_kernel", (1,), {}, ir_level=ir_level)
+    return Measurement(
+        point=point,
+        flops=cost.flops,
+        data_bytes=_net_data_bytes(op_dict, point, cost.element_bytes, local_features),
+        dtype=cost.dtype,
+        element_bytes=cost.element_bytes,
+        kernel_ids=[f"{cost.kernel_name}@grid{list(cost.grid)}"],
+        notes=list(cost.notes),
+        mram_traffic_bytes=cost.mram_traffic_bytes if pimir else None,
+        pim_kernels=[_pim_kernel_dict(cost)] if pimir else [],
         local_features=local_features,
     )
 

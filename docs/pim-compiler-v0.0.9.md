@@ -429,6 +429,7 @@ git clone https://github.com/pimtools/genesim.git
 
 cd /path/genesim
 ./install.sh --skip-attacc --torch-cpu
+uv pip install "torch-geometric==2.8.0.post1"
 ```
 
 `--skip-attacc` 跳过 AttAcc/Ramulator2 的克隆和编译，PIM 仿真用内置回退。

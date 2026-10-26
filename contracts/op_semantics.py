@@ -181,6 +181,26 @@ def aten_to_gml() -> dict:
     return out
 
 
+# 可折叠：纯算子里真正有计算的那部分。形状类（reshape、transpose、squeeze）
+# 不折：它们不产生新数值，折掉会改变切分传播看到的节点，跨段通信边随之变化。
+FOLDABLE = frozenset({
+    "add.Tensor", "mul.Tensor", "sub.Tensor", "div.Tensor",
+    "neg.default", "tanh.default", "relu.default", "sigmoid.default",
+    "exp.default", "sqrt.default", "reciprocal.default", "rsqrt.default",
+    "silu.default", "pow.Tensor_Scalar",
+})
+
+# 纯逐元素：不改变形状的纯算子。融合只在这张表里配对，
+# 含归约或形状变化的算子因此不会被合并。
+ELEMENTWISE = frozenset({
+    "add.Tensor", "mul.Tensor", "sub.Tensor", "div.Tensor",
+    "neg.default", "tanh.default", "relu.default", "sigmoid.default",
+    "exp.default", "sqrt.default", "reciprocal.default", "rsqrt.default",
+    "silu.default", "pow.Tensor_Scalar", "gelu.default", "leaky_relu.default",
+    "clone.default",
+})
+
+
 def role_to_gml() -> dict:
     """角色 → GML op_type。取代 from_fx.py 的 _ROLE_OP_TYPES。
 

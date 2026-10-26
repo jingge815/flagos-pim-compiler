@@ -250,3 +250,41 @@ def test_unrelated_scalar_division_is_not_absorbed() -> None:
     graph = _aten_graph(
         Scaled(), torch.randn(2, 4, 8), torch.randn(2, 8, 4))
     assert _absorb_attention_scale(graph) == 0
+
+
+def test_silu_after_float_cast_is_folded_into_its_gemm() -> None:
+    """`linear -> to.dtype(float32) -> silu` 同样折进 Gemm，GML 才有 contraction 块。"""
+    from graph.fuse_pim import _fuse_activations
+
+    class CastGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.randn(128, 64, dtype=torch.float16))
+
+        def forward(self, x):
+            return torch.nn.functional.silu(
+                torch.nn.functional.linear(x, self.w).to(torch.float32))
+
+    gm = _aten_graph(CastGate(), torch.randn(4, 64, dtype=torch.float16))
+    assert _fuse_activations(gm) == 1
+    (host,) = [n for n in gm.graph.nodes if FUSED_TAIL_META_KEY in n.meta]
+    assert host.target is torch.ops.aten.linear.default
+    (silu,) = [n for n in gm.graph.nodes if n.target is torch.ops.aten.silu.default]
+    assert silu.meta.get(ABSORBED_META_KEY)
+
+
+def test_silu_after_integer_cast_is_not_folded() -> None:
+    """转成整数后再接激活，挪到转换前算值就变了，不折。"""
+    from graph.fuse_pim import _fuse_activations
+
+    class IntGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.randn(128, 64))
+
+        def forward(self, x):
+            return torch.relu(
+                torch.nn.functional.linear(x, self.w).to(torch.int32))
+
+    gm = _aten_graph(IntGate(), torch.randn(4, 64))
+    assert _fuse_activations(gm) == 0

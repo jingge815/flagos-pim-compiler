@@ -201,7 +201,11 @@ _ATEN_TO_PIM_OP = {
 
 
 def _cpp_fusion_targets() -> set[str]:
-    """从 `FuseActivation.cpp` 的 `isFusionTarget` 里抽出 op 类名集合。"""
+    """FlagTree 里能持有折入激活的算子类名。
+
+    `isFusionTarget` 不再按名字列举，改认「带 `activation` 属性位」的算子，
+    所以这里从 ODS 里找声明了 `$activation` 的定义，再还原成类名。
+    """
     import re
 
     from genesim_bridge.paths import flagtree_source
@@ -209,15 +213,15 @@ def _cpp_fusion_targets() -> set[str]:
     root = flagtree_source(required=False)
     if root is None:
         pytest.skip("FlagTree 源码树不在位")
-    source = root / "lib/Dialect/TritonPIM/Transforms/FuseActivation.cpp"
+    source = root / "include/triton/Dialect/TritonPIM/IR/PIMOps.td"
     text = source.read_text()
-    match = re.search(r"isFusionTarget\(Operation \*op\)\s*\{\s*"
-                      r"return\s+isa<([^>]*)>\(op\);", text)
-    assert match, (
-        f"没能在 {source} 里认出 `isFusionTarget` 的 isa<...> 列表。"
-        f"那个函数改了形状，这条测试要跟着改 —— 而不是删掉")
-    return {name.strip() for name in match.group(1).split(",")}
-
+    names = set()
+    for block in re.split(r"\ndef ", "\n" + text):
+        head = re.match(r"TTPIM_(\w+)", block)
+        if head and re.search(r"\$activation\b", block):
+            names.add(head.group(1))
+    assert names, f"没能在 {source} 里找到带 $activation 属性位的算子"
+    return names
 
 def test_main_op_table_agrees_with_flagtrees_isfusiontarget() -> None:
     """本仓每个融合主算子，在 FlagTree 的 `isFusionTarget` 里都要是融合目标。
@@ -262,3 +266,28 @@ def test_flagtree_fusion_targets_match_the_contract() -> None:
     ops = _cpp_fusion_targets()
     assert ops == {"MatmulOp", "ConvOp", "EltwiseOp"}, (
         f"与设计不一致：{sorted(ops)}")
+
+
+def test_flagtree_isfusiontarget_queries_the_activation_attribute() -> None:
+    """`isFusionTarget` 的函数体必须按 `activation` 属性位判定。
+
+    上面两条只核对 ODS 里哪些算子声明了 `$activation`；函数体退回只认
+    `MatmulOp` 时 ODS 不变，它们照样通过。这里直接读函数体，防止退回名单。
+    """
+    import re
+
+    from genesim_bridge.paths import flagtree_source
+
+    root = flagtree_source(required=False)
+    if root is None:
+        pytest.skip("FlagTree 源码树不在位")
+    text = (root / "lib/Dialect/TritonPIM/Transforms/FuseActivation.cpp"
+            ).read_text()
+    match = re.search(r"static bool isFusionTarget\(Operation \*op\) \{(.*?)\n\}",
+                      text, re.S)
+    assert match, "FuseActivation.cpp 里找不到 isFusionTarget"
+    body = re.sub(r"//[^\n]*", "", match.group(1))
+    assert 'getAttr("activation")' in body, body
+    assert "getAttributeNames()" in body and '"activation"' in body, body
+    assert not re.search(r"isa<\s*\w+Op", body), \
+        f"isFusionTarget 退回了按算子名判定：{body}"

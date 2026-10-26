@@ -342,6 +342,167 @@ def test_compiled_linear_handles_non_power_of_two_k_and_n(M, K, N) -> None:
     np.testing.assert_allclose(out, x @ w.T, atol=1e-4)
 
 
+def _run_with_sentinels(result, M, K, N, dtype):
+    """三块缓冲后各接一段哨兵再执行内核，返回输出与三项越界检查。
+
+    读越界会把哨兵带进结果，写越界会改掉输出或输入后面的哨兵。
+    """
+    import ctypes
+
+    from opcompiler_bridge.driver import load_kernel
+
+    fn = load_kernel(result)
+    dt = np.dtype(dtype)
+    guard = 4096
+    rng = np.random.default_rng(5)
+    x = np.concatenate([(rng.standard_normal(M * K) * 0.1).astype(dt),
+                        np.full(guard, 300, dt)])
+    w = np.concatenate([(rng.standard_normal(N * K) * 0.1).astype(dt),
+                        np.full(guard, 300, dt)])
+    out = np.concatenate([np.zeros(M * N, dt), np.full(guard, -7, dt)])
+    x0, w0 = x.copy(), w.copy()
+    fn(x.ctypes.data_as(ctypes.c_void_p), w.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p))
+    assert (out[M * N:] == -7).all(), "尾块写过了输出边界"
+    assert (x == x0).all() and (w == w0).all(), "内核改动了输入缓冲"
+    ref = (x0[:M * K].reshape(M, K).astype(np.float32)
+           @ w0[:N * K].reshape(N, K).astype(np.float32).T)
+    np.testing.assert_allclose(out[:M * N].reshape(M, N).astype(np.float32),
+                               ref, rtol=2e-2, atol=2e-2)
+
+
+def _tiles_of(pimir: str) -> dict:
+    import re
+
+    return {d: int(re.search(rf'"pim\.tile-{d}" = (\d+)', pimir).group(1))
+            for d in "mnk"}
+
+
+@pytest.mark.parametrize(
+    "M, K, N, wram, dtype, tasklets",
+    [
+        (2, 64, 1000, 4096, "float32", 1),      # N 不被 tile-n 整除
+        (9, 48, 1000, 1024, "float32", 1),      # M、N 都有尾块
+        (16, 4096, 11008, 65536, "float16", 1),  # 默认预算下真实 gate_proj 形状
+        (16, 4096, 11008, 65536, "float16", 16),  # 默认 16 tasklet
+    ],
+)
+def test_a_path_tail_tiles_stay_in_bounds(M, K, N, wram, dtype, tasklets) -> None:
+    """A 路 tt.dot 分块的 tile 不整除维度时，尾块不越界、数值不变。"""
+    import dataclasses
+
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import compile_op
+
+    hw = dataclasses.replace(DEFAULT_HARDWARE_CONFIG, num_dpus=1,
+                             num_tasklets=tasklets, wram_bytes_per_dpu=wram)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hw, dtype=dtype,
+        num_tasklets=tasklets), force=True)
+    tiles = _tiles_of(result.pimir)
+    assert M % tiles["m"] or N % tiles["n"] or K % tiles["k"], \
+        f"用例要覆盖不整除的尾块：{tiles}"
+    _run_with_sentinels(result, M, K, N, dtype)
+
+
+@pytest.mark.parametrize(
+    "M, K, N, shard",
+    [
+        (16, 4096, 5504, ("shard", 1, 2)),   # gate_proj tp2 的本地 N
+        (16, 4096, 1376, ("shard", 1, 8)),   # gate_proj tp8 的本地 N
+        (16, 4096, 4000, ("shard", 1, 8)),   # lm_head tp8 的本地 N
+        (1, 4096, 32000, None),              # lm_head 整块，decode 一行
+        (16, 1376, 4096, ("partial", -1, 8)),  # down_proj tp8 行切的部分和
+    ],
+)
+def test_a_path_default_hardware_local_shapes(M, K, N, shard) -> None:
+    """默认 8 DPU、16 tasklet 下，带放置决策的本地形状经 A 路分块后不越界。
+
+    图层块数上限把真实 7B 投影留给 A 路，这里按它们分片后的本地形状编译。
+    """
+    from contracts.op_contract import (
+        DEFAULT_HARDWARE_CONFIG, DpuShard, OpCompileRequest)
+    from opcompiler_bridge.driver import compile_op
+
+    hw = DEFAULT_HARDWARE_CONFIG
+    assert (hw.num_dpus, hw.num_tasklets) == (8, 16)
+    decision = None
+    if shard is not None:
+        kind, dim, dpus = shard
+        decision = DpuShard(dim=dim, num_dpus=dpus, kind=kind,
+                            reduce="sum" if kind == "partial" else None)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hw,
+        dtype="float16", num_tasklets=hw.num_tasklets, shard=decision),
+        force=True)
+    assert "scf.for" in result.pimir, "超预算的本地形状没有被 A 路分块"
+    _run_with_sentinels(result, M, K, N, "float16")
+
+
+def test_capped_projection_is_tiled_by_a_path() -> None:
+    """图层因块数上限不切的投影，切分传播后的本地形状由 A 路分块压进预算。
+
+    真实 gate_proj（11008×4096，float16，16 行）按列切到两台，默认 65536 预算。
+    图层返回 0；每台本地形状编译后改写出循环，tile 工作集不超预算，数值一致。
+    """
+    from torch.fx import Graph, GraphModule
+
+    from contracts.graph_meta import SPEC_META_KEY
+    from contracts.op_contract import (
+        DEFAULT_HARDWARE_CONFIG, DpuShard, OpCompileRequest)
+    from graph.opt_passes import optimize_graph
+    from graph.partition import partition_graph
+    from graph.spec_prop import propagate_specs
+    from graph.strategy import ShardStrategy
+    from opcompiler_bridge.driver import compile_op
+    from runtime.exec_plan_gen import _shard_decision_of
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("gate_proj_weight")
+    lin = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    graph.output(lin)
+    mod = torch.nn.Module()
+    mod.register_buffer("gate_proj_weight",
+                        torch.empty(11008, 4096, dtype=torch.float16))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(16, 4096, dtype=torch.float16)
+    w.meta["val"] = torch.empty(11008, 4096, dtype=torch.float16)
+    lin.meta["val"] = torch.empty(16, 11008, dtype=torch.float16)
+    partition_graph(gm)
+    hw = DEFAULT_HARDWARE_CONFIG
+    report = optimize_graph(gm, wram_bytes=hw.wram_bytes_per_dpu, tp_width=2)
+    assert report.tiled == 0
+    propagate_specs(gm, ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("gate_proj_weight", "col"),)))
+
+    linear = next(n for n in gm.graph.nodes
+                  if n.target is torch.ops.aten.linear.default)
+    spec = linear.meta[SPEC_META_KEY]
+    w_spec = linear.args[1].meta[SPEC_META_KEY]
+    # 激活是主机上的占位符，经重分布复制到各台，每台都是完整形状。
+    assert linear.args[0].meta[SPEC_META_KEY].placement.kind == "Replicate"
+    x_shape = tuple(x.meta["val"].shape)
+    shapes = set()
+    for dpu_id in spec.shard_map:
+        w_shape = tuple(w_spec.shard_map[dpu_id].local_shape)
+        raw = _shard_decision_of(spec, spec.shard_map[dpu_id])
+        shapes.add((x_shape, w_shape, tuple(raw) if raw else None))
+    assert shapes == {((16, 4096), (5504, 4096), (1, 2, "shard", None))}, shapes
+
+    (x_shape, w_shape, raw), = shapes
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[x_shape, w_shape], hardware=hw,
+        dtype="float16", num_tasklets=hw.num_tasklets,
+        shard=DpuShard.from_payload(raw)), force=True)
+    assert "scf.for" in result.pimir
+    import re
+    wram = int(re.search(r'"pim\.tile-wram-bytes" = (\d+)', result.pimir).group(1))
+    assert wram <= hw.wram_bytes_per_dpu, wram
+    _run_with_sentinels(result, x_shape[0], x_shape[1], w_shape[0], "float16")
+
+
 def test_mlp_shapes_reach_the_compiled_kernel() -> None:
     """1376 和 32000 这类维度必须走编译内核，不能在进编译器前被退回。
 
@@ -824,3 +985,312 @@ def test_k_below_16_stays_on_the_numpy_mirror() -> None:
     assert not _compiled_linear_supports([(2, 4), (4, 4)], "float32")
     # 恰好 16 仍走编译。
     assert _compiled_linear_supports([(1, 16), (4, 16)], "float16")
+
+
+def test_a_path_fuses_silu_into_tt_dot() -> None:
+    """A 路真实触发融合：linear 带 activation=silu 编译时，TTIR 的
+    silu 算术链被 -pim-fuse-activation 折进 tt.dot。
+
+    pimir 里链算子消失、dot 带 activation 属性，编译出的内核数值与
+    torch 的 silu(linear) 闭式一致。
+    """
+    import ctypes
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+
+    M, K, N = 4, 64, 128
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4,
+                           mram_bytes_per_dpu=1 << 20,
+                           wram_bytes_per_dpu=65536, dma_align=8)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hw,
+        dtype="float16", num_tasklets=hw.num_tasklets,
+        activation="silu"), force=True)
+    for gone in ("math.exp", "arith.subf", "arith.divf", "arith.mulf"):
+        assert gone not in result.pimir, f"{gone} 还在 pimir 里，链没有折掉"
+    assert "activation = #pim.act_spec<kind = silu>" in result.pimir, \
+        "tt.dot 上没有折入的 activation 属性"
+
+    fn = load_kernel(result)
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(M * K) * 0.2).astype(np.float16)
+    w = (rng.standard_normal(N * K) * 0.2).astype(np.float16)
+    out = np.zeros(M * N, np.float16)
+    fn(x.ctypes.data_as(ctypes.c_void_p), w.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p))
+    lin = (x.reshape(M, K).astype(np.float32)
+           @ w.reshape(N, K).astype(np.float32).T)
+    ref = lin / (1.0 + np.exp(-lin))
+    np.testing.assert_allclose(out.reshape(M, N).astype(np.float32),
+                               ref, rtol=2e-2, atol=2e-2)
+
+
+def test_default_compile_llama2_fuses_gate_silu_on_the_a_path(monkeypatch) -> None:
+    """默认 `compile_llama2`（不开编译内核）也要让 A 路融合真实触发。
+
+    门控 silu 折进 linear 后，编译期探针发给 A 路的请求必须带上 activation，
+    否则 `-pim-fuse-activation` 在默认通路上没有对象，改动数恒为 0。
+    """
+    import opcompiler_bridge.driver as driver
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from graph.strategy import llama_strategy
+    from memory.mem_planner import HwBudget
+    from runtime.compile import compile_llama2
+
+    seen = []
+    real = driver.compile_op
+
+    def spy(request, **kwargs):
+        result = real(request, **kwargs)
+        seen.append((request, result))
+        return result
+
+    monkeypatch.setattr(driver, "compile_op", spy)
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=4, vocab_size=128,
+    )).eval().to(torch.float16)
+    hardware = PIMHardwareConfig(num_dpus=2, num_tasklets=4,
+                                 mram_bytes_per_dpu=1 << 28,
+                                 wram_bytes_per_dpu=65536, dma_align=64)
+    compile_llama2(
+        model, llama_strategy(2, num_stages=1, num_heads=4, num_kv_heads=4,
+                              intermediate_size=128, vocab_size=128,
+                              num_layers=2),
+        prefill_seq_len=4, max_seq=16,
+        hw=HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20),
+        hardware=hardware)
+
+    fused = [(req, res) for req, res in seen
+             if req.op == "linear" and req.activation == "silu"]
+    assert fused, "默认通路的 A 路请求没有一条带 activation=silu"
+    for _req, res in fused:
+        assert "activation = #pim.act_spec<kind = silu>" in res.pimir
+        assert "math.exp" not in res.pimir, "silu 五连没有被融合掉"
+
+
+@pytest.mark.parametrize("dtype, np_dtype", [
+    ("float16", np.float16),
+    ("float32", np.float32),
+], ids=["f16", "f32"])
+@pytest.mark.parametrize("kind, ref_fn", [
+    ("relu", lambda y: np.maximum(y, 0.0)),
+    ("sigmoid", lambda y: 1.0 / (1.0 + np.exp(-y))),
+    ("silu", lambda y: y / (1.0 + np.exp(-y))),
+])
+def test_a_path_fuses_other_activations_into_tt_dot(kind, ref_fn, dtype,
+                                                     np_dtype) -> None:
+    """三种激活折进 tt.dot，f16、f32 都能加载内核，数值与 torch 一致。
+
+    f32 内核没有 f16 转换函数，激活函数的定义不能只随它一起输出。
+    """
+    import ctypes
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+
+    M, K, N = 4, 64, 128
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4,
+                           mram_bytes_per_dpu=1 << 20,
+                           wram_bytes_per_dpu=65536, dma_align=8)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hw,
+        dtype=dtype, num_tasklets=hw.num_tasklets,
+        activation=kind), force=True)
+    for gone in ("math.exp", "arith.maxnumf", "arith.divf"):
+        assert gone not in result.pimir, f"{gone} 还在 pimir 里，{kind} 没有折掉"
+    assert f"activation = #pim.act_spec<kind = {kind}>" in result.pimir
+
+    fn = load_kernel(result)
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(M * K) * 0.2).astype(np_dtype)
+    w = (rng.standard_normal(N * K) * 0.2).astype(np_dtype)
+    out = np.zeros(M * N, np_dtype)
+    fn(x.ctypes.data_as(ctypes.c_void_p), w.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p))
+    lin = (x.reshape(M, K).astype(np.float32)
+           @ w.reshape(N, K).astype(np.float32).T)
+    np.testing.assert_allclose(out.reshape(M, N).astype(np.float32),
+                               ref_fn(lin), rtol=2e-2, atol=2e-2)
+
+
+def test_a_path_does_not_fuse_silu_inside_the_k_loop() -> None:
+    """激活写在 K 循环里时每轮累加后都激活，不能折进 tt.dot。
+
+    降到 C 时整段 K 归约完只激活一次，折进去会静默算错。不折时链留在
+    循环里；能编出来就必须与逐轮激活的参考一致，编不出来要报错而不是出错数。
+    """
+    import ctypes
+    import subprocess
+    import tempfile
+
+    import triton
+    import triton.language as tl
+
+    from opcompiler_bridge.cpu_host import make_ttir
+    from opcompiler_bridge.driver import (_parse_signature, _run_passes,
+                                          _run_triton_opt, _translate_to_c,
+                                          _triton_opt)
+    from opcompiler_bridge.pipeline import a_path_passes
+
+    @triton.jit
+    def silu_in_loop(x_ptr, w_ptr, out_ptr, M: tl.constexpr, K: tl.constexpr,
+                     N: tl.constexpr, BLOCK_M: tl.constexpr,
+                     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        for m0 in range(0, M, BLOCK_M):
+            offs_m = m0 + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < M
+            for n0 in range(0, N, BLOCK_N):
+                offs_n = n0 + tl.arange(0, BLOCK_N)
+                mask_n = offs_n < N
+                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for k0 in range(0, K, BLOCK_K):
+                    offs_k = k0 + tl.arange(0, BLOCK_K)
+                    mask_k = offs_k < K
+                    x_off = offs_m[:, None] * K + offs_k[None, :]
+                    w_off = offs_n[:, None] * K + offs_k[None, :]
+                    x_blk = tl.load(x_ptr + x_off, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+                    w_blk = tl.load(w_ptr + w_off, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+                    acc = tl.dot(x_blk, tl.trans(w_blk), acc, allow_tf32=False)
+                    acc = acc * tl.sigmoid(acc)
+                o_off = offs_m[:, None] * N + offs_n[None, :]
+                tl.store(out_ptr + o_off, acc.to(out_ptr.dtype.element_ty),
+                         mask=mask_m[:, None] & mask_n[None, :])
+
+    M, K, N, BK = 4, 64, 128, 32
+    ttir = make_ttir(
+        silu_in_loop,
+        signature={"x_ptr": "*fp16", "w_ptr": "*fp16", "out_ptr": "*fp16",
+                   "M": "constexpr", "K": "constexpr", "N": "constexpr",
+                   "BLOCK_M": "constexpr", "BLOCK_N": "constexpr",
+                   "BLOCK_K": "constexpr"},
+        constexprs={"M": M, "K": K, "N": N,
+                    "BLOCK_M": M, "BLOCK_N": N, "BLOCK_K": BK},
+        num_stages=1)
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4,
+                           mram_bytes_per_dpu=1 << 20,
+                           wram_bytes_per_dpu=65536, dma_align=8)
+    pimir = _run_passes(_triton_opt(), ttir,
+                        a_path_passes(hw, target="pim:v1"), "pim mlir")
+    assert "#pim.act_spec" not in pimir, "循环内的激活被折进了 tt.dot"
+    assert "math.exp" in pimir, "循环内的 silu 链被删掉了"
+
+    try:
+        _, emitc = _run_triton_opt(ttir, hw)
+    except RuntimeError:
+        return  # 降不下去就报错，不出错数
+    src = _translate_to_c(emitc)
+    symbol, _, _ = _parse_signature(src)
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal(M * K) * 0.5).astype(np.float16)
+    w = (rng.standard_normal(N * K) * 0.5).astype(np.float16)
+    out = np.zeros(M * N, np.float16)
+    with tempfile.TemporaryDirectory() as tmp:
+        c_path, so_path = Path(tmp) / "k.c", Path(tmp) / "k.so"
+        c_path.write_text("#include <stdint.h>\n#include <stdlib.h>\n"
+                          "#include <math.h>\n#include <stdbool.h>\n" + src)
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", str(so_path),
+                        str(c_path), "-lm"], check=True)
+        fn = getattr(ctypes.CDLL(str(so_path)), symbol)
+        fn(*(a.ctypes.data_as(ctypes.c_void_p) for a in (x, w, out)))
+    xf = x.reshape(M, K).astype(np.float32)
+    wf = w.reshape(N, K).astype(np.float32)
+    ref = np.zeros((M, N), np.float32)
+    for k0 in range(0, K, BK):
+        ref = ref + xf[:, k0:k0 + BK] @ wf[:, k0:k0 + BK].T
+        ref = ref / (1.0 + np.exp(-ref))
+    np.testing.assert_allclose(out.reshape(M, N).astype(np.float32), ref,
+                               rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("activation", ["silu", None], ids=["silu", "plain"])
+def test_a_path_fusion_survives_tile_rebuild(activation) -> None:
+    """WRAM 预算逼出 tt.dot 重建时，折入的 activation 必须跟到新 dot 上。
+
+    4x512->1024、WRAM 8192 让分块把 N 从内核的 512 压到 64，dot 被重建。
+    融合已删掉激活链，属性若没带过去就会静默丢掉激活。不带激活时同一形状
+    照样分块。
+    """
+    import ctypes
+    import re
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import compile_op, load_kernel
+    from opcompiler_bridge.kernel_src import DEFAULT_BLOCK_N
+
+    M, K, N = 4, 512, 1024
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4,
+                           mram_bytes_per_dpu=1 << 28,
+                           wram_bytes_per_dpu=8192, dma_align=8)
+    result = compile_op(OpCompileRequest(
+        op="linear", arg_shapes=[(M, K), (N, K)], hardware=hw,
+        dtype="float16", num_tasklets=hw.num_tasklets,
+        activation=activation), force=True)
+    tile_n = re.search(r'"pim\.tile-n"\s*=\s*(\d+)', result.pimir)
+    assert tile_n and int(tile_n.group(1)) < DEFAULT_BLOCK_N, \
+        "预算没有逼出 dot 重建，这条用例守不住重建路径"
+    for attr in ("pim.tile-m", "pim.tile-k"):
+        assert attr in result.pimir
+    if activation:
+        assert "activation = #pim.act_spec<kind = silu>" in result.pimir, \
+            "重建后的 tt.dot 丢了折入的 activation"
+        assert "math.exp" not in result.pimir
+    else:
+        assert "#pim.act_spec" not in result.pimir
+
+    fn = load_kernel(result)
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(M * K) * 0.1).astype(np.float16)
+    w = (rng.standard_normal(N * K) * 0.1).astype(np.float16)
+    out = np.zeros(M * N, np.float16)
+    fn(x.ctypes.data_as(ctypes.c_void_p), w.ctypes.data_as(ctypes.c_void_p),
+       out.ctypes.data_as(ctypes.c_void_p))
+    ref = torch.nn.functional.linear(
+        torch.from_numpy(x.reshape(M, K)).float(),
+        torch.from_numpy(w.reshape(N, K)).float())
+    if activation:
+        ref = torch.nn.functional.silu(ref)
+    np.testing.assert_allclose(out.reshape(M, N).astype(np.float32),
+                               ref.numpy(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("size", [64, 256])
+def test_a_path_pim_cse_triggers_on_real_linear(size) -> None:
+    """真实 64×64、256×256 linear 的默认 A 路上 -pim-cse 合并重复的地址算子，数值不变。
+
+    前面的 LICM 把两条地址链外提到同一层后，`tt.expand_dims` 出现两份相同的。
+    """
+    import collections
+    import re
+
+    from contracts.op_contract import OpCompileRequest
+    from opcompiler_bridge.driver import _make_ttir, _run_passes, _triton_opt
+    from opcompiler_bridge.pipeline import a_path_passes
+
+    M = K = N = size
+    hardware = PIMHardwareConfig(1, 4, 1 << 20, 64 * 1024, 8)
+    req = OpCompileRequest(op="linear", arg_shapes=[(M, K), (N, K)],
+                           hardware=hardware, dtype="float32")
+    passes = a_path_passes(hardware, target="pim:v1")
+    cut = passes.index("-pim-cse")
+    before = _run_passes(_triton_opt(), _make_ttir(req), passes[:cut], "cse 前")
+    after = _run_passes(_triton_opt(), before, ["-pim-cse"], "cse 后")
+
+    def ops(text):
+        return collections.Counter(re.findall(r"= ([a-z_]+\.[a-z_]+)", text))
+
+    merged = ops(before) - ops(after)
+    assert merged["tt.expand_dims"] > 0, f"-pim-cse 没有合并重复算子：{merged}"
+
+    rng = np.random.default_rng(5)
+    x = rng.standard_normal((M, K)).astype(np.float32)
+    w = rng.standard_normal((N, K)).astype(np.float32)
+    backend = _backend()
+    register_all(backend, use_compiled_linear=True)
+    result = _run(backend, str(torch.ops.aten.linear.default), [(M, K), (N, K)],
+                  [x, w], (M, N), hardware=hardware)
+    ref = torch.nn.functional.linear(torch.from_numpy(x), torch.from_numpy(w)).numpy()
+    np.testing.assert_allclose(result, ref, atol=1e-4)

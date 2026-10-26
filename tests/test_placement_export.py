@@ -1449,3 +1449,59 @@ def test_a_layer_without_kv_gets_no_zone() -> None:
     _mark_kv_zone(ir, sidecar, kv_specs)
 
     assert "zone" not in sidecar["operators"]["0"]
+
+
+def test_measured_gate_kernel_is_fused_by_the_operator_compiler(monkeypatch) -> None:
+    """带激活的投影要让 A 路编译请求带上 activation，由 FlagTree 融合。
+
+    原来先编不带激活的内核，再用正则往 tt.dot 上贴属性，算子层融合在
+    GeneSim 旁支上从来不触发。
+    """
+    import opcompiler_bridge.driver as driver
+    from contracts.op_contract import PIMHardwareConfig
+    from genesim_bridge.placement_export import _measure_kernel_tile_n
+
+    seen = []
+    real = driver.compile_op
+
+    def spy(request, **kwargs):
+        seen.append(request)
+        return real(request, **kwargs)
+
+    monkeypatch.setattr(driver, "compile_op", spy)
+    hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4, mram_bytes_per_dpu=1 << 32,
+                           wram_bytes_per_dpu=65536, dma_align=64)
+    _tile, path, _placed = _measure_kernel_tile_n(
+        256, 512, "float16", hw, {}, activation="silu")
+    assert [r.activation for r in seen] == ["silu"], seen
+    text = Path(path).read_text()
+    assert "activation = #pim.act_spec<kind = silu>" in text
+    assert "math.exp" not in text
+
+
+def test_fused_activations_follow_tiled_gate_blocks() -> None:
+    """图层分块后权重的直接用户是切片，融合清单要穿过切片找到带标记的子块。"""
+    from torch.fx import Graph
+
+    from genesim_bridge.placement_export import _activation_of, _fused_activations
+    from graph.opt_passes import fuse_linear_activation, optimize_graph
+
+    name = "layers.0.mlp.gate_proj.weight"
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr(name)
+    lin = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    out = graph.call_function(torch.ops.aten.silu.default, (lin,))
+    graph.output(out)
+    gm = GraphModule({name: torch.empty(128, 64, dtype=torch.float16)}, graph)
+    x.meta["val"] = torch.empty(4, 64, dtype=torch.float16)
+    w.meta["val"] = torch.empty(128, 64, dtype=torch.float16)
+    lin.meta["val"] = torch.empty(4, 128, dtype=torch.float16)
+    out.meta["val"] = torch.empty(4, 128, dtype=torch.float16)
+
+    assert optimize_graph(gm, wram_bytes=2048).tiled == 1
+    assert fuse_linear_activation(gm) == 1
+    assert _fused_activations(gm) == [
+        {"layer": 0, "role": "gate_proj", "activation": "silu"}]
+    (weight,) = [n for n in gm.graph.nodes if n.op == "get_attr"]
+    assert _activation_of(weight) == "silu"

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.fx import Graph
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -25,6 +26,7 @@ from memory.mem_planner import (
     greedy_reuse,
     pending_readers_of_reused_addresses,
     plan_dpu,
+    redistribute_landing_tensors,
     transient_tensors,
     weights_of,
 )
@@ -316,3 +318,44 @@ def test_format_mem_plan_printable() -> None:
     plans, _, _ = _plan_both_dpus(hw)
     text = format_mem_plan(plans, hw)
     assert "dpu0" in text and "dpu1" in text and "margin=" in text
+
+
+def test_shared_redistribute_edge_merges_landing_lifetime() -> None:
+    """同一条重分布边挂在多个消费者上时，落地缓冲只算一份。
+
+    生命周期要并到最后一个读者、读者集合取全部；按消费者各记一份会
+    让缓冲被提前复用，后面的消费者读到覆盖后的数据（tp2_pp2 分块实测）。
+    """
+    from contracts.pim_tensor_spec import (
+        PIMTensorSpec, Placement, RedistributeEdge, TensorShardDetail)
+
+    graph = Graph()
+    src = graph.placeholder("src")
+    c1 = graph.call_function(torch.ops.aten.add.Tensor, (src, src))
+    c2 = graph.call_function(torch.ops.aten.add.Tensor, (c1, src))
+    c3 = graph.call_function(torch.ops.aten.add.Tensor, (c1, src))
+    nodes = list(graph.nodes)
+
+    dst_spec = PIMTensorSpec(
+        "dpu", Placement("Replicate", None), "transient", None,
+        {0: TensorShardDetail(0, -1, 0, 8, (2, 4))}, None, dtype="float16")
+    shared = RedistributeEdge(
+        edge_id=7, src="src", dst="c1",
+        from_placement=Placement("Shard", 0), to_placement=Placement("Replicate", None),
+        src_spec=dst_spec, dst_spec=dst_spec, type="all_gather",
+        src_loc={"device": "dpu", "dpus": [0]},
+        dst_loc={"device": "dpu", "dpus": [0]},
+        nbytes=16, dtype="float16")
+    for n in (c1, c2, c3):
+        n.meta[REDISTRIBUTE_META_KEY] = [shared]
+    node_step, edge_step = _build_step_index(nodes)
+
+    tensors = redistribute_landing_tensors(nodes, dpu_id=0,
+                                           node_step=node_step,
+                                           edge_step=edge_step)
+    assert len(tensors) == 1, [t.name for t in tensors]
+    (landing,) = tensors
+    assert landing.name == "redist_dst:e7"
+    # 生命周期并到最后一个消费者，读者是全部三个。
+    assert landing.last_read_at == node_step[c3]
+    assert set(landing.readers) == {c1.name, c2.name, c3.name}

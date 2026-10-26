@@ -203,6 +203,33 @@ def _fuse_rms_norms(gm: GraphModule) -> int:
     return fused
 
 
+# 只改 dtype 的转换算子。`torch.export` 对 `.to(dtype)` 产出 `to.dtype`，分块插的是 `_to_copy`。
+_CASTS = frozenset((
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.to.dtype,
+    torch.ops.aten.to.dtype_layout,
+))
+
+
+def is_float_cast(node: Node) -> bool:
+    """`node` 是否是转到浮点类型的转换。
+
+    激活挪到浮点转换之前只差一次舍入，挪到整数转换之前值就变了，所以只认浮点。
+    """
+    if node.target not in _CASTS or not isinstance(node.args[0], Node):
+        return False
+    dtype = node.kwargs.get("dtype")
+    if dtype is None and len(node.args) > 1:
+        dtype = node.args[1]
+    return isinstance(dtype, torch.dtype) and dtype.is_floating_point
+
+
+def _real_users(node: Node) -> list[Node]:
+    """去掉导出器插入的元数据断言后的用户。"""
+    return [u for u in node.users
+            if u.target is not torch.ops.aten._assert_tensor_metadata.default]
+
+
 def _fuse_activations(gm: GraphModule) -> int:
     """把 `linear -> silu` 折成一个带 contraction 的 Gemm。
 
@@ -216,11 +243,16 @@ def _fuse_activations(gm: GraphModule) -> int:
     for host in hosts:
         if FUSED_TAIL_META_KEY in host.meta:
             continue
-        users = [u for u in host.users
-                 if u.target is not torch.ops.aten._assert_tensor_metadata.default]
+        users = _real_users(host)
         if len(users) != 1:
             continue
         activation = users[0]
+        # 中间夹一层浮点转换也认，激活仍按主算子尾部表达。
+        if is_float_cast(activation):
+            users = _real_users(activation)
+            if len(users) != 1:
+                continue
+            activation = users[0]
         if (activation.op != "call_function"
                 or activation.target not in GATE_ACTIVATIONS):
             continue

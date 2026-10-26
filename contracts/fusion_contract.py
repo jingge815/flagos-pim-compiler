@@ -66,6 +66,15 @@ GATE_ACTIVATIONS = {
 }
 
 
+# 执行路径上折进 linear 的尾部激活 → 激活名。A 路编译内核、numpy 镜像与
+# FlagTree 的 tt.dot 融合都按这张表实现，改一处必须同步另外三处。
+LINEAR_TAIL_ACTIVATIONS = {
+    torch.ops.aten.silu.default: "silu",
+    torch.ops.aten.relu.default: "relu",
+    torch.ops.aten.sigmoid.default: "sigmoid",
+}
+
+
 def _validate_fusion_targets() -> None:
     """融合表引用的 aten 目标必须在算子登记表里能查到 GML 类型。
 

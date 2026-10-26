@@ -198,9 +198,16 @@ def _kernel_launcher(request: OpCompileRequest):
         )
     # M、K、N 都按分块遍历，最后一块由掩码处理，不再要求维度是 2 的幂
     # 或能被分块整除。
+    from contracts.fusion_contract import LINEAR_TAIL_ACTIVATIONS
+
+    if (request.activation is not None
+            and request.activation not in LINEAR_TAIL_ACTIVATIONS.values()):
+        raise ValueError(
+            f"A 路 linear 不支持折入 activation={request.activation!r}，"
+            f"可折的是 {sorted(LINEAR_TAIL_ACTIVATIONS.values())}")
     from .kernel_src import make_kernel_launcher
 
-    return make_kernel_launcher(m, k, n)
+    return make_kernel_launcher(m, k, n, request.activation)
 
 
 _TRITON_DTYPE_BY_NAME = {"float16": "fp16", "float32": "fp32"}
@@ -264,10 +271,12 @@ def _make_ttir_without_gpu(
             "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "BLOCK_K": "constexpr",
+            "ACTIVATION": "constexpr",
         },
         constexprs={
             "M": m, "K": k, "N": n,
             "BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k,
+            "ACTIVATION": request.activation or "none",
         },
         num_stages=NUM_STAGES,
     )
@@ -306,19 +315,11 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig,
         )
 
     # 第一段到 pim mlir：这一层带 !pim.memdesc、pim.dma_load/store 和真实分块。
+    # pass 顺序的真源在 pipeline.py，五类优化插在转换与显式 DMA 之间。
+    from opcompiler_bridge.pipeline import a_path_passes
+
     pimir = _run_passes(
-        triton_opt,
-        ttir,
-        [
-            f"-convert-triton-to-pim=target={opts['pim_target']} "
-            f"num-dpus={hardware.num_dpus} "
-            f"num-tasklets={hardware.num_tasklets} "
-            f"wram-bytes={hardware.wram_bytes_per_dpu} "
-            f"mram-bytes={hardware.mram_bytes_per_dpu} "
-            f"dma-align={hardware.dma_align}",
-            "-pim-tile-to-budget",
-            "-pim-explicit-dma",
-        ],
+        triton_opt, ttir, a_path_passes(hardware, target=opts["pim_target"]),
         "pim mlir",
     )
     # 第二段到 EmitC：后续 mlir-translate 生成 C 的输入。
@@ -463,7 +464,10 @@ def _module_text(body: str, request: OpCompileRequest) -> str:
                 elem_strides=request.elem_strides,
                 mram_offset=request.mram_offset,
                 align_bytes=request.align_bytes))
-    return f"module attributes {{{', '.join(attrs)}}} {{\n{body}\n}}\n"
+    from opcompiler_bridge.pipeline import with_budget
+
+    text = f"module attributes {{{', '.join(attrs)}}} {{\n{body}\n}}\n"
+    return with_budget(text, request.hardware)
 
 
 # 把结果写进 memdesc、没有张量结果的算子。`#pim.tasklet_tiled` 是**张量类型的
@@ -790,10 +794,11 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
 
 
 def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
-    """算子级 IR 走一遍：融合 → 展开 → 校验 → 降到 EmitC。
+    """算子级 IR 走一遍：融合 → 展开 → 折叠 → CSE → DCE → 分块 → 校验 → 降到 EmitC。
 
     与 A 路的两次调用同构，只是 pass 列表不同：这条没有 DMA，也就没有
-    `convert-triton-to-pim` / `tile-to-budget` / `explicit-dma` 三段。
+    `convert-triton-to-pim` / `explicit-dma` 两段。模块头缺预算属性时按
+    `pim_options()` 补上，与 A 路同一份硬件参数。
     """
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -801,18 +806,26 @@ def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
             f"找不到带 pim-lower-to-emitc 的 triton-opt: {triton_opt}\n"
             "需要先在 FlagTree 里重新编译。"
         )
-    pimir = _run_passes(
-        triton_opt, mlir_text,
-        ["-pim-fuse-activation", "-pim-expand-phases",
-         "-pim-verify-gml-contract"],
-        "pim mlir",
-    )
+    from opcompiler_bridge.pipeline import b_path_passes, with_budget
+
+    mlir_text = with_budget(mlir_text, _options_hardware())
+    pimir = _run_passes(triton_opt, mlir_text, b_path_passes(), "pim mlir")
     emitc = _run_passes(
         triton_opt, pimir,
         ["-pim-lower-to-emitc", "-convert-func-to-emitc"],
         "emitc",
     )
     return pimir, emitc
+
+
+def _options_hardware():
+    """`pim_options()` 里的预算，供只拿到 IR 文本、没有请求的调用方补模块属性。"""
+    import types
+
+    opts = pim_options()
+    return types.SimpleNamespace(wram_bytes_per_dpu=opts["pim_wram_bytes"],
+                                 mram_bytes_per_dpu=opts["pim_mram_bytes"],
+                                 dma_align=opts["pim_dma_align"])
 
 
 def _prod(shape) -> int:

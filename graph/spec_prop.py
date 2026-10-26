@@ -215,6 +215,39 @@ def _shard_map(
     }
 
 
+
+# 插在权重和 linear 之间、但不改变切分的算子。切片取子区间，类型转换
+# 只改 dtype，两者都要穿透才能找到真正消费这块权重的 linear。
+_LAYOUT_NEUTRAL = frozenset((
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.to.dtype,
+    torch.ops.aten.to.dtype_layout,
+))
+
+
+def _consumers_through_slices(node: Node) -> list[Node]:
+    """权重的真实消费者。
+
+    分块会在权重和 linear 之间插入切片和类型转换，只看直接用户会把
+    这块权重误判成没有 linear 消费，从而丢掉按列切分。
+    """
+    seen = []
+    pending = list(node.users)
+    visited = set()
+    while pending:
+        user = pending.pop()
+        if user in visited:
+            continue
+        visited.add(user)
+        # 两维同时切会产生切片套切片，要顺着链一路往下找到真实消费者。
+        if user.target in _LAYOUT_NEUTRAL:
+            pending.extend(user.users)
+        else:
+            seen.append(user)
+    return seen
+
+
 def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTensorSpec:
     """按策略为权重构造常驻的 host 或 DPU 张量规格。"""
     shape = tuple(node.meta["val"].shape)
@@ -223,7 +256,8 @@ def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTen
     qz = WEIGHT_LAYOUT if dt in ("int4", "int8") else None
     dpus = _dpus_of_node(node, strategy, num_layers)
     # propagate_specs 的入口断言已保证全图每个节点都有 device，这里不必再容忍缺失
-    dpu_users = [u for u in node.users if u.meta[DEVICE_META_KEY] == DEVICE_DPU]
+    dpu_users = [u for u in _consumers_through_slices(node)
+                 if u.meta[DEVICE_META_KEY] == DEVICE_DPU]
     linear_users = [
         u for u in dpu_users if u.target in (torch.ops.aten.linear.default, torch.ops.aten.addmm.default)
     ]
@@ -407,10 +441,9 @@ def _rule_convert_dtype(
     """`aten.to.dtype`：逐元素类型转换，下标不动，所以布局原样传。
 
     与视图族分开写：那一族要聚合是因为元素会换位置，这个不换。
+    部分和也原样传：各台先转再归约，与不分块时 linear 直接产出低精度部分和相同。
     """
     x_node, x_spec = x
-    if x_spec.placement.kind == "Partial":
-        raise _unsupported_layouts(node, x_spec)
     return [(x_node, _dpu_req(x_spec.placement))], x_spec.placement
 
 
@@ -493,6 +526,9 @@ RULE_TABLE = {
     # 类型转换：逐元素，下标不动，布局原样传。
     torch.ops.aten.to.dtype: _rule_convert_dtype,
     torch.ops.aten.to.dtype_layout: _rule_convert_dtype,
+    # 分块把 float16 提升到 float32 时用的就是这个。与 to.dtype 一样逐元素，
+    # 下标不动，所以布局原样传。
+    torch.ops.aten._to_copy.default: _rule_convert_dtype,
     # 切片与拼接也是视图：元素的**位置**变了（切片取子区间、拼接把两段接起来），
     # 所以与视图族同一条规则——输入必须完整副本，下游要 Shard 时发 local_slice。
     # `cat` 的实参里第一个是张量列表，`_tensor_inputs` 已按列表展开。
@@ -552,15 +588,29 @@ def _edge_type(node: Node, actual: PIMTensorSpec, req: _Req) -> str:
 
 def _diff_edge(
     edge_id: int, src: Node, dst: Node, actual: PIMTensorSpec, req: _Req,
-    dst_dpus: tuple[int, ...]
+    dst_dpus: tuple[int, ...], dst_spec: PIMTensorSpec | None = None,
 ) -> RedistributeEdge | None:
     """比较边两端规格；相同返回 `None`，否则返回重分布标记。"""
-    dst_spec = _required_spec(src, req, dst_dpus)
+    if dst_spec is None:
+        dst_spec = _required_spec(src, req, dst_dpus)
     if (
         actual.device == req.device
         and actual.placement == req.placement
         and set(actual.shard_map) == set(dst_spec.shard_map)
     ):
+        return None
+    # 权重切片只被与自己有交集的 DPU 持有，持有者比整块权重少。
+    # 这是切片本身的结果，不是一次重分布；别的同布局、不同 DPU 集合仍要搬。
+    # 类型转换插在切片和 linear 之间时也一样：它的持有者继承自切片。
+    if (actual.device == req.device and actual.placement == req.placement
+            and (_is_weight_slice(src)
+                 or src.target is torch.ops.aten._to_copy.default)):
+        return None
+    # 部分和只落在部分台上时，其余台的贡献是 0，不必搬：执行计划在那些台上
+    # 把这个操作数当作 0。
+    if (actual.device == req.device == DEVICE_DPU
+            and actual.placement.kind == req.placement.kind == "Partial"
+            and set(actual.shard_map) <= set(dst_spec.shard_map)):
         return None
     if actual.residency == "pinned":
         # 常驻张量不支持重分布。
@@ -635,6 +685,304 @@ def _require_host_inputs(
         _append_edge(node, input_node, req, edges, strategy, num_layers)
 
 
+
+def _weight_root(node: Node) -> Node | None:
+    """沿切片链找到最里面的权重。不是在切权重时返回 None。
+
+    两维同时切时，归约维那一刀的源是输出特征那一刀，不是 `get_attr`。
+    只认直接源会把第二刀当成普通视图，切分随之丢掉。
+    """
+    seen = set()
+    while node.target is torch.ops.aten.slice.Tensor:
+        if node in seen:
+            return None
+        seen.add(node)
+        src = node.args[0] if node.args else None
+        if not isinstance(src, Node):
+            return None
+        node = src
+    return node if node.op == "get_attr" else None
+
+
+def _is_weight_slice(node: Node) -> bool:
+    """这个切片是不是在切一块权重。
+
+    权重是 `get_attr`，激活是别的算子的输出。只对权重切片保持切分布局，
+    激活上的切片仍走视图规则。切片套切片时顺着链往里找。
+    """
+    return _weight_root(node) is not None
+
+
+def _slice_span(node: Node, src_len: int) -> tuple[int, int, int]:
+    """切片的轴与真实区间。上界超过源长度时截到末尾。"""
+    dim = int(node.args[1]) if len(node.args) > 1 else 0
+    start = int(node.args[2]) if len(node.args) > 2 else 0
+    end = int(node.args[3]) if len(node.args) > 3 else src_len
+    return dim, max(start, 0), min(end, src_len)
+
+
+def _clipped_detail(det: TensorShardDetail, dim: int,
+                     start: int, end: int) -> TensorShardDetail | None:
+    """把一条分片夹进切片区间，没有交集就返回空。"""
+    lo = max(det.start_idx, start)
+    hi = min(det.end_idx, end)
+    if lo >= hi:
+        return None
+    local = list(det.local_shape)
+    local[dim] = hi - lo
+    local = tuple(local)
+    return TensorShardDetail(det.dpu_id, det.shard_dim, lo, hi, local,
+                             elem_strides=row_major_strides(local))
+
+
+def _weight_slice_spec(node: Node, src_spec: PIMTensorSpec) -> PIMTensorSpec:
+    """按切片落在权重的哪一段重算输出规格。
+
+    切片轴与切分轴不同时，被切的那一维在每台上都是完整的，切完只是变短，
+    切分方式照搬。轴相同时，每台只保留切片区间与自己持有区间的交集：权重
+    按连续的行段存在各台上，一台拿不到别人那一段的行，按切片长度重新对半
+    会把行分给没有这些行的台。没有交集的台不持有这个切片。
+    """
+    # 切片套切片时，区间要相对整块权重算，而不是相对外面那一刀。
+    src_shape = tuple(_weight_root(node).meta["val"].shape)
+    dim = int(node.args[1]) if len(node.args) > 1 else 0
+    dim, start, end = _slice_span(node, src_shape[dim])
+    out_shape = tuple(node.meta["val"].shape)
+    placement = src_spec.placement
+    if placement.kind != "Shard" or dim != placement.dim:
+        # 切的不是切分轴。源是整块权重时各台持有完整的这一维，按输出形状
+        # 重新平分即可。源本身是切片时，各台持有的区间已经夹过，重新平分
+        # 会把全局下标重置成从 0 开始，所以沿用源的区间，只把被切的那一维
+        # 缩短到这段的长度。
+        # 只对权重切片沿用源的区间。激活切片的源区间是另一套坐标系，
+        # 沿用它会把行号抄到归约维上。
+        # 切片是内核写出的新缓冲，不能继承源的常驻属性：标成常驻时内存规划
+        # 不给它分地址，切片写到偏移 0，盖掉同一位置上的整块权重。
+        if node.args[0].op == "get_attr" or not _is_weight_slice(node):
+            return _dpu_spec(placement, out_shape, tuple(src_spec.shard_map),
+                             residency="transient", dtype=src_spec.dtype,
+                             quant=src_spec.quant)
+        length = out_shape[placement.dim]
+        holders = {}
+        for dpu_id, det in src_spec.shard_map.items():
+            local = list(out_shape)
+            local[placement.dim] = det.end_idx - det.start_idx
+            local = tuple(local)
+            holders[dpu_id] = TensorShardDetail(
+                dpu_id, det.shard_dim, det.start_idx, det.end_idx, local,
+                elem_strides=row_major_strides(local))
+        spec = PIMTensorSpec(
+            DEVICE_DPU, placement, "transient", None, holders,
+            placement.reduce_type, dtype=src_spec.dtype, quant=src_spec.quant)
+        spec.validate()
+        return spec
+    holders = {
+        dpu_id: clipped
+        for dpu_id, det in src_spec.shard_map.items()
+        if (clipped := _clipped_detail(det, dim, start, end))
+    }
+    spec = PIMTensorSpec(
+        DEVICE_DPU, placement, "transient", None, holders,
+        placement.reduce_type, dtype=src_spec.dtype, quant=src_spec.quant)
+    spec.validate()
+    return spec
+
+
+def _row_slice_linear(node: Node, x, weight, edges, strategy, num_layers) -> bool:
+    """行切权重被切片后的 linear：激活跟着权重切片走，部分和只落在持有者上。
+
+    K 段只与部分台的分片相交，激活按整段对半会把这段 K 分给没有对应权重的台。
+    激活的要求按权重切片在每台的 K 区间给出，输出部分和只标在这些台上，其余台
+    相当于贡献 0，后面相加时按 0 处理。不是权重切片返回 False，调用方照旧处理。
+    """
+    w_node = node.args[1]
+    while (isinstance(w_node, Node) and w_node.target in _LAYOUT_NEUTRAL
+           and w_node.target is not torch.ops.aten.slice.Tensor):
+        w_node = w_node.args[0]
+    if not isinstance(w_node, Node) or not _is_weight_slice(w_node):
+        return False
+    w_spec = w_node.meta[SPEC_META_KEY]
+    if w_spec.placement != Placement("Shard", 1):
+        return False
+    # 这段 K 在整块权重里的起点：沿切片链找切 K 的那一刀。没切 K 时每台
+    # 仍持有自己整段的 K，照旧按整段对半，不走这里。
+    k_start = None
+    cur = w_node
+    while cur.target is torch.ops.aten.slice.Tensor:
+        dim = int(cur.args[1]) if len(cur.args) > 1 else 0
+        if dim in (1, -1):
+            k_start = _slice_span(cur, _weight_root(cur).meta["val"].shape[1])[1]
+            break
+        cur = cur.args[0]
+    if k_start is None:
+        return False
+    x_node, _ = x
+    x_shape = tuple(x_node.meta["val"].shape)
+    out_dim = len(x_shape) - 1
+    holders = {}
+    for dpu_id, det in w_spec.shard_map.items():
+        local = x_shape[:-1] + (det.end_idx - det.start_idx,)
+        holders[dpu_id] = TensorShardDetail(
+            dpu_id, out_dim, det.start_idx - k_start, det.end_idx - k_start, local,
+            elem_strides=row_major_strides(local))
+    x_spec = PIMTensorSpec(DEVICE_DPU, Placement("Shard", out_dim), "transient",
+                           None, holders, None, dtype=_dtype_of(x_node))
+    x_spec.validate()
+    dpus = tuple(sorted(holders))
+    _append_edge(node, x_node, _dpu_req(x_spec.placement), edges, strategy,
+                 num_layers, dst_dpus=dpus, dst_spec=x_spec)
+    _append_edge(node, weight[0], _dpu_req(weight[1].placement), edges, strategy,
+                 num_layers, dst_dpus=dpus)
+    node.meta[SPEC_META_KEY] = _dpu_spec(
+        Placement("Partial", reduce_type="sum"), tuple(node.meta["val"].shape),
+        dpus, dtype=_dtype_of(node))
+    return True
+
+
+def _linear_output_following_weight(node: Node, out_placement: Placement,
+                                     out_shape: tuple[int, ...]) -> PIMTensorSpec | None:
+    """按列切的权重被切开时，输出特征跟权重行走，不按整段重新对半。
+
+    一段切片只落在持有这些行的台上，输出的对应列也只能由这些台算。按整段
+    输出重新对半会让没有这些权重行的台去算它的列。返回 None 表示不属这种情况，
+    调用方照旧按整段切分。
+    """
+    if node.target is not torch.ops.aten.linear.default or out_placement.kind != "Shard":
+        return None
+    weight = node.args[1] if len(node.args) > 1 else None
+    # 权重和 linear 之间可能隔着类型转换，穿透后才是切片。
+    while isinstance(weight, Node) and weight.target in _LAYOUT_NEUTRAL             and weight.target is not torch.ops.aten.slice.Tensor:
+        weight = weight.args[0]
+    if not isinstance(weight, Node) or not _is_weight_slice(weight):
+        return None
+    w_spec = weight.meta[SPEC_META_KEY]
+    if w_spec.placement != Placement("Shard", 0):
+        return None
+    # 下标沿用权重规格的全局下标：每段 linear 的输出列与它用的权重行
+    # 在整块里的位置相同，拼接据此把各段排到输出的对应位置。减掉切片
+    # 起点会让每段都从 0 开始，拼接时各段重叠，输出的后半列全是 0。
+    holders = {}
+    for dpu_id, det in w_spec.shard_map.items():
+        length = det.end_idx - det.start_idx
+        local = out_shape[:-1] + (length,)
+        holders[dpu_id] = TensorShardDetail(
+            dpu_id, out_placement.dim, det.start_idx, det.end_idx, local,
+            elem_strides=row_major_strides(local))
+    spec = PIMTensorSpec(
+        DEVICE_DPU, out_placement, "transient", None, holders,
+        out_placement.reduce_type, dtype=_dtype_of(node))
+    spec.validate()
+    return spec
+
+
+def _stacked_cat_spec(node: Node, tensors, dim: int):
+    """几段沿另一维切分、沿这一维拼接时，返回按段序拼好的输出规格。
+
+    每段的切分维与拼接维不同，每台持有的区间在各段上一致。拼完后切分还在
+    原来那一维，每台持有的长度不变。对不齐返回 None，调用方照旧聚合。
+    """
+    out_shape = tuple(node.meta["val"].shape)
+    if dim < 0:
+        dim += len(out_shape)
+    first = tensors[0].meta.get(SPEC_META_KEY)
+    shard_dim = first.placement.dim if first is not None else None
+    if (first is None or first.placement.kind != "Shard"
+            or shard_dim == dim or shard_dim is None):
+        return None
+    spans: dict[int, tuple[int, int]] = {}
+    base = 0
+    for source in tensors:
+        spec = source.meta.get(SPEC_META_KEY)
+        if spec is None or spec.placement != first.placement:
+            return None
+        if set(spec.shard_map) != set(first.shard_map):
+            return None
+        for dpu_id, det in spec.shard_map.items():
+            seen = spans.get(dpu_id)
+            if seen is None:
+                spans[dpu_id] = (det.start_idx, det.end_idx)
+            elif seen != (det.start_idx, det.end_idx):
+                return None
+        base += source.meta["val"].shape[dim]
+    if base != out_shape[dim]:
+        return None
+    holders = {}
+    for dpu_id, (lo, hi) in spans.items():
+        local = list(out_shape)
+        # 切分维的长度是这一台持有的，不是各段之和：各段在这一维上的
+        # 区间相同，拼完之后每台还是持有这么长。
+        local[shard_dim] = hi - lo
+        local = tuple(local)
+        holders[dpu_id] = TensorShardDetail(
+            dpu_id, shard_dim, lo, hi, local,
+            elem_strides=row_major_strides(local))
+    spec = PIMTensorSpec(
+        DEVICE_DPU, first.placement, "transient", None, holders,
+        first.reduce_type, dtype=_dtype_of(node))
+    spec.validate()
+    return spec
+
+
+def _aligned_cat_spec(node: Node, tensors, dim: int):
+    """几段沿拼接维的切分对齐时，返回拼接后仍保持切分的输出规格。
+
+    每段都沿拼接维切分，把每段的区间平移到它在输出里的起点后，同一台的
+    区间要首尾相接成一段，各台的段再无重叠地铺满输出。对得齐就不用先把
+    每段聚成副本，每台只拼自己那几列。对不齐返回 None，调用方照旧聚合。
+    """
+    out_shape = tuple(node.meta["val"].shape)
+    if dim < 0:
+        dim += len(out_shape)
+    spans: dict[int, list[tuple[int, int]]] = {}
+    base = 0
+    for source in tensors:
+        operand = _tensor_operand_of(source)
+        spec = operand[1]
+        if spec.placement.kind != "Shard" or spec.placement.dim != dim:
+            return None
+        # 起点落在本段范围内的是相对下标，平移到它在输出里的位置；
+        # 落在本段之后的是全局下标，直接用。两行各算一次时，第二行的
+        # 区间也从 0 开始，按「不小于前面总长」会把它当成全局下标，
+        # 排到第一行的位置上。
+        extent = source.meta["val"].shape[dim]
+        for dpu_id, det in spec.shard_map.items():
+            if det.start_idx < extent:
+                spans.setdefault(dpu_id, []).append(
+                    (base + det.start_idx, base + det.end_idx))
+            else:
+                spans.setdefault(dpu_id, []).append((det.start_idx, det.end_idx))
+        base += extent
+    if base != out_shape[dim]:
+        return None
+    merged = []
+    holders = {}
+    for dpu_id, pieces in spans.items():
+        pieces.sort()
+        cursor = pieces[0][0]
+        for start, end in pieces:
+            if start != cursor:
+                return None
+            cursor = end
+        lo, hi = pieces[0][0], pieces[-1][1]
+        merged.append((lo, hi, dpu_id))
+    merged.sort()
+    cursor = 0
+    for lo, hi, dpu_id in merged:
+        if lo != cursor:
+            return None
+        local = out_shape[:dim] + (hi - lo,) + out_shape[dim + 1:]
+        holders[dpu_id] = TensorShardDetail(
+            dpu_id, dim, lo, hi, local, elem_strides=row_major_strides(local))
+        cursor = hi
+    if cursor != out_shape[dim]:
+        return None
+    spec = PIMTensorSpec(
+        DEVICE_DPU, Placement("Shard", dim), "transient", None, holders,
+        None, dtype=_dtype_of(node))
+    spec.validate()
+    return spec
+
+
 def _propagate_dpu_node(
     node: Node, edges: list[RedistributeEdge], strategy: ShardStrategy, num_layers: int
 ) -> None:
@@ -656,11 +1004,41 @@ def _propagate_dpu_node(
         weight = _tensor_operand(node, 1, "weight")
         _reject_tensor_scalar_operand(node, 2, "bias")
         reqs, out_placement = rule(node, x, weight)
+        if out_placement.kind == "Partial" and _row_slice_linear(
+                node, x, weight, edges, strategy, num_layers):
+            return
     elif node.target in _BINARY_TARGETS:
         x = _tensor_operand(node, 0, "self")
         y = _tensor_or_scalar_operand(node, 1, "other")
         _reject_tensor_scalar_operand(node, 2, "alpha")
         reqs, out_placement = rule(node, x, y)
+        # 两侧沿同一维切分且区间完全相同时，输出沿用这个区间。按输出形状
+        # 重新平分会把一段切成两台各一半，K 维各段相加的结果因此对不齐。
+        if (y is not None and x[1].placement == y[1].placement == out_placement
+                and out_placement.kind == "Shard"
+                and x[1].shard_map.keys() == y[1].shard_map.keys()
+                and all(x[1].shard_map[d].start_idx == y[1].shard_map[d].start_idx
+                        and x[1].shard_map[d].end_idx == y[1].shard_map[d].end_idx
+                        for d in x[1].shard_map)):
+            shape = tuple(val.shape)
+            holders = {}
+            for dpu_id, det in x[1].shard_map.items():
+                local = list(shape)
+                local[out_placement.dim] = det.end_idx - det.start_idx
+                local = tuple(local)
+                holders[dpu_id] = TensorShardDetail(
+                    dpu_id, det.shard_dim, det.start_idx, det.end_idx, local,
+                    elem_strides=row_major_strides(local))
+            node.meta[SPEC_META_KEY] = PIMTensorSpec(
+                DEVICE_DPU, out_placement, "transient", None, holders,
+                out_placement.reduce_type, dtype=_dtype_of(node))
+            node.meta[SPEC_META_KEY].validate()
+            # 目标按收窄后的持有者算：K 段只落在部分台上，按全部台算会给
+            # 同一区间插一条多余的收集，收集的各段区间也拼不成整块。
+            for src, req in reqs:
+                _append_edge(node, src, req, edges, strategy, num_layers,
+                             dst_dpus=tuple(sorted(holders)))
+            return
     elif node.target == torch.ops.aten.addmm.default:
         reqs, out_placement = rule(node)
     elif node.target == torch.ops.aten.matmul.default:
@@ -690,23 +1068,86 @@ def _propagate_dpu_node(
     elif node.target in (torch.ops.aten.embedding.default,
                          torch.ops.aten.scaled_dot_product_attention.default):
         reqs, out_placement = rule(node)
+    elif _is_weight_slice(node):
+        # 分块沿特征维切权重。普通视图规则把输出判成复制，而 linear 只接受
+        # 按列或按行切分的权重，于是切过的图无法传播。输出规格按切片区间
+        # 重算，不能照搬整块权重的切分。源可能隔着一次类型转换，穿透它。
+        src = node.args[0]
+        while src.target in _LAYOUT_NEUTRAL and src.target is not torch.ops.aten.slice.Tensor:
+            src = src.args[0]
+        src_spec = src.meta[SPEC_META_KEY]
+        node.meta[SPEC_META_KEY] = _weight_slice_spec(node, src_spec)
+        reqs = [(src, _dpu_req(src_spec.placement))]
+        for src_node, req in reqs:
+            _append_edge(node, src_node, req, edges, strategy, num_layers)
+        return
     elif node.target == torch.ops.aten.cat.default:
         # `cat([a, b, ...], dim)`：第一个实参是**张量列表**，不是单个张量。
         # 搬运的是每一段，所以逐段要完整副本。
         tensors = _operand_value(node, 0, "tensors")
+        cat_dim = _operand_value(node, 1, "dim")
         if not isinstance(tensors, (list, tuple)) or not tensors:
             raise ValueError(f"{node.name}: cat 的第一个实参必须是非空张量列表")
         reqs = []
         for source in tensors:
             if not isinstance(source, Node):
                 raise ValueError(f"{node.name}: cat 的表里混进了非张量实参")
-            sub_reqs, out_placement = rule(node, _tensor_operand_of(source))
-            reqs.extend(sub_reqs)
+            operand = _tensor_operand_of(source)
+            # 部分和是各卡持有的一段累加，拼之前要先归约成复制，
+            # 否则每段只是局部值，拼起来不等于整块。
+            if operand[1].placement.kind == "Partial":
+                reqs.append((operand[0], _dpu_req(REPLICATE)))
+            else:
+                sub_reqs, _ = rule(node, operand)
+                reqs.extend(sub_reqs)
+        # 各段沿拼接维的切分对齐时，每台只拼自己的列，输出保持切分，
+        # 不再要求每段先聚成完整副本。
+        aligned = _aligned_cat_spec(node, tensors, int(cat_dim))
+        if aligned is not None:
+            # 每段的切分已经是拼接要的样子，持有者也覆盖了输出的每一列，
+            # 不需要再搬。每台直接拼自己持有的那些段。
+            node.meta[SPEC_META_KEY] = aligned
+            return
+        stacked = _stacked_cat_spec(node, tensors, int(cat_dim))
+        if stacked is not None:
+            # 各段沿另一维切分，沿这一维拼。每台持有的列数不变，
+            # 不再把每段聚成整块后互相覆盖。
+            node.meta[SPEC_META_KEY] = stacked
+            return
+        out_placement = REPLICATE
     else:
         reqs, out_placement = rule(node, _tensor_operand(node, 0, "self"))
+        # 类型转换不改变谁持有这块数据。输入是一段只落在部分台上的切片时，
+        # 输出沿用这些台和它们的区间，而不是按输出形状重新平分到全部台。
+        if node.target in _LAYOUT_NEUTRAL and out_placement.kind == "Shard":
+            src_node, src_spec = _tensor_operand(node, 0, "self")
+            # 持有者沿用输入的。按阶段重新分配会把只在一台的切片
+            # 平分到全部台，收集校验按全局形状对不上。
+            if src_spec.placement == out_placement:
+                shape = tuple(val.shape)
+                holders = {}
+                for dpu_id, det in src_spec.shard_map.items():
+                    local = list(shape)
+                    length = det.end_idx - det.start_idx
+                    local[out_placement.dim] = length
+                    local = tuple(local)
+                    # 源是切片时输出是一段新张量，区间从 0 计。源本身已按全局
+                    # 下标切分时，输出沿用这个下标，否则拼接会对不齐。
+                    lo = 0 if src_node.target is torch.ops.aten.slice.Tensor else det.start_idx
+                    holders[dpu_id] = TensorShardDetail(
+                        dpu_id, det.shard_dim, lo, lo + length, local,
+                        elem_strides=row_major_strides(local))
+                node.meta[SPEC_META_KEY] = PIMTensorSpec(
+                    DEVICE_DPU, out_placement, "transient", None, holders,
+                    out_placement.reduce_type, dtype=_dtype_of(node))
+                node.meta[SPEC_META_KEY].validate()
+                for src, req in reqs:
+                    _append_edge(node, src, req, edges, strategy, num_layers)
+                return
     for src, req in reqs:
         _append_edge(node, src, req, edges, strategy, num_layers)
-    node.meta[SPEC_META_KEY] = _dpu_spec(
+    followed = _linear_output_following_weight(node, out_placement, tuple(val.shape))
+    node.meta[SPEC_META_KEY] = followed or _dpu_spec(
         out_placement, tuple(val.shape), _dpus_of_node(node, strategy, num_layers),
         dtype=_dtype_of(node),
     )
@@ -771,11 +1212,26 @@ def _reject_tensor_scalar_operand(node: Node, position: int, keyword: str) -> No
 
 def _append_edge(
     dst: Node, src: Node, req: _Req, edges: list[RedistributeEdge],
-    strategy: ShardStrategy, num_layers: int
+    strategy: ShardStrategy, num_layers: int,
+    dst_dpus: tuple[int, ...] | None = None,
+    dst_spec: PIMTensorSpec | None = None,
 ) -> None:
-    """根据消费节点的 DPU 集合，为一条输入边追加重分布标记。"""
-    dst_dpus = _dpus_of_node(dst, strategy, num_layers)
-    edge = _diff_edge(len(edges), src, dst, src.meta[SPEC_META_KEY], req, dst_dpus)
+    """根据消费节点的 DPU 集合，为一条输入边追加重分布标记。
+
+    类型转换的持有者继承自输入，可能只是阶段里的一部分台。按阶段的
+    全部台重建目标规格会多出没有数据的台，收集校验按全局形状对不上。
+    """
+    # 只收窄分块插入的 _to_copy。图里原有的 to.dtype 是跨阶段的类型
+    # 转换，它的下游在另一个阶段，按输入的持有者收窄会让下游读不到数据。
+    if dst_dpus is not None:
+        pass
+    elif (dst.target is torch.ops.aten._to_copy.default
+            and SPEC_META_KEY in dst.meta):
+        dst_dpus = tuple(sorted(dst.meta[SPEC_META_KEY].shard_map))
+    else:
+        dst_dpus = _dpus_of_node(dst, strategy, num_layers)
+    edge = _diff_edge(len(edges), src, dst, src.meta[SPEC_META_KEY], req, dst_dpus,
+                      dst_spec)
     if edge is not None:
         # 同一份源张量搬到同一组目标 DPU 只发一条边。残差 add 的输出同时
         # 喂下一层 layernorm 的 to.dtype 与下一次残差 add 时，两个消费者

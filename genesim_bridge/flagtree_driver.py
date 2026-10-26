@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -62,8 +63,18 @@ def lower_ttir_to_pimir(
             dma_align=options["pim_dma_align"],
             enable_source_remat=False,
         )
-        # 为矩阵乘选择符合 WRAM 预算的分块。
-        if tile_to_budget and "tt.dot" in ttir:
+        # 五类优化，顺序与 opcompiler_bridge.pipeline.a_path_passes 一致。
+        # canonicalize 与 cse 先清一遍 TTIR 里的 arith。
+        # 分块无条件加入：没有点积也没有可切循环时它保持原样，不再报错。
+        passes.common.add_canonicalizer(manager)
+        passes.common.add_cse(manager)
+        # 循环不变量外提：地址与布局转换不随内层迭代变化。
+        passes.common.add_licm(manager)
+        passes.pim.add_constant_fold(manager)
+        passes.pim.add_pim_cse(manager)
+        passes.pim.add_fuse_activation(manager)
+        passes.pim.add_pim_dce(manager)
+        if tile_to_budget:
             passes.pim.add_tile_to_budget(
                 manager, full_m=full_m, full_n=full_n, full_k=full_k
             )
@@ -206,7 +217,7 @@ def lower_oplevel_to_pimir(mlir_text: str) -> str:
 
     与 `lower_ttir_to_pimir` 是两条不同的入口：那条从 Triton kernel 出发，
     经布局转换、分块与显式 DMA；这条从图编译器发的整算子级 IR 出发，没有
-    DMA 可显式化，走的是融合 → 展开 → 校验三步。
+    DMA 可显式化，走的是融合 → 展开 → 优化与分块 → 校验。
 
     顺序不能反：展开后主算子已经变成相位链，`-pim-fuse-activation` 认的
     `pim.matmul + pim.lut` 模式就不在了；而校验查的跨属性不变量（相位数连续、
@@ -219,14 +230,13 @@ def lower_oplevel_to_pimir(mlir_text: str) -> str:
     genesim 量到的就不是算子编译器真正产出的 IR——成本看着正常，对的是另一份
     产物。pass 列表与 `driver._run_oplevel_triton_opt` 逐字相同。
     """
-    from opcompiler_bridge.driver import _run_passes, _triton_opt
+    from opcompiler_bridge.driver import _options_hardware, _run_passes, _triton_opt
+
+    from opcompiler_bridge.pipeline import b_path_passes, with_budget
 
     return _run_passes(
-        _triton_opt(),
-        mlir_text,
-        ["-pim-fuse-activation", "-pim-expand-phases",
-         "-pim-verify-gml-contract"],
-        "整算子级 pim mlir",
+        _triton_opt(), with_budget(mlir_text, _options_hardware()),
+        b_path_passes(), "整算子级 pim mlir",
     )
 
 
@@ -309,6 +319,68 @@ def _use_gems():
             yield
 
 
+_TILE_KEY = re.compile(r"^(?:BLOCK|TILE)(?:_SIZE)?_([MNK])$")
+# 抓到的矩阵乘都是 fp16 操作数、f32 累加器（见 op_classify 的配方）。
+_OPERAND_BYTES = 2
+_ACCUM_BYTES = 4
+
+
+def _tile_of(config) -> Optional[Tuple[int, int, int]]:
+    """从 autotune 候选里读出 (M, N, K) 分块；不是矩阵乘分块就返回 None。"""
+    dims = {}
+    for name, value in config.kwargs.items():
+        match = _TILE_KEY.match(name)
+        if match:
+            dims[match.group(1)] = int(value)
+    if set(dims) != {"M", "N", "K"}:
+        return None
+    return dims["M"], dims["N"], dims["K"]
+
+
+def _tile_fits(tile: Tuple[int, int, int], wram_bytes: int, dma_align: int) -> bool:
+    """分块能否原样放进 WRAM，与 `-pim-tile-to-budget` 的 `fitsBudget` 同一口径。
+
+    输入、权重按操作数宽度，输出按累加器宽度，三块相加不超预算，且每块各自按 DMA 对齐。
+    """
+    m, n, k = tile
+    blocks = (m * k * _OPERAND_BYTES, n * k * _OPERAND_BYTES, m * n * _ACCUM_BYTES)
+    return sum(blocks) <= wram_bytes and all(b % dma_align == 0 for b in blocks)
+
+
+@contextmanager
+def _autotune_within_wram(wram_bytes: int, dma_align: int):
+    """让 FlagGems 的矩阵乘 autotune 只在放得进 WRAM 的分块里选。
+
+    FlagGems 在 GPU 上 autotune，会选出 128x256x64 这类 GPU 最快的分块。grid 切分的
+    内核 `pim-tile-to-budget` 不重切（v0.0.6），超预算的分块到 `pim-explicit-dma`
+    直接报错。所以在抓内核前先把超预算的候选去掉。换了候选列表，FlagGems 的
+    autotune 缓存表名也跟着换，不会复用旧表里超预算的最优分块。
+    """
+    from flag_gems.utils.libentry import LibTuner
+
+    original = LibTuner.run
+
+    def run(self, *args, **kwargs):
+        if getattr(self, "_pim_wram_filter", None) != (wram_bytes, dma_align):
+            tiles = [_tile_of(c) for c in self.configs]
+            if all(t is not None for t in tiles):
+                kept = [c for c, t in zip(self.configs, tiles)
+                        if _tile_fits(t, wram_bytes, dma_align)]
+                if not kept:
+                    raise RuntimeError(
+                        f"{self.__name__} 没有放得进 {wram_bytes} B WRAM 的 autotune 分块："
+                        f"{sorted(set(tiles))}")
+                self._set_configs_and_strategy(kept, self.strategy)
+            self._pim_wram_filter = (wram_bytes, dma_align)
+        return original(self, *args, **kwargs)
+
+    LibTuner.run = run
+    try:
+        yield
+    finally:
+        LibTuner.run = original
+
+
 def run_and_capture(
     fn,
     emit_pimir: bool = False,
@@ -335,16 +407,24 @@ def run_and_capture(
         if has_gpu:
             torch.cuda.synchronize()
 
-    with _use_gems():
-        fn()
-    _sync()
+    # 要按真实预算出 pim mlir 时，预热之前就收紧候选：预热会把选中的内核缓存下来。
+    if emit_pimir and tile_to_budget:
+        budget = wram_bytes if wram_bytes is not None else pim_options()["pim_wram_bytes"]
+        tuning = _autotune_within_wram(budget, pim_options()["pim_dma_align"])
+    else:
+        tuning = nullcontext()
 
-    with capture_kernels(
-        emit_pimir=emit_pimir,
-        tile_to_budget=tile_to_budget,
-        wram_bytes=wram_bytes,
-    ) as captured:
+    with tuning:
         with _use_gems():
             fn()
         _sync()
+
+        with capture_kernels(
+            emit_pimir=emit_pimir,
+            tile_to_budget=tile_to_budget,
+            wram_bytes=wram_bytes,
+        ) as captured:
+            with _use_gems():
+                fn()
+            _sync()
     return list(captured)

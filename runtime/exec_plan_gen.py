@@ -14,7 +14,9 @@ from comm.lowering import DmaEngine, all_gather, all_reduce, all_to_all, scatter
 from comm.plan import CommPlanEntry
 from contracts.dtypes import dtype_bytes
 from contracts.exec_plan import Access, Command, ExecutionPlan
-from contracts.graph_meta import DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, REDISTRIBUTE_META_KEY, SPEC_META_KEY
+from contracts.graph_meta import (
+    DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, FUSED_TAIL_META_KEY,
+    REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 
 _REDISTRIBUTE_OP = {
@@ -133,6 +135,11 @@ def _assert_same_shape_args_share_the_decision(
     """
     if _oplevel_op_of(node) is None:
         return                              # A 路：不贴张量编码，无从写错
+    if node.target is torch.ops.aten.cat.default:
+        # 拼接的每个实参只是一段，不是输出本身；与本地输出同形只是本台恰好
+        # 持有一段与它等长。MLIR 要求同值同型，编码只能跟着结果类型一起贴，
+        # B 路没有按轴读这段编码的消费者，不产生数值后果。
+        return
     out_decision = _shard_decision_of(spec, out_detail)
     if out_decision is None:                # 没有切分就不贴编码，无从写错
         return
@@ -170,6 +177,40 @@ def _node_access(node: Node, dpu_id: int, placed_elem_bytes=None) -> Access:
     for dim in detail.local_shape:
         nbytes *= dim
     return Access(("dpu", dpu_id), detail.mram_offset, nbytes)
+
+
+def _weight_slice_local_bounds(node: Node, dpu_id: int) -> tuple[int, int] | None:
+    """权重切片在这台上的本地下标区间，越界的部分夹到本地权重内。
+
+    只认切的是权重、且切的就是权重分片那一维的切片。切的是激活、或者切
+    别的轴时返回 None，下标保持原样——另一根轴上每台都持有全段，平移会
+    切到不存在的行。平移后还要夹到这台持有的长度，否则命令的起止会落到
+    本地权重之外，靠内核越界夹取掩盖规格与命令的不一致。
+    """
+    if node.target is not torch.ops.aten.slice.Tensor:
+        return None
+    src = node.args[0] if node.args else None
+    # 两维都切时 K 那一刀挂在 N 那一刀上；N 不是分片轴，本地仍是整段 K，
+    # 所以按根权重的分片换算。
+    while (isinstance(src, Node) and src.target is torch.ops.aten.slice.Tensor
+           and src.args):
+        src = src.args[0]
+    if not isinstance(src, Node) or src.op != "get_attr":
+        return None
+    spec = src.meta.get(SPEC_META_KEY)
+    if spec is None or dpu_id not in spec.shard_map:
+        return None
+    dim = int(node.args[1]) if len(node.args) > 1 else 0
+    if dim < 0:
+        dim += src.meta["val"].ndim
+    if spec.placement.kind != "Shard" or spec.placement.dim != dim:
+        return None
+    detail = spec.shard_map[dpu_id]
+    start = node.args[2] if len(node.args) > 2 and node.args[2] is not None else 0
+    end = node.args[3] if len(node.args) > 3 else None
+    end = detail.end_idx if end is None else int(end)
+    return (max(int(start) - detail.start_idx, 0),
+            min(end - detail.start_idx, detail.local_shape[dim]))
 
 
 def _flatten_node_args(args) -> list:
@@ -213,6 +254,8 @@ class _PlanBuilder:
     def append(self, op: str, dpu_id: int | None, payload: dict,
                reads: list[Access], writes: list[Access], waits: list[int],
                num_tasklets: int = 1) -> Command:
+        # 写后写：等所有写过同一区间的旧命令，否则旧写者晚跑会覆盖新值。
+        waits = waits + _deps_of(writes, self.writers)
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
                        reads=reads, writes=writes, waits=sorted(set(waits)),
                        num_tasklets=num_tasklets)
@@ -239,7 +282,9 @@ class _PlanBuilder:
             return (lambda hal: obj), None
         if node.op == "placeholder":
             name = node.name
-            return (lambda hal: hal.bound_value(name)), None
+            # 绑定值是 numpy 时转成 torch：主机节点（如融合闭包）里的
+            # aten 算子只认张量，其余读取路径都已过 `_as_torch`。
+            return (lambda hal: _as_torch(hal.bound_value(name))), None
         cmd_id = self.host_value_of[node.name]
         return (lambda hal: _as_torch(hal.result_of(cmd_id))), cmd_id
 
@@ -318,6 +363,14 @@ def _emit_host_op(builder: _PlanBuilder, node: Node, host_handler_of: HostHandle
     return cmd
 
 
+def _fused_activation_of(node: Node) -> str | None:
+    """linear 节点折进主算子的尾部激活种类；没折返回 None。"""
+    tail = node.meta.get(FUSED_TAIL_META_KEY)
+    if tail is None or node.target is not torch.ops.aten.linear.default:
+        return None
+    return str(tail.activation)
+
+
 def build_execution_plan(
     nodes: list[Node],
     gm_root,
@@ -339,6 +392,7 @@ def build_execution_plan(
     builder = _PlanBuilder(gm_root, pending_readers)
     by_name = {n.name: n for n in nodes}
     output_cmd_id = -1
+    emitted_edges: set[int] = set()
     for node in nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
@@ -346,8 +400,13 @@ def build_execution_plan(
             # 无张量输出的节点不生成命令。
             continue
 
-        # 处理节点输入的重分布。
+        # 处理节点输入的重分布。同一条边挂在每个消费者上（spec_prop 去重），
+        # 命令只发一次：重复发会在后面的消费者处重读源分片，而源缓冲彼时
+        # 已被复用覆盖，读到的全是垃圾。
         for edge in node.meta.get(REDISTRIBUTE_META_KEY, []):
+            if edge.edge_id in emitted_edges:
+                continue
+            emitted_edges.add(edge.edge_id)
             _emit_redistribute(builder, edge, comm_entries[edge.edge_id], by_name[edge.src])
 
         if node.op == "output":
@@ -383,6 +442,9 @@ def build_execution_plan(
                     if not isinstance(arg, Node):
                         continue
                     if arg.name in landing_by_src and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", []):
+                        # 有落地边时读落地规格，`cat` 也一样：部分和归约后的值在
+                        # 落地缓冲里，源缓冲是归约前的。只有对齐或堆叠的切分 cat
+                        # 没有落地边，那时走下面按源规格读、不持有的段跳过。
                         detail = landing_by_src[arg.name].dst_spec.shard_map[dpu_id]
                         nbytes = dtype_bytes(landing_by_src[arg.name].dtype)
                         for dim in detail.local_shape:
@@ -390,7 +452,8 @@ def build_execution_plan(
                         reads.append(Access(("dpu", dpu_id), detail.mram_offset, nbytes))
                         continue
                     arg_spec = arg.meta.get(SPEC_META_KEY)
-                    if arg_spec is not None and arg_spec.device == DEVICE_DPU and dpu_id in arg_spec.shard_map:
+                    if (arg_spec is not None and arg_spec.device == DEVICE_DPU
+                            and dpu_id in arg_spec.shard_map):
                         reads.append(_node_access(arg, dpu_id, _placed_width(
                             arg, placed_elem_bytes)))
                 if kv_access_of is not None:
@@ -410,30 +473,58 @@ def build_execution_plan(
                 arg_shapes = []
                 arg_dtypes = []
                 arg_decisions: list[tuple] = []
-                for arg in flat_args:
+                # 权重切片的起止是全局下标，每台的本地权重只是全局的一段。
+                # 下发前换算成本地区间并夹到本地长度，否则每台都用全局下标
+                # 切自己的本地权重，越界的被夹成空、没越界的读到别人的行。
+                slice_bounds = _weight_slice_local_bounds(node, dpu_id)
+                for index, arg in enumerate(flat_args):
                     if not isinstance(arg, Node):
+                        if slice_bounds is not None and index in (2, 3):
+                            arg = slice_bounds[index - 2]
                         arg_kinds.append(arg)
                         arg_shapes.append(None)
                         arg_dtypes.append(None)
                         continue
+                    held = arg.meta.get(SPEC_META_KEY)
+                    if (held is not None and held.placement.kind == "Partial"
+                            and dpu_id not in held.shard_map):
+                        # 部分和只落在部分台上，这台的贡献是 0。
+                        arg_kinds.append(0.0)
+                        arg_shapes.append(None)
+                        arg_dtypes.append(None)
+                        continue
                     arg_kinds.append("tensor")
-                    if arg.name in landing_by_src and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", []):
+                    if (arg.name in landing_by_src
+                            and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", [])):
                         arg_spec_here = landing_by_src[arg.name].dst_spec
                     else:
                         arg_spec_here = arg.meta[SPEC_META_KEY]
+                    # 拼接的某段这台并不持有：那段的列在别的台上，这里跳过，
+                    # 只拼这台自己的列。reads 那边本来就按持有者过滤，两边一致。
+                    if (node.target is torch.ops.aten.cat.default
+                            and dpu_id not in arg_spec_here.shard_map):
+                        arg_kinds.pop()
+                        continue
                     arg_detail = arg_spec_here.shard_map[dpu_id]
                     arg_shapes.append(arg_detail.local_shape)
                     arg_dtypes.append(arg.meta[SPEC_META_KEY].dtype)
                     # 形状与切分决策取同一个 spec：发射侧按「同形状 ⇒ 同切分」
                     # 把编码一起贴上去，这里留下逐实参的决策供出口断言核对。
+                    decision = _shard_decision_of(arg_spec_here, arg_detail)
+                    # 只落在部分台上的部分和，缺的台贡献 0，归约跨的仍是输出那些台。
+                    if (arg_spec_here.placement.kind == spec.placement.kind == "Partial"
+                            and set(arg_spec_here.shard_map) < set(spec.shard_map)):
+                        decision = _shard_decision_of(spec, spec.shard_map[dpu_id])
                     arg_decisions.append(
-                        (arg.name, arg_detail.local_shape,
-                         _shard_decision_of(arg_spec_here, arg_detail)))
+                        (arg.name, arg_detail.local_shape, decision))
                 out_detail = spec.shard_map[dpu_id]
                 _assert_same_shape_args_share_the_decision(
                     node, dpu_id, arg_decisions, spec, out_detail)
                 payload = {
                     "kernel": str(node.target), "node": node.name,
+                    # 折进主算子的尾部激活：A 路编译内核按它带 ACTIVATION
+                    # 常量，numpy 镜像按它补上激活再写回。
+                    "activation": _fused_activation_of(node),
                     "arg_kinds": arg_kinds, "arg_shapes": arg_shapes,
                     "arg_dtypes": arg_dtypes,
                     "dtype": spec.dtype,
