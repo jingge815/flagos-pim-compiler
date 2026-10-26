@@ -625,6 +625,22 @@ def test_repeated_writer_of_same_range_only_leaves_the_last_one_as_dep() -> None
     assert raw == [w2.id]
 
 
+def test_same_lane_waits_collapse_to_the_last_command() -> None:
+    """同一 DPU 只等该 DPU 上最后一条前驱；host 命令之间没有串行关系。
+
+    DPU 的命令链保证同 DPU 按提交序执行，等最后一条就够了。host 命令在
+    线程池里无序，必须逐条保留。
+    """
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    a = builder.append("launch", 0, {}, [], [], [])
+    b = builder.append("launch", 0, {}, [], [], [])
+    c = builder.append("launch", 1, {}, [], [], [])
+    host = builder.append("host_slice", None, {}, [], [], [a.id, b.id, c.id])
+    assert host.waits == [b.id, c.id]
+    local = builder.append("launch", 0, {}, [], [], [a.id, b.id, c.id, host.id])
+    assert local.waits == [b.id, c.id, host.id]
+
+
 def test_overlapping_but_not_identical_writes_are_all_kept() -> None:
     """区间只部分重叠时不能省：它们各自的等待链不保证相互覆盖。"""
     builder = exec_plan_gen_module._PlanBuilder(None, {})

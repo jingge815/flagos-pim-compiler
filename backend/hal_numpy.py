@@ -92,7 +92,12 @@ class MRAMAllocator:
 
 
 class NumpyBackend:
-    """提供异步命令执行、每 DPU 有序流和共享 MRAM 的 HAL。"""
+    """提供异步命令执行、每 DPU 有序流和共享 MRAM 的 HAL。
+
+    每台 DPU 有一条命令链：同一 DPU 的命令严格按提交序执行。执行计划依赖
+    这一点，把同 DPU 的显式等待折叠成「只等最后一条前驱」。host 命令没有
+    这种链，必须逐条声明依赖。
+    """
 
     def __init__(self, config: NumpyBackendConfig) -> None:
         if config.allow_device_to_device:

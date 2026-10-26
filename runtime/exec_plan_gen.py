@@ -219,6 +219,7 @@ class _PlanBuilder:
         self.reader_cmds: dict[tuple, list[int]] = {}
         self.pending_readers = pending_readers
         self.host_value_of: dict[str, int] = {}  # 节点名称到 host 结果命令的映射。
+        self.lane_of: dict[int, int | None] = {}  # 命令所属执行泳道：DPU 号或 None。
         self._next_id = 0
 
     def append(self, op: str, dpu_id: int | None, payload: dict,
@@ -226,11 +227,20 @@ class _PlanBuilder:
                num_tasklets: int = 1) -> Command:
         # 写后写：等所有写过同一区间的旧命令，否则旧写者晚跑会覆盖新值。
         waits = waits + _deps_of(writes, self.writers)
+        # 同一 DPU 的命令由执行后端按提交序串行，等该 DPU 上最后一条前驱即可；
+        # host 命令之间没有这种串行关系，逐条保留。
+        last: dict[tuple, int] = {}
+        for cid in waits:
+            lane = self.lane_of[cid]
+            key = ("dpu", lane) if lane is not None else ("host", cid)
+            if cid > last.get(key, -1):
+                last[key] = cid
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
-                       reads=reads, writes=writes, waits=sorted(set(waits)),
+                       reads=reads, writes=writes, waits=sorted(last.values()),
                        num_tasklets=num_tasklets)
         self._next_id += 1
         self.commands.append(cmd)
+        self.lane_of[cmd.id] = dpu_id
         for w in writes:
             self.writers.setdefault(w.loc, []).append((w, cmd.id))
         return cmd
