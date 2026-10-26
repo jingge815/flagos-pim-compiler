@@ -1399,8 +1399,8 @@ def _paged_attention(hal, owner: int, entry: dict, geo: dict,
     """一个头的注意力：融合内核优先，主机两遍兜底。
 
     融合路径把槽池与块表的指针直接交给 `pim.paged_attn`，逻辑块到物理槽的
-    解析在设备上做。图上传来的掩码只在长度与 KV 历史一致时才有意义，而融合
-    内核的可见性按位置算，所以那种情况下走主机路径。
+    解析和单遍在线 softmax 都在设备上做。图上传来的掩码只在长度与 KV 历史
+    一致时才有意义，而融合内核的可见性按位置算，所以那种情况下走主机路径。
     """
     tq = q_head.shape[0]
     hist_len = pos + num_tokens
@@ -1412,7 +1412,7 @@ def _paged_attention(hal, owner: int, entry: dict, geo: dict,
     if num_blocks > int(geo["max_blocks"]):
         raise RuntimeError(
             f"历史长度 {hist_len} 需要 {num_blocks} 个块，块表只有 {geo['max_blocks']} 项")
-    # 融合内核的相位链按 fp16 落盘，f32 的 KV（只有测试会造）走主机路径。
+    # 融合内核的分数与指数按 fp16 落盘，f32 的 KV（只有测试会造）走主机路径。
     fn = None
     if np_dtype == np.dtype(np.float16) and not uses_graph_mask:
         fn = _compiled_paged_attn(
@@ -1444,10 +1444,11 @@ def _host_paged_attention(hal, owner: int, entry: dict, geo: dict,
                           pos: int, hist_len: int, head_dim: int,
                           slot_tokens: int, np_dtype: np.dtype,
                           graph_mask, scale: float) -> np.ndarray:
-    """主机镜像：逐块算 QKᵀ、逐行掩码与 softmax、逐块 PV 累加。
+    """主机兜底：逐块算 QKᵀ、逐行掩码与 softmax、逐块 PV 累加。
 
-    与融合内核逐元素同一口径（`matmul` 落 f16、`add_mask` 加法、`softmax`
-    五相、每块 PV 落 f16 后在 f32 里累加），判据见 `test_kernels` 的对拍。
+    走的是相位链（`matmul` 落 f16、`add_mask` 加法、`softmax` 五相、每块 PV
+    落 f16 后在 f32 里累加），与融合内核的单遍在线形式数学等价、取整位置
+    不同，判据见 `test_kernels` 的 allclose 对拍。
     """
     # 第一遍：逐物理块算 QKᵀ，把分数填进预分配矩阵，不拼 KV 历史。
     # 按 query 整批算（M=tq）是关键：逐 query 逐块重读 K 会把 K 的读放大

@@ -1,5 +1,10 @@
 # 分页注意力融合算子 pim.paged_attn（2026-10-25）
 
+> **2026-10-26 修订**：设备端 softmax 改成单遍在线形式，分数缓冲从
+> `tokens × max_blocks × slot_tokens` 降到 `tokens × slot_tokens`，K/V 各只
+> 扫一遍。数值上不再与主机相位链逐元素相等，判据改为 allclose。见
+> `docs/kv-paged-attn-online-20261026.md`；下文保留 10-25 的两遍实现记录。
+
 ## 目标
 
 原来的 `runtime/kernels.py::sdpa_kernel` 在主机侧做两遍：读块表、逐逻辑块查物理槽、
@@ -34,7 +39,7 @@ MLIR 形态（每个头、每个 token 步调一次）：
 ```
 %y = pim.paged_attn %q, %c, %bt, %ko, %vo, %pos, %nb, %nt
     {slotTokens = 16 : i64, slotElems = 512 : i64, scale = 0.35355339059327373 : f64}
-    : tensor<4x128xf16>, !pim.memdesc<4096x i16, #pim.mram>, tensor<8xi32>,
+    : tensor<4x128xf16>, !pim.memdesc<4096xf16, #pim.mram>, tensor<8xi32>,
       i32, i32, i32, i32, i32 -> tensor<4x128xf16>
 ```
 

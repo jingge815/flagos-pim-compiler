@@ -1403,11 +1403,12 @@ def _dot_f16(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
-def test_paged_attn_matches_the_phase_chain() -> None:
-    """分页注意力：内核自己在设备上查块表、逐槽算 QK / softmax / PV。
+def test_paged_attn_matches_the_online_reference() -> None:
+    """分页注意力：内核自己在设备上查块表，用单遍在线 softmax 算 QK 与 PV。
 
-    参考按镜像逐步复现：分数落 f16、掩码是一次加法、softmax 是五相链、
-    PV 每块落 f16。块表乱序（逻辑块 0 → 物理槽 1）时也必须按表取值。
+    参考按内核的展开逐步复现：分数落 f16、掩码是一次选择、逐块维护 running
+    max / sum、指数落 f16、输出在 f32 里按 alpha 重标定，最后除以 running sum。
+    块表乱序（逻辑块 0 → 物理槽 1）时也必须按表取值。
     """
     tokens, head_dim, slot_tokens = 4, 16, 16
     plane = slot_tokens * head_dim
@@ -1444,11 +1445,33 @@ def test_paged_attn_matches_the_phase_chain() -> None:
     vb = cache[base + plane:base + 2 * plane].reshape(slot_tokens, head_dim)[:tokens]
     scores = (_dot_f16(q, np.ascontiguousarray(kb.T)).astype(np.float32)
               * np.float32(scale))
-    weights = np.empty((tokens, tokens), dtype=np.float16)
+    logits = np.empty((tokens, tokens), dtype=np.float16)
     for t in range(tokens):
-        mask = np.where(np.arange(tokens) <= t, 0.0, -np.inf).astype(np.float32)
-        weights[t] = mirrors.softmax(mirrors.mask(scores[t], mask))
-    ref = _dot_f16(weights, vb)
+        for r in range(tokens):
+            logits[t, r] = scores[t, r] if r <= t else np.float16(-np.inf)
+
+    running_max = np.full(tokens, -1e30, dtype=np.float32)
+    running_sum = np.zeros(tokens, dtype=np.float32)
+    acc = np.zeros((tokens, head_dim), dtype=np.float32)
+    for t in range(tokens):
+        row = logits[t].astype(np.float32)
+        m_new = np.float32(max(running_max[t], row.max()))
+        alpha = np.float32(np.exp(np.float32(running_max[t] - m_new),
+                                  dtype=np.float32))
+        probs = np.exp((row - m_new).astype(np.float32)).astype(np.float16)
+        # 顺序累加，和 EmitC 展开的循环同一口径（BLAS 的归约顺序不保证）。
+        block_sum = np.float32(0)
+        for r in range(tokens):
+            block_sum = np.float32(block_sum + np.float32(probs[r]))
+        running_sum[t] = np.float32(running_sum[t] * alpha + block_sum)
+        for d in range(head_dim):
+            dot = np.float32(0)
+            for r in range(tokens):
+                dot = np.float32(
+                    dot + np.float32(probs[r]) * np.float32(vb[r, d]))
+            acc[t, d] = acc[t, d] * alpha + dot
+        running_max[t] = m_new
+    ref = (acc / running_sum[:, None]).astype(np.float16)
     np.testing.assert_array_equal(out, ref)
 
 
