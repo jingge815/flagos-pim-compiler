@@ -1,7 +1,8 @@
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from threading import Lock
-from dataclasses import dataclass
 from typing import Callable, Literal
 
 import numpy as np
@@ -16,12 +17,27 @@ class NumpyBackendConfig:
     mram_bytes_per_dpu: int
     wram_bytes_per_dpu: int = 65536
     allow_device_to_device: bool = False
+    num_parallel_slots: int = 1       # 同一步并发的请求上下文数，只影响线程池尺寸。
 
 
 @dataclass
 class Event:
     kind: Literal["dpu", "dma", "host"]
     future: Future[object]
+
+
+@dataclass
+class ExecutionContext:
+    """一次请求执行的独立输入、事件表和执行泳道。
+
+    为空时所有字段都退回 `NumpyBackend` 的全局语义，旧的单请求路径不变。
+    """
+
+    lane_key: int = 0
+    values: dict[str, object] = field(default_factory=dict)
+    pos: int | None = None
+    num_tokens: int | None = None
+    events: dict[int, Event] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,11 +108,12 @@ class MRAMAllocator:
 
 
 class NumpyBackend:
-    """提供异步命令执行、每 DPU 有序流和共享 MRAM 的 HAL。
+    """提供异步命令执行、每 (上下文, DPU) 有序流和共享 MRAM 的 HAL。
 
-    每台 DPU 有一条命令链：同一 DPU 的命令严格按提交序执行。执行计划依赖
-    这一点，把同 DPU 的显式等待折叠成「只等最后一条前驱」。host 命令没有
-    这种链，必须逐条声明依赖。
+    每台 DPU 的每个执行上下文有一条命令链：同链命令严格按提交序执行。执行
+    计划依赖这一点，把同 DPU 的显式等待折叠成「只等最后一条前驱」。不同上下文
+    （不同请求）的链互不排队，才能在一步里同时执行。host 命令没有这种链，
+    必须逐条声明依赖。
     """
 
     def __init__(self, config: NumpyBackendConfig) -> None:
@@ -104,10 +121,15 @@ class NumpyBackend:
             raise ValueError("device-to-device copies are not supported in Phase 1")
         self.config = config
         self._kernels = KernelStubRegistry()
-        self._pool = ThreadPoolExecutor(max_workers=config.num_dpus + 1)
-        self._stream_locks = {dpu_id: Lock() for dpu_id in range(config.num_dpus)}
-        self._stream_tail: dict[int, Future[object]] = {}
+        lanes = max(1, config.num_parallel_slots)
+        self._pool = ThreadPoolExecutor(
+            max_workers=min(64, config.num_dpus * lanes + lanes + 1))
+        # 键是 (lane_key, dpu_id)；lane_key=0 是旧的串行路径。
+        self._stream_locks: dict[tuple[int, int], Lock] = {}
+        self._stream_tail: dict[tuple[int, int], Future[object]] = {}
+        self._stream_meta_lock = Lock()
         self._events_by_id: dict[int, Event] = {}
+        self._ctx_local = threading.local()
         self._dpu_set: DpuSet = dpu_alloc(
             config.num_dpus, mram_bytes=config.mram_bytes_per_dpu,
             wram_bytes=config.wram_bytes_per_dpu,
@@ -186,10 +208,13 @@ class NumpyBackend:
         for dpu_id, offset, data in transfers:
             self.copy_to_dpu(dpu_id, offset, data)
 
-    def submit(self, cmd: Command) -> Event:
-        if cmd.id in self._events_by_id:
+    def submit(self, cmd: Command, ctx: ExecutionContext | None = None) -> Event:
+        """提交一条命令；`ctx` 为空时沿用全局事件表和 0 号泳道。"""
+        events = self._events_by_id if ctx is None else ctx.events
+        if cmd.id in events:
             raise ValueError(f"duplicate command id {cmd.id}")
-        deps = self._dependency_futures(cmd.waits)
+        deps = self._dependency_futures(cmd.waits, events)
+        lane_key = 0 if ctx is None else int(ctx.lane_key)
         if cmd.op == "launch":
             kernel = self._kernels.lookup(str(cmd.payload["kernel"]))
             tracker = HazardTracker()
@@ -204,7 +229,7 @@ class NumpyBackend:
 
             event = Event(
                 "dpu",
-                self._submit_on_dpu(int(cmd.dpu_id), deps, run_with_tracker),
+                self._submit_on_dpu(int(cmd.dpu_id), lane_key, deps, ctx, run_with_tracker),
             )
         elif cmd.op == "dma_in":
             data = np.ascontiguousarray(np.asarray(cmd.payload["data"])).copy()
@@ -212,7 +237,9 @@ class NumpyBackend:
                 "dma",
                 self._submit_on_dpu(
                     int(cmd.dpu_id),
+                    lane_key,
                     deps,
+                    ctx,
                     self.copy_to_dpu,
                     int(cmd.dpu_id),
                     int(cmd.payload["offset"]),
@@ -224,7 +251,9 @@ class NumpyBackend:
                 "dma",
                 self._submit_on_dpu(
                     int(cmd.dpu_id),
+                    lane_key,
                     deps,
+                    ctx,
                     self.copy_from_dpu,
                     int(cmd.dpu_id),
                     int(cmd.payload["offset"]),
@@ -233,16 +262,17 @@ class NumpyBackend:
                 ),
             )
         elif cmd.dpu_id is None:
-            event = Event("host", self._pool.submit(self._run_host_or_dma, cmd, deps))
+            event = Event("host", self._pool.submit(self._run_host_or_dma, cmd, deps, ctx))
         else:
             raise ValueError(f"unsupported command op {cmd.op!r}")
-        self._events_by_id[cmd.id] = event
+        events[cmd.id] = event
         return event
 
-    def _dependency_futures(self, waits: list[int]) -> list[Future[object]]:
+    def _dependency_futures(self, waits: list[int],
+                            events: dict[int, Event]) -> list[Future[object]]:
         deps: list[Future[object]] = []
         for wait in waits:
-            event = self._events_by_id.get(wait)
+            event = events.get(wait)
             if event is None:
                 raise ValueError(f"unknown dependency command id {wait}")
             deps.append(event.future)
@@ -251,31 +281,56 @@ class NumpyBackend:
     def _submit_on_dpu(
         self,
         dpu_id: int,
+        lane_key: int,
         deps: list[Future[object]],
+        ctx: ExecutionContext | None,
         fn: Callable[..., object],
         *args: object,
     ) -> Future[object]:
-        with self._stream_locks[dpu_id]:
-            prev = self._stream_tail.get(dpu_id)
+        key = (lane_key, dpu_id)
+        with self._stream_meta_lock:
+            lock = self._stream_locks.get(key)
+            if lock is None:
+                lock = self._stream_locks[key] = Lock()
+        with lock:
+            prev = self._stream_tail.get(key)
 
             def run() -> object:
                 if prev is not None:
                     prev.result()
                 for dep in deps:
                     dep.result()
-                return fn(*args)
+                with self._install_context(ctx):
+                    return fn(*args)
 
             future = self._pool.submit(run)
-            self._stream_tail[dpu_id] = future
+            self._stream_tail[key] = future
             return future
 
-    def _run_host_or_dma(self, cmd: Command, deps: list[Future[object]]) -> object:
+    @contextmanager
+    def _install_context(self, ctx: ExecutionContext | None):
+        """在 worker 线程里安装本次命令的上下文，退出时清理。"""
+        if ctx is None:
+            yield
+            return
+        self._ctx_local.ctx = ctx
+        try:
+            yield
+        finally:
+            del self._ctx_local.ctx
+
+    def _current_context(self) -> ExecutionContext | None:
+        return getattr(self._ctx_local, "ctx", None)
+
+    def _run_host_or_dma(self, cmd: Command, deps: list[Future[object]],
+                         ctx: ExecutionContext | None) -> object:
         for dep in deps:
             dep.result()
         operation = cmd.payload.get("fn")
         if callable(operation):
-            with self._host_lock:
-                return operation(self, cmd)
+            with self._install_context(ctx):
+                with self._host_lock:
+                    return operation(self, cmd)
         return None
 
     def wait(self, event: Event, timeout: float | None = None) -> object:
@@ -293,18 +348,25 @@ class NumpyBackend:
 
     def bound_value(self, name: str) -> object:
         """取本次绑定的某个 placeholder 值（`exec_plan_gen._resolve_value` 用）。"""
+        ctx = self._current_context()
+        if ctx is not None:
+            return ctx.values[name]
         return self._bound_values[name]
 
     @property
     def bound_pos(self) -> int | None:
         """取本次 `bind_inputs` 绑定的 `pos`（KV/SDPA handler 读写位置用）。"""
-        return self._bound_pos
+        ctx = self._current_context()
+        return ctx.pos if ctx is not None else self._bound_pos
 
     @property
     def bound_num_tokens(self) -> int | None:
         """取本次 `bind_inputs` 绑定的真实 token 数（限制 KV 写入行数）。"""
-        return self._bound_num_tokens
+        ctx = self._current_context()
+        return ctx.num_tokens if ctx is not None else self._bound_num_tokens
 
     def result_of(self, cmd_id: int) -> object:
         """返回指定命令的执行结果。"""
-        return self._events_by_id[cmd_id].future.result()
+        ctx = self._current_context()
+        events = self._events_by_id if ctx is None else ctx.events
+        return events[cmd_id].future.result()

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -45,6 +46,9 @@ class PIMWorker(WorkerBase):
         super().__init__(vllm_config, local_rank, rank,
                          distributed_init_method, is_driver_worker)
         self.num_request_slots = int(self.scheduler_config.max_num_seqs)
+        # 同一步并发的请求窗口数：受 host 请求槽上限约束，可用环境变量调小。
+        self.num_parallel_slots = min(
+            self.num_request_slots, int(os.environ.get("PIM_PARALLEL_SLOTS", "2")))
         self.kv_slot_tokens = int(self.cache_config.block_size)
         self.max_seq = int(self.model_config.max_model_len)
         # prefill 图是静态导出的，prompt 右侧补齐到这个长度再执行。
@@ -69,13 +73,15 @@ class PIMWorker(WorkerBase):
         self.hal: NumpyBackend | None = None
         self.compiled = None
         self.table: RequestTable | None = None
+        self._executor: ThreadPoolExecutor | None = None
 
     # ---- 设备与模型 ----
 
     def init_device(self) -> None:
         """初始化 NumpyBackend 并注册全部设备内核。"""
         self.hal = NumpyBackend(NumpyBackendConfig(
-            num_dpus=self.num_dpus, mram_bytes_per_dpu=self.mram_bytes))
+            num_dpus=self.num_dpus, mram_bytes_per_dpu=self.mram_bytes,
+            num_parallel_slots=self.num_parallel_slots))
         register_all(self.hal)
 
     def load_model(self) -> None:
@@ -109,6 +115,7 @@ class PIMWorker(WorkerBase):
             num_request_slots=self.num_request_slots,
             kv_slot_tokens=self.kv_slot_tokens,
             kv_pool_slots=self.kv_pool_slots,
+            num_parallel_slots=self.num_parallel_slots,
         )
         load_weights(self.compiled, self.hal)
         self.table = RequestTable(self.num_request_slots, self.compiled.kv_pool_slots)
@@ -169,7 +176,6 @@ class PIMWorker(WorkerBase):
         self._sync_preempted(scheduler_output)
 
         req_ids = list(scheduler_output.num_scheduled_tokens)
-        sampled: list[list[int]] = []
         for req_id in req_ids:
             slot = self.table.get(req_id)
             scheduled = scheduler_output.num_scheduled_tokens[req_id]
@@ -185,17 +191,39 @@ class PIMWorker(WorkerBase):
             if slot.is_prefill_done and scheduled != 1:
                 raise RuntimeError(
                     f"请求 {req_id} 解码步调度了 {scheduled} 个 token，只支持 1 个")
-            sampled.append([step_request(
-                self.compiled, self.hal, slot, causal_mask_of,
-                sample_fn=_argmax,
-                pad_to=self.prefill_seq_len, pad_id=self.eos_id,
-            )])
+
+        # 按并行窗口数分 wave，wave 内每个请求用自己的窗口同时执行。
+        sampled: list[list[int] | None] = [None] * len(req_ids)
+        width = min(self.num_parallel_slots, len(req_ids)) if req_ids else 1
+        if width <= 1:
+            for index, req_id in enumerate(req_ids):
+                sampled[index] = [self._step(req_id)]
+        else:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=self.num_parallel_slots)
+            for start in range(0, len(req_ids), width):
+                wave = req_ids[start:start + width]
+                futures = [
+                    self._executor.submit(self._step, req_id, index)
+                    for index, req_id in enumerate(wave)
+                ]
+                for offset, future in enumerate(futures):
+                    sampled[start + offset] = [future.result()]
 
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
             sampled_token_ids=sampled,
             prompt_logprobs_dict={rid: None for rid in req_ids},
+        )
+
+    def _step(self, req_id: str, slot_index: int = 0) -> int:
+        """执行一个请求的一步，使用第 `slot_index` 号激活/块表窗口。"""
+        return step_request(
+            self.compiled, self.hal, self.table.get(req_id), causal_mask_of,
+            sample_fn=_argmax,
+            pad_to=self.prefill_seq_len, pad_id=self.eos_id,
+            slot_index=slot_index,
         )
 
     def _sync_preempted(self, scheduler_output: SchedulerOutput) -> None:

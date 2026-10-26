@@ -2,34 +2,40 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
+from backend.hal_numpy import ExecutionContext
 from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import write_block_table
 
 
 class KVSlotPool:
-    """管理请求之间共享的物理 KV 槽池。"""
+    """管理请求之间共享的物理 KV 槽池；多请求并发申请，读写都要加锁。"""
 
     def __init__(self, num_slots: int) -> None:
         if num_slots < 1:
             raise ValueError(f"num_slots 必须 >= 1，got {num_slots}")
         self._num_slots = num_slots
         self._free = list(range(num_slots))
+        self._lock = threading.Lock()
 
     def alloc(self) -> int:
         """分配一个物理槽；池耗尽时抛 RuntimeError。"""
-        if not self._free:
-            raise RuntimeError(f"KV 物理槽已耗尽（共 {self._num_slots} 个）")
-        return self._free.pop(0)
+        with self._lock:
+            if not self._free:
+                raise RuntimeError(f"KV 物理槽已耗尽（共 {self._num_slots} 个）")
+            return self._free.pop(0)
 
     def free(self, slot: int) -> None:
         """归还物理槽。"""
-        self._free.append(slot)
-        self._free.sort()
+        with self._lock:
+            self._free.append(slot)
+            self._free.sort()
 
 
 class KVBlockTable:
@@ -81,6 +87,13 @@ class RequestTable:
         self._pool = KVSlotPool(kv_pool_slots)
         self._slots: dict[str, RequestSlot] = {}   # request_id -> RequestSlot
         self._free: list[int] = list(range(num_request_slots))
+        self._step_executor: ThreadPoolExecutor | None = None
+
+    def step_executor(self, max_workers: int) -> ThreadPoolExecutor:
+        """返回执行各请求一步的线程池，首次调用时按并发窗口数创建。"""
+        if self._step_executor is None:
+            self._step_executor = ThreadPoolExecutor(max_workers=max_workers)
+        return self._step_executor
 
     def add_request(self, request_id: str, prompt_ids: list[int],
                     eos_id: int = 2) -> RequestSlot:
@@ -131,6 +144,7 @@ def step_request(
     sample_fn=None,
     pad_to: int | None = None,
     pad_id: int = 0,
+    slot_index: int = 0,
 ) -> int:
     """对单个请求执行一步（未 prefill 则 prefill，否则 decode），返回新 token。
 
@@ -138,20 +152,22 @@ def step_request(
     `pad_to` 非空时把 prompt 右侧补齐到该长度，适配静态导出的 prefill 图；
     补齐位置不写 KV（`num_tokens` 只算真实 prompt），也不参与采样。
 
-    共享块表缓冲依赖串行：`execute_plan` 等本计划全部命令结束才返回，
-    下一步覆盖块表时不会有上一步的内核还在读表。
+    `slot_index` 指定本次用的激活窗口和块表窗口（0..并行窗口数-1）。同一步
+    并发的请求各用各的窗口，激活、块表都不相交；物理 KV 槽由槽池全局分配。
     """
     if sample_fn is None:
         sample_fn = lambda logits: int(np.argmax(logits))
 
+    ctx = ExecutionContext(lane_key=slot_index)
     if not slot.is_prefill_done:
         prompt_len = len(slot.prompt_ids)
         seq_len = pad_to if pad_to is not None else prompt_len
         ids = list(slot.prompt_ids) + [pad_id] * (seq_len - prompt_len)
         slot.blocks.ensure(_blocks_for(prompt_len, compiled.kv_slot_tokens))
-        _write_block_table(compiled, hal, slot)
+        _write_block_table(compiled, hal, slot, slot_index)
         events = execute_plan(
-            compiled.prefill.plan, hal,
+            _window_plan(compiled, "prefill", slot_index), hal,
+            ctx=ctx,
             values={
                 "input_ids": _as_batch_tensor(ids),
                 "causal_mask": causal_mask_of(seq_len),
@@ -167,9 +183,10 @@ def step_request(
     else:
         total_len = slot.valid_len + 1
         slot.blocks.ensure(_blocks_for(total_len, compiled.kv_slot_tokens))
-        _write_block_table(compiled, hal, slot)
+        _write_block_table(compiled, hal, slot, slot_index)
         events = execute_plan(
-            compiled.decode.plan, hal,
+            _window_plan(compiled, "decode", slot_index), hal,
+            ctx=ctx,
             values={
                 "input_ids": _as_batch_tensor([slot.generated[-1]]),
                 "causal_mask": causal_mask_of(1),
@@ -186,6 +203,14 @@ def step_request(
     return token
 
 
+def _window_plan(compiled, phase: str, slot_index: int):
+    """取某阶段第 `slot_index` 号窗口的计划；手搓蓝图没有窗口表时退回原计划。"""
+    plans = getattr(compiled, f"{phase}_plans", None)
+    if plans:
+        return plans[slot_index]
+    return getattr(compiled, phase).plan
+
+
 def run_one_step(
     compiled,
     hal,
@@ -193,33 +218,68 @@ def run_one_step(
     causal_mask_of,
     *,
     sample_fn=None,
+    parallel_slots: int | None = None,
 ) -> list[tuple[str, list[int]]]:
     """对表中每个活跃请求各执行一步，返回刚生成完毕的 (request_id, tokens)。
 
-    串行逐 slot 执行，每步先把本请求的块表写进共享缓冲。
+    活跃请求按 `parallel_slots` 分 wave，wave 内并发执行，每个请求用 wave 内
+    自己的窗口（激活区与块表都不相交）。wave 之间串行，结果语义与逐个执行一致。
     """
+    slots = table.active_slots()
     results: list[tuple[str, list[int]]] = []
-    for slot in table.active_slots():
+    pending: list[RequestSlot] = []
+    for slot in slots:
         if slot.generated and slot.generated[-1] == slot.eos_id:
             results.append((slot.request_id, list(slot.generated)))
-            continue
-        step_request(compiled, hal, slot, causal_mask_of, sample_fn=sample_fn)
+        else:
+            pending.append(slot)
+
+    max_windows = getattr(compiled, "num_parallel_slots", 1)
+    width = parallel_slots if parallel_slots is not None else max_windows
+    width = max(1, min(width, max_windows, len(pending))) if pending else 1
+    if width == 1:
+        for slot in pending:
+            step_request(compiled, hal, slot, causal_mask_of, sample_fn=sample_fn)
+    else:
+        executor = table.step_executor(max_windows)
+        for start in range(0, len(pending), width):
+            wave = pending[start:start + width]
+            futures = [
+                executor.submit(
+                    step_request, compiled, hal, slot, causal_mask_of,
+                    sample_fn=sample_fn, slot_index=index)
+                for index, slot in enumerate(wave)
+            ]
+            for future in futures:
+                future.result()
     return results
 
 
-def execute_plan(plan: ExecutionPlan, hal, *, values: dict[str, object] | None = None,
+def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
+                 values: dict[str, object] | None = None,
                  pos: int | None = None,
                  num_tokens: int | None = None) -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。
 
     命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
     自己的依赖完成，主线程不必逐条前置等待，否则提交无法提前、DPU 排不满。
+    `ctx` 非空时输入值、事件表和泳道都走该上下文，多个请求才能同时在飞；
+    为空时沿用全局事件表，保持旧的单请求语义。
     """
-    hal.reset_events()
-    hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
-    events: dict[int, object] = {}
-    for cmd in plan.commands:
-        events[cmd.id] = hal.submit(cmd)
+    if ctx is None:
+        hal.reset_events()
+        hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
+        events: dict[int, object] = {}
+        for cmd in plan.commands:
+            events[cmd.id] = hal.submit(cmd)
+    else:
+        ctx.events.clear()
+        ctx.values = values or {}
+        ctx.pos = pos
+        ctx.num_tokens = num_tokens
+        for cmd in plan.commands:
+            hal.submit(cmd, ctx)
+        events = dict(ctx.events)
     # 等待当前计划的全部命令。
     for event in events.values():
         hal.wait(event)
@@ -256,10 +316,10 @@ def _blocks_for(n_tokens: int, slot_tokens: int) -> int:
     return -(-n_tokens // slot_tokens)
 
 
-def _write_block_table(compiled, hal, slot: RequestSlot) -> None:
-    """把本请求的块表覆盖进每台 DPU 的同一块表缓冲。"""
+def _write_block_table(compiled, hal, slot: RequestSlot, slot_index: int = 0) -> None:
+    """把本请求的块表写进每台 DPU 的第 `slot_index` 份块表缓冲。"""
     for spec in compiled.kv_specs.values():
-        write_block_table(spec, hal, slot.blocks.slots)
+        write_block_table(spec, hal, slot.blocks.slots, slot_index)
 
 
 def _as_batch_tensor(ids: list[int]):

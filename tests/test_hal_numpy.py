@@ -5,7 +5,13 @@ import pytest
 import torch
 
 from backend import VendorBackend
-from backend.hal_numpy import HazardTracker, NumpyBackend, NumpyBackendConfig, TaskletHazardError
+from backend.hal_numpy import (
+    ExecutionContext,
+    HazardTracker,
+    NumpyBackend,
+    NumpyBackendConfig,
+    TaskletHazardError,
+)
 from contracts.exec_plan import Access, Command, ExecutionPlan
 from contracts.pim_tensor_spec import Placement, PIMTensorSpec, TensorShardDetail
 
@@ -324,6 +330,88 @@ def test_llama2_smoke_payload_stays_model_agnostic() -> None:
     backend.copy_to_dpu(0, 0, activation)
 
     assert np.array_equal(backend.copy_from_dpu(0, 0, activation.shape, activation.dtype), activation)
+
+
+def test_distinct_contexts_can_reuse_command_ids() -> None:
+    """两个请求各自从 0 编号命令，事件表互不干扰。"""
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
+    ctx_a = ExecutionContext(lane_key=1)
+    ctx_b = ExecutionContext(lane_key=2)
+    event_a = backend.submit(
+        Command(0, "dma_in", 0, {"offset": 0, "data": np.asarray([1], np.int32)}), ctx_a)
+    event_b = backend.submit(
+        Command(0, "dma_in", 0, {"offset": 4, "data": np.asarray([2], np.int32)}), ctx_b)
+    backend.wait(event_a)
+    backend.wait(event_b)
+
+    assert set(ctx_a.events) == {0} and set(ctx_b.events) == {0}
+    assert backend._events_by_id == {}, "上下文事件不该写进全局表"
+    with pytest.raises(ValueError, match="duplicate command id 0"):
+        backend.submit(
+            Command(0, "dma_in", 0, {"offset": 8, "data": np.asarray([3], np.int32)}), ctx_a)
+
+
+def test_bound_values_are_read_from_the_running_context() -> None:
+    """两个上下文同时执行时各读各的占位符，不能懒查全局。"""
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
+    ctx_a = ExecutionContext(lane_key=1, values={"v": np.asarray([11], np.int32)})
+    ctx_b = ExecutionContext(lane_key=2, values={"v": np.asarray([22], np.int32)})
+    both_in_flight = threading.Barrier(2, timeout=2.0)
+
+    def write_bound(hal, dpu_id, cmd) -> None:
+        both_in_flight.wait()
+        hal.write_local(dpu_id, int(cmd.payload["offset"]), hal.bound_value("v"))
+
+    backend.register_kernel("write_bound", write_bound)
+    event_a = backend.submit(
+        Command(0, "launch", 0, {"kernel": "write_bound", "offset": 0}), ctx_a)
+    event_b = backend.submit(
+        Command(0, "launch", 0, {"kernel": "write_bound", "offset": 4}), ctx_b)
+    backend.wait(event_a)
+    backend.wait(event_b)
+
+    assert backend.read_local(0, 0, (1,), np.int32)[0] == 11
+    assert backend.read_local(0, 4, (1,), np.int32)[0] == 22
+
+
+def test_result_of_reads_the_context_event_table() -> None:
+    """主机命令里的 `result_of` 走本上下文的事件表。"""
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64))
+    ctx = ExecutionContext(lane_key=3)
+    backend.submit(Command(0, "host_op", None, {"fn": lambda hal, cmd: 41}), ctx)
+    backend.submit(
+        Command(1, "host_op", None, {"fn": lambda hal, cmd: hal.result_of(0) + 1}, waits=[0]), ctx)
+    event = backend.submit(
+        Command(2, "host_op", None, {"fn": lambda hal, cmd: hal.result_of(1) + 1}, waits=[1]), ctx)
+    assert backend.wait(event) == 43
+
+
+def test_same_dpu_different_lanes_run_concurrently() -> None:
+    """不同上下文的命令在同一 DPU 上互不排队；默认 0 号泳道仍严格串行。"""
+    backend = NumpyBackend(NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=64,
+                                              num_parallel_slots=2))
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_ran = threading.Event()
+
+    def block(hal, dpu_id, cmd) -> None:
+        first_started.set()
+        release_first.wait()
+
+    def mark(hal, dpu_id, cmd) -> None:
+        second_ran.set()
+
+    backend.register_kernel("block", block)
+    backend.register_kernel("mark", mark)
+    ctx_lane1 = ExecutionContext(lane_key=1)
+    ctx_lane2 = ExecutionContext(lane_key=2)
+    first = backend.submit(Command(0, "launch", 0, {"kernel": "block"}), ctx_lane1)
+    assert first_started.wait(timeout=1.0)
+    second = backend.submit(Command(0, "launch", 0, {"kernel": "mark"}), ctx_lane2)
+    assert second_ran.wait(timeout=1.0), "不同泳道的命令应能在同一 DPU 上交错执行"
+    release_first.set()
+    backend.wait(first)
+    backend.wait(second)
 
 
 def test_concurrent_host_xfers_do_not_steal_each_others_buffer(monkeypatch) -> None:

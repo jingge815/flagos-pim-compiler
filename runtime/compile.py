@@ -17,7 +17,8 @@ from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
 from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy
-from memory.mem_planner import DPUPlan, HwBudget, plan_dpu
+from memory.mem_planner import DPUPlan, HwBudget, fit_activation_windows, plan_dpu
+from runtime.binding import bind_plan
 from runtime.exec_plan_gen import CompiledPlan, build_execution_plan
 
 
@@ -40,6 +41,11 @@ class CompiledModel:
     kv_slot_tokens: int = 16
     kv_pool_slots: int = 0
     prefill_seq_len: int = 0
+    num_parallel_slots: int = 1            # 同一步并发执行的请求窗口数。
+    act_stride: int = 0                    # 相邻激活窗口的统一步长。
+    block_table_bytes: int = 0             # 单份块表窗口的字节数。
+    prefill_plans: list | None = None      # 按窗口平移后的 prefill 计划，0 号即原计划。
+    decode_plans: list | None = None
 
 
 class PositionalLlama(torch.nn.Module):
@@ -206,12 +212,17 @@ def compile_llama2(
     num_request_slots: int = 1,
     kv_slot_tokens: int = 16,
     kv_pool_slots: int | None = None,
+    num_parallel_slots: int | None = None,
+    block_table_slots: int | None = None,
 ) -> CompiledModel:
     """编译 Llama 的两张图，返回共享内存蓝图的命令计划。
 
-    `num_request_slots` 只做 host 侧并发上限记账；设备侧只认一份全局块表缓冲和
-    `kv_pool_slots` 个物理槽。`kv_pool_slots` 为空时取 `num_request_slots` 个满长
-    请求的块数（与改动前的槽池容量一致）。
+    `num_request_slots` 只做 host 侧并发上限记账；设备侧有
+    `num_parallel_slots` 份激活窗口与块表窗口，供同一步的多个请求并行使用，
+    物理槽池仍是全局一份（`kv_pool_slots`）。
+    `num_parallel_slots` 为空时取 `min(2, num_request_slots)`；
+    `block_table_slots` 为空时等于它。`kv_pool_slots` 为空时取
+    `num_request_slots` 个满长请求的块数（与改动前的槽池容量一致）。
     """
     cfg = model.config
     prefill_gm = export_annotated_graph(
@@ -248,12 +259,28 @@ def compile_llama2(
     if kv_pool_slots is None:
         blocks_per_request = -(-max_seq // kv_slot_tokens)
         kv_pool_slots = num_request_slots * blocks_per_request
+    # 同一步最多并飞几个请求：host 请求槽仍是上限，激活窗口与它对齐。
+    parallel_slots = min(num_parallel_slots or 2, num_request_slots)
+    if block_table_slots is None:
+        block_table_slots = parallel_slots
+    if block_table_slots < parallel_slots:
+        raise ValueError(
+            f"block_table_slots={block_table_slots} 小于并行窗口数 {parallel_slots}")
+    # 先按单窗口规划拿到各 DPU 的实际激活占用，再统一成并行窗口。
     mem_plans = {
         dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
                          kernel_mram_bytes=kernel_mram,
-                         kv_pool_slots=kv_pool_slots)
+                         kv_pool_slots=kv_pool_slots,
+                         act_slots=1,
+                         block_table_slots=block_table_slots)
         for dpu_id in strategy.dpu_ids
     }
+    act_stride = fit_activation_windows(mem_plans, parallel_slots, hw, kernel_mram)
+
+    bt_bytes = {spec.block_table_bytes for spec in kv_specs.values()}
+    if len(bt_bytes) != 1:
+        raise ValueError(f"各 DPU 的块表字节数必须一致，got {sorted(bt_bytes)}")
+    block_table_bytes = bt_bytes.pop()
 
     pool_slots = {spec.pool_slots for spec in kv_specs.values()}
     if pool_slots != {kv_pool_slots}:
@@ -299,6 +326,18 @@ def compile_llama2(
         hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
     )
 
+    # 每个窗口一份计划：0 号就是原计划（零拷贝），其余把激活地址和块表基址平移到
+    # 自己的窗口。两张图共用同一份激活布局，所以窗口步长完全一致。
+    act_base_by_dpu = {dpu_id: plan.act_base for dpu_id, plan in mem_plans.items()}
+
+    def _windows(plan):
+        return [
+            bind_plan(plan, act_base_by_dpu=act_base_by_dpu,
+                      act_shift=k * act_stride, block_slot=k,
+                      bt_stride=block_table_bytes)
+            for k in range(parallel_slots)
+        ]
+
     return CompiledModel(
         strategy=strategy,
         prefill_gm=prefill_gm,
@@ -315,6 +354,11 @@ def compile_llama2(
         kv_slot_tokens=kv_slot_tokens,
         kv_pool_slots=kv_pool_slots,
         prefill_seq_len=prefill_seq_len,
+        num_parallel_slots=parallel_slots,
+        act_stride=act_stride,
+        block_table_bytes=block_table_bytes,
+        prefill_plans=_windows(prefill.plan),
+        decode_plans=_windows(decode.plan),
     )
 
 

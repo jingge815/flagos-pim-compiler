@@ -18,21 +18,33 @@ from comm.plan import CommPlanEntry, CommSegment, DmaOp, dma_sequence
 
 
 class DmaEngine:
-    """封装点对点和批量 DMA 调用。"""
+    """封装点对点和批量 DMA 调用，可按请求窗口平移激活区地址。"""
 
-    def __init__(self, dpu_set: DpuSet) -> None:
+    def __init__(self, dpu_set: DpuSet, act_base_by_dpu: dict[int, int] | None = None,
+                 act_shift: int = 0) -> None:
         self._set = dpu_set
+        self._act_base_by_dpu = act_base_by_dpu
+        self._act_shift = act_shift
+
+    def _addr(self, dpu_id: int, addr: int) -> int:
+        """落在激活区的 DPU 地址平移；host 缓冲与权重/KV 区不动。"""
+        if self._act_base_by_dpu is None:
+            return addr
+        base = self._act_base_by_dpu.get(dpu_id)
+        if base is None or addr < base:
+            return addr
+        return addr + self._act_shift
 
     def copy_from_dpu(self, dpu_id: int, addr: int, length: int, dtype: np.dtype) -> np.ndarray:
         """从一 DPU 的 MRAM[addr, addr+length*itemsize) 读回一段摊平数组（点对点一跳）。"""
         buf = np.empty(length, dtype=dtype)
-        dpu_copy_from(self._set.dpu(dpu_id), addr, buf, buf.nbytes)
+        dpu_copy_from(self._set.dpu(dpu_id), self._addr(dpu_id, addr), buf, buf.nbytes)
         return buf
 
     def copy_to_dpu(self, dpu_id: int, addr: int, data: np.ndarray) -> None:
         """把一段摊平数组写入一 DPU 的 MRAM[addr, ...)（点对点一跳）。"""
         flat = np.ascontiguousarray(data).reshape(-1)
-        dpu_copy_to(self._set.dpu(dpu_id), addr, flat, flat.nbytes)
+        dpu_copy_to(self._set.dpu(dpu_id), self._addr(dpu_id, addr), flat, flat.nbytes)
 
     def run_collect(self, op: DmaOp, dtype: np.dtype) -> list[np.ndarray]:
         """执行一条收集方向的传输调用，返回与 op.segments 对齐的逐段 host 缓冲。"""
@@ -45,10 +57,11 @@ class DmaEngine:
         for seg, buf in zip(op.segments, bufs):
             dpu_prepare_xfer(self._set.dpu(seg.src_dpu), buf)
         first = op.segments[0]
+        # 批量扇出共用 first 的基址，按它的 DPU 判一次激活区即可。
         dpu_push_xfer(
             self._set.subset(tuple(s.src_dpu for s in op.segments)),
             DPU_XFER_FROM_DPU,
-            first.src_addr,
+            self._addr(first.src_dpu, first.src_addr),
             first.nbytes,
         )
         return bufs
@@ -63,7 +76,8 @@ class DmaEngine:
             seg = op.segments[0]
             targets = self._set.subset(tuple(s.dst_dpu for s in op.segments))
             payload = np.ascontiguousarray(host_buf[seg.global_range[0] : seg.global_range[1]])
-            dpu_broadcast_to(targets, seg.dst_addr, payload, payload.nbytes)
+            dpu_broadcast_to(targets, self._addr(seg.dst_dpu, seg.dst_addr),
+                             payload, payload.nbytes)
             return
         if op.kind != "push_to":
             raise ValueError(f"非回写方向的 DmaOp: {op.kind}")
@@ -74,7 +88,7 @@ class DmaEngine:
         dpu_push_xfer(
             self._set.subset(tuple(s.dst_dpu for s in op.segments)),
             DPU_XFER_TO_DPU,
-            first.dst_addr,
+            self._addr(first.dst_dpu, first.dst_addr),
             first.nbytes,
         )
 

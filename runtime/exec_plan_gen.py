@@ -267,6 +267,15 @@ class _PlanBuilder:
         return (lambda hal: _as_torch(hal.result_of(cmd_id))), cmd_id
 
 
+def _dma_engine(hal, cmd) -> DmaEngine:
+    """按命令上的窗口信息构造 DMA 引擎；原计划没有这些字段时零平移。"""
+    return DmaEngine(
+        hal.dpu_set,
+        act_base_by_dpu=cmd.payload.get("act_base_by_dpu"),
+        act_shift=cmd.payload.get("act_shift", 0),
+    )
+
+
 def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_node: Node) -> None:
     """将一条重分布边生成包含全部段访问的命令。"""
     reads, writes = _edge_accesses(entry)
@@ -280,12 +289,12 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
             waits.append(dep_id)
 
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             scatter(entry, engine, get_host_buf(hal))
             return None
     elif edge.type == "local_slice":
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             itemsize = entry.dtype.itemsize
             for seg in entry.segments:
                 n = seg.nbytes // itemsize
@@ -297,7 +306,7 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
         primitive = _REDISTRIBUTE_FN[edge.type]
 
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             return primitive(entry, engine)
 
     op = _REDISTRIBUTE_OP[edge.type]
