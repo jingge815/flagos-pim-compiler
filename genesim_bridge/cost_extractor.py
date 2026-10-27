@@ -763,6 +763,12 @@ def _cross_validate(
         except Exception as exc:                     # noqa: BLE001
             result[name] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
+        if not captured:
+            # 无卡时 CPU 上的 SDPA 走 torch 自己的 math 实现，不进 FlagGems 的
+            # flash 路径，抓不到内核。记成错误而不是 0，免得看着像"成本为 0"。
+            result[name] = {"error": "未捕获到融合 attention 内核"
+                                     "（无 GPU 时 SDPA 不经 FlagGems）"}
+            continue
         entries = []
         total = 0.0
         total_mram = 0.0

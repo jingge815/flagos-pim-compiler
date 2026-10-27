@@ -1174,6 +1174,11 @@ def test_autotune_drops_tiles_over_the_wram_budget(monkeypatch) -> None:
     FlagGems 在 4090 上给 M=128、N=11008 选了 128x256x64：暂存 115200 B，超过
     65536 B 预算，`pim-explicit-dma` 直接报错，`refine_ir_with_flagtree.py` 中断。
     """
+    # 无卡机器上 `import flag_gems` 会在设备探测处抛 RuntimeError（importorskip 不拦），
+    # 先注入编译期 driver，和 `capture_with_flagtree` 的做法一致。
+    from opcompiler_bridge.cpu_host import ensure_compile_driver
+
+    ensure_compile_driver()
     pytest.importorskip("flag_gems")
     import triton
     from flag_gems.utils.libentry import LibTuner

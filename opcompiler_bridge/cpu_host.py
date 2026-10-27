@@ -36,6 +36,7 @@ GPU 从来不参与生成，只是 Triton 前端的既有实现顺手依赖了�
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 from typing import Any, Dict, Tuple
@@ -272,3 +273,119 @@ def _pointer_attrs(signature: Dict[str, str]) -> Dict[Tuple[int, ...], Any]:
         for index, kind in enumerate(signature.values())
         if kind.startswith("*")
     }
+
+
+class _FrontendKernel:
+    """无卡时代替 `CompiledKernel`：只带 TTIR，launch 是空操作。
+
+    `genesim_bridge.flagtree_driver.capture_kernels` 只读 `name` 和
+    `asm["ttir"]`；FlagGems 的 `LibEntry` 命中缓存后会 `kernel[grid](*args)`，
+    这里吞掉——要的是编译产物，不是计算结果。
+    """
+
+    def __init__(self, name: str, ttir: str) -> None:
+        self.name = name
+        self.asm = {"ttir": ttir}
+
+    def __getitem__(self, grid):
+        return lambda *args, **kwargs: None
+
+
+def _frontend_jit_run(self, *args, grid, warmup, **kwargs):
+    """`JITFunction.run` 的无卡版本：绑定参数、前端编译到 TTIR，不 launch。
+
+    参数绑定、特化与缓存键沿用 Triton 自己的实现（`binder` / `_pack_args` /
+    `compute_cache_key`），只把 `compile` 截在 ttir stage，与 `make_ttir` 同口径。
+    """
+    from triton._C.libtriton import ir
+    from triton.backends.nvidia.compiler import CUDABackend
+    from triton.runtime.driver import driver
+    from triton.runtime.jit import compute_cache_key
+
+    kwargs["debug"] = kwargs.get("debug", self.debug)
+    device = driver.active.get_current_device()
+    kernel_cache, key_cache, target, backend, binder = self.device_caches[device]
+    bound_args, specialization, options = binder(*args, **kwargs)
+    key = compute_cache_key(key_cache, specialization, options)
+    kernel = kernel_cache.get(key)
+    if kernel is None:
+        options, signature, constexprs, attrs = self._pack_args(
+            backend, kwargs, bound_args, specialization, options)
+        source = self.ASTSource(self, signature, constexprs, attrs)
+        context = ir.context()
+        ir.load_dialects(context)
+        backend.load_dialects(context)
+        module = source.make_ir(
+            target, options, backend.get_codegen_implementation(options),
+            backend.get_module_map(), context)
+        ttir = str(CUDABackend.make_ttir(module, {}, options, target.arch))
+        kernel = _FrontendKernel(source.name, ttir)
+        kernel_cache[key] = kernel
+    return kernel
+
+
+def _frontend_autotune_run(self, *args, **kwargs):
+    """autotune 的无卡版本：不 benchmark，取剪枝后的第一个候选。
+
+    无卡时没法计时。抓 pim mlir 时 `_autotune_within_wram` 已经把候选收窄到放得进
+    WRAM 的分块，第一个就是合法分块；有卡时 autotune 选的是 GPU 上最快的那个，
+    两者分块可能不同，成本按各自的分块算。
+    """
+    self.nargs = dict(zip(self.arg_names, args))
+    configs = self.prune_configs(kwargs) if len(self.configs) > 1 else self.configs
+    config = configs[0]
+    self.best_config = config
+    try:
+        return self.fn.run(*args, **kwargs, **config.all_kwargs())
+    finally:
+        self.nargs = None
+
+
+@contextlib.contextmanager
+def frontend_only_launches():
+    """无卡时让 FlagGems 算子"调用即编译"：抓得到 TTIR，但不发射 kernel。
+
+    `genesim_bridge` 的 A 路靠"跑一遍 FlagGems 算子、在 launch 处抓内核"取 TTIR。
+    无卡时 launch 无处可去，但 TTIR 本来就是前端产物。这里在上下文里替换四处：
+
+    - `JITFunction.run`：编译截在 ttir stage，返回 `_FrontendKernel`；
+    - `Autotuner.run` / `LibTuner.run`：不 benchmark，取第一个候选；
+    - `torch_device_fn.device` / `current_device`：FlagGems 用 `torch.cuda` 做
+      设备守卫，CPU 张量会被拒；`current_device()` 返回 `"cpu"` 让 `LibEntry`
+      走它自带的 CPU 缓存分支；
+    - 注册的 dispatch key 换成 `CPU`：否则 `use_gems` 只接管 CUDA 张量，CPU
+      上的探针张量根本不进 FlagGems。
+
+    有卡时什么都不做。必须在 `_autotune_within_wram` 之外进入，后者包的是进入时
+    的 `LibTuner.run`。
+    """
+    if gpu_hardware_present():
+        yield
+        return
+
+    ensure_compile_driver()
+    from flag_gems import runtime
+    from flag_gems.runtime import torch_device_fn
+    from flag_gems.utils.libentry import LibTuner
+    from triton.runtime.autotuner import Autotuner
+    from triton.runtime.jit import JITFunction
+
+    saved = [
+        (JITFunction, "run", JITFunction.run),
+        (Autotuner, "run", Autotuner.run),
+        (LibTuner, "run", LibTuner.run),
+        (torch_device_fn, "device", torch_device_fn.device),
+        (torch_device_fn, "current_device", torch_device_fn.current_device),
+        (runtime.device, "dispatch_key", runtime.device.dispatch_key),
+    ]
+    JITFunction.run = _frontend_jit_run
+    Autotuner.run = _frontend_autotune_run
+    LibTuner.run = _frontend_autotune_run
+    torch_device_fn.device = lambda device=None: contextlib.nullcontext()
+    torch_device_fn.current_device = lambda: "cpu"
+    runtime.device.dispatch_key = "CPU"
+    try:
+        yield
+    finally:
+        for owner, name, value in saved:
+            setattr(owner, name, value)

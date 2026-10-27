@@ -394,8 +394,15 @@ def run_and_capture(
     `import flag_gems` 在 import 期就会去读 `triton.runtime.driver.active` 而抛
     "0 active drivers"。同样地，`torch.cuda.synchronize()` 只在真有卡时才有意义——
     无卡时 CPU 执行本来就是同步的，调用它会直接抛 "No CUDA GPUs are available"。
+
+    无卡时整段包在 `frontend_only_launches` 里：FlagGems 算子照常调用，launch 处
+    只做前端编译拿 TTIR，不发射 kernel。
     """
-    from opcompiler_bridge.cpu_host import ensure_compile_driver, gpu_hardware_present
+    from opcompiler_bridge.cpu_host import (
+        ensure_compile_driver,
+        frontend_only_launches,
+        gpu_hardware_present,
+    )
 
     ensure_compile_driver()
 
@@ -414,7 +421,7 @@ def run_and_capture(
     else:
         tuning = nullcontext()
 
-    with tuning:
+    with frontend_only_launches(), tuning:
         with _use_gems():
             fn()
         _sync()
