@@ -17,22 +17,30 @@
 
 ## 核心约束
 
-MRAM 地址由硬件绑定，没有虚拟地址层，做不了 PagedAttention。替代方案是
-**固定大小槽 + 间接寻址**（早期版本是「一个请求独占一整段连续 MRAM」，
-已被取代）：
+> **更正（2026-10-26）**：早期版本这里写「MRAM 没有虚拟地址层，做不了
+> PagedAttention」，这是错的。PagedAttention 本质是**软件层的块表间接寻址**
+> ——逻辑块 → 物理块，由算子在设备内核里查表拼接，不需要 MMU 或虚拟地址。
+> 我们已实现分页 KV：固定大小物理槽 + 块表 + 内核按表 gather
+> （`pim.paged_attn`）。与 vLLM 的真实差异只剩「几何是编译期常量、块表窗口
+> 数固定、无前缀缓存/COW」，不再是「做不了」。
+
+MRAM 地址由硬件绑定，没有虚拟地址层。替代方案是**固定大小槽 + 块表间接
+寻址**（早期版本是「一个请求独占一整段连续 MRAM」，已被取代）：
 
 | 项目 | vLLM 常规做法 | PIM 做法 |
 | --- | --- | --- |
 | 并发单元 | 分页 block，运行期自由拼接 | 固定 `slot_tokens` 的物理槽，运行期分配 |
 | KV 位置 | 每请求 block 表动态映射 | 每台 DPU 一份共享块表缓冲，每步由 host 覆盖 |
+| 间接寻址 | 块表 → 物理块，内核查表 | 相同：`pim.paged_attn` 内核按块表 gather |
 | 容量 | 由显存决定 | 全局槽池 `kv_pool_slots` |
 | 并发上限 | 由显存决定 | `max_num_seqs`（host 侧记账） |
-| 改并发 | 改配置即可 | 必须重新编译 |
+| 改几何/并发 | 改配置即可 | 必须重新编译 |
 
 vLLM 看到的 block 是账面数字：`num_gpu_blocks = kv_pool_slots`，默认
 `max_num_seqs × ceil(max_seq / block_size)`。槽几何、地址公式与块表布局见
-`docs/kv-global-block-table-20261025.md`。在串行执行且没有块共享的前提下，
-把池调大不会提高并发数。
+`docs/kv-global-block-table-20261025.md`。多请求已可并发执行（Phase 1），
+块表窗口数 `P` 决定同时在飞的请求数，见
+`docs/executor-parallel-phase1-20261026.md`。
 
 ## 改动清单
 
@@ -172,5 +180,6 @@ vLLM 0.14 的 `--model` 默认值是 `Qwen/Qwen3-0.6B`，必须显式指定本�
 - prompt 超过 `PIM_PREFILL_SEQ_LEN` 或 `max_model_len` 时无法运行。
 - 不支持分块 prefill，长 prompt 需要一次性排进 batch。
 - 不支持前缀缓存、LoRA、投机解码、多卡张量并行（PIM 内部已有 TP）。
-- 多槽仍是串行逐槽执行，没有利用 `NumpyBackend` 的线程池并发。
-- 改并发数必须重新编译。
+- 多槽已可并发（Phase 1，2026-10-26）：活跃请求按 `P` 分 wave，wave 内每请求
+  各用一份激活窗口和块表窗口并发执行。同 DPU 允许两条请求交错是建模选择。
+- 改几何/并发数必须重新编译。
