@@ -59,10 +59,12 @@ class PIMWorker(WorkerBase):
                 f"PIM_PREFILL_SEQ_LEN={self.prefill_seq_len} 超过 max_model_len={self.max_seq}")
         self.num_dpus = int(os.environ.get("PIM_NUM_DPUS", "4"))
         self.mram_bytes = int(os.environ.get("PIM_MRAM_BYTES", str(4 << 30)))
-        # 全局物理槽池大小。默认与「并发上限 × 每请求块数」一致，调大只是留余量；
-        # 这里用 max_seq 而不是实际 prompt 长度，与编译期几何保持一致。
+        # 全局物理槽池大小。vLLM 的 BlockPool 会永久占掉一个 null 块，所以默认
+        # 在「并发上限 × 每请求块数」之外多给一块，否则最高并发恒少一路。
         raw = os.environ.get("PIM_KV_POOL_SLOTS")
-        self.kv_pool_slots = int(raw) if raw else self.blocks_per_slot() * self.num_request_slots
+        self.kv_pool_slots = (
+            int(raw) if raw
+            else self.blocks_per_slot() * self.num_request_slots + 1)
         if self.kv_pool_slots < self.blocks_per_slot():
             raise ValueError(
                 f"PIM_KV_POOL_SLOTS={self.kv_pool_slots} 装不下一个满长请求"

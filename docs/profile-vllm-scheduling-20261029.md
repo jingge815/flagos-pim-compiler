@@ -48,10 +48,12 @@ llm.generate
 两个请求在 P=1 下被同一个 wave 串行执行，在 P=2 下真正重叠，且窗口不相交，
 无窗口冲突。说明 vLLM 这条路的 wave 循环确实生效。
 
-## 发现的问题：全局槽池默认少一块
+## 顺带修复：全局槽池默认少一块
+
+这套采集第一次跑出来 P=2 的效率也是 1.00，追下去发现不是采集的问题。
 
 vLLM 的 `BlockPool` 在初始化时会永久占掉一个 `null_block`
-（`vllm/v1/core/block_pool.py:174`）。而 `PIMWorker` 默认把池子开成
+（`vllm/v1/core/block_pool.py:174`）。而 `PIMWorker` 原来把池子开成
 `每请求块数 × 请求槽数`，正好没有余量，于是最后一路并发永远进不来：
 
 ```text
@@ -59,12 +61,15 @@ vLLM 的 `BlockPool` 在初始化时会永久占掉一个 `null_block`
 ```
 
 实测 `max_num_seqs=2`、`max_seq=16`、块大小 16 时池子只有 2 块，可用 1 块，
-两个请求被完全排成前后两段。演示脚本里用 `PIM_KV_POOL_SLOTS = 请求数 + 1`
-绕开；生产侧建议把 `backend/vllm_worker.py` 的默认池改成多一块：
+两个请求被完全排成前后两段。已在 `backend/vllm_worker.py` 的默认值上补一块：
 
 ```python
-self.kv_pool_slots = int(raw) if raw else self.blocks_per_slot() * self.num_request_slots + 1
+self.kv_pool_slots = (
+    int(raw) if raw
+    else self.blocks_per_slot() * self.num_request_slots + 1)
 ```
+
+显式设置 `PIM_KV_POOL_SLOTS` 时仍按给定值使用，不再额外加一。
 
 ## 不足
 

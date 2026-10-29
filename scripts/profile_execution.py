@@ -841,9 +841,6 @@ def _vllm_case(model_dir: Path, parallel_slots: int) -> VllmProfileResult:
     os.environ["PIM_PARALLEL_SLOTS"] = str(parallel_slots)
     os.environ["PIM_PREFILL_SEQ_LEN"] = str(VLLM_PREFILL_LEN)
     os.environ.setdefault("PIM_MRAM_BYTES", str(1 << 28))
-    # vLLM 会永久占一个 null 块，池子要比「每请求一块 × 请求数」多一块，
-    # 否则最后一个请求永远排不进来，并发恒为 1。
-    os.environ["PIM_KV_POOL_SLOTS"] = str(len(VLLM_PROMPTS) + 1)
 
     from vllm import LLM, SamplingParams
 
