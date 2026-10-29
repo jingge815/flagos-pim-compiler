@@ -15,13 +15,18 @@
     python scripts/profile_execution.py
 
     # 换成真实 Llama-2-7B：把 __main__ 里的 _demo() 改成 complete_7b()
+
+    # 采集 vLLM 的调度：PIM_PARALLEL_SLOTS 取 1 和 2 各跑一次并对比
+    python scripts/profile_execution.py vllm
 """
 
 from __future__ import annotations
 
 import html
 import itertools
+import os
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -284,6 +289,162 @@ def print_report(result: ProfileResult) -> None:
             bar = "█" * max(1, int(pct / 2))
             print(f"  {count} 个并发: {bar} {d_ms:.1f} ms ({pct:.1f}%)")
 
+    print(f"{'=' * 65}\n")
+
+
+# ────────────────────────────────────────────────────────────
+# vLLM 调度采集
+# ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class StepRecord:
+    """一次 `PIMWorker.execute_model` 的调度记录。"""
+
+    step: int
+    req_ids: list[str]                          # 本步被调度的请求
+    tokens: list[int]                           # 各请求本步调度的 token 数
+    start: float
+    end: float
+    tasks: list[tuple[str, int, float, float]]  # (请求, 窗口号, 起, 止)
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+    @property
+    def busy(self) -> float:
+        """各请求执行时间之和；真并发时大于本步墙钟。"""
+        return sum(end - start for _, _, start, end in self.tasks)
+
+    @property
+    def efficiency(self) -> float:
+        """并行效率 = 忙碌和 / 墙钟：1 是完全串行，k 是 k 路真重叠。"""
+        return self.busy / self.duration if self.duration > 0 else 0.0
+
+    @property
+    def concurrency(self) -> int:
+        """同一时刻最多有几个请求在跑。"""
+        edges: list[tuple[float, int]] = []
+        for _, _, start, end in self.tasks:
+            edges.append((start, 1))
+            edges.append((end, -1))
+        edges.sort()
+        running = peak = 0
+        for _, delta in edges:
+            running += delta
+            peak = max(peak, running)
+        return peak
+
+    @property
+    def is_prefill(self) -> bool:
+        """本步是否含预填充：调度 token 数大于 1 即预填充。"""
+        return any(count > 1 for count in self.tokens)
+
+    def slot_conflicts(self) -> list[tuple[str, str, int]]:
+        """时间重叠却共用同一个激活窗口的请求对。"""
+        conflicts = []
+        for index, (req_a, slot_a, start_a, end_a) in enumerate(self.tasks):
+            for req_b, slot_b, start_b, end_b in self.tasks[index + 1:]:
+                if slot_a == slot_b and start_a < end_b and start_b < end_a:
+                    conflicts.append((req_a, req_b, slot_a))
+        return conflicts
+
+
+@dataclass
+class VllmProfileResult:
+    """vLLM 调度采集结果：逐步的请求构成与请求级执行区间。"""
+
+    steps: list[StepRecord]
+
+    def mean_efficiency(self, prefill: bool) -> float:
+        """按阶段统计的平均并行效率。"""
+        values = [s.efficiency for s in self.steps if s.is_prefill == prefill]
+        return sum(values) / len(values) if values else 0.0
+
+    def max_concurrency(self) -> int:
+        return max((s.concurrency for s in self.steps), default=0)
+
+    def slot_conflicts(self) -> list[tuple[str, str, int]]:
+        return [c for s in self.steps for c in s.slot_conflicts()]
+
+
+class _VllmProfiler:
+    """包装 PIMWorker 的 execute_model 和 _step，记录每个请求自己的执行区间。
+
+    两者的方法都换在实例上：`execute_model` 划步骤边界，`_step` 记请求起止。
+    拿不到 worker 实例（多进程模式）时用不了，因为那时 worker 在子进程里。
+    """
+
+    def __init__(self, worker) -> None:
+        self.worker = worker
+        self.steps: list[StepRecord] = []
+        self._tasks: list[tuple[str, int, float, float]] = []
+        self._lock = threading.Lock()
+        self._orig_execute_model = worker.execute_model
+        self._orig_step = worker._step
+        worker.execute_model = self._execute_model
+        worker._step = self._step
+
+    def _execute_model(self, scheduler_output):
+        with self._lock:
+            mark = len(self._tasks)
+        start = time.perf_counter()
+        try:
+            return self._orig_execute_model(scheduler_output)
+        finally:
+            end = time.perf_counter()
+            # execute_model 返回前已 join 完全部 wave，这里取到的区间是完整的。
+            with self._lock:
+                tasks = self._tasks[mark:]
+            self.steps.append(StepRecord(
+                step=len(self.steps),
+                req_ids=list(scheduler_output.num_scheduled_tokens),
+                tokens=list(scheduler_output.num_scheduled_tokens.values()),
+                start=start, end=end, tasks=tasks))
+
+    def _step(self, req_id, slot_index=0):
+        start = time.perf_counter()
+        try:
+            return self._orig_step(req_id, slot_index)
+        finally:
+            with self._lock:
+                self._tasks.append(
+                    (req_id, int(slot_index), start, time.perf_counter()))
+
+    def stop(self) -> VllmProfileResult:
+        """还原 worker 的方法并返回采集结果。"""
+        self.worker.execute_model = self._orig_execute_model
+        self.worker._step = self._orig_step
+        return VllmProfileResult(steps=list(self.steps))
+
+
+def profile_vllm(worker) -> _VllmProfiler:
+    """开始采集 vLLM 调度；`worker` 是 PIMWorker 实例。"""
+    return _VllmProfiler(worker)
+
+
+def print_vllm_report(result: VllmProfileResult, *, title: str = "vLLM 调度报告") -> None:
+    """打印每步的请求构成、并行效率、并发度与窗口使用。"""
+    prefill = sum(1 for s in result.steps if s.is_prefill)
+    decode = len(result.steps) - prefill
+    conflicts = result.slot_conflicts()
+    print(f"\n{'=' * 65}")
+    print(title)
+    print(f"{'=' * 65}")
+    print(f"步数: {len(result.steps)}（预填充 {prefill}，解码 {decode}）")
+    print(f"平均并行效率: 预填充 {result.mean_efficiency(True):.2f}，"
+          f"解码 {result.mean_efficiency(False):.2f}"
+          f"  （1 = 完全串行，2 = 两请求真重叠）")
+    print(f"最大并发请求: {result.max_concurrency()}")
+    print(f"激活窗口冲突: {'无' if not conflicts else conflicts}")
+    print(f"\n  步  阶段     请求          效率   并发  窗口  墙钟ms  忙碌ms")
+    for s in result.steps:
+        stage = "prefill" if s.is_prefill else "decode"
+        slots = ",".join(str(task[1]) for task in s.tasks)
+        print(f"  {s.step:>2}  {stage:<8} {'+'.join(s.req_ids):<12}  "
+              f"{s.efficiency:>5.2f}  {s.concurrency:>4}  {slots:<4}  "
+              f"{s.duration * 1000:>6.1f}  {s.busy * 1000:>6.1f}")
     print(f"{'=' * 65}\n")
 
 
@@ -643,5 +804,99 @@ def complete_7b():
     print("  注意: numpy 后端受 GIL 限制，毫秒数只反映执行结构，不代表硬件性能")
 
 
+# ────────────────────────────────────────────────────────────
+# 独立运行：vLLM 调度演示
+# ────────────────────────────────────────────────────────────
+
+
+VLLM_PARALLEL_SLOTS = (1, 2)
+VLLM_MAX_SEQ = 16
+VLLM_PREFILL_LEN = 4
+VLLM_MAX_NEW_TOKENS = 3
+VLLM_PROMPTS = [[1, 2, 3, 4], [5, 6, 7, 8]]
+
+
+def _tiny_model_dir(root: Path) -> Path:
+    """存一个随机初始化的微型 Llama，作为 vLLM 的模型目录。"""
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=4, vocab_size=128,
+        max_position_embeddings=VLLM_MAX_SEQ,
+    )).eval().half()
+    path = root / "tiny-llama"
+    model.save_pretrained(path)
+    return path
+
+
+def _vllm_case(model_dir: Path, parallel_slots: int) -> VllmProfileResult:
+    """用 vLLM 真引擎跑一次生成，返回 PIMWorker 的调度记录。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+    # 引擎与 worker 必须同进程，否则拿不到 worker 实例，也驱动不了 NumpyBackend。
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    os.environ["PIM_PARALLEL_SLOTS"] = str(parallel_slots)
+    os.environ["PIM_PREFILL_SEQ_LEN"] = str(VLLM_PREFILL_LEN)
+    os.environ.setdefault("PIM_MRAM_BYTES", str(1 << 28))
+    # vLLM 会永久占一个 null 块，池子要比「每请求一块 × 请求数」多一块，
+    # 否则最后一个请求永远排不进来，并发恒为 1。
+    os.environ["PIM_KV_POOL_SLOTS"] = str(len(VLLM_PROMPTS) + 1)
+
+    from vllm import LLM, SamplingParams
+
+    from backend.vllm_executor import PIMExecutor
+
+    llm = LLM(
+        model=str(model_dir), skip_tokenizer_init=True, dtype="float16",
+        max_model_len=VLLM_MAX_SEQ, max_num_seqs=len(VLLM_PROMPTS),
+        # 一步内放下所有并发请求的整段 prompt，static 图不支持分块预填充。
+        max_num_batched_tokens=len(VLLM_PROMPTS) * VLLM_PREFILL_LEN,
+        enable_prefix_caching=False, gpu_memory_utilization=0.2,
+        distributed_executor_backend=PIMExecutor,
+    )
+    # 单进程模式下引擎直接握着 PIMWorker：model_executor → wrapper → worker。
+    worker = llm.llm_engine.model_executor.driver_worker.worker
+    prof = profile_vllm(worker)
+    try:
+        llm.generate(
+            [{"prompt_token_ids": prompt} for prompt in VLLM_PROMPTS],
+            SamplingParams(max_tokens=VLLM_MAX_NEW_TOKENS, temperature=0.0),
+        )
+    finally:
+        result = prof.stop()
+        llm.llm_engine.engine_core.shutdown()
+    return result
+
+
+def demo_vllm() -> None:
+    """比较 `PIM_PARALLEL_SLOTS` 对 vLLM 调度的影响。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = _tiny_model_dir(Path(tmp))
+        results: dict[int, VllmProfileResult] = {}
+        for parallel_slots in VLLM_PARALLEL_SLOTS:
+            print(f"\n编译并运行 vLLM，PIM_PARALLEL_SLOTS={parallel_slots} ...")
+            results[parallel_slots] = _vllm_case(model_dir, parallel_slots)
+            print_vllm_report(
+                results[parallel_slots],
+                title=f"vLLM 调度报告（P={parallel_slots}）")
+
+    if len(results) < 2:
+        return
+    (p1, r1), (p2, r2) = sorted(results.items())
+    print(f"\n{'=' * 40}")
+    print(f"vLLM P={p1} vs P={p2}:")
+    print(f"  最大并发请求: {r1.max_concurrency()} → {r2.max_concurrency()}")
+    print(f"  解码平均并行效率: {r1.mean_efficiency(False):.2f} → "
+          f"{r2.mean_efficiency(False):.2f}")
+    print(f"  激活窗口冲突: {len(r1.slot_conflicts())} → {len(r2.slot_conflicts())}")
+    print("  效率接近 2 说明这一步的请求真的同时在跑，接近 1 说明是串行")
+
+
 if __name__ == "__main__":
-    complete_7b()
+    if "vllm" in sys.argv[1:]:
+        demo_vllm()
+    else:
+        complete_7b()
