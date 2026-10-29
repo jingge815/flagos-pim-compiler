@@ -1,6 +1,6 @@
 # tests/ 测试指南与排错手册
 
-本目录共 84 个测试文件、1417 条用例（另有 1 条 `slow` 用例默认不跑）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
+本目录共 89 个测试文件、1464 条用例（其中 2 条 `slow` 默认不跑，需 `-m slow`）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
 
 > 先记住一件事：每次 pytest 结束都会把逐用例状态、耗时和失败首行写到
 > **`test-results/pytest-latest.md`**（由 `conftest.py` 生成）。排错从这里开始。
@@ -168,8 +168,13 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_executor_llama2_7b.py` | 2 | **7B** 整图 prefill logits 与贪心 token 对齐单卡 PyTorch | 7B | 依次查权重分片写入、SDPA KV 偏移、kernel 镜像 |
 | `test_concurrency_llama2_7b.py` | 2 | **7B** 独立 launch 时间重叠、有 waits 的 launch 真等待 | 7B | 串行化查 DPU 线程池/异步 HAL；打印命令 `id/waits/op` |
 | `test_multi_request_decode.py` | 4 | 多请求并发解码与单路一致、`slot_tokens=2` 与整段一致、槽复用、容量溢出报错 | 小模型 | 块表映射错或共享缓冲未按请求重写 |
+| `test_activation_windows.py` | 7 | 每请求激活窗口的统一 `act_stride`、窗口不重叠、超预算报错 | 无 | 步长算错查 `memory/mem_planner.fit_activation_windows` |
+| `test_exec_binding.py` | 6 | `bind_plan` 只平移激活地址与块表基址、窗口 0 返回原计划、`mram_offset` 不动 | 无 | 内核缓存失效先查是否误平移了 `mram_offset` |
+| `test_parallel_requests.py` | 8 | 两/四请求并发的 token 与串行一致、混合 prefill/decode、确定性 | 小模型 | 激活窗口或块表窗口越界先查 `slot_index` 传递 |
+| `test_parallel_overlap.py` | 1 | 同 DPU 上不同请求的命令真交错，允许后发先至 | 小模型 | 泳道是否仍按 `(lane_key, dpu_id)` 分开 |
 | `test_natural_prompt_llama2_7b.py` | 1 | **7B** 自然语言 prompt 的逐 token 生成与 HF `generate` 一致 | 7B | 失败会打印 `route_counts()`；出现主机退回说明某算子未注册 |
-| `test_vllm_executor.py` | 1 | vLLM 引擎经 `PIMExecutor` 跑两个并发请求 | vLLM + CUDA | 环境变量必须在 `import vllm` 前设置；worker 崩溃看 `backend/vllm_worker.py` |
+| `test_vllm_executor.py` | 1 | vLLM 引擎经 `PIMExecutor` 跑两个并发请求，且槽池默认值多留一块 | vLLM + CUDA | 环境变量必须在 `import vllm` 前设置；worker 崩溃看 `backend/vllm_worker.py` |
+| `test_profile_execution.py` | 6 | vLLM 调度采集：效率/并发/窗口冲突、空步不计均值、中途失败不串步、stop 还原方法 | 无 | 失败先看 `scripts/profile_execution.py` 的 `_VllmProfiler` 步号过滤；并发类用例靠线程，慢机器上慎调阈值 |
 
 ### 4.7 GML 导出、格式与校验
 

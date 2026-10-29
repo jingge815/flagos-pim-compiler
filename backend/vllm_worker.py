@@ -5,9 +5,10 @@
 
 - KV 分成固定大小的物理槽，每槽容纳 `block_size` 个 token；每台 DPU 只有一份
   块表缓冲，每步由 host 覆盖，请求通过它间接寻址。物理槽池全局一份，大小由
-  `PIM_KV_POOL_SLOTS` 决定，默认 `max_num_seqs × 每请求块数`。
-- vLLM 的 block 只是账面数字：`num_gpu_blocks = kv_pool_slots`。并发上限仍由
-  `max_num_seqs` 决定；在串行执行且没有块共享的前提下，把池调大不会提高并发。
+  `PIM_KV_POOL_SLOTS` 决定，默认 `max_num_seqs × 每请求块数 + 1`：多出的一块
+  留给 vLLM 启动时永久占用的 null 块。
+- vLLM 的 block 只是账面数字：`num_gpu_blocks = kv_pool_slots`。并发上限仍是
+  `max_num_seqs`；池子小于这个上限时并发会被槽数卡住，调大只是补足余量。
 - 采样固定为贪心（argmax）；温度等采样参数不生效。
 """
 

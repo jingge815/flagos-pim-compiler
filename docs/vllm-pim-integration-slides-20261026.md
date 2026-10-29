@@ -585,7 +585,7 @@ python scripts/serve_pim.py --model /path/to/Llama-2-7b-hf \
 | `PIM_NUM_DPUS` | 4 | PIM 内部张量并行的 DPU 数 |
 | `PIM_MRAM_BYTES` | 4 GiB | 单 DPU 的 MRAM 总量 |
 | `PIM_SYS_RESERVE_BYTES` | 64 MiB | 系统预留，不参与三区规划 |
-| `PIM_KV_POOL_SLOTS` | `max_num_seqs × 每请求块数` | 全局物理槽池大小 |
+| `PIM_KV_POOL_SLOTS` | `max_num_seqs × 每请求块数 + 1` | 全局物理槽池大小（+1 给 vLLM 的 null 块） |
 | `PIM_PARALLEL_SLOTS` | 2 | 同一步并发窗口数（受 `max_num_seqs` 限制） |
 
 ---

@@ -11,10 +11,8 @@
     print_report(profile)                     # 文本报告
     profile.to_html("timeline.html")          # 甘特图
 
-    # 也可以直接当脚本跑一个小型 Llama 演示
+    # 直接当脚本跑真实 Llama-2-7B（小型 Llama 的命令级演示见 _demo()）
     python scripts/profile_execution.py
-
-    # 换成真实 Llama-2-7B：把 __main__ 里的 _demo() 改成 complete_7b()
 
     # 采集 vLLM 的调度：PIM_PARALLEL_SLOTS 取 1 和 2 各跑一次并对比
     python scripts/profile_execution.py vllm
@@ -358,8 +356,9 @@ class VllmProfileResult:
     steps: list[StepRecord]
 
     def mean_efficiency(self, prefill: bool) -> float:
-        """按阶段统计的平均并行效率。"""
-        values = [s.efficiency for s in self.steps if s.is_prefill == prefill]
+        """按阶段统计的平均并行效率；没跑请求的步不计入，否则会被拉成 0。"""
+        values = [s.efficiency for s in self.steps
+                  if s.is_prefill == prefill and s.tasks]
         return sum(values) / len(values) if values else 0.0
 
     def max_concurrency(self) -> int:
@@ -379,7 +378,8 @@ class _VllmProfiler:
     def __init__(self, worker) -> None:
         self.worker = worker
         self.steps: list[StepRecord] = []
-        self._tasks: list[tuple[str, int, float, float]] = []
+        self._tasks: list[tuple[int, str, int, float, float]] = []  # (步号, 请求, 窗口, 起, 止)
+        self._step_index = 0
         self._lock = threading.Lock()
         self._orig_execute_model = worker.execute_model
         self._orig_step = worker._step
@@ -388,15 +388,21 @@ class _VllmProfiler:
 
     def _execute_model(self, scheduler_output):
         with self._lock:
-            mark = len(self._tasks)
+            self._step_index += 1
+            index = self._step_index
+            self._tasks.clear()  # 上一步的残留不再计入本步
         start = time.perf_counter()
         try:
             return self._orig_execute_model(scheduler_output)
         finally:
             end = time.perf_counter()
-            # execute_model 返回前已 join 完全部 wave，这里取到的区间是完整的。
+            # 正常返回时 wave 已全部 join；中途抛异常则剩下的请求还在跑，按步号滤掉，
+            # 免得迟到的记录算进下一步。
             with self._lock:
-                tasks = self._tasks[mark:]
+                tasks = [(req, slot, begin, finish)
+                         for step, req, slot, begin, finish in self._tasks
+                         if step == index]
+                self._tasks.clear()
             self.steps.append(StepRecord(
                 step=len(self.steps),
                 req_ids=list(scheduler_output.num_scheduled_tokens),
@@ -404,13 +410,16 @@ class _VllmProfiler:
                 start=start, end=end, tasks=tasks))
 
     def _step(self, req_id, slot_index=0):
+        # 进入时就定下步号：之后即使这一步已经结束，记录也不会串到下一步。
+        with self._lock:
+            index = self._step_index
         start = time.perf_counter()
         try:
             return self._orig_step(req_id, slot_index)
         finally:
             with self._lock:
                 self._tasks.append(
-                    (req_id, int(slot_index), start, time.perf_counter()))
+                    (index, req_id, int(slot_index), start, time.perf_counter()))
 
     def stop(self) -> VllmProfileResult:
         """还原 worker 的方法并返回采集结果。"""

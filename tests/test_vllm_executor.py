@@ -59,6 +59,11 @@ def test_llm_runs_two_requests(tiny_model_dir: Path) -> None:
         gpu_memory_utilization=0.2,
         distributed_executor_backend=PIMExecutor,
     )
+    worker = llm.llm_engine.model_executor.driver_worker.worker
+    # vLLM 的 BlockPool 永久占掉一个 null 块，池子必须比并发上限多留一块，
+    # 否则最高并发恒少一路。
+    assert worker.kv_pool_slots == worker.blocks_per_slot() * NUM_SLOTS + 1
+
     outputs = llm.generate(
         [{"prompt_token_ids": p} for p in PROMPTS],
         SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=0.0),
