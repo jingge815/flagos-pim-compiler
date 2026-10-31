@@ -1086,6 +1086,61 @@ def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) ->
     assert "<1x" not in text, text
 
 
+def test_attention_matmul_declares_what_does_not_repeat_over_the_history():
+    """四个注意力节点的 pimir 要说明自己按一块历史编的，以及哪部分只读写一次。
+
+    GeneSim 只认「相位链里的 perBlock 相」按块计费；这四份 pimir 没有相位链，
+    不打这个标注，它们的代价就与历史长度无关——同口径对照里四节点会被算得
+    便宜一个数量级（见 genesim/docs/paged-attn-vs-four-node-20261030.md）。
+
+    判据是**两份形状一模一样的产物标注不同**：得分乘的 q 只读一次，上下文乘
+    的累加结果只写一次，混用一份会把固定开销记到错误的算子上。
+    """
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    shapes = [[128, 128], [128, 128]], [[128, 128]]
+    score = Path(_bpath_pimir("matmul", *shapes, op_type="GEMV_SCORE")).read_text()
+    context = Path(_bpath_pimir("matmul", *shapes, op_type="GEMV_CONTEXT")).read_text()
+
+    assert "pim.kvBlockTokens = 128 : i64" in score, score
+    assert "pim.kvFixedIn = 16384 : i64" in score, score
+    assert "pim.kvFixedOut = 0 : i64" in score, score
+    assert "pim.kvFixedIn = 0 : i64" in context, context
+    assert "pim.kvFixedOut = 16384 : i64" in context, context
+
+
+def test_mask_and_softmax_repeat_whole_over_the_history():
+    """掩码与 softmax 没有固定部分：整份算子逐块跑，两个固定量都是 0。"""
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    mask = Path(_bpath_pimir("mask", [[128, 128], [128, 128]],
+                             [[128, 128]], op_type="MASK")).read_text()
+    assert "pim.kvBlockTokens = 128 : i64" in mask, mask
+    assert "pim.kvFixedIn = 0 : i64" in mask and "pim.kvFixedOut = 0 : i64" in mask
+
+
+def test_ops_without_kv_history_carry_no_block_annotation():
+    """不读 KV 历史的算子不被标成块循环：rope 整份只跑一次。"""
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    text = Path(_bpath_pimir("rope", [["Tq", 128]], [["Tq", 128]],
+                             op_type="ROPE")).read_text()
+    assert "pim.kvBlockTokens" not in text, text
+
+
+def test_block_annotation_lands_on_the_function_not_the_op():
+    """标注必须写在 `tt.func` 上：softmax 展开成六个 op，写在 op 上会丢。"""
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    text = Path(_bpath_pimir("softmax", [[128, 128]], [[128, 128]],
+                             op_type="SOFTMAX")).read_text()
+    func_line = next(line for line in text.splitlines()
+                     if line.strip().startswith("tt.func"))
+    assert "pim.kvBlockTokens" in func_line, func_line
+    # 函数体里的 pim.* 行不该各挂一份。
+    assert text.count("pim.kvBlockTokens") == 1, text
+
+
 def test_template_trace_is_rejected_without_an_opt_out(tmp_path) -> None:
     """来源校验没有放宽开关，模板 trace 在默认调用下就被拒。
 

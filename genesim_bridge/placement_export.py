@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
@@ -213,7 +214,65 @@ def _annotate_linear_activation(
     return str(out)
 
 
-def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
+# 一块历史多少 token：读 KV 的算子按这个占位形状编一份，运行期按真实历史长度
+# 折算循环次数。与 `_SYMBOLIC_DIM` 同源——历史维在 IR 里就是这个占位。
+_KV_BLOCK_TOKENS = 128
+
+# 四个注意力节点里哪部分**不**随历史重复：得分乘的 q 只读一次，上下文乘的
+# 累加结果只写一次；掩码与 softmax 整份算子都逐块跑。取值是 'in' / 'out'。
+_KV_BLOCK_FIXED = {
+    "GEMV_SCORE": "in",
+    "GEMV_CONTEXT": "out",
+    "MASK": None,
+    "SOFTMAX": None,
+}
+
+_KV_DTYPE_BYTES = {"i8": 1, "i16": 2, "f16": 2, "bf16": 2, "f32": 4, "i32": 4}
+_FUNC_SIG_RE = re.compile(r"tt\.func @\w+\((.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S)
+_SIG_TENSOR_RE = re.compile(r"tensor<([0-9x]+)x(\w+)>")
+# 函数签名没有返回类型（`tt.func` 只写参数），结果类型只能从算子行尾的 `->` 取。
+_RESULT_TENSOR_RE = re.compile(r"->\s*tensor<([0-9x]+)x(\w+)>")
+
+
+def _sig_tensor_bytes(shape: str, dtype: str) -> int:
+    return prod(int(d) for d in shape.split("x")) * _KV_DTYPE_BYTES[dtype]
+
+
+def _kv_block_attrs(body: str, op_type: str) -> str:
+    """给读 KV 历史的算子写函数属性：一块多少 token，哪些字节只读写一次。
+
+    属性写在函数上而不是逐个 op 上：softmax 会被展开成六个 op，写在算子上的
+    标注会随展开丢掉，写在函数上则一直跟着这份内核。
+    """
+    if op_type not in _KV_BLOCK_FIXED:
+        return ""
+    fixed = _KV_BLOCK_FIXED[op_type]
+    match = _FUNC_SIG_RE.search(body)
+    if match is None:
+        raise RuntimeError(f"{op_type} 的 B 路 IR 里找不到 tt.func 签名")
+    fixed_in = fixed_out = 0
+    if fixed == "in":
+        fixed_in = _sig_tensor_bytes(*_SIG_TENSOR_RE.findall(match.group(1))[0])
+    elif fixed == "out":
+        fixed_out = _sig_tensor_bytes(*_RESULT_TENSOR_RE.findall(body)[0])
+    return (f"pim.kvBlockTokens = {_KV_BLOCK_TOKENS} : i64, "
+            f"pim.kvFixedIn = {fixed_in} : i64, "
+            f"pim.kvFixedOut = {fixed_out} : i64")
+
+
+def _with_func_attrs(body: str, attrs: str) -> str:
+    """把属性插进 `tt.func` 签名后面。"""
+    match = _FUNC_SIG_RE.search(body)
+    if match is None:
+        raise RuntimeError("B 路 IR 里找不到 tt.func 签名")
+    signature = match.group(0)
+    brace = signature.rindex("{")
+    stamped = signature[:brace].rstrip() + f" attributes {{{attrs}}} {{"
+    return body[:match.start()] + stamped + body[match.end():]
+
+
+def _bpath_pimir(mnemonic: str, input_shapes, output_shapes,
+                 op_type: str = "") -> str:
     """给一个算子级 mnemonic 编一份 B 路 pimir，返回落盘路径。
 
     与 `_measure_kernel_tile_n` 对称：那条只服务 GEMM（A 路），这条服务其余
@@ -234,7 +293,10 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
         transpose_kernel,
     )
     from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
-    from genesim_bridge.op_classify import _attention_matmul_body, _module
+    from genesim_bridge.op_classify import (
+        _attention_matmul_body, _module, paged_attn_geometry,
+    )
+    from opcompiler_bridge.oplevel_kernel import paged_attn_kernel
 
     # 符号维的代表值：只要不是 1 这种极端退化值即可，128 和
     # `op_classify.mnemonic_of` 探测配方时用的占位维度同一量级。
@@ -273,6 +335,10 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
         # 照抄会把 KV 缓存说成模型权值。
         "matmul": lambda: _attention_matmul_body(
             "op", ins[0][0], ins[0][1], outs[0][-1]),
+        # 融合分页注意力：q 是 [Tq, head_dim]，KV 是 [Tp+Tq, head_dim]。
+        # 槽几何取占位值，块数在 GeneSim 侧按请求历史长度运行期绑定。
+        "paged_attn": lambda: paged_attn_kernel(
+            "op", ins[0], *paged_attn_geometry(ins[0][1], ins[1][0])),
     }
     body = builders[mnemonic]()
     if body is None:
@@ -281,6 +347,9 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
         raise RuntimeError(
             f"{mnemonic} 的 B 路 IR 缺 stationarity 标记，KV 缓存会被当成模型权值"
         )
+    kv_attrs = _kv_block_attrs(body, op_type)
+    if kv_attrs:
+        body = _with_func_attrs(body, kv_attrs)
     from opcompiler_bridge.driver import _run_oplevel_triton_opt, _CACHE_DIR
     import hashlib, os
     text = _module(body)
@@ -338,12 +407,15 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         mnemonic = _BPATH_MNEMONIC.get(op["op_type"])
         if mnemonic is None:
             continue
-        key = (mnemonic, json.dumps(op["input_shapes"]),
+        # 算子类型进键：GEMV_SCORE 与 GEMV_CONTEXT 形状相同但块循环标注不同
+        # （一个 q 只读一次、一个累加结果只写一次），合成一份会串味。
+        key = (op["op_type"], mnemonic, json.dumps(op["input_shapes"]),
                json.dumps(op["output_shapes"]))
         if key not in cache:
             try:
                 cache[key] = _bpath_pimir(
-                    mnemonic, op["input_shapes"], op["output_shapes"])
+                    mnemonic, op["input_shapes"], op["output_shapes"],
+                    op["op_type"])
             except Exception as exc:
                 raise RuntimeError(
                     f"op{op_id}（{op['op_type']} -> {mnemonic}，形状 "
@@ -360,8 +432,8 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         entry["pimir_sha256"] = _file_sha256(cache[key])
 
 
-# 读 KV 缓存的算子：attention 的两次矩阵乘，一次读 K、一次读 V。
-_KV_OP_TYPES = ("GEMV_SCORE", "GEMV_CONTEXT")
+# 读 KV 缓存的算子：分解路径的两次矩阵乘，以及融合路径那一个节点。
+_KV_OP_TYPES = ("GEMV_SCORE", "GEMV_CONTEXT", "PAGED_ATTN")
 
 
 def _mark_kv_zone(ir: dict, sidecar: dict, kv_specs) -> None:

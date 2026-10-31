@@ -30,6 +30,7 @@ from opcompiler_bridge.oplevel_kernel import (
     mask_kernel,
     matmul_kernel,
     normalize_kernel,
+    paged_attn_kernel,
     reshape_kernel,
     rope_kernel,
     softmax_kernel,
@@ -92,6 +93,7 @@ UNCOVERED_OP_TYPES = frozenset({
     "RESHAPE",
     "SPLIT",
     "CONCAT",
+    "PAGED_ATTN",
 })
 
 
@@ -307,6 +309,18 @@ def _softmax(dims: Dict[str, int], rows: int, cols: int):
     return lambda: torch.softmax(x, dim=-1)
 
 
+def flash_attention_probe(dims: Dict[str, int], point: ShapePoint):
+    """构造一次融合 attention 调用，用于测量总成本。"""
+    import torch
+
+    num_heads = dims["num_heads"]
+    head_dim = dims["head_dim"]
+    q = torch.randn(1, num_heads, point.tq, head_dim, device=_probe_device(), dtype=torch.float16)
+    k = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
+    v = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
+    return lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+
 def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRecipe]]:
     """按模型维度返回各算子类型的配方工厂。"""
     hidden = dims["hidden_size"]
@@ -389,6 +403,15 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
         "GEMV_SCORE": gemv_score,
         "SOFTMAX": softmax,
         "GEMV_CONTEXT": gemv_context,
+        # 融合分页注意力只有 B 路：A 路的 SDPA 会落到 FlagGems 的 flash 内核，
+        # 那份 TTIR 降不到 pim mlir。B 路直接发整算子 IR（QK + 单遍
+        # online softmax + PV 一个节点）。
+        "PAGED_ATTN": bpath(
+            "pim.paged_attn",
+            lambda dims, point: _module(paged_attn_kernel(
+                "op", (point.tq, dims["head_dim"]),
+                *paged_attn_geometry(dims["head_dim"], point.lkv))),
+        ),
         "RMSNORM": bpath("pim.normalize", _normalize_ir),
         "SILU": bpath("pim.lut", _lut_ir),
         "VECTOR_ADD": _binary("pim.eltwise add", "add"),
@@ -404,6 +427,24 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
         "SPLIT": bpath("pim.split_heads", _split_heads_ir),
         "CONCAT": bpath("pim.concat", _concat_ir),
     }
+
+
+PAGED_ATTN_SLOT_TOKENS = 16
+
+
+def paged_attn_geometry(head_dim: int, kv_len: int) -> tuple[int, int, int, int, float]:
+    """按默认槽长推出 `pim.paged_attn` 的编译期槽几何。
+
+    返回 (cache_elems, max_blocks, slot_tokens, slot_elems, scale)，与
+    `oplevel_kernel.paged_attn_kernel` 同名参数对位。块数与槽池只求覆盖这段
+    KV 长度：GeneSim 的块循环次数在运行期按请求的实际历史长度绑定，IR 里的
+    块数只是让 verifier 与 trace 拿到具体形状。
+    """
+    slot_tokens = PAGED_ATTN_SLOT_TOKENS
+    max_blocks = max(1, -(-kv_len // slot_tokens))
+    slot_elems = slot_tokens * head_dim
+    cache_elems = max_blocks * slot_elems
+    return cache_elems, max_blocks, slot_tokens, slot_elems, head_dim ** -0.5
 
 
 def mnemonic_of(op_type: str) -> str | None:
@@ -430,7 +471,7 @@ MNEMONIC_OF = {
     for op_type in (
         "GEMM", "GEMV_SCORE", "GEMV_CONTEXT", "SOFTMAX", "RMSNORM", "SILU",
         "VECTOR_ADD", "VECTOR_MUL", "GATHER", "QUANT", "ROPE", "MASK",
-        "MEM_COPY", "TRANSPOSE", "RESHAPE", "SPLIT", "CONCAT",
+        "MEM_COPY", "TRANSPOSE", "RESHAPE", "SPLIT", "CONCAT", "PAGED_ATTN",
     )
     if (mnemonic := mnemonic_of(op_type))
 }
@@ -445,13 +486,3 @@ def gemm_features(op_dict: dict) -> tuple:
     return int(in_shape[1]), int(out_shape[1])
 
 
-def flash_attention_probe(dims: Dict[str, int], point: ShapePoint):
-    """构造一次融合 attention 调用，用于测量总成本。"""
-    import torch
-
-    num_heads = dims["num_heads"]
-    head_dim = dims["head_dim"]
-    q = torch.randn(1, num_heads, point.tq, head_dim, device=_probe_device(), dtype=torch.float16)
-    k = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
-    v = torch.randn(1, num_heads, point.lkv, head_dim, device=_probe_device(), dtype=torch.float16)
-    return lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v)
