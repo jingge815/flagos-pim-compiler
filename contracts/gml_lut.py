@@ -15,7 +15,7 @@
 
 全图 139 个 LUT 只有 **4 种内容**：倒数 69、恒等 37、exp 32、SiLU 1。
 其中 3 种可自行合成，只有 exp 需要拷贝一次（段索引规则未能反推，见
-docs/gml-parser-output-plan-20260917.md §7 问题 1）。
+docs/GML字段与bin映射策略.md §4.8）。
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def synth_exp() -> bytes:
     """exp 表，供 Softmax phase1（`e[i] = exp(x[i] - max)`）走的 LUT 通路用。
 
     **占位表，不是逼近参考产物的真实段**：硬件走 31 段 PWL，段索引规则未能
-    反推出（见 `docs/gml-parser-output-plan-20260917.md` §7 问题 1），本模块
+    反推出（见 `docs/GML字段与bin映射策略.md` §4.8），本模块
     的 Softmax 数值路径（`gml_bridge/phase_data.py::softmax`）本来就用精确
     `exp` 计算，不经过这张表——那份 docstring 已经说明这是有意为之的已知
     差异。这张表只是为了让 `LUT_phase_1_<id>.bin` 这个引用不再悬空（实测

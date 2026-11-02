@@ -32,8 +32,6 @@ from contracts.mem_layout import L2_ALIGN, align_up, l2_output_bytes
 # 更像 4 GB 虚拟地址（DACU 把 32 位 VA 翻成 64 位 PA）。照样例走。
 QMAN_OFFSET = 0x1FFF0000
 QMAN_SIZE = 65536
-# 数据区顶端 = QMAN 起点，向下不与队列区重叠。
-L2_DATA_TOP = QMAN_OFFSET
 
 
 def _is_dual_input(op_type: str, phase: int | None, node=None) -> bool:
@@ -67,12 +65,6 @@ def _is_dual_input(op_type: str, phase: int | None, node=None) -> bool:
         # phase >= 3（Llama2ActivationDQ 尾部借用的 DQ 四相）不是。
         return phase is not None and phase < 3
     return False
-
-
-# RoPE 表宽（元素数）。mul_cos/mul_sin 的两个输入槎宽度不同（数据槎 H、
-# 表槎 HD）。常量从编译期槽位取，不能 import layer_fields（循环 import）。
-_ROPE_H = DEFAULT_SLOTS.hidden
-_ROPE_HD = DEFAULT_SLOTS.head_dim
 
 
 def _dual_slot1_size(op_type: str, phase: int | None, slot0_size: int,

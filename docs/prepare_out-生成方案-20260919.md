@@ -24,7 +24,7 @@ Llama2-7B → 图编译 6 个 pass → FlagTree -pim-expand-phases
          → 只写出 net.ini 骨架 + layers.tsv，没有逐层 txt
 ```
 
-**已实施完成**（结果与实测记录见 `docs/prepare_out-txt-20260919.md`）：
+**已实施完成**：
 
 ```
 Llama2-7B → 图编译（q/k/v 共用 DQ、cos/sin 建表节点、语义 label）
@@ -431,8 +431,8 @@ DDR Orig Buffer Name：线性层 `bufferN` 不追 TVM 编号；KV 用
 
 ## 3. 验证：每个文件、每个域
 
-> **本节是设计。实际命令、实测输出、以及「对拍器一度放水」的教训，
-> 见 `docs/prepare_out-txt-20260919.md` 的「怎么验证」一节。**
+> **本节是设计。落地的教训：对拍器一度放水，白名单把非结构性差异也放了过去，
+> 报了假的 `VALUE_DIFF 0`；收紧白名单后的真实差异是 104 处。**
 >
 > 落地后补的一条判据：白名单只允许放**结构性**不可对齐的三类（节点编号、
 > 片上/DDR 地址、TVM 专属名）。尺寸、模式、枚举、槽位 id 一律当闭合域 ——
@@ -507,7 +507,6 @@ decode block。
 | 4 | `orchestrator/layer_fields.py`、`layer_render.py` | 23 类填充 + txt 文本 | 完成 |
 | 5 | `orchestrator/net_ini.py`、`plan.py`、`scripts/export_gml.py` | `[general]`、落盘 txt、`--decode-block-only` | 完成 |
 | 6 | `scripts/diff_prepare_out.py` + 测试 | 全量文件×域对拍 | 完成 |
-| 7 | `docs/prepare_out-txt-20260919.md` | 研发记录 | 完成 |
 
 ### 计划外但必须做的改动
 

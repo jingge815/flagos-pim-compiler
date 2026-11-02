@@ -163,7 +163,6 @@ PHASE_COUNTS = {
 #
 # 规则：默认取量化契约的 group_size；attention scores 整条当一组。
 DQ_GROUP_SIZE_DEFAULT = WEIGHT_GROUP_SIZE
-DQ_GROUP_SIZE_ATTENTION_SCORES = 1024
 
 
 def dq_group_size(numel: int, *, is_attention_scores: bool) -> int:

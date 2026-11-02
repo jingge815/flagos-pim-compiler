@@ -251,15 +251,6 @@ def phase_kantor_shift(node_id: int, phase: int, block: str = "A") -> str:
 # （`kantor_A_...`）—— 实测 23 个大写文件全部属于 RoPE 子块，119 个小写文件
 # 全部属于 phase 或非 phase 的普通节点。大小写写错就是悬空引用。
 
-# 子块名。Sin/Cos 另有 `_Broadcast` 变体承载广播后的量化参数。
-ROPE_BLOCKS = (
-    "Llama2Activation_Add_Cos",
-    "Llama2Activation_Add_Sin",
-    "Llama2Activation_Sin",
-    "Llama2Activation_Cos",
-)
-
-
 def rope_scale(node_id: int, unit: int, block: str) -> str:
     """RoPE 子块的 FPSU scale，带单元号。"""
     return f"Scaling_buffer_file_{unit}_{block}_{node_id}{SUFFIX}"
@@ -303,15 +294,6 @@ def rope_kantor_shift(node_id: int, block: str, unit: str = "A") -> str:
 def rms_norm_epsilon(node_id: int) -> str:
     """RMSNorm 的 eps 常量，取自 config.json 的 rms_norm_eps。"""
     return f"RMSNorm_Add_Const_{node_id}{SUFFIX}"
-
-
-def kv_cache_update_scale(node_id: int) -> str:
-    """KV_Cache_DMA 写入值的量化 scale。"""
-    return f"updates_sf_{node_id}{SUFFIX}"
-
-
-def kv_cache_update_zero_point(node_id: int) -> str:
-    return f"updates_zp_{node_id}{SUFFIX}"
 
 
 def rope_intermediate(node_id: int, which: str) -> str:

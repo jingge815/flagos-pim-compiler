@@ -26,28 +26,8 @@ H, I, HD, S = (DEFAULT_SLOTS.hidden, DEFAULT_SLOTS.intermediate,
                DEFAULT_SLOTS.head_dim, DEFAULT_SLOTS.seq)
 
 
-def dtype_code(elem_bytes: int) -> int:
-    if elem_bytes == 1:
-        return DT_INT8
-    if elem_bytes == 2:
-        return DT_FP16
-    if elem_bytes == 4:
-        return DT_FP32
-    raise ValueError(f"未知元素宽度 {elem_bytes}")
-
-
 def extension_of(dt: int) -> int:
     return EXT_FLOAT if dt in (DT_FP16, DT_FP32) else EXT_SIGNED
-
-
-def numel_of_dims(dims: str) -> int:
-    if not dims or dims == "unknown":
-        return 0
-    n = 1
-    for part in dims.split("x"):
-        if part.isdigit():
-            n *= int(part)
-    return n
 
 
 def last_dim(dims: str) -> int:
@@ -447,7 +427,7 @@ def _tvm_name(orig: str) -> str:
 
     参考的名字是 Relay 内部符号（`nprm_182_i12`），我方不走 TVM，拿不到；
     这里回落到我方的语义名，**保证域在、可解析**，数值等甲方确认是否当标识用
-    （见 docs/prepare_out-txt-20260919.md 当前不足第 1 条）。
+    （见 docs/prepare_out-生成方案-20260919.md 的不足一节）。
     """
     if orig == "output":
         return "tvmgen_default_nprm_main_output_0"

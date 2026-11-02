@@ -23,8 +23,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from contracts.gml_hw_constants import (
-    DQ_PHASES,
-    SOFTMAX_PHASES,
     TOP_LEVEL,
     PHASE_TABLE,
     ROPE_UNITS,

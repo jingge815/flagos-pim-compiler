@@ -47,7 +47,7 @@ from contracts.unified_ir import STAGE_FUSED, require_stage
 from graph.fuse_pim import RMS_NORM_META_KEY
 from graph.fuse_rope import ROPE_META_KEY
 from graph.quant_pass import DQ_META_KEY
-from graph.split_heads import HEAD_INDEX_META_KEY, HEAD_ROLE_META_KEY, ROLE_SOFTMAX
+from graph.split_heads import HEAD_ROLE_META_KEY, ROLE_SOFTMAX
 from opcompiler_bridge.oplevel_kernel import (
     dynamic_quant_kernel,
     matmul_kernel,

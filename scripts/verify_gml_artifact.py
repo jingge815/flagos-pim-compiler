@@ -883,7 +883,7 @@ def check_group_saturation(out_dir: Path, nodes: list[str], report: Report) -> N
     **注意：参考产物本身过不了这一条**（o_proj/mlp 97.8~98.2%，但
     q_proj 55.6%、k_proj 63.0%、v_proj 91.5%）。原因是它用的是合成数据，
     `weight_buffer` 与 `weight_sf` 并非同一次量化的输出
-    （见 docs/gml-parser-output-plan-20260917.md §5 的前提）。
+    （见 docs/交付物结构与生成方案分析.md §8.0 的前提）。
     这是**对我方产物的要求**，不是对参考产物的复现目标。
     """
     bad = []

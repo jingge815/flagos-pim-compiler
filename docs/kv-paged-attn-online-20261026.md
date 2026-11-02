@@ -122,7 +122,7 @@ f32 求和、f16 倒数、f16 乘）**不再逐元素相等**：
 | `tests/test_opcompiler_ops.py` | `test_paged_attn_matches_the_online_reference`：在线参考，`assert_array_equal` |
 | `tests/test_kernels.py` | `test_sdpa_fused_paged_attn_tracks_the_host_path`：融合 vs 主机改 `allclose` |
 | `tests/README.md` | `test_kernels` 一行说明改成单遍在线 |
-| `docs/kv-paged-attn-20261025.md` | 顶部加修订说明 |
+| 两遍版设计记录 | 已删除，本文档即当前口径 |
 
 ## 测试
 
