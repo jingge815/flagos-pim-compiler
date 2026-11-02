@@ -11,7 +11,7 @@
     print_report(profile)                     # 文本报告
     profile.to_html("timeline.html")          # 甘特图
 
-    # 直接当脚本跑真实 Llama-2-7B（小型 Llama 的命令级演示见 _demo()）
+    # 直接当脚本跑真实 Llama-2-7B
     python scripts/profile_execution.py
 
     # 采集 vLLM 的调度：PIM_PARALLEL_SLOTS 取 1 和 2 各跑一次并对比
@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import html
-import itertools
 import os
 import sys
 import tempfile
@@ -29,8 +28,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import numpy as np
 
 
 # ────────────────────────────────────────────────────────────
@@ -409,13 +406,13 @@ class _VllmProfiler:
                 tokens=list(scheduler_output.num_scheduled_tokens.values()),
                 start=start, end=end, tasks=tasks))
 
-    def _step(self, req_id, slot_index=0):
+    def _step(self, req_id, slot_index=0, logprobs_width=None, scheduled=None):
         # 进入时就定下步号：之后即使这一步已经结束，记录也不会串到下一步。
         with self._lock:
             index = self._step_index
         start = time.perf_counter()
         try:
-            return self._orig_step(req_id, slot_index)
+            return self._orig_step(req_id, slot_index, logprobs_width, scheduled)
         finally:
             with self._lock:
                 self._tasks.append(
@@ -600,104 +597,6 @@ def _to_chrome_trace(result: ProfileResult, path: str) -> None:
 # 把 to_html / to_chrome_trace 挂到 ProfileResult 上
 ProfileResult.to_html = lambda self, path: _to_html(self, path)
 ProfileResult.to_chrome_trace = lambda self, path: _to_chrome_trace(self, path)
-
-
-# ────────────────────────────────────────────────────────────
-# 独立运行：小型 Llama 演示
-# ────────────────────────────────────────────────────────────
-
-
-def _demo():
-    """编译小型 Llama 并采集执行时间线。"""
-    import torch
-    from transformers import LlamaConfig, LlamaForCausalLM
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
-    from contracts.op_contract import PIMHardwareConfig
-    from graph.strategy import llama_strategies
-    from memory.mem_planner import HwBudget
-    from runtime.compile import causal_mask_of, compile_llama2, load_weights
-    from runtime.executor import RequestTable, run_one_step
-    from runtime.kernels import register_all
-
-    NUM_DPUS, NUM_LAYERS = 4, 4
-    torch.manual_seed(0)
-    model = LlamaForCausalLM(LlamaConfig(
-        hidden_size=128, intermediate_size=256, num_hidden_layers=NUM_LAYERS,
-        num_attention_heads=4, num_key_value_heads=4, vocab_size=256,
-    )).eval().to(torch.float16)
-
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
-    hardware = PIMHardwareConfig(
-        num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
-        wram_bytes_per_dpu=65536, dma_align=64,
-    )
-    strategy = llama_strategies(
-        NUM_DPUS, num_heads=4, num_kv_heads=4, intermediate_size=256,
-        vocab_size=256, num_layers=NUM_LAYERS)[0]
-
-    # 串行模式
-    print("编译串行模式（P=1）...")
-    compiled_serial = compile_llama2(
-        model, strategy, prefill_seq_len=4, max_seq=16,
-        hw=hw, hardware=hardware, num_request_slots=2,
-        num_parallel_slots=1,
-    )
-    backend_s = NumpyBackend(NumpyBackendConfig(
-        num_dpus=NUM_DPUS, mram_bytes_per_dpu=hardware.mram_bytes_per_dpu,
-        num_parallel_slots=1,
-    ))
-    register_all(backend_s)
-    load_weights(compiled_serial, backend_s)
-
-    table_s = RequestTable(2, compiled_serial.kv_pool_slots)
-    for i, p in enumerate([[1, 2, 3, 4], [5, 6, 7, 8]]):
-        table_s.add_request(f"r{i}", p, eos_id=-1)
-
-    prof = profile_backend(backend_s)
-    run_one_step(compiled_serial, backend_s, table_s, causal_mask_of)
-    result_s = prof.stop()
-    print_report(result_s)
-    result_s.to_html("timeline_serial.html")
-    print("甘特图 → timeline_serial.html")
-
-    # 并行模式
-    print("\n编译并行模式（P=2）...")
-    compiled_par = compile_llama2(
-        model, strategy, prefill_seq_len=4, max_seq=16,
-        hw=hw, hardware=hardware, num_request_slots=2,
-        num_parallel_slots=2,
-    )
-    backend_p = NumpyBackend(NumpyBackendConfig(
-        num_dpus=NUM_DPUS, mram_bytes_per_dpu=hardware.mram_bytes_per_dpu,
-        num_parallel_slots=2,
-    ))
-    register_all(backend_p)
-    load_weights(compiled_par, backend_p)
-
-    table_p = RequestTable(2, compiled_par.kv_pool_slots)
-    for i, p in enumerate([[1, 2, 3, 4], [5, 6, 7, 8]]):
-        table_p.add_request(f"r{i}", p, eos_id=-1)
-
-    prof = profile_backend(backend_p)
-    run_one_step(compiled_par, backend_p, table_p, causal_mask_of)
-    result_p = prof.stop()
-    print_report(result_p)
-    result_p.to_html("timeline_parallel.html")
-    print("甘特图 → timeline_parallel.html")
-
-    # 对比
-    print(f"\n{'=' * 40}")
-    print(f"串行 vs 并行对比:")
-    print(f"  Wall: {result_s.wall * 1000:.1f} ms → {result_p.wall * 1000:.1f} ms "
-          f"({result_p.wall / result_s.wall * 100:.0f}%)")
-    s_util = sum(result_s.per_dpu_utilization().values()) / NUM_DPUS * 100
-    p_util = sum(result_p.per_dpu_utilization().values()) / NUM_DPUS * 100
-    print(f"  平均利用率: {s_util:.1f}% → {p_util:.1f}%")
-    print(f"  最大并发内核: {result_s.max_parallel_kernels()} → "
-          f"{result_p.max_parallel_kernels()}")
 
 
 # ────────────────────────────────────────────────────────────

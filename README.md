@@ -286,6 +286,19 @@ GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 用 `PIM_COMPILER_ROOT` 指�
 根目录；未设置时按常见相对布局探测（`../flagOS/flagos-pim-compiler` 或
 `../flagos-pim-compiler`）。
 
+### vLLM 版本
+
+PIM 后端只支持 **vLLM 0.14.x**（当前基线与回归都是 0.14.0）。`PIMExecutor` 启动时会
+校验 `vllm.__version__`，不在范围内直接失败并说明当前版本与支持范围，避免在接口不兼容
+的版本上跑出难查的错。升级前先看
+[`docs/vllm-031-gap-20261102.md`](./docs/vllm-031-gap-20261102.md)，那里列了 0.14 → 0.31
+的接口差异与适配顺序。
+
+```bash
+pip install "vllm==0.14.*"
+python -m pytest tests/test_vllm_compat.py -q
+```
+
 ## 文档
 
 - `docs/spec.md` — 完整技术方案
@@ -297,6 +310,7 @@ GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 用 `PIM_COMPILER_ROOT` 指�
 - `docs/hal_numpy.md` — HAL 接口与 tasklet 模型
 - `docs/kv-paged-attn-online-20261026.md` — 融合分页注意力（单遍在线 softmax）
 - `docs/executor-parallel-phase1-20261026.md` — 跨请求并行执行
+- `docs/vllm-integration-20261102.md` — vLLM 接入现状索引（能力 → 代码 → 文档 → 测试）
 - `docs/<module>.md` — 各模块接口与设计决策
 
 ## 开发约定

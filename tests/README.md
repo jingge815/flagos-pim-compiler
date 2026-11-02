@@ -1,6 +1,6 @@
 # tests/ 测试指南与排错手册
 
-本目录共 89 个测试文件、1464 条用例（其中 2 条 `slow` 默认不跑，需 `-m slow`）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
+本目录共 102 个测试文件、1589 条用例（其中 4 条 `slow` 默认不跑，需 `-m slow`）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
 
 > 先记住一件事：每次 pytest 结束都会把逐用例状态、耗时和失败首行写到
 > **`test-results/pytest-latest.md`**（由 `conftest.py` 生成）。排错从这里开始。
@@ -66,7 +66,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | FlagTree 源码树 | `flagtree_prefix` 下的源码目录 | `test_flagtree_ods_hygiene.py`、`test_genesim_bridge.py`（ODS 卫生）、`test_fusion_contract.py`（与 C++ 对齐） | SKIP |
 | `triton-opt` + PIM pass | `flagtree_prefix` | `test_opcompiler_ops/linear.py`、`test_pimir_layout.py`、`test_phase_plan_live.py`、`test_three_path_generation.py`、`test_ir_cost_eval.py`、`test_genesim_bridge.py`（部分） | 对应文件/用例 SKIP；提示重跑 `0-install-flagtree.sh` |
 | GeneSim 仓库与模型 IR | `genesim_root` | `test_genesim_simulation.py`、`test_genesim_bridge.py`（真实模型段）、`test_ir_cost_eval.py`（往返）、`test_placement_export.py`（ISA 解码一条） | 多数 SKIP；部分因 `required=True` 直接 ERROR |
-| vLLM + CUDA | 系统环境 | `test_vllm_executor.py` | 导入失败 / 用例失败 |
+| vLLM + CUDA | 系统环境 | `test_vllm_executor.py`、`test_vllm_compat.py` | 导入失败 / 用例失败 |
 | networkx | 系统环境 | `test_verify_gml_artifact.py`（一条 `importorskip`） | 单条 SKIP |
 | `flag_gems` | 系统环境 | `test_genesim_bridge.py::test_autotune_drops_tiles_over_the_wram_budget` | 单条 SKIP |
 | 本机 `gcc` | 系统环境 | 所有真编译内核的用例 | `ToolchainUnavailable` |
@@ -173,8 +173,21 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_parallel_requests.py` | 8 | 两/四请求并发的 token 与串行一致、混合 prefill/decode、确定性 | 小模型 | 激活窗口或块表窗口越界先查 `slot_index` 传递 |
 | `test_parallel_overlap.py` | 1 | 同 DPU 上不同请求的命令真交错，允许后发先至 | 小模型 | 泳道是否仍按 `(lane_key, dpu_id)` 分开 |
 | `test_natural_prompt_llama2_7b.py` | 1 | **7B** 自然语言 prompt 的逐 token 生成与 HF `generate` 一致 | 7B | 失败会打印 `route_counts()`；出现主机退回说明某算子未注册 |
-| `test_vllm_executor.py` | 1 | vLLM 引擎经 `PIMExecutor` 跑两个并发请求，且槽池默认值多留一块 | vLLM + CUDA | 环境变量必须在 `import vllm` 前设置；worker 崩溃看 `backend/vllm_worker.py` |
+| `test_vllm_executor.py` | 2 | vLLM 引擎经 `PIMExecutor` 跑两个并发请求（含被拆成 3+1 的分块 prefill）、同 seed 复现与 logprobs 回传，且槽池默认值多留一块 | vLLM + CUDA | 环境变量必须在 `import vllm` 前设置；worker 崩溃看 `backend/vllm_worker.py` |
+| `test_vllm_compat.py` | 2 | 版本锁定：0.14.x 放行、0.31.0 报错且消息同时含当前版本与支持范围 | vLLM | 升级 vLLM 先看 `backend/vllm_compat.py` 与 `docs/vllm-031-gap-20261102.md` |
+| `test_vllm_capabilities.py` | 18 | 启动期/请求期能力矩阵：TP、LoRA、投机、量化、dtype、非 llama、分块预算超图长逐项报错且点名参数 | 无 | 报错文案变了先看 `backend/vllm_worker.py` 的 `_unsupported` |
+| `test_vllm_sampling.py` | 16 | 主机侧采样：温度、top-k/top-p、三种惩罚、seed、logprobs 与未实现参数报错 | 无 | `backend/sampling.py`；先查 `SamplingConfig.from_vllm` 的字段映射 |
+| `test_vllm_block_table.py` | 7 | 块号以 vLLM 为唯一真源：新请求采用、cached 追加、resumed 替换、来源二选一、外部块号不改变 token | 无（1 条小模型） | 块表错乱先查 `KVBlockTable.adopt` 与 `_sync_cached` |
+| `test_vllm_translate.py` | 7 | `execute_model` 翻译层：新请求注册与块号、分块 prefill 返回空 token、按窗口分 wave 且保序、结束清理、抢占重放、解码步多 token 报错、语法约束在跑之前拒绝 | vLLM | 桩掉 `_step` 后只测翻译逻辑；先看 `backend/vllm_worker.py::execute_model` |
+| `test_prefix_cache.py` | 4 | 前缀缓存：命中段只读（共享块字节前后相同）、从命中长度为起点写、三请求共享前缀两窗口、vLLM 引擎命中数与关闭缓存时逐 token 一致 | 小模型 + vLLM | 共享块被改写先查 `_add_request` 的 `valid_len` 初值；`int()` 报错查 `_sync_cached` 是否按 KV 分组取 `[0]` |
+| `test_preemption.py` | 6 | 抢占恢复：prefill 中途 / decode 中途被抢占整段重放、命中共享前缀从 `num_computed_tokens` 续算、真实 vLLM 池 3 块强制抢占后与不抢占逐 token 一致 | 小模型 + vLLM | 恢复后位置错先查 `_sync_cached` 的重置条件与 `RequestSlot.reset` 的 `computed`；没触发抢占就调小 `PIM_KV_POOL_SLOTS` |
+| `test_serve_pim_preflight.py` | 11 | `--pim-*` 参数翻译与启动预检：槽池、MRAM、prefill 图长、分块预算、问题一次性列全；不设槽池时跳过 MRAM 估算 | 无 | 预检规则与 `scripts/serve_pim.py` 的 `preflight` 必须同步 |
+| `test_auto_capacity.py` | 5 | KV 槽池与并行窗口自动定容：剩余 MRAM 求容量、超预算时报所需与可用、显式值装得下则保留、不设任何 `PIM_*` 环境变量时 vLLM 分到的块数等于定容结果 | 小模型 + vLLM | 槽数偏小先查 `memory.mem_planner.fit_pool_slots` 是否漏了内核 tile 或块表；块数对不上查 `determine_available_memory` |
+| `test_prefill_buckets.py` | 21 | prefill 分桶：桶表排序、按最短可容纳原则选桶、跨桶 token 一致、各桶共享权重与 KV 布局、融合 vs 强制主机 | 小模型 | 桶几何查 `compile_llama2(prefill_seq_lens=)`；选桶查 `prefill_bucket` |
+| `test_chunked_prefill.py` | 12（2 条 `slow`） | 分块 prefill：各种切法与整段逐 token 一致、主机两遍路径同样一致、交错请求互不干扰、中间段不采样、3000 token 的 64/512 切法（slow） | 小模型（slow 用 3072 长度图，约 8 分钟/用例） | 位置错先查 `prefill_chunk` 的 `pos`/`position_ids` 与 `_host_paged_attention` 的绝对位置掩码 |
 | `test_profile_execution.py` | 6 | vLLM 调度采集：效率/并发/窗口冲突、空步不计均值、中途失败不串步、stop 还原方法 | 无 | 失败先看 `scripts/profile_execution.py` 的 `_VllmProfiler` 步号过滤；并发类用例靠线程，慢机器上慎调阈值 |
+| `test_architectures.py` | 5 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling`/`sliding_window` 点名拒绝、GQA（4 Q 头 / 2 KV 头）的 KV 布局与两请求 token 一致 | 小模型（GQA 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束 |
+| `test_step_stats.py` | 4 | 每步指标：wave 取整与最宽值、共用块去重占用、日志字段、真实 vLLM 下 `PIM_LOG_STEPS` 有输出且 `PIM_PROFILE` 两套采集器都有数据 | 小模型 + vLLM | 日志没有输出先查 `PIM_LOG_STEPS` 是否生效；采不到步查 `profile_vllm` 的 `_step` 签名是否跟 worker 对齐 |
 
 ### 4.7 GML 导出、格式与校验
 

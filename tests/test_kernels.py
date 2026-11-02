@@ -416,6 +416,58 @@ def test_sdpa_fused_paged_attn_tracks_the_host_path(monkeypatch) -> None:
                        atol=0.05)
 
 
+def test_sdpa_standard_causal_mask_routes_to_fused_kernel(monkeypatch) -> None:
+    """声明「掩码是标准因果掩码」后，带掩码的 prefill 也走融合内核。
+
+    没声明时同一个掩码必须回退主机路径（自定义掩码的兜底不能被破坏），
+    两条路径的数值差在 f16 末位量级。
+    """
+    from types import SimpleNamespace
+
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout, write_block_table
+
+    head_dim, slot_tokens, max_seq = 8, 4, 8
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=max_seq, head_dim=head_dim, dtype_bytes=2,
+        kv_base=8192, slot_tokens=slot_tokens), align=8, pool_slots=3)
+
+    rng = np.random.default_rng(13)
+    q = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    k = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    v = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    mask = np.zeros((1, 1, max_seq, max_seq), dtype=np.float16)
+    mask[0, 0] = np.triu(np.full((max_seq, max_seq), -np.inf,
+                                 dtype=np.float16), k=1)
+    info = km.sdpa_kv_info(SimpleNamespace(name="n"), {0: spec}, {"n": 0},
+                           np.dtype(np.float16))
+
+    def run(standard: bool, force_host: bool):
+        backend = NumpyBackend(
+            NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+        register_all(backend)
+        write_block_table(spec, backend, [2, 0])
+        backend.bind_inputs({"causal_mask_standard": True} if standard else {})
+        if force_host:
+            monkeypatch.setattr(km, "_compiled_paged_attn", lambda *a, **kw: None)
+        km.reset_route_counts()
+        out = _run(backend,
+                   str(torch.ops.aten.scaled_dot_product_attention.default),
+                   ["tensor"] * 4, [q.shape, k.shape, v.shape, mask.shape],
+                   [q, k, v, mask], q.shape, dtype="float16",
+                   extra_payload={"sdpa": info})
+        return out, km.route_counts()
+
+    fused, routes = run(standard=True, force_host=False)
+    assert routes.get(("paged_attn", "hit"), 0) > 0, "标准掩码的 prefill 没有走融合内核"
+    custom, routes = run(standard=False, force_host=False)
+    assert routes.get(("paged_attn", "fallback"), 0) > 0, "未声明的掩码没有回退"
+    host, _ = run(standard=True, force_host=True)
+    assert np.allclose(fused, host, rtol=1e-3, atol=1e-3)
+    assert np.allclose(custom, host, rtol=1e-3, atol=1e-3)
+
+
 def test_paged_attention_rejects_history_longer_than_the_block_table() -> None:
     """块表项不够时直接报错：再多读会拿到槽池里的垃圾槽号。"""
     import runtime.kernels as km

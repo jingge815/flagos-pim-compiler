@@ -39,21 +39,32 @@ class KVSlotPool:
 
 
 class KVBlockTable:
-    """保存一个请求的逻辑块到物理槽的映射。"""
+    """保存一个请求的逻辑块到物理块号的映射；`pool` 为空表示块号由外部给定。"""
 
-    def __init__(self, pool: KVSlotPool) -> None:
+    def __init__(self, pool: KVSlotPool | None = None) -> None:
         self.pool = pool
         self.slots: list[int] = []
 
     def ensure(self, n_blocks: int) -> None:
-        """保证至少 n_blocks 个物理槽，按需追加。"""
+        """保证至少 n_blocks 个块：自管时按需申请，外部给定时只校验够不够。"""
+        if self.pool is None:
+            if len(self.slots) < n_blocks:
+                raise ValueError(
+                    f"块表只有 {len(self.slots)} 项，本次需要 {n_blocks} 项")
+            return
         while len(self.slots) < n_blocks:
             self.slots.append(self.pool.alloc())
 
+    def adopt(self, block_ids: list[int], *, replace: bool = False) -> None:
+        """采用外部块号：`replace` 为真时整段替换，否则追加。"""
+        ids = [int(block) for block in block_ids]
+        self.slots = ids if replace else [*self.slots, *ids]
+
     def release(self) -> None:
-        """归还全部物理槽。"""
-        for slot in self.slots:
-            self.pool.free(slot)
+        """归还物理槽；外部给定的块号只清本地记录。"""
+        if self.pool is not None:
+            for slot in self.slots:
+                self.pool.free(slot)
         self.slots.clear()
 
 
@@ -70,21 +81,24 @@ class RequestSlot:
     is_prefill_done: bool = False
     eos_id: int = 2
 
-    def reset(self, prompt_ids: list[int]) -> None:
-        """归还全部物理槽，按新 prompt 重新 prefill（抢占重算用）。"""
+    def reset(self, prompt_ids: list[int], computed: int = 0) -> None:
+        """清空块表并按新 prompt 重新 prefill（抢占重算用）。
+
+        `computed` 是已经算过的长度：命中前缀缓存时从它之后接着算，不重跑这段。
+        """
         self.blocks.release()
         self.prompt_ids = list(prompt_ids)
-        self.valid_len = 0
+        self.valid_len = computed
         self.generated.clear()
         self.is_prefill_done = False
 
 
 class RequestTable:
-    """管理多请求并发状态：共享物理槽池，设备侧共用一份块表缓冲。"""
+    """管理多请求并发状态；`kv_pool_slots` 为空表示块号由外部（vLLM）提供。"""
 
-    def __init__(self, num_request_slots: int, kv_pool_slots: int) -> None:
+    def __init__(self, num_request_slots: int, kv_pool_slots: int | None = None) -> None:
         self._num_request_slots = num_request_slots
-        self._pool = KVSlotPool(kv_pool_slots)
+        self._pool = None if kv_pool_slots is None else KVSlotPool(kv_pool_slots)
         self._slots: dict[str, RequestSlot] = {}   # request_id -> RequestSlot
         self._free: list[int] = list(range(num_request_slots))
         self._step_executor: ThreadPoolExecutor | None = None
@@ -95,19 +109,25 @@ class RequestTable:
             self._step_executor = ThreadPoolExecutor(max_workers=max_workers)
         return self._step_executor
 
-    def add_request(self, request_id: str, prompt_ids: list[int],
-                    eos_id: int = 2) -> RequestSlot:
-        """申请一个空闲请求槽并注册新请求；无空闲槽时抛 RuntimeError。"""
+    def add_request(self, request_id: str, prompt_ids: list[int], eos_id: int = 2,
+                    block_ids: list[int] | None = None) -> RequestSlot:
+        """注册新请求；块号要么由 `block_ids` 给定，要么由本表的池分配。"""
+        if (block_ids is None) == (self._pool is None):
+            raise ValueError(
+                "块号来源必须二选一：给 block_ids，或给 kv_pool_slots 由本类分配")
         if not self._free:
             raise RuntimeError(
                 f"所有 {self._num_request_slots} 个请求槽已占满，无法接入新请求")
         if request_id in self._slots:
             raise ValueError(f"request_id={request_id!r} 已存在")
         request_slot = self._free.pop(0)
+        blocks = KVBlockTable(self._pool)
+        if block_ids is not None:
+            blocks.adopt(block_ids, replace=True)
         slot = RequestSlot(
             request_id=request_id,
             request_slot=request_slot,
-            blocks=KVBlockTable(self._pool),
+            blocks=blocks,
             prompt_ids=list(prompt_ids),
             eos_id=eos_id,
         )
@@ -115,7 +135,7 @@ class RequestTable:
         return slot
 
     def free_slot(self, request_id: str) -> None:
-        """释放请求占用的请求槽和全部物理槽。"""
+        """释放请求槽；外部托管的块号只清本地记录，不归还给谁。"""
         slot = self._slots.pop(request_id, None)
         if slot is not None:
             slot.blocks.release()
@@ -142,51 +162,34 @@ def step_request(
     causal_mask_of,
     *,
     sample_fn=None,
-    pad_to: int | None = None,
     pad_id: int = 0,
     slot_index: int = 0,
 ) -> int:
-    """对单个请求执行一步（未 prefill 则 prefill，否则 decode），返回新 token。
+    """对单个请求执行一步（未 prefill 则整段 prefill，否则 decode），返回新 token。
 
-    每次调用只产生一个 token，与 vLLM 一次 `execute_model` 一步的语义一致。
-    `pad_to` 非空时把 prompt 右侧补齐到该长度，适配静态导出的 prefill 图；
-    补齐位置不写 KV（`num_tokens` 只算真实 prompt），也不参与采样。
+    每次调用只产生一个 token。分块 prefill 走 `prefill_chunk` 自己拼段，
+    这里只处理「一次跑完整段 prompt」，桶按 prompt 长度选，补齐位置不写 KV。
 
     `slot_index` 指定本次用的激活窗口和块表窗口（0..并行窗口数-1）。同一步
-    并发的请求各用各的窗口，激活、块表都不相交；物理 KV 槽由槽池全局分配。
+    并发的请求各用各的窗口，激活、块表都不相交；物理块号由块表决定（外部块号
+    或自管槽池）。
     """
     if sample_fn is None:
         sample_fn = lambda logits: int(np.argmax(logits))
 
-    ctx = ExecutionContext(lane_key=slot_index)
     if not slot.is_prefill_done:
-        prompt_len = len(slot.prompt_ids)
-        seq_len = pad_to if pad_to is not None else prompt_len
-        ids = list(slot.prompt_ids) + [pad_id] * (seq_len - prompt_len)
-        slot.blocks.ensure(_blocks_for(prompt_len, compiled.kv_slot_tokens))
-        _write_block_table(compiled, hal, slot, slot_index)
-        events = execute_plan(
-            _window_plan(compiled, "prefill", slot_index), hal,
-            ctx=ctx,
-            values={
-                "input_ids": _as_batch_tensor(ids),
-                "causal_mask": causal_mask_of(seq_len),
-                "position_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
-            },
-            pos=0,
-            num_tokens=prompt_len,
-        )
-        logits = hal.wait(events[compiled.prefill.output_cmd_id])
-        slot.valid_len = prompt_len
+        logits = prefill_chunk(
+            compiled, hal, slot, slot.prompt_ids, 0, causal_mask_of,
+            pad_id=pad_id, slot_index=slot_index)
         slot.is_prefill_done = True
-        token = sample_fn(np.asarray(logits)[0, prompt_len - 1])
+        token = sample_fn(logits[0, len(slot.prompt_ids) - 1])
     else:
         total_len = slot.valid_len + 1
         slot.blocks.ensure(_blocks_for(total_len, compiled.kv_slot_tokens))
         _write_block_table(compiled, hal, slot, slot_index)
         events = execute_plan(
             _window_plan(compiled, "decode", slot_index), hal,
-            ctx=ctx,
+            ctx=ExecutionContext(lane_key=slot_index),
             values={
                 "input_ids": _as_batch_tensor([slot.generated[-1]]),
                 "causal_mask": causal_mask_of(1),
@@ -194,6 +197,7 @@ def step_request(
             },
             pos=slot.valid_len,
             num_tokens=1,
+            causal_mask_standard=True,
         )
         logits = hal.wait(events[compiled.decode.output_cmd_id])
         slot.valid_len += 1
@@ -201,6 +205,74 @@ def step_request(
 
     slot.generated.append(token)
     return token
+
+
+def prefill_chunk(
+    compiled,
+    hal,
+    slot: RequestSlot,
+    token_ids: list[int],
+    pos: int,
+    causal_mask_of,
+    *,
+    pad_id: int = 0,
+    slot_index: int = 0,
+) -> np.ndarray:
+    """把 `[pos, pos+len(token_ids))` 这段 token 写进 KV，返回 `[1, 桶长, vocab]` logits。
+
+    桶按**本段长度**选，右侧补 pad（不参与计算、不写 KV）；`pos` 之前的历史
+    已在 KV 里，注意力按绝对位置读取。`causal_mask_of` 生成标准因果掩码，
+    据此走融合内核。分块 prefill 的中间段不采样，由调用方决定。
+    """
+    length = len(token_ids)
+    seq_len = prefill_bucket(compiled, length)
+    ids = list(token_ids) + [pad_id] * (seq_len - length)
+    slot.blocks.ensure(_blocks_for(pos + length, compiled.kv_slot_tokens))
+    _write_block_table(compiled, hal, slot, slot_index)
+    events = execute_plan(
+        _prefill_plan(compiled, seq_len, slot_index), hal,
+        ctx=ExecutionContext(lane_key=slot_index),
+        values={
+            "input_ids": _as_batch_tensor(ids),
+            "causal_mask": causal_mask_of(seq_len),
+            "position_ids": torch.arange(
+                pos, pos + seq_len, dtype=torch.long).unsqueeze(0),
+        },
+        pos=pos,
+        num_tokens=length,
+        causal_mask_standard=True,
+    )
+    logits = np.asarray(hal.wait(events[_prefill_output_cmd(compiled, seq_len)]))
+    slot.valid_len = pos + length
+    return logits
+
+
+def prefill_bucket(compiled, n_tokens: int) -> int:
+    """选最小的能放下 n_tokens 行的 prefill 桶；没有桶表时按原长。"""
+    lengths = getattr(compiled, "prefill_seq_lens", ()) or ()
+    if not lengths:
+        return n_tokens
+    for length in lengths:
+        if n_tokens <= length:
+            return length
+    raise ValueError(
+        f"token 数 {n_tokens} 超过最长 prefill 桶 {lengths[-1]}；"
+        f"建议调大 PIM_PREFILL_SEQ_LEN 或调小 --max-num-batched-tokens")
+
+
+def _prefill_plan(compiled, seq_len: int, slot_index: int):
+    """取第 `seq_len` 桶第 `slot_index` 号窗口的计划；没有桶表时退回原计划。"""
+    plans = getattr(compiled, "prefill_plans", None) or {}
+    windows = plans.get(seq_len)
+    if windows:
+        return windows[slot_index]
+    return compiled.prefill.plan
+
+
+def _prefill_output_cmd(compiled, seq_len: int) -> int:
+    """取第 `seq_len` 桶输出节点对应的命令编号。"""
+    ids = getattr(compiled, "prefill_cmd_ids", None) or {}
+    return ids.get(seq_len, compiled.prefill.output_cmd_id)
 
 
 def _window_plan(compiled, phase: str, slot_index: int):
@@ -258,14 +330,19 @@ def run_one_step(
 def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
                  values: dict[str, object] | None = None,
                  pos: int | None = None,
-                 num_tokens: int | None = None) -> dict[int, object]:
+                 num_tokens: int | None = None,
+                 causal_mask_standard: bool = False) -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。
 
     命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
     自己的依赖完成，主线程不必逐条前置等待，否则提交无法提前、DPU 排不满。
     `ctx` 非空时输入值、事件表和泳道都走该上下文，多个请求才能同时在飞；
     为空时沿用全局事件表，保持旧的单请求语义。
+    `causal_mask_standard` 声明本次传入的掩码就是标准因果掩码，注意力内核
+    据此走融合路径；自定义掩码（滑动窗口、bias）不要置位。
     """
+    if causal_mask_standard:
+        values = {**(values or {}), "causal_mask_standard": True}
     if ctx is None:
         hal.reset_events()
         hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)

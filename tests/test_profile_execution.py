@@ -40,7 +40,7 @@ class _FakeWorker:
             self._step(req_id, slot)
         return None
 
-    def _step(self, req_id, slot_index=0):
+    def _step(self, req_id, slot_index=0, logprobs_width=None, scheduled=None):
         time.sleep(0.02)
         if req_id == self.boom:
             raise RuntimeError("wave 中途失败")
@@ -149,7 +149,7 @@ def test_interrupted_wave_not_attributed_to_next_step() -> None:
             late[0].join()
             return None
 
-        def _step(self, req_id, slot_index=0):
+        def _step(self, req_id, slot_index=0, logprobs_width=None, scheduled=None):
             self.entered.set()
             if req_id == "late":
                 release.wait(5.0)

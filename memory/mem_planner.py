@@ -387,6 +387,33 @@ def fit_activation_windows(
     return stride
 
 
+def fit_pool_slots(
+    plans: dict[int, DPUPlan],
+    kv_specs: dict[int, KVRegionSpec],
+    hw: HwBudget,
+    *,
+    kernel_mram_bytes: int = 0,
+    act_slots: int = 1,
+    block_table_slots: int | None = None,
+) -> int:
+    """按剩余 MRAM 算物理槽池最多能放多少个槽，多台 DPU 取最小。
+
+    权重区、块表窗口、激活窗口先扣掉，剩下的连续空间按单槽字节数整除。
+    槽池大小不改变权重与激活的占用，所以随便拿一份已规划好的蓝图就能反推。
+    `block_table_slots` 为空时用蓝图里的份数。
+    """
+    budget = hw.mram_bytes - hw.sys_reserve_bytes
+    stride = align_up(max(plan.act_extent for plan in plans.values()), hw.align)
+    caps = []
+    for dpu_id, plan in plans.items():
+        spec = kv_specs[dpu_id]
+        bt_slots = spec.block_table_slots if block_table_slots is None else block_table_slots
+        used = plan.kv_base + bt_slots * spec.block_table_bytes
+        room = budget - (kernel_mram_bytes or 0) - used - act_slots * stride
+        caps.append(room // spec.slot_bytes)
+    return min(caps)
+
+
 def format_mem_plan(plans: dict[int, DPUPlan], hw: HwBudget) -> str:
     """把各 DPU 的内存蓝图格式化为可读文本（对齐 format_kv_layout/format_comm_plan 惯例）。"""
     budget = hw.mram_bytes - hw.sys_reserve_bytes

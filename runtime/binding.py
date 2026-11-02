@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 
-from contracts.exec_plan import Access, Command, ExecutionPlan
+from contracts.exec_plan import Access, ExecutionPlan
 
 
 def _shift_access(access: Access, act_base_by_dpu: dict[int, int],

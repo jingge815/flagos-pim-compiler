@@ -17,7 +17,8 @@ from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
 from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy
-from memory.mem_planner import DPUPlan, HwBudget, fit_activation_windows, plan_dpu
+from memory.mem_planner import (
+    DPUPlan, HwBudget, fit_activation_windows, fit_pool_slots, plan_dpu)
 from runtime.binding import bind_plan
 from runtime.exec_plan_gen import CompiledPlan, build_execution_plan
 
@@ -44,7 +45,9 @@ class CompiledModel:
     num_parallel_slots: int = 1            # 同一步并发执行的请求窗口数。
     act_stride: int = 0                    # 相邻激活窗口的统一步长。
     block_table_bytes: int = 0             # 单份块表窗口的字节数。
-    prefill_plans: list | None = None      # 按窗口平移后的 prefill 计划，0 号即原计划。
+    prefill_seq_lens: tuple[int, ...] = ()        # 可用的 prefill 桶（升序）。
+    prefill_plans: dict[int, list] | None = None  # 桶长 → 各窗口的 prefill 计划。
+    prefill_cmd_ids: dict[int, int] | None = None  # 桶长 → 输出命令编号。
     decode_plans: list | None = None
 
 
@@ -199,6 +202,16 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
     return peak
 
 
+DEFAULT_PREFILL_BUCKETS = (128, 512, 2048)
+
+
+def default_prefill_buckets(max_len: int) -> tuple[int, ...]:
+    """默认按 128/512/2048 分桶，末项恒为 `max_len`；超过它的桶丢弃。"""
+    return tuple(sorted(
+        {bucket for bucket in DEFAULT_PREFILL_BUCKETS if bucket < max_len}
+        | {max_len}))
+
+
 def compile_llama2(
     model: torch.nn.Module,
     strategy: ShardStrategy,
@@ -214,31 +227,44 @@ def compile_llama2(
     kv_pool_slots: int | None = None,
     num_parallel_slots: int | None = None,
     block_table_slots: int | None = None,
+    prefill_seq_lens: tuple[int, ...] = (),
 ) -> CompiledModel:
-    """编译 Llama 的两张图，返回共享内存蓝图的命令计划。
+    """编译 Llama 的 decode 图与一组按长度分桶的 prefill 图。
 
+    `prefill_seq_len` 是最长桶，始终参与编译；`prefill_seq_lens` 是额外桶。
+    各桶共享权重区与 KV 区（`kv_base` 一致），激活区按最长桶规划出统一步长
+    `act_stride`，短桶只用到窗口的前一段，不额外占内存。
     `num_request_slots` 只做 host 侧并发上限记账；设备侧有
     `num_parallel_slots` 份激活窗口与块表窗口，供同一步的多个请求并行使用，
     物理槽池仍是全局一份（`kv_pool_slots`）。
-    `num_parallel_slots` 为空时取 `min(2, num_request_slots)`；
-    `block_table_slots` 为空时等于它。`kv_pool_slots` 为空时取
-    `num_request_slots` 个满长请求的块数（与改动前的槽池容量一致）。
+    `num_parallel_slots` 为空时取 `min(2, num_request_slots)`，放不下时自动减到 1；
+    `block_table_slots` 为空时等于它。`kv_pool_slots` 为空时按 MRAM 剩余空间
+    自动定容（上限是 `num_request_slots` 个满长请求的块数再加一块）。
     """
     cfg = model.config
-    prefill_gm = export_annotated_graph(
-        model, prefill_seq_len,
-        torch.arange(prefill_seq_len, dtype=torch.long).unsqueeze(0), dtype=dtype,
-    )
+    seq_lens = tuple(sorted({*prefill_seq_lens, prefill_seq_len}))
+    if seq_lens[-1] != prefill_seq_len:
+        raise ValueError(
+            f"最长的 prefill 桶 {seq_lens[-1]} 与 prefill_seq_len="
+            f"{prefill_seq_len} 不一致；把最长长度传给 prefill_seq_len")
+
+    def _export_prefill(seq_len: int) -> GraphModule:
+        return export_annotated_graph(
+            model, seq_len,
+            torch.arange(seq_len, dtype=torch.long).unsqueeze(0), dtype=dtype)
+
+    prefill_gms = {seq_len: _export_prefill(seq_len) for seq_len in seq_lens}
     decode_gm = export_annotated_graph(
         model, 1, torch.tensor([[0]], dtype=torch.long), dtype=dtype
     )
-
-    prefill_edges = propagate_specs(prefill_gm, strategy)
+    prefill_edges_of = {
+        seq_len: propagate_specs(gm, strategy) for seq_len, gm in prefill_gms.items()}
     decode_edges = propagate_specs(decode_gm, strategy)
 
     head_dim = cfg.hidden_size // cfg.num_attention_heads
+    # KV 几何与序列长度无关，用最长桶的图推一次即可。
     kv_specs = kv_specs_from_strategy(
-        prefill_gm,
+        prefill_gms[prefill_seq_len],
         strategy,
         num_layers=cfg.num_hidden_layers,
         num_kv_heads=cfg.num_key_value_heads,
@@ -249,32 +275,74 @@ def compile_llama2(
         slot_tokens=kv_slot_tokens,
     )
 
-    prefill_nodes = list(prefill_gm.graph.nodes)
+    prefill_nodes_of = {
+        seq_len: list(gm.graph.nodes) for seq_len, gm in prefill_gms.items()}
     decode_nodes = list(decode_gm.graph.nodes)
     # 内核 tile 占的是与三区同一块 MRAM，所以容量判据要把两者相加。那份占用只有
     # 算子编译器知道（它定分块），这里问它回传；工具链不在位时退回 0，判据只看
-    # 三区，与改动前逐字节等价。
-    kernel_mram = peak_kernel_mram_bytes(prefill_nodes + decode_nodes,
-                                         hardware=hardware)
-    if kv_pool_slots is None:
-        blocks_per_request = -(-max_seq // kv_slot_tokens)
-        kv_pool_slots = num_request_slots * blocks_per_request
+    # 三区，与改动前逐字节等价。多桶取峰值，不是求和。
+    kernel_mram = peak_kernel_mram_bytes(
+        [node for nodes in prefill_nodes_of.values() for node in nodes] + decode_nodes,
+        hardware=hardware)
+    blocks_per_request = -(-max_seq // kv_slot_tokens)
     # 同一步最多并飞几个请求：host 请求槽仍是上限，激活窗口与它对齐。
     parallel_slots = min(num_parallel_slots or 2, num_request_slots)
-    if block_table_slots is None:
+    auto_parallel = num_parallel_slots is None
+    auto_block_table = block_table_slots is None
+    if auto_block_table:
         block_table_slots = parallel_slots
     if block_table_slots < parallel_slots:
         raise ValueError(
             f"block_table_slots={block_table_slots} 小于并行窗口数 {parallel_slots}")
-    # 先按单窗口规划拿到各 DPU 的实际激活占用，再统一成并行窗口。
-    mem_plans = {
-        dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
-                         kernel_mram_bytes=kernel_mram,
-                         kv_pool_slots=kv_pool_slots,
-                         act_slots=1,
-                         block_table_slots=block_table_slots)
-        for dpu_id in strategy.dpu_ids
-    }
+
+    def _plan(nodes, pool_slots, bt_slots):
+        return {
+            dpu_id: plan_dpu(dpu_id, nodes, decode_nodes, kv_specs, hw,
+                             kernel_mram_bytes=kernel_mram,
+                             kv_pool_slots=pool_slots,
+                             act_slots=1,
+                             block_table_slots=bt_slots)
+            for dpu_id in strategy.dpu_ids
+        }
+
+    def _max_slots(plans):
+        return fit_pool_slots(
+            plans, kv_specs, hw, kernel_mram_bytes=kernel_mram,
+            act_slots=parallel_slots, block_table_slots=block_table_slots)
+
+    # 自动定容：先用最小槽池探一次几何，再按剩余 MRAM 收窗口数、定槽数。
+    # 槽池与窗口都不改变权重占用，所以探测得到的蓝图就能反推容量。
+    if kv_pool_slots is None or auto_parallel:
+        probe = _plan(prefill_nodes_of[prefill_seq_len],
+                      blocks_per_request, block_table_slots)
+        if auto_parallel:
+            while parallel_slots > 1 and _max_slots(probe) < blocks_per_request:
+                parallel_slots -= 1
+                if auto_block_table:
+                    block_table_slots = parallel_slots
+        if kv_pool_slots is None:
+            # vLLM 的块池永久留一块当 null 块，槽池比满并发容量多留一块。
+            request_capacity = num_request_slots * blocks_per_request + 1
+            kv_pool_slots = min(request_capacity, _max_slots(probe))
+            if kv_pool_slots <= blocks_per_request:
+                raise ValueError(
+                    f"MRAM 装不下一个满长请求：需要 {blocks_per_request} 个 KV 槽"
+                    f"再加一块空位，按当前权重、块表 ×{block_table_slots}、激活窗口 "
+                    f"×{parallel_slots} 只能放 {kv_pool_slots} 个；"
+                    f"调小 max_model_len、num_request_slots 或 PIM_MRAM_BYTES 不够"
+                    f"时调大 PIM_MRAM_BYTES")
+
+    mem_plans_of = {
+        seq_len: _plan(nodes, kv_pool_slots, block_table_slots)
+        for seq_len, nodes in prefill_nodes_of.items()}
+    mem_plans = mem_plans_of[prefill_seq_len]
+    # 权重区和 KV 区只按一遍算，短桶必须落在同一组地址上，否则窗口平移失效。
+    for seq_len, plans in mem_plans_of.items():
+        for dpu_id, plan in plans.items():
+            base = mem_plans[dpu_id]
+            if plan.weight != base.weight or plan.kv_base != base.kv_base:
+                raise ValueError(
+                    f"prefill 桶 {seq_len} 的权重/KV 布局与最长桶不一致（dpu{dpu_id}）")
     act_stride = fit_activation_windows(mem_plans, parallel_slots, hw, kernel_mram)
 
     bt_bytes = {spec.block_table_bytes for spec in kv_specs.values()}
@@ -287,22 +355,15 @@ def compile_llama2(
         raise ValueError(
             f"各 DPU 的物理槽数 {pool_slots} 与 kv_pool_slots={kv_pool_slots} 不一致")
     # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
-    # 两张图的 mram_offset 都已回填。
-    mark_stage(prefill_gm, STAGE_PLANNED)
+    # 所有图的 mram_offset 都已回填。
+    for gm in prefill_gms.values():
+        mark_stage(gm, STAGE_PLANNED)
     mark_stage(decode_gm, STAGE_PLANNED)
-
-    prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}
-    decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
-    pending_prefill: dict = {}
-    pending_decode: dict = {}
-    for plan in mem_plans.values():
-        pending_prefill.update(plan.pending_readers_prefill)
-        pending_decode.update(plan.pending_readers_decode)
 
     np_dtype = np.dtype(np.float16 if dtype == torch.float16 else np.float32)
 
     # 注意力不再是主机回调：那段计算搬进了设备内核
-    # （`runtime/kernels.sdpa_kernel`）。它要读的设备侧 KV 区域编译期才知道，
+    # （`runtime.kernels.sdpa_kernel`）。它要读的设备侧 KV 区域编译期才知道，
     # 所以在这里算好、烘进命令 payload——三种策略连着编译时用模块级全局
     # 会互相覆盖，前面那些 plan 再执行就用错了别人的 KV 规格。
     from runtime.kernels import sdpa_kv_info
@@ -317,17 +378,8 @@ def compile_llama2(
 
         return sdpa_info_of
 
-    prefill = build_execution_plan(
-        prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
-        hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gm),
-    )
-    decode = build_execution_plan(
-        decode_nodes, decode_gm, decode_entries, pending_decode,
-        hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
-    )
-
     # 每个窗口一份计划：0 号就是原计划（零拷贝），其余把激活地址和块表基址平移到
-    # 自己的窗口。两张图共用同一份激活布局，所以窗口步长完全一致。
+    # 自己的窗口。所有图共用同一份激活布局，所以窗口步长完全一致。
     act_base_by_dpu = {dpu_id: plan.act_base for dpu_id, plan in mem_plans.items()}
 
     def _windows(plan):
@@ -338,15 +390,41 @@ def compile_llama2(
             for k in range(parallel_slots)
         ]
 
+    prefill_plans: dict[int, list] = {}
+    prefill_cmd_ids: dict[int, int] = {}
+    prefill_plan_max = None
+    for seq_len in seq_lens:
+        entries = {e.edge_id: e for e in build_comm_plan(prefill_edges_of[seq_len])}
+        pending: dict = {}
+        for plan in mem_plans_of[seq_len].values():
+            pending.update(plan.pending_readers_prefill)
+        compiled_plan = build_execution_plan(
+            prefill_nodes_of[seq_len], prefill_gms[seq_len], entries, pending,
+            hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gms[seq_len]),
+        )
+        prefill_plans[seq_len] = _windows(compiled_plan.plan)
+        prefill_cmd_ids[seq_len] = compiled_plan.output_cmd_id
+        if seq_len == prefill_seq_len:
+            prefill_plan_max = compiled_plan
+
+    decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
+    pending_decode: dict = {}
+    for plan in mem_plans.values():
+        pending_decode.update(plan.pending_readers_decode)
+    decode = build_execution_plan(
+        decode_nodes, decode_gm, decode_entries, pending_decode,
+        hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
+    )
+
     return CompiledModel(
         strategy=strategy,
-        prefill_gm=prefill_gm,
+        prefill_gm=prefill_gms[prefill_seq_len],
         decode_gm=decode_gm,
-        prefill_edges=prefill_edges,
+        prefill_edges=prefill_edges_of[prefill_seq_len],
         decode_edges=decode_edges,
         kv_specs=kv_specs,
         mem_plans=mem_plans,
-        prefill=prefill,
+        prefill=prefill_plan_max,
         decode=decode,
         hw=hw,
         hardware=hardware,
@@ -357,7 +435,9 @@ def compile_llama2(
         num_parallel_slots=parallel_slots,
         act_stride=act_stride,
         block_table_bytes=block_table_bytes,
-        prefill_plans=_windows(prefill.plan),
+        prefill_seq_lens=seq_lens,
+        prefill_plans=prefill_plans,
+        prefill_cmd_ids=prefill_cmd_ids,
         decode_plans=_windows(decode.plan),
     )
 

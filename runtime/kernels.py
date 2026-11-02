@@ -12,7 +12,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from memory.kv_layout import decode_mask, prefill_mask
+from memory.kv_layout import prefill_mask
 from runtime import kernels_pim
 
 
@@ -1380,6 +1380,8 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
     # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
     graph_mask = args[3] if len(args) > 3 else None
+    # 执行器在掩码就是 `causal_mask_of()` 时置位；只有那种掩码才允许融合内核。
+    standard_mask = hal.bound_flag("causal_mask_standard")
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
@@ -1387,7 +1389,7 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
         out[0, head] = _paged_attention(
             hal, owner, entry, geometry[owner], block_tables[owner],
             q[0, head], pos, num_tokens, head_dim, slot_tokens, np_dtype,
-            graph_mask, scale, ctx=_ctx_of(cmd))
+            graph_mask, scale, standard_mask=standard_mask, ctx=_ctx_of(cmd))
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
 
 
@@ -1395,16 +1397,20 @@ def _paged_attention(hal, owner: int, entry: dict, geo: dict,
                      table: np.ndarray, q_head: np.ndarray, pos: int,
                      num_tokens: int, head_dim: int, slot_tokens: int,
                      np_dtype: np.dtype, graph_mask, scale: float, *,
+                     standard_mask: bool = False,
                      ctx: _OpContext | None = None) -> np.ndarray:
     """一个头的注意力：融合内核优先，主机两遍兜底。
 
     融合路径把槽池与块表的指针直接交给 `pim.paged_attn`，逻辑块到物理槽的
     解析和单遍在线 softmax 都在设备上做。图上传来的掩码只在长度与 KV 历史
-    一致时才有意义，而融合内核的可见性按位置算，所以那种情况下走主机路径。
+    一致时才有意义；`standard_mask` 为真表示它就是标准因果掩码，可见性与
+    内核按位置算的一致，可以融合。其余掩码（滑动窗口、自定义 bias）走主机路径。
     """
     tq = q_head.shape[0]
     hist_len = pos + num_tokens
-    uses_graph_mask = graph_mask is not None and graph_mask.shape[-1] == hist_len
+    uses_graph_mask = (graph_mask is not None
+                       and graph_mask.shape[-1] == hist_len
+                       and not standard_mask)
     dtype_bytes = np_dtype.itemsize
     slot_elems = int(geo["slot_bytes"]) // dtype_bytes
     num_blocks = -(-hist_len // slot_tokens)
@@ -1469,13 +1475,15 @@ def _host_paged_attention(hal, owner: int, entry: dict, geo: dict,
         # 而图上的掩码只覆盖当前 query，短一截时补零会把历史位置当成可见，
         # 结果就错了。长度对不上就退回按位置重算。
         if graph_mask is not None and graph_mask.shape[-1] == hist_len:
+            # 掩码覆盖整段历史时按绝对位置取行（第 t 行 = 位置 pos+t）。
             row = graph_mask.reshape(-1, hist_len)
-            mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
+            mask_row = row[min(pos + t, row.shape[0] - 1)].astype(scores.dtype)
         else:
-            # 补齐的 query 行（t >= hist_len）只算不用，掩码按全部可见处理。
-            mask = (prefill_mask(min(t + 1, hist_len), hist_len) if tq > 1
-                    else decode_mask(hist_len - 1, hist_len))
-            mask_row = mask[min(t, hist_len - 1)] if tq > 1 else mask
+            # 第 t 行是绝对位置 pos+t，可见到它自己为止；分块 prefill 时
+            # pos>0，前半段历史已在 KV 里。补齐行（pos+t 越界）只算不用，
+            # 按全部可见处理。解码（tq=1）时 pos=hist_len-1，同样成立。
+            mask = prefill_mask(hist_len, hist_len)
+            mask_row = mask[min(pos + t, hist_len - 1)]
         weights[t] = softmax(add_mask(scores[t], mask_row).astype(np.float32))
 
     # 第二遍：逐物理块算 PV，f32 累加后合并；V 历史同样不落地。

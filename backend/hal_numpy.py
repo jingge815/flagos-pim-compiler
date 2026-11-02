@@ -353,6 +353,15 @@ class NumpyBackend:
             return ctx.values[name]
         return self._bound_values[name]
 
+    def bound_flag(self, name: str) -> bool:
+        """本次绑定里附加的布尔开关；没设置就是 False。
+
+        用来下发「图上的掩码就是标准因果掩码」这类编译期看不出来的事实。
+        """
+        ctx = self._current_context()
+        values = ctx.values if ctx is not None else self._bound_values
+        return bool((values or {}).get(name, False))
+
     @property
     def bound_pos(self) -> int | None:
         """取本次 `bind_inputs` 绑定的 `pos`（KV/SDPA handler 读写位置用）。"""
