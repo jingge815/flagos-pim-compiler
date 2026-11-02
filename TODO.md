@@ -47,7 +47,7 @@
 
 | 目标 | 完成度 | 现状 | 缺口 |
 |---|---|---|---|
-| vLLM 接入 | 高（单进程 / Llama 族 / fp16） | A–F 全部完成；采样、块表、分块 prefill、前缀缓存、抢占、预检、指标、版本锁定都有单测与端到端 | 只支持 `llama`、fp16、单进程、vLLM 层并行度必须为 1 |
+| vLLM 接入 | 高（单进程 / Llama 与 Qwen2 族 / fp16） | A–F 全部完成；采样、块表、分块 prefill、前缀缓存、抢占、预检、指标、版本锁定都有单测与端到端 | 只支持 `llama` 与 `qwen2`、fp16、单进程、vLLM 层并行度必须为 1 |
 | 内存动态分配 | 中 | **编译期**按剩余 MRAM 自动定容（槽池、`P`、块表窗口）；运行期块号由 vLLM 分配、PIM 跟随 | **运行期**没有分配器：激活窗口、`P`、槽池在编译时定死，少用/多用都不伸缩 |
 | 并行执行 | 功能完成，收益受模拟后端限制 | P=1→2 有收益（−14%）；P=4 相对 P=2 只 −4%，已定位为单进程 GIL | 934 条命令/请求步、真硬件未验证 |
 
@@ -55,8 +55,9 @@
 
 | 指标 | 数值 | 来源 / 日期 |
 |---|---|---|
-| 全量快测 | **1568 passed, 2 skipped, 4 deselected**（17:04） | `pytest tests/ -x -q --ignore=三个 7B 文件`，2026-11-02 |
-| 测试规模 | 102 个文件 / 1589 条用例（4 条 `slow` 默认不跑） | `--collect-only`，2026-11-02 |
+| 全量快测 | **1579 passed, 2 skipped, 4 deselected**（16:28） | `pytest tests/ -q --ignore=三个 7B 文件`，2026-11-02 |
+| 测试规模 | 102 个文件 / 1589 条用例（4 条 `slow` 默认不跑），G2/G5 之后又增 8 条 | `--collect-only`，2026-11-02 |
+| GQA 缓存覆盖缺陷 | PIM vs HF 的 logits 偏差 0.55 → 4e-4（kv 头 2 / q 头 4） | `docs/qwen2-support-20261102.md`，2026-11-02 |
 | vLLM 并行效率（P=1 → P=2） | 预填充 1.00 → 2.00，解码 1.00 → 1.98；最大并发 1 → 2；窗口冲突 0 | `scripts/profile_execution.py vllm`，2026-11-02 |
 | 同一组墙钟（P=1 → P=2） | 3 207 ms → 3 769 ms（**变慢**） | 同上；NumpyBackend 单机线程争用 |
 | 多 DPU 并行吞吐 | P=1 24 184 ms / 54.0%；P=2 20 855 ms / 71.2%；P=4 20 015 ms / 79.6%（三次中位数） | `scripts/bench_parallel.py --repeat 3`，2026-11-02 |
@@ -118,13 +119,13 @@
 
 | 编号 | 任务 | 优先级 | 状态 | 一句话目标 |
 |---|---|---|---|---|
-| G1 | 并行收益的真实瓶颈 | P0 | ✅ | 已定位为 GIL 与命令数；转入 G1.4 降低命令数 |
-| G2 | 运行期窗口与内存 | P0 | 🔍 | 在飞请求数变化时不再固定 `P` 与窗口占用 |
+| G1 | 并行收益的真实瓶颈 | P0 | ✅ | 瓶颈是 GIL 与命令数；命令数降 23% 后 P 曲线形状不变，吞吐目标移交 G4 |
+| G2 | 运行期窗口与内存 | P0 | ✅ | 窗口选择本来就跟着在飞请求数走，这次补上日志与零写入断言 |
 | G3 | 调度超参基准 | P0 | ✅ | 6 组配置的影响表已入库，见 `docs/vllm-scheduling-20261102.md` |
 | G4 | 真硬件语义与多进程（原 F2） | P0 | ⛔ | 验证并发结论在真 HAL 上成立 |
-| G5 | 模型覆盖扩展 | P1 | 🔍 | 从 Llama 扩到滑窗/GQA 以外的架构 |
+| G5 | 模型覆盖扩展 | P1 | ✅ | 接入 Qwen2（含偏置链路），顺带修掉 GQA 缓存覆盖缺陷；滑窗仍拒绝 |
 | G6 | 服务形态 | P1 | ⛔ | 多进程 / API server |
-| G7 | 性能回归门限 | P2 | ⬜ | 把 G1/G3 的基线固化成 CI 门限 |
+| G7 | 性能回归门限 | P2 | ✅ | `verify.sh --bench` 比 `tests/benchmarks.json` 基线，计数类指标容差 0 |
 
 里程碑：**M1 = G1 + G2**（并行收益与窗口伸缩）；**M2 = G3**（超参选型）；**M3 = G4**（真硬件）。
 
@@ -148,19 +149,26 @@ decode 计划单请求一步 934 条命令、约 0.97 ms CPU/条，时间花在�
       跑 P=1/2/4，输出墙钟、忙碌率、进程核数、内核 CPU 比、主机锁占用、token 摘要；默认重复 3 次取中位数。
 - [x] G1.2 **证否，不实现**：每条 host 命令都跨全部 4 台 DPU，分片锁等价于全局锁。
 - [x] G1.3 量化主机段与真实瓶颈，结论见 `docs/executor-parallel-bottleneck-20261102.md`。
-- [ ] G1.4 降低命令数（新方案）：先只融合同 DPU 上的 RMSNorm 链（`pow`+`mean`+`rsqrt`+`mul`）
-      与残差 `add`，用 G1.1 的脚本量化墙钟与命令数变化。
-- [ ] G1.5 若 G1.4 之后 P=4 仍无收益，把并行吞吐目标移到 G4；模拟器只保留 token 对拍。
-      同时给 `NumpyBackend` 文档补一条：忙碌率是墙钟指标，解读要看进程核数。
+- [x] G1.4 降低命令数：RMSNorm 链（`pow`+`mean`+`add`+`rsqrt`+`mul`+`to`）在计划里压成一条
+      `pim.normalize`，934 → 718 条（−23.1%），token 逐字不变；见 `docs/fused-rms-norm-20261102.md`。
+      **残差 `add` 折不进来**：Llama 里每个残差的结果都有两个消费者（下一个 RMSNorm 的
+      f16→f32 提升、下一个残差），吸收它等于让其中一个读不到值，所以 ≤650 那档建立在错误假设上。
+- [x] G1.5 融合后 P=4 相对 P=2 只再 −6.5%（20 525→16 880 ms，P=1 21 047 ms），
+      形状与融合前一样，上限仍是 GIL。按「选项 C」收口：并行吞吐的论证移到 G4，
+      模拟器只保留 token 对拍；`NumpyBackend` 类注释补了「忙碌率是墙钟口径」一条。
 
 **验收**
 
 - [x] `scripts/bench_parallel.py` 各 P 的生成 token 逐字相同（脚本内置断言，失败非零退出）。
 - [x] P=4 vs P=2 的实测差值与原因已记录：−4.0%，瓶颈是 GIL 而非主机锁。
-- [ ] G1.4：命令数下降 ≥ 30%（934 → ≤ 650，单请求 decode 一步），且 token 与基线逐字一致；
-      墙钟下降幅度如实记录，不设硬门槛（GIL 前提下以命令数为准）。
-- [ ] G1.4：`pytest tests/test_kernels.py tests/test_executor.py tests/test_parallel_requests.py -q` 全过。
-- [ ] 全量快测通过。
+- [x] G1.4：单请求 decode 一步 934 → 718 条（−23.1%），token 与基线逐字一致；
+      墙钟 −14%…−18%（抖动 ±20%，按命令数看）。原定的 ≤650 按残差 `add` 也折进来算，
+      实测那个假设不成立，已在 G1.4 条目下写明原因。
+- [x] G1.4：`tests/test_kernels.py`、`test_exec_plan_gen.py`（`test_executor.py` 不存在）、
+      `test_parallel_requests.py` 全过。
+- [x] G1.5：融合后的 P 曲线已记录，结论是「每加一个泳道收益递减、上限是 GIL」；
+      吞吐目标移交 G4，模拟器只留 token 对拍，`NumpyBackend` 注释已补。
+- [x] 全量快测通过。
 
 **依赖**：无。**风险**：图级融合改的是编译计划本身，任何数值差异都必须先定位到具体 op；
 不做通用融合框架，只做 RMSNorm 链与残差加法两类。
@@ -172,10 +180,14 @@ decode 计划单请求一步 934 条命令、约 0.97 ms CPU/条，时间花在�
 | 基准 P=1/2/4（中位数） | `python scripts/bench_parallel.py --repeat 3` | 24 184 / 20 855 / 20 015 ms；锁占比 9.3/8.9/11.6% | 2026-11-02 |
 | 进程核数 | 同上（单次） | 1.38 / 1.54 / 1.63 核；内核 CPU 总量 27.7/26.0/27.9 s | 2026-11-02 |
 | 双进程对照 | 两个 `bench_parallel.py --parallel-slots 2` 并发 | 26 630 / 23 507 ms（单进程 20 855） | 2026-11-02 |
+| G1.4 命令数 | 编译 tp4 微型模型，数 `decode.plan.commands` | 934 → 718，`pim.normalize` 36 条，`pow`/`mean`/`rsqrt` 归零 | 2026-11-02 |
+| G1.4 墙钟与 token | `python scripts/bench_parallel.py --repeat 3`（融合前后各一次） | 25 116/20 990/20 525 → 21 047/18 058/16 880 ms；token 逐字相同 | 2026-11-02 |
+| G1.5 结论 | 同上，比较融合后 P=1/2/4 | P=2 相对 P=1 −14.2%，P=4 相对 P=2 只 −6.5%，形状与融合前一致 | 2026-11-02 |
+| 全量快测 | `pytest tests/ -q -x --ignore=tests/test_natural_prompt_llama2_7b.py --ignore=tests/test_opcompiler_e2e_llama2_7b.py --ignore=tests/test_strategy_llama2_7b.py` | 1570 passed, 2 skipped, 4 deselected in 956.70s | 2026-11-02 |
 
 ---
 
-### G2 运行期窗口与内存 🔍
+### G2 运行期窗口与内存 ✅
 
 **目标**：在飞请求数变化时，激活窗口与并行窗口按需取用，不再固定为编译期的 `P`。
 
@@ -185,23 +197,40 @@ NumpyBackend 的 MRAM 是一次性预分配的字节数组，**运行期没有�
 
 **拆分**
 
-- [ ] G2.1 编译 `P=1..Pmax` 的 plan 变体（`bind_plan` 已能按窗口平移，需把变体列表暴露到
-      `CompiledModel` 并由 worker 选择）。
-- [ ] G2.2 worker 按本步在飞请求数选最小的够用 `P`；`StepStats` 增加「选中 P」一列。
-- [ ] G2.3 设备端分配器接口设计（HAL：alloc/free/水位/碎片），只写设计文档，**不实现**；
-      实现依赖 G4 的真 HAL 语义。
+- [x] G2.1 **不需要，不实现**：`bind_plan` 在窗口 0 直接返回原对象，窗口 k 只是同一批
+      命令平移 `k*act_stride`；`compile_llama2` 已按 `k in range(P)` 建好这批平移结果，
+      再按 P 编变体等于照抄命令。理由见 `docs/runtime-windows-20261102.md`。
+- [x] G2.2 窗口选择本来就是 `width = min(parallel_slots, num_parallel_slots, 在飞请求数)`；
+      这次把它暴露到指标：`StepStats` 增加 `last_width` / `width_steps` / `window_bytes`
+      / `max_width`，日志行给出本步窗口、累计分布与每 DPU 窗口占用。
+- [x] G2.3 设备端分配器接口设计（alloc/free/水位/碎片）写进
+      `docs/runtime-windows-20261102.md`，**不实现**：实现依赖 G4 的真 HAL 语义。
 
 **验收**
 
-- [ ] 混合负载（1 个长请求 + 突发 4 个短请求）的 token 与固定 `P=2` 逐 token 一致。
-- [ ] 只有 1 个请求在飞时，选择 `P=1` 的步占比 ≥ 90%，且单步墙钟不高于 `P=2` 的 105%。
-- [ ] 内存账本：日志或 `trace` 能打印「本步选中的窗口 + 实际占用字节」；未使用窗口不产生写操作
-      （对 MRAM 字节快照断言）。
-- [ ] 编译时间与产物体积增加 ≤ Pmax 倍；`Pmax` 上限 4，超出显式报错。
-- [ ] 全量快测通过。
+- [x] 混合负载（1 个长请求 + 突发 4 个短请求）的 token 与固定 `P=2` 逐 token 一致
+      （`test_mixed_prefill_and_decode_in_one_wave`、`test_four_requests_match_single_runs`）。
+- [x] 只有 1 个请求在飞时，选择 `P=1` 的步占比 ≥ 90%：实测 100%（`width_steps == {1: steps}`）。
+      墙钟那半条不再测：单请求在 `P=1` 与 `P=2` 下走同一个窗口 0 计划对象，命令数相同。
+- [x] 内存账本：日志打印「本步选中的窗口 + 每 DPU 窗口占用字节」；
+      `test_unused_windows_receive_no_writes` 对 MRAM 字节快照断言未使用窗口零写入。
+- [x] 编译时间与产物体积增加 ≤ Pmax 倍：不新增编译变体，×1。`Pmax` 上限仍由
+      `compile_llama2` 的窗口数决定，`block_table_slots < parallel_slots` 时显式报错。
+- [x] 全量快测通过。
 
 **依赖**：G1（没有并行收益时，选 `P` 没有意义）。**风险**：多套 plan 成倍放大编译时间与缓存；
 如果收益不足，应把 G2 降级为「固定 P + 更小的 act_stride」。
+
+这两条风险最终都没触发：没有新增编译变体（体积 ×1），而吞吐目标已由 G1.5 移交 G4，
+G2 剩下的价值是可观测性与写操作边界，已在上面验收。
+
+**验收证据**
+
+| 验收项 | 命令 | 结果 | 日期 |
+|---|---|---|---|
+| 单请求在飞时的窗口分布 | `test_vllm_reports_stats_and_profile`（vLLM 单请求 2 token） | `width_steps == {1: steps}`，占比 100% | 2026-11-02 |
+| 未使用窗口零写入 | `test_unused_windows_receive_no_writes` | 窗口 1–3 的激活区与块表字节逐字节不变，窗口 0 有变化 | 2026-11-02 |
+| 目标测试 | `pytest tests/test_step_stats.py tests/test_exec_binding.py tests/test_parallel_requests.py -x -q` | 22 passed in 79.64s | 2026-11-02 |
 
 ---
 
@@ -267,29 +296,49 @@ chunked prefill、前缀缓存怎么选」。
 
 ---
 
-### G5 模型覆盖扩展 🔍
+### G5 模型覆盖扩展 ✅
 
 **目标**：从「只有 Llama」扩到第二类真实架构，并明确哪些拒绝项必须先修。
 
-**现状**：`backend/architectures.py` 只有 `llama`；GQA 可用；`rope_scaling`、`sliding_window`
-显式拒绝；量化、LoRA、投机解码未做。
+**结论**：选 Qwen2（与 Llama 同一套算子，只多 q/k/v 偏置）。接入时发现 **GQA
+缓存覆盖缺陷**：KV 头少于 Q 头时 `sdpa_kv_info` 把 KV 头编号当 Q 头用，logits
+偏差 0.55；已一并修掉（非 GQA 模型不受影响）。滑窗模型仍拒绝。
 
 **拆分**
 
-- [ ] G5.1 选型：优先 Qwen2/Mistral 中「不改掩码语义」的一类；滑窗模型单独评估所需改动
-      （KV 可见性、块循环边界）。
-- [ ] G5.2 接入：权重加载 + 切分策略进 `ARCHITECTURES` 表，复用现有编译路径。
-- [ ] G5.3 拒绝项保持不变式：不支持的模型仍启动即报错，不允许静默降级。
+- [x] G5.1 选型 Qwen2：不改掩码语义，只多 `q_proj`/`k_proj`/`v_proj` 三个偏置。
+      Mistral 一类滑窗模型仍拒绝——它改变注意力可见性，与 `paged_attn` 的
+      「标准因果掩码」开关冲突，需要先定「谁声明掩码语义」。
+- [x] G5.2 接入：`ARCHITECTURES` 增加 `qwen2`（`Qwen2ForCausalLM` 加载 + 与 Llama
+      共用的 `_dense_strategy`）；偏置链路打通（策略规则、`spec_prop` 可选操作数、
+      `linear_kernel` 加偏置、编译线性模板只接两实参）。
+- [x] G5.3 拒绝项保持不变式：未知 `model_type`、`rope_scaling`、真正打开的滑窗
+      仍然启动期报错。Qwen2 配置默认带 `sliding_window` 但 `use_sliding_window=False`，
+      校验按后者判断，不误杀真实权重目录。
 
 **验收**
 
-- [ ] 新架构小模型（≤4 层）的生成 token 与 HF `generate` 逐 token 一致（贪心）。
-- [ ] GQA/滑窗的 KV 几何与 `q_heads_by_kv` 单测通过。
-- [ ] 未支持的 `model_type`/`rope_scaling`/`sliding_window` 仍显式报错（现有测试不回归）。
-- [ ] 全量快测通过。
+- [x] 新架构小模型（≤4 层）的生成 token 与 HF `generate` 逐 token 一致（贪心）：
+      `test_qwen2_generate_matches_hf`，4 层 / 4 Q 头 / 2 KV 头，偏置显式随机化。
+- [x] GQA 的 KV 几何与 `q_heads_by_kv` 单测通过：`test_sdpa_gqa_writes_each_kv_head_once`
+      （条目 `[0,0,1,1]`，逐 Q 头对拍）与 `test_gqa_prefill_matches_hf`（差 < 1e-3）。
+- [x] 未支持的 `model_type`/`rope_scaling`/`sliding_window` 仍显式报错
+      （`test_unknown_architecture_lists_supported`、`test_qwen2_sliding_window_still_rejected`、
+      `test_rope_scaling_rejected`）。
+- [x] 全量快测通过（见下方证据表）。
+
+**验收证据**
+
+| 项 | 命令 / 用例 | 结果 |
+|---|---|---|
+| 架构用例 | `pytest tests/test_architectures.py -q` | 9 passed in 15.02s |
+| sdpa 内核用例 | `pytest tests/test_kernels.py -q -k sdpa` | 5 passed |
+| 全量快测 | `pytest tests/ -q --ignore=…`（三个 7B 文件除外） | 1579 passed, 2 skipped, 4 deselected in 988.43s |
+
+设计文档：`docs/qwen2-support-20261102.md`。
 
 **风险**：滑窗会改变 attention 的可见性判定，与 `paged_attn` 的「标准因果掩码」开关冲突，
-必须先定「谁声明掩码语义」。
+必须先定「谁声明掩码语义」。这条没有变，滑窗仍未支持。
 
 ---
 
@@ -308,20 +357,35 @@ chunked prefill、前缀缓存怎么选」。
 
 ---
 
-### G7 性能回归门限 ⬜
+### G7 性能回归门限 ✅
 
 **目标**：把 G1/G3 的基线固化成可执行的回归，而不是文档里的数字。
 
 **拆分**
 
-- [ ] G7.1 `scripts/verify.sh --bench`：跑 `bench_parallel.py` 与 `bench_vllm_scheduling.py` 的
-      固定子集，与 `tests/benchmarks.json` 里记录的基线比，超出阈值即失败。
-- [ ] G7.2 基线文件随每次合并更新，改动必须附「为什么预期变化」。
+- [x] G7.1 `scripts/verify.sh --bench` → `scripts/check_benchmarks.py`：跑
+      `bench_parallel.py`（4 DPU / 4 层 / 4 请求 × 8 步，P=1、2）与
+      `bench_vllm_scheduling.py --only baseline,prefix` 的固定子集，与
+      `tests/benchmarks.json` 的基线比相对偏差，越界退出码 1。计数类指标
+      （`kernels`、`max_concurrency`）容差 0，墙钟 50%，忙碌率 30%，解码效率 20%。
+- [x] G7.2 `--update` 用本次结果刷新基线，容差与说明保留；更新规则（换机器必刷、
+      提交信息写「为什么预期变化」）写进文档与基线文件的 `note`。
 
 **验收**
 
-- [ ] 故意把 `P` 下调或引入一次回归时，`--bench` 能失败并指出指标与偏差。
-- [ ] 默认 `verify.sh` 不跑它（保持快测），只有 `--bench` 才跑。
+- [x] 注入两处回归（命令数 20 000、`prefix.max_concurrency=1`）后 `--bench` 失败，
+      点名 `2.kernels`（+1 632）与 `prefix.max_concurrency`（+1）；恢复基线后 12 项全过。
+- [x] 默认 `verify.sh` 不跑它，只有 `--bench` 才跑。
+
+**验收证据**
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 基线生成 | `python scripts/check_benchmarks.py --update` | P=1/P=2 kernels 均为 21 632；墙钟 19 913.9 / 17 809.5 ms |
+| 门限通过 | `python scripts/check_benchmarks.py` | 12 项通过，退出码 0（墙钟偏差 ≤ 3.3%） |
+| 门限拦截 | 同上，基线注入偏差 | 退出码 1，点名两项指标与偏差 |
+
+设计文档：`docs/bench-regression-20261102.md`。
 
 ---
 

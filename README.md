@@ -312,7 +312,11 @@ python -m pytest tests/test_vllm_compat.py -q
 - `docs/executor-parallel-phase1-20261026.md` — 跨请求并行执行
 - `docs/vllm-integration-20261102.md` — vLLM 接入现状索引（能力 → 代码 → 文档 → 测试）
 - `docs/vllm-scheduling-20261102.md` — vLLM 调度超参影响表（预算、块大小、前缀缓存、分块预填充）
-- `docs/executor-parallel-bottleneck-20261102.md` — 并行瓶颈测量（GIL 与命令数）
+- `docs/executor-parallel-bottleneck-20261102.md` — 并行瓶颈测量（GIL 与命令数），G1.5 收口
+- `docs/fused-rms-norm-20261102.md` — RMSNorm 链融合（934 → 718 条命令，token 逐字不变）
+- `docs/runtime-windows-20261102.md` — 运行期窗口选择与设备端分配器接口设计
+- `docs/qwen2-support-20261102.md` — 接入 Qwen2（偏置链路）与 GQA 缓存覆盖修复
+- `docs/bench-regression-20261102.md` — 基准回归门限：`verify.sh --bench` 与基线文件
 - `docs/<module>.md` — 各模块接口与设计决策
 
 ## 开发约定

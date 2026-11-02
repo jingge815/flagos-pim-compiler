@@ -22,7 +22,7 @@ def _slot(blocks: list[int]) -> SimpleNamespace:
 
 
 def test_record_aggregates_waves_and_tokens() -> None:
-    """wave 数按宽度向上取整，最宽 wave 取历史最大值。"""
+    """wave 数按宽度向上取整，最宽 wave 取历史最大值，窗口档位按步计数。"""
     stats = StepStats(pool_total=9)
     stats.record({"a": 1, "b": 1}, width=2, slots=[])
     stats.record({"a": 1, "b": 1, "c": 1}, width=2, slots=[])
@@ -30,6 +30,29 @@ def test_record_aggregates_waves_and_tokens() -> None:
     assert (stats.steps, stats.requests, stats.tokens) == (2, 5, 5)
     assert (stats.waves, stats.widest_wave) == (3, 2)
     assert stats.last_requests == 3
+    assert stats.width_steps == {2: 2} and stats.last_width == 2
+
+
+def test_record_tracks_the_chosen_width_per_step() -> None:
+    """在飞请求变少时窗口跟着变窄，分布如实记下每一步选了几窗。"""
+    stats = StepStats(pool_total=9)
+    stats.record({"a": 1, "b": 1, "c": 1}, width=3, slots=[])
+    stats.record({"a": 1, "b": 1}, width=2, slots=[])
+    stats.record({"a": 1}, width=1, slots=[])
+    stats.record({}, width=1, slots=[])
+
+    assert stats.width_steps == {3: 1, 2: 1, 1: 1}
+    assert stats.last_width == 1
+
+
+def test_format_lists_window_usage() -> None:
+    """日志行给出本步窗口、累计窗口分布与每台 DPU 的窗口占用。"""
+    stats = StepStats(pool_total=9, max_width=4, window_bytes=1000)
+    stats.record({"a": 1, "b": 1}, width=2, slots=[])
+
+    line = stats.format()
+    assert "窗口 2" in line and "窗口分布 2×1" in line
+    assert "窗口占用 2000/4000 B/DPU" in line
 
 
 def test_record_counts_shared_blocks_once() -> None:
@@ -83,7 +106,11 @@ def test_vllm_reports_stats_and_profile(tmp_path, monkeypatch, caplog) -> None:
         stats = worker.stats
         assert stats.steps >= 2 and stats.requests == stats.steps
         assert 0 < stats.pool_used <= stats.pool_total
+        # 单请求在飞时每一步都只开一个窗口。
+        assert stats.width_steps == {1: stats.steps}
+        assert stats.window_bytes > 0
         assert "槽池" in caplog.text and "paged_attn" in caplog.text
+        assert "窗口占用" in caplog.text
         assert worker._profiler.steps, "请求级调度没有采到步"
         assert worker._backend_profiler.records, "DPU 命令没有采到"
     finally:

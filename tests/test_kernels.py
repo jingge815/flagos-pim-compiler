@@ -276,7 +276,7 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
                     extra_payload={"sdpa": {
                         "np_dtype": "float32", "layer": 0,
                         "head_dim": 8, "slot_tokens": 4,
-                        "heads": [{"head": 0, "dpu": 0, "row": 8 * 4,
+                        "heads": [{"head": 0, "kv_head": 0, "dpu": 0, "row": 8 * 4,
                                    "k_off": slots_base, "v_off": slots_base + 128}],
                         "dpus": {0: {"bt_base": block_table_base,
                                      "slots_base": slots_base,
@@ -326,7 +326,7 @@ def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
             extra_payload={"sdpa": {
                 "np_dtype": "float32", "layer": 0,
                 "head_dim": head_dim, "slot_tokens": slot_tokens,
-                "heads": [{"head": 0, "dpu": 0, "row": head_dim * 4,
+                "heads": [{"head": 0, "kv_head": 0, "dpu": 0, "row": head_dim * 4,
                            "k_off": slots_base,
                            "v_off": slots_base + plane_stride}],
                 "dpus": {0: {"bt_base": bt_base, "slots_base": slots_base,
@@ -356,6 +356,56 @@ def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
     weights = np.exp(masked.astype(np.float32))
     weights /= weights.sum(-1, keepdims=True)
     assert np.allclose(identity[0, 0], weights @ v[0, 0], atol=0.05)
+
+
+def test_sdpa_gqa_writes_each_kv_head_once() -> None:
+    """一个 KV 头服务两个 Q 头：四个 Q 头都要出结果，缓存只按 KV 头写一次。
+
+    图上 `repeat_kv` 已经把 K/V 复制到每个 Q 头上，内核若按 Q 头逐个写缓存，
+    后一组的行会覆盖前一组的行；KV 头数少于 Q 头数时结果直接跑偏。
+    """
+    from types import SimpleNamespace
+
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout, write_block_table
+
+    head_dim, slot_tokens, max_seq = 8, 4, 8
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0, 1],
+        q_heads_by_kv={0: [0, 1], 1: [2, 3]},
+        max_seq=max_seq, head_dim=head_dim, dtype_bytes=2,
+        kv_base=8192, slot_tokens=slot_tokens), align=8, pool_slots=3)
+
+    rng = np.random.default_rng(17)
+    q = rng.standard_normal((1, 4, max_seq, head_dim)).astype(np.float16)
+    kv = rng.standard_normal((1, 2, max_seq, head_dim)).astype(np.float16)
+    k = np.repeat(kv, 2, axis=1)
+    v = np.repeat(kv, 2, axis=1)
+    info = km.sdpa_kv_info(SimpleNamespace(name="n"), {0: spec}, {"n": 0},
+                           np.dtype(np.float16))
+    assert [entry["head"] for entry in info["heads"]] == [0, 1, 2, 3]
+    assert [entry["kv_head"] for entry in info["heads"]] == [0, 0, 1, 1]
+
+    backend = NumpyBackend(
+        NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+    register_all(backend)
+    write_block_table(spec, backend, [2, 0])
+    out = _run(backend,
+               str(torch.ops.aten.scaled_dot_product_attention.default),
+               ["tensor"] * 3, [q.shape, k.shape, v.shape], [q, k, v],
+               q.shape, dtype="float16", extra_payload={"sdpa": info})
+
+    scale = 1.0 / np.sqrt(head_dim)
+    hidden = np.triu(np.full((max_seq, max_seq), -np.inf, dtype=np.float32), k=1)
+    for head in range(4):
+        scores = (q[0, head].astype(np.float32)
+                  @ kv[0, head // 2].T.astype(np.float32)) * scale
+        masked = scores + hidden
+        weights = np.exp(masked - masked.max(-1, keepdims=True))
+        weights /= weights.sum(-1, keepdims=True)
+        expected = weights @ kv[0, head // 2].astype(np.float32)
+        assert np.allclose(out[0, head], expected, atol=0.05), (
+            f"q head {head} 的结果与它所属 KV 头对不上")
 
 
 def test_sdpa_fused_paged_attn_tracks_the_host_path(monkeypatch) -> None:
@@ -487,6 +537,27 @@ def test_paged_attention_rejects_history_longer_than_the_block_table() -> None:
         km._paged_attention(None, 0, entry, geo, np.zeros(2, np.int32),
                             np.zeros((1, 8), np.float16), 8, 1, 8, 4,
                             np.dtype(np.float16), None, 0.35)
+
+
+def test_fused_rms_norm_rounds_before_the_scale() -> None:
+    """融合的 RMSNorm 要在乘缩放之前先落一次 f16，与图上的 `to` 节点同一个位置。
+
+    输入取自实测：两种算法在这组数上给出不同的 f16 结果，走错那条会让解码
+    token 分叉。判据是逐元素相等，不用 allclose。
+    """
+    from runtime.kernels import RMS_NORM_KERNEL
+
+    backend = _backend()
+    register_all(backend)
+    x = np.array([[2.041015625, -2.556640625, 0.418212890625, -0.56787109375]],
+                 dtype=np.float16)
+    gamma = np.array([-0.45263671875, -0.215576171875, -2.01953125, -0.23193359375],
+                     dtype=np.float16)
+    got = _run(backend, RMS_NORM_KERNEL, ["tensor", "tensor"],
+               [(1, 4), (4,)], [x, gamma], (1, 4), dtype="float16",
+               extra_payload={"epsilon": 1e-5})
+    assert got.tolist() == [[-0.55224609375, 0.32958984375,
+                             -0.50439453125, 0.0787353515625]], got
 
 
 def test_view_ops_reach_the_compiler(monkeypatch) -> None:

@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:  # 只为类型标注，避免 contracts 与 graph 之间的运行时循环导入。
     from contracts.partition_plan import PartitionPlan
 
-# Llama 权重的列切和行切规则。
+# Llama/Qwen2 权重的列切和行切规则。Qwen2 的 q/k/v 带偏置，切法跟权重同向；
+# 偏置只在输出维上分片，所以只能是列切。
 LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
     ("q_proj.weight", "col"),
     ("k_proj.weight", "col"),
@@ -18,6 +19,9 @@ LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
     ("up_proj.weight", "col"),
     ("down_proj.weight", "row"),
     ("lm_head.weight", "col"),
+    ("q_proj.bias", "col"),
+    ("k_proj.bias", "col"),
+    ("v_proj.bias", "col"),
 )
 
 

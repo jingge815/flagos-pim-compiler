@@ -13,6 +13,7 @@ from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.pim_tensor_spec import RedistributeEdge
 from contracts.unified_ir import STAGE_PLANNED, mark_stage
+from graph.fuse_pim import fuse_rms_norms
 from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
 from graph.strategy import ShardStrategy
@@ -260,6 +261,9 @@ def compile_llama2(
     prefill_edges_of = {
         seq_len: propagate_specs(gm, strategy) for seq_len, gm in prefill_gms.items()}
     decode_edges = propagate_specs(decode_gm, strategy)
+    # 融合标注要看传播出来的重分布边，所以放在 `propagate_specs` 之后。
+    for gm in [*prefill_gms.values(), decode_gm]:
+        fuse_rms_norms(gm)
 
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     # KV 几何与序列长度无关，用最长桶的图推一次即可。

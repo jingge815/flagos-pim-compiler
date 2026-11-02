@@ -9,17 +9,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import (
+    LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from backend.architectures import ARCHITECTURES
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from backend.vllm_worker import validate_engine_config
 from contracts.op_contract import PIMHardwareConfig
 from graph.strategy import llama_strategies
 from memory.mem_planner import HwBudget
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
-from runtime.executor import RequestTable, run_decode_loop, run_one_step
+from runtime.executor import (
+    RequestTable, prefill_chunk, run_decode_loop, run_one_step)
 from runtime.kernels import register_all
 
 NUM_DPUS = 4
@@ -53,9 +56,26 @@ def _configs(hf_config: SimpleNamespace) -> dict:
 def test_unknown_architecture_lists_supported() -> None:
     """白名单之外报错，并列出受支持的架构。"""
     with pytest.raises(ValueError, match="model_type") as excinfo:
-        validate_engine_config(**_configs(SimpleNamespace(model_type="qwen2")))
+        validate_engine_config(**_configs(SimpleNamespace(model_type="gpt2")))
 
-    assert "llama" in str(excinfo.value)
+    assert "llama" in str(excinfo.value) and "qwen2" in str(excinfo.value)
+
+
+def test_qwen2_config_passes() -> None:
+    """Qwen2 配置默认带滑窗长度，`use_sliding_window=False` 时必须放行。"""
+    hf_config = SimpleNamespace(
+        model_type="qwen2", rope_scaling=None,
+        sliding_window=4096, use_sliding_window=False)
+    validate_engine_config(**_configs(hf_config))
+
+
+def test_qwen2_sliding_window_still_rejected() -> None:
+    """真的打开滑窗注意力时仍然拒绝。"""
+    hf_config = SimpleNamespace(
+        model_type="qwen2", rope_scaling=None,
+        sliding_window=4096, use_sliding_window=True)
+    with pytest.raises(ValueError, match="sliding_window"):
+        validate_engine_config(**_configs(hf_config))
 
 
 def test_rope_scaling_rejected() -> None:
@@ -73,28 +93,38 @@ def test_sliding_window_rejected() -> None:
 
 
 @pytest.fixture(scope="module")
-def gqa_compiled_and_backend():
-    """按 2 个 KV 头编译，4 台 DPU 分成 2 段、段内张量并行宽度 2。"""
+def gqa_model():
+    """4 个 Q 头共用 2 个 KV 头的 Llama。"""
     torch.manual_seed(0)
-    model = LlamaForCausalLM(LlamaConfig(
+    return LlamaForCausalLM(LlamaConfig(
         max_position_embeddings=MAX_SEQ, **MODEL_KWARGS)).eval().to(torch.float16)
+
+
+def _compile_and_load(model, strategy, num_request_slots=2, num_parallel_slots=2):
+    """编译 + 建后端 + 装权重，供各架构的数值测试共用。"""
     hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64)
-    strategy = llama_strategies(
-        NUM_DPUS, num_heads=4, num_kv_heads=2, intermediate_size=128,
-        vocab_size=128, num_layers=NUM_LAYERS)[0]
     compiled = compile_llama2(
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
-        hw=hw, hardware=hardware, num_request_slots=2, kv_slot_tokens=4,
-        num_parallel_slots=2)
+        hw=hw, hardware=hardware, num_request_slots=num_request_slots,
+        kv_slot_tokens=4, num_parallel_slots=num_parallel_slots)
     backend = NumpyBackend(NumpyBackendConfig(
         num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes,
         num_parallel_slots=compiled.num_parallel_slots))
     register_all(backend)
     load_weights(compiled, backend)
     return compiled, backend
+
+
+@pytest.fixture(scope="module")
+def gqa_compiled_and_backend(gqa_model):
+    """按 2 个 KV 头编译，4 台 DPU 分成 2 段、段内张量并行宽度 2。"""
+    strategy = llama_strategies(
+        NUM_DPUS, num_heads=4, num_kv_heads=2, intermediate_size=128,
+        vocab_size=128, num_layers=NUM_LAYERS)[0]
+    return _compile_and_load(gqa_model, strategy)
 
 
 def _greedy(logits):
@@ -107,6 +137,27 @@ def test_gqa_kv_layout_keeps_two_heads(gqa_compiled_and_backend) -> None:
     heads = {head for spec in compiled.kv_specs.values() for head in spec.kv_heads}
 
     assert heads == {0, 1}
+
+
+def test_gqa_prefill_matches_hf(gqa_model, gqa_compiled_and_backend) -> None:
+    """GQA 的 PIM prefill logits 与 HF 对齐。
+
+    一个 KV 头服务多个 Q 头，缓存行只能写一次；重复写会让后一组的 K/V
+    覆盖前一组的缓存位置，logits 直接跑偏到另一个 token。
+    """
+    compiled, backend = gqa_compiled_and_backend
+    prompt = PROMPTS[0]
+    table = RequestTable(1, compiled.kv_pool_slots)
+    slot = table.add_request("r0", prompt, eos_id=-1)
+    got = np.asarray(prefill_chunk(
+        compiled, backend, slot, prompt, 0, causal_mask_of))
+
+    with torch.no_grad():
+        ref = gqa_model(
+            input_ids=torch.tensor([prompt]),
+            attention_mask=causal_mask_of(len(prompt)),
+            position_ids=torch.arange(len(prompt)).unsqueeze(0)).logits.numpy()
+    assert np.abs(got - ref).max() < 1e-3
 
 
 def test_gqa_two_requests_match_single_runs(gqa_compiled_and_backend) -> None:
@@ -127,3 +178,36 @@ def test_gqa_two_requests_match_single_runs(gqa_compiled_and_backend) -> None:
 
     got = [list(table.get(f"r{index}").generated) for index in range(2)]
     assert got == alone
+
+
+@pytest.fixture(scope="module")
+def qwen2_model(tmp_path_factory):
+    """带随机 q/k/v 偏置的小 Qwen2，存盘后按注册表路径加载。"""
+    torch.manual_seed(1)
+    model = Qwen2ForCausalLM(Qwen2Config(
+        max_position_embeddings=MAX_SEQ, **MODEL_KWARGS)).eval().to(torch.float16)
+    # 默认初始化的偏置全为 0，显式随机化才能覆盖到偏置路径。
+    with torch.no_grad():
+        for layer in model.model.layers:
+            for name in ("q_proj", "k_proj", "v_proj"):
+                getattr(layer.self_attn, name).bias.normal_(0, 0.02)
+    path = tmp_path_factory.mktemp("qwen2")
+    model.save_pretrained(path)
+    return model, path
+
+
+def test_qwen2_generate_matches_hf(qwen2_model) -> None:
+    """Qwen2 走注册表的加载与切分，贪心生成的 token 与 HF `generate` 逐字一致。"""
+    model, path = qwen2_model
+    loaded = ARCHITECTURES["qwen2"].load(str(path))
+    strategy = ARCHITECTURES["qwen2"].strategy(NUM_DPUS, loaded.config)
+    compiled, backend = _compile_and_load(
+        loaded, strategy, num_request_slots=1, num_parallel_slots=1)
+
+    prompt = torch.tensor(PROMPTS[0])
+    got = run_decode_loop(
+        compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,
+        eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of)
+    ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
+                         do_sample=False)
+    assert got == ref[0][len(PROMPTS[0]):].tolist()

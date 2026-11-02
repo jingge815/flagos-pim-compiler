@@ -3,7 +3,7 @@
 `graph/fuse.py` 做的是「主算子 + 尾部激活」这一种通用折叠。本模块做的是
 **llama2 特有的固定模式**，它们在 aten 里是一串算子，在 GML 里是一个硬件节点。
 
-三种模式，都以实物为准（见 docs/gml-parser-output-plan-20260917.md §4 步骤 ①）：
+三种模式，都以实物为准（见 docs/GML字段与bin映射策略.md 的融合 pass 一节）：
 
 | aten 形态 | GML 节点 | 依据 |
 | --- | --- | --- |
@@ -30,6 +30,7 @@ from contracts.graph_meta import (
     ATTENTION_SCALE_META_KEY,
     FUSED_TAIL_META_KEY,
     RMS_NORM_META_KEY,
+    REDISTRIBUTE_META_KEY,
 )
 from contracts.ir_payloads import FusedTail, RmsNormFusion
 
@@ -79,20 +80,6 @@ class FusionReport:
         return (f"RMSNorm {self.rms_norms} 个、"
                 f"融合激活 {self.activations} 个、"
                 f"attention 定标 {self.attention_scales} 处")
-
-
-def _skip_transparent(node: Node) -> Node:
-    """顺着唯一消费者往下走，跳过只做 dtype 转换/断言的节点。"""
-    current = node
-    while True:
-        users = [u for u in current.users
-                 if u.target is not torch.ops.aten._assert_tensor_metadata.default]
-        if len(users) != 1:
-            return current
-        nxt = users[0]
-        if nxt.op != "call_function" or nxt.target not in TRANSPARENT:
-            return current
-        current = nxt
 
 
 def _next_op(node: Node, target, skipped: list[Node] | None = None) -> Node | None:
@@ -170,7 +157,7 @@ def _match_rms_norm(start: Node) -> RmsNormFusion | None:
         eaten=eaten, passthrough=passthrough)
 
 
-def _fuse_rms_norms(gm: GraphModule) -> int:
+def _fuse_rms_norms(gm: GraphModule, *, for_exec_plan: bool = False) -> int:
     """把每条 RMSNorm 链标注成一个 `RMSNorm_vpu` 节点。
 
     **锚点取链尾那个乘权重的 `mul`**，不是链首的 `pow`。两个理由：
@@ -182,6 +169,9 @@ def _fuse_rms_norms(gm: GraphModule) -> int:
     链上其余算子打 `ABSORBED_META_KEY`，GML 侧跨过它们。**一个节点都不删** ——
     `pow`/`mean`/`rsqrt` 本来就不在 `OP_TYPES` 里（不会误发射），
     而 `add`/`mul` 在，所以必须靠这个标记挡住。
+
+    `for_exec_plan` 供执行计划使用：被吸收的节点不再发命令，所以链上不能有
+    重分布边，也必须带缩放权重，否则那条链只能按算子逐条执行。
     """
     fused = 0
     starts = [n for n in gm.graph.nodes
@@ -193,6 +183,10 @@ def _fuse_rms_norms(gm: GraphModule) -> int:
         match = _match_rms_norm(start)
         if match is None:
             continue
+        if for_exec_plan and (match.weight_node is None or any(
+                n.meta.get(REDISTRIBUTE_META_KEY)
+                for n in match.eaten + match.passthrough)):
+            continue
 
         anchor = match.eaten[-1]
         anchor.meta[RMS_NORM_META_KEY] = match
@@ -201,6 +195,11 @@ def _fuse_rms_norms(gm: GraphModule) -> int:
         fused += 1
 
     return fused
+
+
+def fuse_rms_norms(gm: GraphModule) -> int:
+    """按执行计划的要求标注 RMSNorm 链，返回标注条数。"""
+    return _fuse_rms_norms(gm, for_exec_plan=True)
 
 
 def _fuse_activations(gm: GraphModule) -> int:

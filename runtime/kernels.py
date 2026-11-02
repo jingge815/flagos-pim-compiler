@@ -12,6 +12,7 @@ from typing import Callable
 import numpy as np
 import torch
 
+from contracts.op_semantics import RMS_NORM_KERNEL
 from memory.kv_layout import prefill_mask
 from runtime import kernels_pim
 
@@ -118,9 +119,12 @@ def _write_result(hal, dpu_id: int, cmd, result: np.ndarray) -> None:
 
 
 def linear_kernel(hal, dpu_id: int, cmd) -> None:
-    """计算 ``aten.linear(x, w)``。"""
-    x, w = _read_tensor_args(hal, dpu_id, cmd)
+    """计算 ``aten.linear(x, w[, bias])``；偏置是本 DPU 分到的那一段。"""
+    args = _read_tensor_args(hal, dpu_id, cmd)
+    x, w = args[0], args[1]
     y = x.astype(np.float32) @ w.astype(np.float32).T
+    if len(args) > 2:
+        y = y + args[2].astype(np.float32)
     _write_result(hal, dpu_id, cmd, y)
 
 
@@ -206,7 +210,8 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     """运行已编译的线性内核；不支持的形状改用 NumPy 内核。"""
     arg_shapes = tuple(tuple(s) for s in cmd.payload["arg_shapes"])
     dtype = str(cmd.payload["dtype"])
-    if not _compiled_linear_supports(arg_shapes, dtype):
+    # 编译内核只出 `x @ w`，带偏置的线性算子没有对应的模板，退回镜像。
+    if len(arg_shapes) != 2 or not _compiled_linear_supports(arg_shapes, dtype):
         record_route("linear", "fallback")
         linear_kernel(hal, dpu_id, cmd)
         return
@@ -573,55 +578,25 @@ def silu_kernel(hal, dpu_id: int, cmd) -> None:
 
 
 def rmsnorm_kernel(hal, dpu_id: int, cmd) -> None:
-    """RMSNorm：走 `pim.normalize`，不再拆成 pow/mean/rsqrt/mul 四步。"""
+    """RMSNorm 融合命令：一条命令算完 `pow/mean/加 ε/rsqrt/乘/乘缩放`。
+
+    ε 由执行计划从图上读出来放进 payload，不在这里发明默认值。
+    """
     x, gamma = _read_tensor_args(hal, dpu_id, cmd)
-    _write_result(hal, dpu_id, cmd, _normalize(x, gamma, ctx=_ctx_of(cmd)))
+    _write_result(hal, dpu_id, cmd, _normalize(
+        x, gamma, epsilon=float(cmd.payload["epsilon"])))
 
 
-def _normalize(x: np.ndarray, gamma: np.ndarray, *, ctx: _OpContext | None = None) -> np.ndarray:
-    array = np.ascontiguousarray(x, dtype=np.float16)
-    g = np.ascontiguousarray(gamma, dtype=np.float16)
-    fn = _compiled_normalize(tuple(array.shape), ctx=ctx)
-    if fn is None:
-        record_route("normalize", "fallback")
-        return kernels_pim.normalize(array, g)
-    record_route("normalize", "hit")
-    out = np.zeros(array.shape, dtype=np.float16)
-    # epsilon 是内核的第三个操作数，与镜像的默认值同一个数。
-    eps = np.array([1e-5], dtype=np.float32)
-    fn(array.ctypes.data_as(ctypes.c_void_p),
-       g.ctypes.data_as(ctypes.c_void_p),
-       eps.ctypes.data_as(ctypes.c_void_p),
-       out.ctypes.data_as(ctypes.c_void_p))
-    return out
+def _normalize(x: np.ndarray, gamma: np.ndarray, *, epsilon: float = 1e-5) -> np.ndarray:
+    """按图上的顺序算：f32 归一化 → 落 f16 → 用 f16 的缩放乘。
 
-
-def _compiled_normalize(shape: tuple[int, ...], *, ctx: _OpContext | None = None):
-    """按形状编一个 `pim.normalize`；工具链不在位时返回 None。"""
-    key = (ctx, "normalize", shape)
-    if key in _COMPILED_KERNEL_CACHE:
-        return _COMPILED_KERNEL_CACHE[key]
-
-    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
-    from opcompiler_bridge.driver import (
-        ToolchainUnavailable, compile_op, load_kernel)
-
-    try:
-        result = compile_op(OpCompileRequest(
-            # 契约只要输入形状；gamma 的长度等于最后一维，内核自己取。
-            op="normalize", arg_shapes=[shape],
-            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype="float16",
-            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
-            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
-            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
-            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
-        ))
-    except ToolchainUnavailable:
-        _COMPILED_KERNEL_CACHE[key] = None
-        return None
-    fn = load_kernel(result)
-    _COMPILED_KERNEL_CACHE[key] = fn
-    return fn
+    中间结果必须先落到 f16 再乘缩放，位置正是图上那个 `to` 节点。在 f32 里
+    乘完再落盘会少一次取整，解码 token 会跟着变（实测 4 条请求里第 3 条分叉）。
+    """
+    x32 = x.astype(np.float32)
+    mean_sq = np.mean(x32 * x32, axis=-1, keepdims=True)
+    inv = 1.0 / np.sqrt(mean_sq + np.float32(epsilon))
+    return (x32 * inv).astype(np.float16) * gamma.astype(np.float16)
 
 
 def rope_kernel(hal, dpu_id: int, cmd) -> None:
@@ -1238,13 +1213,16 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
             "max_blocks": int(spec.blocks_per_request),
         }
         for head in spec.kv_heads:
-            heads.append({
-                "head": int(head),
-                "dpu": int(dpu_id),
-                "row": int(spec.head_dim * spec.dtype_bytes),
-                "k_off": int(spec.kv_off[(layer, head, "k")]),
-                "v_off": int(spec.kv_off[(layer, head, "v")]),
-            })
+            # 一个 KV 头服务一组 Q 头：结果按 Q 头出，缓存的读写落在 KV 头的区域。
+            for q_head in spec.q_heads_by_kv[head]:
+                heads.append({
+                    "head": int(q_head),
+                    "kv_head": int(head),
+                    "dpu": int(dpu_id),
+                    "row": int(spec.head_dim * spec.dtype_bytes),
+                    "k_off": int(spec.kv_off[(layer, head, "k")]),
+                    "v_off": int(spec.kv_off[(layer, head, "v")]),
+                })
     if not heads:
         return None
     first = next(iter(kv_specs.values()))
@@ -1357,10 +1335,16 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
             raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
         return slot
 
+    written: set[tuple[int, int]] = set()
     for entry in info["heads"]:
         head, owner = entry["head"], entry["dpu"]
         if head >= num_heads:
             continue
+        # 一个 KV 头服务多个 Q 头，图上的 K/V 已按 Q 头复制过，只写一次。
+        group = (entry["kv_head"], owner)
+        if group in written:
+            continue
+        written.add(group)
         geo = geometry[owner]
         plane_elems = slot_tokens * head_dim
         for t in range(num_tokens):
@@ -1708,6 +1692,8 @@ _KERNELS = {
     str(torch.ops.aten.unsqueeze.default): KernelEntry(unsqueeze_kernel),
     str(torch.ops.aten.to.dtype): KernelEntry(convert_kernel),
     str(torch.ops.aten.to.dtype_layout): KernelEntry(convert_kernel),
+    # 融合命令只有这一个非 aten 名字：执行计划把 RMSNorm 链接成一条命令。
+    RMS_NORM_KERNEL: KernelEntry(rmsnorm_kernel),
 }
 # 下面这些 aten 目标 **故意不在表里**：它们仍在主机侧口径里，放进这张表
 # 就是按构造永不执行的死代码。反向闭合测试

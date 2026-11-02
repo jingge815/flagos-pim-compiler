@@ -1,6 +1,6 @@
 # tests/ 测试指南与排错手册
 
-本目录共 102 个测试文件、1589 条用例（其中 4 条 `slow` 默认不跑，需 `-m slow`）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
+本目录共 102 个测试文件、1597 条用例（其中 4 条 `slow` 默认不跑，需 `-m slow`）。本文按「依赖 → 分组 → 失败症状 → 排查入口」组织，目标是**测试报错后 1 分钟内知道该看哪个模块、哪份产物**。
 
 > 先记住一件事：每次 pytest 结束都会把逐用例状态、耗时和失败首行写到
 > **`test-results/pytest-latest.md`**（由 `conftest.py` 生成）。排错从这里开始。
@@ -186,7 +186,7 @@ python -m pytest tests/test_genesim_simulation.py -q -m slow
 | `test_prefill_buckets.py` | 21 | prefill 分桶：桶表排序、按最短可容纳原则选桶、跨桶 token 一致、各桶共享权重与 KV 布局、融合 vs 强制主机 | 小模型 | 桶几何查 `compile_llama2(prefill_seq_lens=)`；选桶查 `prefill_bucket` |
 | `test_chunked_prefill.py` | 12（2 条 `slow`） | 分块 prefill：各种切法与整段逐 token 一致、主机两遍路径同样一致、交错请求互不干扰、中间段不采样、3000 token 的 64/512 切法（slow） | 小模型（slow 用 3072 长度图，约 8 分钟/用例） | 位置错先查 `prefill_chunk` 的 `pos`/`position_ids` 与 `_host_paged_attention` 的绝对位置掩码 |
 | `test_profile_execution.py` | 6 | vLLM 调度采集：效率/并发/窗口冲突、空步不计均值、中途失败不串步、stop 还原方法 | 无 | 失败先看 `scripts/profile_execution.py` 的 `_VllmProfiler` 步号过滤；并发类用例靠线程，慢机器上慎调阈值 |
-| `test_architectures.py` | 5 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling`/`sliding_window` 点名拒绝、GQA（4 Q 头 / 2 KV 头）的 KV 布局与两请求 token 一致 | 小模型（GQA 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束 |
+| `test_architectures.py` | 9 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling` 与真滑窗点名拒绝、Qwen2 配置放行、GQA（4 Q 头 / 2 KV 头）的 KV 布局 / prefill 对拍 HF / 两请求 token 一致、带偏置 Qwen2 贪心生成与 HF `generate` 一致 | 小模型（GQA、Qwen2 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束；Qwen2 生成分叉先查偏置是否进 MRAM |
 | `test_step_stats.py` | 4 | 每步指标：wave 取整与最宽值、共用块去重占用、日志字段、真实 vLLM 下 `PIM_LOG_STEPS` 有输出且 `PIM_PROFILE` 两套采集器都有数据 | 小模型 + vLLM | 日志没有输出先查 `PIM_LOG_STEPS` 是否生效；采不到步查 `profile_vllm` 的 `_step` 签名是否跟 worker 对齐 |
 
 ### 4.7 GML 导出、格式与校验

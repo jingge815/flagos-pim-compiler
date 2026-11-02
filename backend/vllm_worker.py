@@ -15,7 +15,7 @@
 - 能力矩阵在启动期（`validate_engine_config`）与请求期
   （`validate_new_request` / `validate_scheduler_output`）校验，不支持的能力
   不会静默算错。
-- 架构白名单在 `backend/architectures.py`：目前只有 Llama（含 GQA 与标准 RoPE），
+- 架构白名单在 `backend/architectures.py`：目前有 Llama 与 Qwen2（含 GQA 与标准 RoPE），
   其它架构、位置缩放与滑窗注意力在启动期拒绝。
 - 运行时指标由 `PIM_LOG_STEPS` 每 N 步打印一行，`PIM_PROFILE=1` 在退出时打印
   请求级调度报告与各 DPU 忙碌时间。
@@ -95,8 +95,10 @@ def validate_engine_config(
         raise _unsupported(
             "rope_scaling", rope_scaling, "未设置（标准 RoPE）",
             "换用不做位置插值/缩放的权重目录")
+    # Qwen2 配置里默认带滑窗长度，只有 `use_sliding_window` 打开时才算滑窗。
+    uses_window = getattr(model_config.hf_config, "use_sliding_window", True)
     sliding_window = getattr(model_config.hf_config, "sliding_window", None)
-    if sliding_window:
+    if sliding_window and uses_window:
         raise _unsupported(
             "sliding_window", sliding_window, "未设置（全注意力）",
             "换用全注意力模型的权重目录")
@@ -247,7 +249,11 @@ class PIMWorker(WorkerBase):
         self.kv_pool_slots = self.compiled.kv_pool_slots
         self.num_parallel_slots = self.compiled.num_parallel_slots
         if self.stats_interval > 0:
-            self.stats = StepStats(pool_total=self.kv_pool_slots)
+            self.stats = StepStats(
+                pool_total=self.kv_pool_slots,
+                max_width=self.num_parallel_slots,
+                window_bytes=self.compiled.act_stride + self.compiled.block_table_bytes,
+            )
         load_weights(self.compiled, self.hal)
         # 块号全部由 vLLM 分配，本表只做 host 记账，不再自建物理槽池。
         self.table = RequestTable(self.num_request_slots)

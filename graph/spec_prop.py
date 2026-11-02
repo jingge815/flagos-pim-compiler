@@ -654,8 +654,14 @@ def _propagate_dpu_node(
     if node.target == torch.ops.aten.linear.default:
         x = _tensor_operand(node, 0, "input")
         weight = _tensor_operand(node, 1, "weight")
-        _reject_tensor_scalar_operand(node, 2, "bias")
+        bias = _optional_tensor_operand(node, 2, "bias")
         reqs, out_placement = rule(node, x, weight)
+        if bias is not None:
+            # 偏置只能跟着列切分走：输出的每一列是独立的，本 DPU 加本片的偏置；
+            # 行切分的输出是部分和，加偏置会重复累加。
+            if weight[1].placement != Placement("Shard", 0):
+                raise _unsupported_layouts(node, x[1], weight[1], bias[1])
+            reqs.append((bias[0], _dpu_req(Placement("Shard", 0))))
     elif node.target in _BINARY_TARGETS:
         x = _tensor_operand(node, 0, "self")
         y = _tensor_or_scalar_operand(node, 1, "other")
@@ -756,6 +762,19 @@ def _tensor_or_scalar_operand(
     if isinstance(operand, (int, float, bool)):
         return None
     raise TypeError(f"{node.name} 的 {keyword} 必须是 tensor 节点或标量")
+
+
+def _optional_tensor_operand(
+    node: Node, position: int, keyword: str
+) -> tuple[Node, PIMTensorSpec] | None:
+    """可选的 tensor 操作数：缺省或为 None 时返回 None，标量不接受。"""
+    operand = _operand_value(node, position, keyword)
+    if operand is _MISSING or operand is None:
+        return None
+    _reject_nested_tensor_container(node, operand, keyword)
+    if not isinstance(operand, Node):
+        raise TypeError(f"{node.name} 的 {keyword} 必须是 tensor 节点")
+    return operand, operand.meta[SPEC_META_KEY]
 
 
 def _reject_tensor_scalar_operand(node: Node, position: int, keyword: str) -> None:

@@ -1,5 +1,9 @@
 # 架构白名单与 GQA 支持（2026-11-02）
 
+> 同日后续：Qwen2 已接入，GQA 也发现并修掉一个缓存覆盖缺陷，
+> 以 `docs/qwen2-support-20261102.md` 为准。本文保留白名单抽表的记录，
+> 其中「GQA 不需要加新代码」的结论已被推翻。
+
 ## 改了什么
 
 以前 worker 直接写死 `LlamaForCausalLM` 与 `llama_strategies`，`validate_engine_config`
@@ -17,7 +21,7 @@
 
 | 检查项 | 支持 | 拒绝时的提示 |
 | --- | --- | --- |
-| `model_type` | `llama`（含 GQA） | 列出白名单里的架构名，建议换权重目录 |
+| `model_type` | `llama`、`qwen2`（含 GQA） | 列出白名单里的架构名，建议换权重目录 |
 | `rope_scaling` | 未设置（标准 RoPE） | 说明只实现标准位置编码 |
 | `sliding_window` | 未设置（全注意力） | 说明只实现全注意力 |
 
@@ -35,8 +39,9 @@ GQA 不影响图结构，只影响 KV 区的几何：一个 KV 头服务连续�
         └─ 2 段 × TP2 ──► 每台 DPU 1 个 KV 头，q_heads_by_kv = {0:[0,1], 1:[2,3]}
 ```
 
-`memory/kv_layout` 生成的 `KVRegionSpec` 本来就有 `q_heads_by_kv` 与 `kv_heads`，
-注意力内核按这张映射取 KV，所以不需要为 GQA 加新代码，缺的只是验证。
+`memory/kv_layout` 生成的 `KVRegionSpec` 本来就有 `q_heads_by_kv` 与 `kv_heads`。
+但内核没有按这张映射展开——见 `docs/qwen2-support-20261102.md`：当时按 KV 头
+生成注意力条目，Q 头 2、3 根本没算，缓存还被重复覆盖。现已改为按 Q 头出条目。
 
 ## 已实施的测试
 
@@ -44,7 +49,7 @@ GQA 不影响图结构，只影响 KV 区的几何：一个 KV 头服务连续�
 
 | 测试 | 验证点 |
 | --- | --- |
-| `test_unknown_architecture_lists_supported` | `model_type="qwen2"` 报错，消息里能看到 `llama` |
+| `test_unknown_architecture_lists_supported` | `model_type="gpt2"` 报错，消息里能看到白名单 |
 | `test_rope_scaling_rejected` | 带位置缩放时点名 `rope_scaling` |
 | `test_sliding_window_rejected` | 带滑窗时点名 `sliding_window` |
 | `test_gqa_kv_layout_keeps_two_heads` | 2 个 KV 头分别落到两台 DPU，KV 区没有按 Q 头数重复 |
@@ -55,8 +60,7 @@ Llama 基线不变由既有用例保证：端到端 vLLM 用例、`tests/test_vl
 
 ## 当前不足
 
-- 只有 Llama 一类架构。Qwen2 等同构模型还不能直接用：qkv 带 bias、词表/头数
-  默认值不同，需要各自的权重切分规则后才能进白名单，现在会明确拒绝。
+- Llama 与 Qwen2 两类架构；Mistral 等滑窗模型仍拒绝。
 - GQA 只在微型模型（4 Q 头 / 2 KV 头）上验证，真实 7B/70B 的 GQA 权重没有跑过。
 - 拒绝项是静态配置检查，不覆盖模型文件本身与配置不一致的情况（例如配置写的是
   全注意力、权重里其实带滑窗）。

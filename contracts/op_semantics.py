@@ -36,6 +36,10 @@ class OpSemantics:
     note: str = ""
 
 
+# RMSNorm 链融合后的命令名。它不是 aten 目标，设备侧内核入口仍是 `normalize`。
+RMS_NORM_KERNEL = "pim.normalize"
+
+
 # 声明序即 `mnemonics()` 的顺序 —— 与改动前的字面量一致，便于人读错误信息。
 OP_SEMANTICS: tuple[OpSemantics, ...] = (
     OpSemantics("normalize", "RMSNorm_vpu", has_kernel=True, is_mnemonic=True,

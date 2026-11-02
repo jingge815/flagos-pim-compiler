@@ -141,6 +141,45 @@ def test_repeated_runs_are_deterministic(parallel_setup) -> None:
     assert all(run == runs[0] for run in runs)
 
 
+def test_unused_windows_receive_no_writes(parallel_setup) -> None:
+    """只有 1 个请求在飞时只开窗口 0，其余激活窗口与块表窗口的字节一动不动。"""
+    _, compiled, hardware = parallel_setup
+    backend = _backend_with_weights(compiled, hardware)
+    table = RequestTable(NUM_SLOTS, compiled.kv_pool_slots)
+    table.add_request("r0", PROMPTS[0], eos_id=-1)
+
+    stride = compiled.act_stride
+    act_bases = {dpu: plan.act_base for dpu, plan in compiled.mem_plans.items()}
+    bt_specs = {spec.dpu_id: spec for spec in compiled.kv_specs.values()}
+
+    def read(dpu: int, offset: int, size: int) -> np.ndarray:
+        return backend.read_local(dpu, offset, (size,), np.uint8)
+
+    def spare_windows() -> dict[tuple[str, int, int], np.ndarray]:
+        """窗口 1 起的激活区与块表字节快照，键是 (区, DPU, 窗口)。"""
+        snap = {}
+        for dpu, base in act_bases.items():
+            for window in range(1, compiled.num_parallel_slots):
+                snap[("act", dpu, window)] = read(dpu, base + window * stride, stride)
+        for dpu, spec in bt_specs.items():
+            for window in range(1, compiled.num_parallel_slots):
+                snap[("bt", dpu, window)] = read(
+                    dpu, spec.block_table_base + window * spec.block_table_bytes,
+                    spec.block_table_bytes)
+        return snap
+
+    before = spare_windows()
+    used_before = {dpu: read(dpu, base, stride) for dpu, base in act_bases.items()}
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    after = spare_windows()
+
+    for key, old in before.items():
+        assert np.array_equal(old, after[key]), f"{key} 被写了"
+    # 窗口 0 确实在用，否则上面的断言没有意义。
+    assert any(not np.array_equal(used_before[dpu], read(dpu, base, stride))
+               for dpu, base in act_bases.items())
+
+
 def test_block_table_windows_are_independent(parallel_setup) -> None:
     """每份块表窗口独立可写，互不覆盖。"""
     _, compiled, hardware = parallel_setup

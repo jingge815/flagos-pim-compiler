@@ -64,7 +64,7 @@ def test_supported_config_passes() -> None:
             hf_config=SimpleNamespace(model_type="llama"))}, "dtype"),
         ({"model_config": SimpleNamespace(
             dtype=torch.float16, quantization=None,
-            hf_config=SimpleNamespace(model_type="qwen2"))}, "model_type"),
+            hf_config=SimpleNamespace(model_type="gpt2"))}, "model_type"),
         ({"scheduler_config": SimpleNamespace(
             enable_chunked_prefill=True,
             max_num_batched_tokens=PREFILL_SEQ_LEN + 1)},

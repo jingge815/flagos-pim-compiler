@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-from transformers import LlamaForCausalLM
+from transformers import LlamaForCausalLM, Qwen2ForCausalLM
 
 from graph.strategy import ShardStrategy, llama_strategies
 
@@ -28,8 +28,13 @@ def _load_llama(path: str) -> torch.nn.Module:
     return LlamaForCausalLM.from_pretrained(path, dtype=torch.float16).eval()
 
 
-def _llama_strategy(num_dpus: int, cfg) -> ShardStrategy:
-    """按配置里的头数/层数取第一个可行的 Llama 切分。"""
+def _load_qwen2(path: str) -> torch.nn.Module:
+    """Qwen2 与 Llama 的差别只有 q/k/v 偏置，加载口径相同。"""
+    return Qwen2ForCausalLM.from_pretrained(path, dtype=torch.float16).eval()
+
+
+def _dense_strategy(num_dpus: int, cfg) -> ShardStrategy:
+    """按配置里的头数/层数取第一个可行的切分，Llama 与 Qwen2 共用。"""
     return llama_strategies(
         num_dpus,
         num_heads=cfg.num_attention_heads,
@@ -41,5 +46,6 @@ def _llama_strategy(num_dpus: int, cfg) -> ShardStrategy:
 
 
 ARCHITECTURES: dict[str, Architecture] = {
-    "llama": Architecture(_load_llama, _llama_strategy),
+    "llama": Architecture(_load_llama, _dense_strategy),
+    "qwen2": Architecture(_load_qwen2, _dense_strategy),
 }

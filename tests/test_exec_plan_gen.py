@@ -648,3 +648,38 @@ def test_overlapping_but_not_identical_writes_are_all_kept() -> None:
     hi = builder.append("launch", 0, {}, [], [Access(("dpu", 0), 8, 16)], [])
     raw = exec_plan_gen_module._deps_of([Access(("dpu", 0), 0, 24)], builder.writers)
     assert set(raw) == {lo.id, hi.id}
+
+
+def test_the_plan_emits_one_command_per_rms_norm() -> None:
+    """RMSNorm 链在执行计划里只留一条 `pim.normalize`。
+
+    链上的 pow/mean/add/rsqrt/mul 与那次 `to` 都被吸收，不再各发一条命令；
+    没折的话这些内核名会原样出现在每台 DPU 上。
+    """
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from graph.strategy import llama_strategies
+    from runtime.compile import compile_llama2
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=4, vocab_size=128,
+    )).eval().half()
+    strategy = llama_strategies(
+        4, num_heads=4, num_kv_heads=4, intermediate_size=128,
+        vocab_size=128, num_layers=2)[0]
+    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hardware = PIMHardwareConfig(
+        num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536, dma_align=64)
+    compiled = compile_llama2(
+        model, strategy, prefill_seq_len=4, max_seq=16, hw=hw,
+        hardware=hardware, num_request_slots=1, kv_slot_tokens=16)
+
+    names = [cmd.payload["kernel"] for cmd in compiled.decode.plan.commands
+             if cmd.dpu_id is not None]
+    # 2 层各 2 个 RMSNorm，加末尾那个 norm，共 5 条链，每条每台 DPU 一条命令。
+    assert names.count("pim.normalize") == 5 * 4
+    for gone in ("aten.pow.Tensor_Scalar", "aten.mean.dim", "aten.rsqrt.default"):
+        assert gone not in names, f"{gone} 还在计划里，链没有折干净"

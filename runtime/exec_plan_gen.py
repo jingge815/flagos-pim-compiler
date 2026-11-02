@@ -16,6 +16,8 @@ from contracts.dtypes import dtype_bytes
 from contracts.exec_plan import Access, Command, ExecutionPlan
 from contracts.graph_meta import DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, REDISTRIBUTE_META_KEY, SPEC_META_KEY
 from contracts.op_contract import DpuShard, PIMHardwareConfig
+from contracts.op_semantics import RMS_NORM_KERNEL
+from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY
 
 _REDISTRIBUTE_OP = {
     "all_reduce": "host_reduce",
@@ -388,6 +390,10 @@ def build_execution_plan(
             output_cmd_id = builder.host_value_of.get(src.name, output_cmd_id)
             continue
 
+        # 已折进锚点的算子不再发命令，只留锚点那一条。
+        if node.meta.get(ABSORBED_META_KEY):
+            continue
+
         if node.meta.get(DEVICE_META_KEY) == DEVICE_DPU:
             spec = node.meta[SPEC_META_KEY]
             # 校验张量分片对应有效的 DPU 地址。
@@ -405,10 +411,13 @@ def build_execution_plan(
                 e.src: e for e in node.meta.get(REDISTRIBUTE_META_KEY, [])
                 if e.dst_loc.get("device") == DEVICE_DPU
             }
+            # 融合锚点的实参是链首输入和缩放权重，不是它自己那两个操作数。
+            fusion = node.meta.get(RMS_NORM_META_KEY)
             for dpu_id in spec.shard_map:
                 # 按节点参数顺序收集输入地址。`cat` 的第一个实参是**张量
                 # 列表**，要摊平——不摊平它整段被跳过，内核一个输入都读不到。
-                flat_args = _flatten_node_args(node.args)
+                flat_args = ([fusion.eaten[0].args[0], fusion.weight_node]
+                             if fusion is not None else _flatten_node_args(node.args))
                 reads: list[Access] = []
                 for arg in flat_args:
                     if not isinstance(arg, Node):
@@ -458,7 +467,8 @@ def build_execution_plan(
                 _assert_same_shape_args_share_the_decision(
                     node, dpu_id, arg_decisions, spec, out_detail)
                 payload = {
-                    "kernel": str(node.target), "node": node.name,
+                    "kernel": RMS_NORM_KERNEL if fusion is not None else str(node.target),
+                    "node": node.name,
                     "arg_kinds": arg_kinds, "arg_shapes": arg_shapes,
                     "arg_dtypes": arg_dtypes,
                     "dtype": spec.dtype,
@@ -476,6 +486,8 @@ def build_execution_plan(
                     "mram_offset": out_detail.mram_offset,
                     "align_bytes": out_detail.align_bytes,
                 }
+                if fusion is not None:
+                    payload["epsilon"] = fusion.epsilon
                 # 注意力要读的设备侧 KV 区域，编译期才知道，在这里烘进命令——
                 # 内核自己拿不到 `kv_specs`，而用模块级全局会在多个策略之间
                 # 互相覆盖（实测三种策略连着编译时后面的把前面的盖掉）。
