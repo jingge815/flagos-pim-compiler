@@ -311,6 +311,8 @@ python -m pytest tests/test_vllm_compat.py -q
 - `docs/kv-paged-attn-online-20261026.md` — 融合分页注意力（单遍在线 softmax）
 - `docs/executor-parallel-phase1-20261026.md` — 跨请求并行执行
 - `docs/vllm-integration-20261102.md` — vLLM 接入现状索引（能力 → 代码 → 文档 → 测试）
+- `docs/vllm-scheduling-20261102.md` — vLLM 调度超参影响表（预算、块大小、前缀缓存、分块预填充）
+- `docs/executor-parallel-bottleneck-20261102.md` — 并行瓶颈测量（GIL 与命令数）
 - `docs/<module>.md` — 各模块接口与设计决策
 
 ## 开发约定
