@@ -757,8 +757,11 @@ def _vllm_case(model_dir: Path, parallel_slots: int) -> VllmProfileResult:
     llm = LLM(
         model=str(model_dir), skip_tokenizer_init=True, dtype="float16",
         max_model_len=VLLM_MAX_SEQ, max_num_seqs=len(VLLM_PROMPTS),
-        # 一步内放下所有并发请求的整段 prompt，static 图不支持分块预填充。
-        max_num_batched_tokens=len(VLLM_PROMPTS) * VLLM_PREFILL_LEN,
+        # 让一步内放下所有并发请求的整段 prompt；关掉分块预填充，
+        # 否则预算会超过单段 prefill 桶，且请求不会在同一步里一起预填充。
+        # 关掉分块后 vLLM 要求预算不小于 max_model_len。
+        max_num_batched_tokens=VLLM_MAX_SEQ,
+        enable_chunked_prefill=False,
         enable_prefix_caching=False, gpu_memory_utilization=0.2,
         distributed_executor_backend=PIMExecutor,
     )
