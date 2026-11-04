@@ -35,7 +35,7 @@ python -m pytest tests/test_spec_prop_llama2_7b.py -q -s
 python -m pytest tests/test_genesim_simulation.py -q -m slow
 
 # 并行加速（一次性安装：pip install pytest-xdist；见 6.5 节选 worker 数）
-OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 8
+OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 ```
 
 `pytest.ini` 里只有一条全局约定：`addopts = -m "not slow"`。`slow` 标记目前只用在 `test_genesim_simulation.py::test_simulation_produces_a_summary`。
@@ -329,9 +329,10 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 8
 - **worker 数受内存限制**：真 7B 用例单条峰值约 32GB（模型 14GB + 运行时），
   `-n N` 最坏峰值 ≈ N × 32GB。本机（152 核 / 1TB）用 `-n 8` 约 256GB，安全。
 - **别用 `-n auto`**：会把 worker 拉到 152，多个真 7B 用例同时加载模型可能压爆内存。
-- **实测**（本机，`-k llama2_7b` 48 条）：串行 6272s → `-n 8` 4304s（1.46×）。
-  差距来自调度（长用例与其他重用例共享 worker）与并发 setup 膨胀；重用例分散到
-  专属 worker（加大 `-n`、重用例文件放参数最前）可逼近下述单条用例地板。
+- **实测**（本机，`-k llama2_7b` 48 条）：串行 6272s → `-n 8` 4304s（1.46×）→
+  **`-n 12` 2940s（2.13×）**。worker 数要让重用例各自独占 worker（本选择集 13 条
+  真模型用例）：少了会多条重用例排进同一 worker，临界路径被拉长。2940s 已贴近
+  下述单条用例地板（2763s 执行 + setup），再加工数无用。
 - **提速上限被单条用例钉死**：`test_opcompiler_e2e_llama2_7b[tp1_pp8]` 一条约
   2760s，是**被测内核的真实执行期**——tp1_pp8 每层跑全宽 linear（实测编译内核
   M=22/N=4096 单次 2.0s、M=1 单次 0.23s；tp8_pp1 的 1/8 宽只要 0.13s/0.02s），
