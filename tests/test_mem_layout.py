@@ -115,13 +115,11 @@ def test_align_up_has_exactly_one_implementation() -> None:
     assert len(hits) == 1, f"align_up 应只有一处实现，实际 {hits}"
 
 
-def test_both_old_import_sites_now_resolve_to_the_single_source() -> None:
-    """两处旧调用方仍然可用，但拿到的是同一份实现。"""
+def test_old_import_site_now_resolves_to_the_single_source() -> None:
+    """旧调用方仍然可用，但拿到的是同一份实现。"""
     from memory.kv_layout import align_up as kv_align_up
-    from orchestrator.l2_alloc import align_up as l2_align_up
 
     assert kv_align_up is align_up
-    assert l2_align_up is align_up
 
 
 # ---- Memory Layout 的两个生产方：排布与逐张量对齐 ----

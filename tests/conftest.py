@@ -3,8 +3,20 @@ from datetime import datetime
 from pathlib import Path
 import time
 
+import pytest
+
 
 _REPORT_STATE = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_grad_mode():
+    """每个测试文件结束后恢复梯度开关。7B 夹具会全局关闭梯度，漏到后续文件会改变 torch.export 的图。"""
+    import torch
+
+    enabled = torch.is_grad_enabled()
+    yield
+    torch.set_grad_enabled(enabled)
 
 
 @dataclass

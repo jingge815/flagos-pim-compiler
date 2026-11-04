@@ -42,6 +42,7 @@ SPLIT_META_KEY = "pim_split"
 ROPE_META_KEY = "pim_rope"
 HEAD_ROLE_META_KEY = "pim_head_role"
 HEAD_INDEX_META_KEY = "pim_head_index"
+STATIC_QUANT_META_KEY = "pim_static_quant"
 VAL_META_KEY = "val"
 MODULE_STACK_META_KEY = "nn_module_stack"
 
@@ -147,6 +148,13 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         consumers=("graph.kv_dma_pass", "graph.quant_pass",
                    "gml_bridge.from_fx", "opcompiler_bridge.oplevel_emitter"),
         note="头下标，GML 落成 split_channel_number；也指示本地分片落在哪台 DPU"),
+    MetaKeySpec(
+        STATIC_QUANT_META_KEY, (DIM_OP_SEMANTICS, DIM_DTYPE), "bool",
+        producer="gml_bridge.ceva:mark_static_quant",
+        consumers=("graph.quant_pass", "gml_bridge.from_fx",
+                   "opcompiler_bridge.oplevel_emitter"),
+        note="矩阵乘走 int8 静态量化：激活由上游直接给 int8、不插 DQ，"
+             "权重 int8，定点累加后 FPSU 用 fixed2float 转回浮点"),
     MetaKeySpec(
         VAL_META_KEY, (DIM_INFRA,), "FakeTensor",
         producer="torch.export | graph.split_heads:split_attention_heads",

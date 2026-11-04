@@ -319,3 +319,109 @@ def test_fpsu_triple_is_per_group_only_for_rope_dq(files) -> None:
     assert (files.directory / "Bias_buffer_phase_0_22.bin").stat().st_size == 128
     assert (files.directory
             / "Scaling_PS_buffer_phase_0_22.bin").stat().st_size == 32
+
+
+def test_int4_weight_is_stored_input_major(files) -> None:
+    """int4 权重按「输入维 × 输出维」落盘，scale 仍按「输出维 × 输入维/128」。
+
+    厂商第 0、17 层 7 个投影实测如此；按 HF 的「输出 × 输入」写，GC 读到的是转置后的权重。
+    """
+    from quant.weights import from_storage_order
+
+    rng = np.random.default_rng(1)
+    weight = (rng.standard_normal((256, 384)) * 0.02).astype(np.float32)
+    quantized = quantize_weight(weight)
+    write_weight(files, 8, quantized, shape=weight.shape)
+
+    stored = np.fromfile(files.directory / names.weight_buffer(8), dtype=np.int8)
+    assert stored.reshape(384, 256).T.tobytes() == quantized.values.tobytes()
+    assert from_storage_order(stored, weight.shape).tobytes() == quantized.values.tobytes()
+    scales = np.fromfile(files.directory / names.weight_scale(8), dtype=np.float16)
+    assert scales.tobytes() == quantized.scales.tobytes()
+
+
+def test_fpsu_mul_shift_matches_vendor_encoding() -> None:
+    """定点 FPSU 的 scale 编成 16 位有符号 mul + 右移：取不溢出的最大右移。
+
+    向量取自厂商产物：KV_Cache_DMA（in/out 同 scale，1.0 -> 16384, 14）、
+    输出头（fp32 的 in_sf 0.03019653 × fp16 的 w_sf -> 29066, 29；in_sf 先取 fp16 会差 1）。
+    """
+    from gml_bridge.runtime_files import fpsu_mul_shift
+
+    assert fpsu_mul_shift(1.0) == (16384, 14)
+    factor = float(np.float32(0.03019653)) * float(np.float16(0.00179290771484375))
+    assert fpsu_mul_shift(factor) == (29066, 29)
+
+
+def test_fpsu_mul_shift_accepts_int16_max_and_rejects_zero() -> None:
+    """32767 是合法的 int16 上限；所有右移都得到零乘数时必须报错，不能静默写零。"""
+    from gml_bridge.runtime_files import fpsu_mul_shift
+
+    assert fpsu_mul_shift(32767 / 2 ** 31) == (32767, 31)
+    with pytest.raises(ValueError, match="过小"):
+        fpsu_mul_shift(1e-20)
+
+
+def test_fixed_point_scaling_writes_int16_mul(files) -> None:
+    from gml_bridge.runtime_files import write_fixed_point_scaling
+
+    write_fixed_point_scaling(files, 3, 1.0)
+    d = files.directory
+    assert np.fromfile(d / "Scaling_buffer_file_3.bin", np.int16).tolist() == [16384]
+    assert np.fromfile(d / "Scaling_PS_buffer_file_3.bin", np.uint8).tolist() == [14]
+    assert np.fromfile(d / "Bias_buffer_file_3.bin", np.float32).tolist() == [0.0]
+
+
+def test_buffer_node_scale_reference_is_written_by_consumer(tmp_path) -> None:
+    """output_sf/zp 指向消费者的 input_sf/zp 文件时（入口缓冲、直连出口的布局算子），由消费者写一次。"""
+    from gml_bridge.export import GmlArtifact, write_runtime_files
+    from gml_bridge.writer import Edge, Node
+
+    entry = Node(1, {"label": "nprm_0_i0", "name": "nprm_0_i0", "is_buffer": 1,
+                     "output_buffer": "input_buffer_2.bin", "output_sf": "input_sf_2.bin",
+                     "output_zp": "input_zp_2.bin"})
+    add = Node(2, {"label": "a", "name": "a", "op_type": "EltwiseAdd",
+                   "input0_node_id": 1, "input_buffer": "input_buffer_2.bin",
+                   "input_buffer_dtype": "float16", "input_sf": "input_sf_2.bin",
+                   "input_zp": "input_zp_2.bin"})
+    artifact = GmlArtifact(text="", nodes=[entry, add], edges=[Edge(1, 2, "1x8")],
+                           buffer_names={"input_buffer_2.bin", "input_sf_2.bin",
+                                         "input_zp_2.bin"})
+    files = write_runtime_files(artifact, tmp_path)
+    assert files.names_written == {"input_buffer_2.bin", "input_sf_2.bin", "input_zp_2.bin"}
+
+
+def test_slot_numbered_consumer_scale_reference_is_skipped(tmp_path) -> None:
+    """消费者按槽号命名的 input_0_sf_<id> 同样由消费者写。"""
+    from gml_bridge.export import GmlArtifact, write_runtime_files
+    from gml_bridge.writer import Edge, Node
+
+    entry = Node(1, {"label": "nprm_0_i0", "name": "nprm_0_i0", "is_buffer": 1,
+                     "output_buffer": "input_buffer_0_2.bin", "output_sf": "input_0_sf_2.bin",
+                     "output_zp": "input_0_zp_2.bin"})
+    add = Node(2, {"label": "a", "name": "a", "op_type": "EltwiseAdd", "input0_node_id": 1,
+                   "input_buffer_0": "input_buffer_0_2.bin", "input_buffer_0_dtype": "float16",
+                   "input_0_sf": "input_0_sf_2.bin", "input_0_zp": "input_0_zp_2.bin"})
+    names_ = {"input_buffer_0_2.bin", "input_0_sf_2.bin", "input_0_zp_2.bin"}
+    artifact = GmlArtifact(text="", nodes=[entry, add], edges=[Edge(1, 2, "1x8")],
+                           buffer_names=names_)
+    assert write_runtime_files(artifact, tmp_path).names_written == names_
+
+
+def test_gemm_feeding_value_cache_is_found_by_structure() -> None:
+    """写进 V cache 的投影按 GML 声明认（输出 int8），不看参数名。"""
+    from gml_bridge.export import _output_scale_of
+    from gml_bridge.writer import Node
+    from quant.calibration import ActivationScales
+
+    gemm = Node(5, {"op_type": "Gemm", "pim_weight_param": "layer.any_name.weight",
+                    "output0_node_id": 6, "output_buffer_dtype": "int8"})
+    reshape = Node(6, {"op_type": "Reshape", "output0_node_id": 7})
+    dma = Node(7, {"op_type": "KV_Cache_DMA", "pim_kv_is_key": 0})
+    other = Node(8, {"op_type": "Gemm", "pim_weight_param": "layer.v_proj.weight",
+                     "output0_node_id": 9, "output_buffer_dtype": "float16"})
+    tail = Node(9, {"op_type": "EltwiseAdd"})
+    by_id = {n.node_id: n for n in (gemm, reshape, dma, other, tail)}
+    scales = ActivationScales(key=0.05, value=0.003)
+    assert _output_scale_of(gemm, by_id, scales) == 0.003
+    assert _output_scale_of(other, by_id, scales) == 1.0

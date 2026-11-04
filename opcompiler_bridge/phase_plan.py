@@ -88,8 +88,7 @@ def _attr_params(body: str) -> dict[str, str]:
 def _parse_hw_fields(line: str) -> dict[str, int]:
     """一行里的硬件域。
 
-    键名沿用编排器一直在用的**旧契约**（带连字符）：`orchestrator/plan.py`
-    与 `layer_fields` 按这些名字取值，属性换成 ODS 形态不该顺带改这层名字。
+    键名沿用旧契约（带连字符），属性换成 ODS 形态不该顺带改这层名字。
     """
     fields = {_ATTR_ALIAS[m.group(1)]: int(m.group(2))
               for m in _I64_ATTR.finditer(line)}
@@ -158,6 +157,8 @@ class Phase:
     fpsu_mode: int | None = None
     transpose_type: int | None = None
     activation_mode: int | None = None
+    # 本相读哪些前序相位（DQ 的 p1、p2 都读 p0，是扇出不是链）。
+    reads: tuple[int, ...] = ()
 
 
 @dataclass
@@ -173,6 +174,9 @@ class PhasePlan:
     func: str
     phases: list[Phase] = field(default_factory=list)
     op_attrs: dict[str, int] = field(default_factory=dict)
+    # 单相算子的 FPSU 模式名。整数卡值只覆盖两种浮点模式，输出头的
+    # fixed2float 没有卡值，按名字传。
+    fpsu_mode_name: str | None = None
 
     @property
     def count(self) -> int:
@@ -228,6 +232,8 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
             is_op = _OP_RE.search(line) is not None
             if is_op or prev_was_op:
                 current.op_attrs.update(_parse_hw_fields(line))
+                if match := _FPSU_RE.search(line):
+                    current.fpsu_mode_name = _attr_params(match.group(1)).get("mode")
             prev_was_op = is_op
             continue
 
@@ -237,7 +243,7 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
         kind_match = _KIND_RE.search(line)
         attrs = _parse_hw_fields(line)
 
-        for index, phase_bytes, unit, consecutive, _reads in specs:
+        for index, phase_bytes, unit, consecutive, reads in specs:
             if any(p.index == index for p in current.phases):
                 continue
             current.phases.append(Phase(
@@ -255,6 +261,7 @@ def parse_phase_plans(pimir_text: str) -> dict[str, PhasePlan]:
                 fpsu_mode=attrs.get("fpsu-mode"),
                 transpose_type=attrs.get("transpose-type"),
                 activation_mode=attrs.get("activation-mode"),
+                reads=tuple(reads),
             ))
 
     for plan in plans.values():

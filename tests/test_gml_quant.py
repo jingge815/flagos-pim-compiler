@@ -286,3 +286,10 @@ def test_int4_weight_quantization_round_trips_exactly() -> None:
     assert requantized.ravel().tobytes() == weights.tobytes()
     assert requantized.min() >= INT4_MIN
     assert requantized.max() <= INT4_MAX
+
+
+def test_dq_group_size_rows_for_prefill_scores():
+    """prefill 的注意力分数按行分组：组宽为行宽 S，旧调用（不给行宽）不变。"""
+    assert dq_group_size(1024 * 1024, is_attention_scores=True, row_width=1024) == 1024
+    assert dq_group_size(1024, is_attention_scores=True) == 1024
+    assert dq_group_size(4096 * 8, is_attention_scores=False, row_width=4096) == 128

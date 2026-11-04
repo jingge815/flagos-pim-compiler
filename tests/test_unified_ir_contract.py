@@ -36,7 +36,7 @@ from contracts.unified_ir import (
 
 # 登记表以外的读者目录：源码扫描的范围。
 SCAN_DIRS = ("graph", "gml_bridge", "genesim_bridge", "opcompiler_bridge",
-             "memory", "runtime", "comm", "contracts", "orchestrator")
+             "memory", "runtime", "comm", "contracts")
 
 # 阶段标记挂在 GraphModule 上而非 node.meta，扫描时按键名区分不了接收者，
 # 显式排除。它描述整张图的状态，不进键登记表。

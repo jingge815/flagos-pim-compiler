@@ -88,18 +88,19 @@ def test_every_matmul_gets_a_dq_on_its_activation_input(quantized) -> None:
 
 
 def test_attention_scores_are_one_group(quantized) -> None:
-    """attention scores 整条当一组，其余按 128 切。
+    """attention scores 每个查询 token 一行、一行一组，其余按 128 切。
 
-    实测参考产物 `global_pooling_group_size_phase_0` 只有两种取值：
-    1024（32 个 attention scores 节点）与 128（5 个 hidden/MLP 节点）。
+    实测参考产物（decode，一行）`global_pooling_group_size_phase_0` 只有两种
+    取值：1024（32 个 attention scores 节点）与 128（5 个 hidden/MLP 节点）。
+    多 token 时整段压成一组会把不同 token 的分数混在一个 scale 里。
     """
     clone, report = quantized
     assert report.attention_scores == HEADS
 
     for spec in _specs(clone):
         if spec.is_attention_scores:
-            assert spec.groups == 1, "scores 应当整条一组"
-            assert spec.group_size == spec.numel
+            assert spec.group_size == SEQ, "scores 应当一行一组"
+            assert spec.groups == spec.numel // SEQ
         else:
             assert spec.group_size == 128
 

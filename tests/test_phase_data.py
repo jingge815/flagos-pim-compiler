@@ -374,7 +374,7 @@ def test_softmax_runtime_landings_are_wired_to_the_phases() -> None:
     result = softmax(np.linspace(-4, 4, 256).astype(np.float16))
 
     assert result.phase1_bias == result.phase0_bytes
-    assert result.phase4_scale == struct.pack("<e", np.float16(result.phase3))
+    assert result.phase4_scale == np.asarray(result.phase3, dtype=np.float16).tobytes()
 
 
 def test_softmax_subtracts_the_max_for_stability() -> None:

@@ -99,6 +99,38 @@ GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 用 `PIM_COMPILER_ROOT` 指�
 根目录；未设置时按常见相对布局探测（`../flagOS/flagos-pim-compiler` 或
 `../flagos-pim-compiler`）。
 
+## CEVA 全流程验证
+
+先在 `paths.json` 配好 `ceva_workspace`、`ceva_reference_dir` 和 `ceva_embedding`。
+以下命令自动加载编译环境，依次执行图编译、FlagTree 算子编译、65 张 GML 与全部 bin
+生成、来源清单校验、厂商 GC、DDR 布局和 CEVA 仿真。仿真使用我方生成的 GML/bin，
+不直接使用厂商自带的 GML、bin 或旧 Registry：
+
+```bash
+cd /data/fjg/flagOS/flagos-pim-compiler
+bash scripts/run_ceva_pipeline.sh --run-name ours_e2e --decode-steps 10
+```
+
+我方 bin 默认使用 `--token-check warn`，允许 token 与厂商基线不同，但仿真正常结束、
+65 图编译、Registry 来源等必要检查必须全部通过。需要严格逐 token 对拍时执行：
+
+```bash
+bash scripts/run_ceva_pipeline.sh --run-name ours_e2e_strict --decode-steps 10 --token-check strict
+```
+
+完整流程约 10 小时，工作区要求至少 130G 可用磁盘。产物和日志位于：
+
+- GML/bin：`/data/fjg/ceva/bundles/<实验名>`
+- GC、仿真与判定：`/data/fjg/ceva/runs/<实验名>`
+- 编排日志：`test-results/ceva-<实验名>`
+
+命令退出码为 0，且 `results/verdict.txt` 显示 `结论: PASS`、无 `FAIL` 和 `SKIP`，
+才表示固定 Llama2 7B 用例的全流程验证通过。例如查看上述默认实验的判定报告：
+
+```bash
+cat /data/fjg/ceva/runs/ours_e2e/results/verdict.txt
+```
+
 ## 文档
 
 - `docs/spec.md` — 完整技术方案

@@ -41,12 +41,16 @@ def test_pass_pipeline_fuses_before_expanding() -> None:
         "-pim-expand-phases")
 
 
+# FlagTree 实际发出的跨相依赖：DQ 的 p1、p2 读 p0，Softmax 的 p4 读 p1 与 p3。
+_READS = {"dq": {1: (0,), 2: (0,)}, "softmax": {4: (1, 3)}}
+
+
 def test_cross_check_accepts_matching_template() -> None:
     """相位数与归约 kind 都对时，交叉校验放行。"""
     source = PhaseSource(by_node={
         "dq0": {"dq": PhasePlan(func="dq0__dq", phases=[
             Phase(index=i, op="", unit="", bytes=0,
-                  kind="absmax" if i == 0 else None)
+                  kind="absmax" if i == 0 else None, reads=_READS["dq"].get(i, ()))
             for i in range(4)
         ])},
     })
@@ -58,7 +62,7 @@ def test_cross_check_catches_wrong_phase_count() -> None:
     source = PhaseSource(by_node={
         "dq0": {"dq": PhasePlan(func="dq0__dq", phases=[
             Phase(index=i, op="", unit="", bytes=0,
-                  kind="absmax" if i == 0 else None)
+                  kind="absmax" if i == 0 else None, reads=_READS["dq"].get(i, ()))
             for i in range(3)
         ])},
     })
@@ -74,7 +78,7 @@ def test_cross_check_catches_max_instead_of_absmax() -> None:
     source = PhaseSource(by_node={
         "dq0": {"dq": PhasePlan(func="dq0__dq", phases=[
             Phase(index=i, op="", unit="", bytes=0,
-                  kind="max" if i == 0 else None)
+                  kind="max" if i == 0 else None, reads=_READS["dq"].get(i, ()))
             for i in range(4)
         ])},
     })
@@ -88,7 +92,7 @@ def test_cross_check_reports_softmax_reduction_kind() -> None:
     source = PhaseSource(by_node={
         "sm0": {"softmax": PhasePlan(func="sm0__softmax", phases=[
             Phase(index=i, op="", unit="", bytes=0,
-                  kind="absmax" if i == 0 else None)
+                  kind="absmax" if i == 0 else None, reads=_READS["softmax"].get(i, ()))
             for i in range(5)
         ])},
     })
@@ -247,3 +251,39 @@ def test_rtl_version_with_a_dash_in_the_name_is_still_read() -> None:
     text = ('module attributes {"pim.rtl-version" = "1.4", '
             'pim.target = "pim:v1"} { }')
     assert rtl_version_of(text) == "1.4"
+
+
+def _plan_with_reads(kind_name: str, n: int, reads: dict[int, tuple[int, ...]], first: str):
+    return PhasePlan(func=f"x__{kind_name}", phases=[
+        Phase(index=i, op="", unit="", bytes=0, kind=first if i == 0 else None,
+              reads=reads.get(i, ()))
+        for i in range(n)])
+
+
+def test_cross_check_accepts_expected_phase_reads() -> None:
+    """DQ 的 p1、p2 读 p0，Softmax 的 p4 读 p1 与 p3：这些跨相依赖一致时放行。"""
+    source = PhaseSource(by_node={
+        "dq0": {"dq": _plan_with_reads("dq", 4, {1: (0,), 2: (0,)}, "absmax")},
+        "sm0": {"softmax": _plan_with_reads("softmax", 5, {4: (1, 3)}, "max")},
+    })
+    assert [m for m in cross_check(source) if m.field.endswith(".reads")] == []
+
+
+def test_cross_check_catches_changed_phase_reads() -> None:
+    """p2 改读 p1 就是另一条数据流（倒数取错了相），要报出来。"""
+    source = PhaseSource(by_node={
+        "dq0": {"dq": _plan_with_reads("dq", 4, {1: (0,), 2: (1,)}, "absmax")},
+    })
+    bad = [m for m in cross_check(source) if m.field.endswith(".reads")]
+    assert len(bad) == 1 and bad[0].field == "phase2.reads"
+    assert bad[0].from_opcompiler == (1,) and bad[0].from_static_table == (0,)
+
+
+def test_cross_check_catches_dropped_phase_reads() -> None:
+    """IR 里 reads 全部丢失也要报出来，不能因为没写就整段跳过。"""
+    source = PhaseSource(by_node={
+        "dq0": {"dq": _plan_with_reads("dq", 4, {}, "absmax")},
+        "sm0": {"softmax": _plan_with_reads("softmax", 5, {}, "max")},
+    })
+    bad = sorted(m.field for m in cross_check(source) if m.field.endswith(".reads"))
+    assert bad == ["phase1.reads", "phase2.reads", "phase4.reads"]

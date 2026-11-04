@@ -22,8 +22,8 @@
 - 我方产物内部的结构恒等式（`Bias_phase_1 == phase0`、
   `Scaling_phase_4 == phase3`）按构造成立，与实物的 32/32 一致。
 
-若将来要求逐字节复现硬件，把 `contracts.gml_lut` 的 exp 表接进 phase1 即可
-（那张表的段索引规则尚未反推出，见计划 §7 问题 1）。
+phase1 落盘的 exp 查找表本身由 `contracts.pwla` 拟合，与厂商逐字节一致；这里的
+相位缓冲只是 GC 按尺寸分配的样例数据，不进 Registry。
 """
 
 from __future__ import annotations
@@ -202,21 +202,21 @@ class SoftmaxPhases:
     """
 
     source: np.ndarray          # 输入（fp16）
-    phase0: float               # -max(x)
+    phase0: np.ndarray          # 逐行 -max(x)
     phase1: np.ndarray          # exp(x - max)（fp16）
-    phase2: float               # Σ phase1（fp32 归约）
-    phase3: float               # 1 / phase2
+    phase2: np.ndarray          # 逐行 Σ phase1（fp32 归约）
+    phase3: np.ndarray          # 逐行 1 / phase2
     phase4: np.ndarray          # phase1 * phase3，即 softmax 输出（fp16）
 
     @property
     def phase0_bytes(self) -> bytes:
-        """fp16 位模式放高 2 字节。实测 32/32 个节点如此。"""
-        return pack_fp16_in_high_half(self.phase0)
+        """每行一个 fp16 位模式放高 2 字节。实测 32/32 个节点如此。"""
+        return b"".join(pack_fp16_in_high_half(v) for v in self.phase0)
 
     @property
     def phase2_bytes(self) -> bytes:
-        """真正的 fp32。与 phase0 的编码**不同**。"""
-        return struct.pack("<f", np.float32(self.phase2))
+        """每行一个真正的 fp32。与 phase0 的编码**不同**。"""
+        return np.asarray(self.phase2, dtype=np.float32).tobytes()
 
     @property
     def phase1_bias(self) -> bytes:
@@ -229,14 +229,14 @@ class SoftmaxPhases:
 
     @property
     def phase4_scale(self) -> bytes:
-        """`Scaling_buffer_phase_4` 的内容：逐字节等于 phase3 的输出。
+        """`Scaling_buffer_phase_4` 的内容：逐字节等于 phase3 的输出（每行一个 fp16）。
 
         实测 32/32 个节点吻合。同样是运行时落点，不是常量。
         """
-        return struct.pack("<e", np.float16(self.phase3))
+        return np.asarray(self.phase3, dtype=np.float16).tobytes()
 
 
-def softmax(source: np.ndarray) -> SoftmaxPhases:
+def softmax(source: np.ndarray, row_width: int | None = None) -> SoftmaxPhases:
     """算一个 Softmax 节点的五相。
 
     公式（节点 18 / 1024 元素，逐元素验证）：
@@ -254,16 +254,18 @@ def softmax(source: np.ndarray) -> SoftmaxPhases:
     flat = np.ascontiguousarray(source, dtype=np.float32).ravel()
     if not flat.size:
         raise ValueError("Softmax 的输入不能为空")
+    # 每行（一个查询 token）独立归约；不给行宽时整条一行（decode）。
+    rows = flat.reshape(-1, row_width or flat.size)
 
     # 用 fp16 截断后的 max 参与计算：硬件的 phase0 就是按 fp16 落盘的，
     # 后续各相读的是那个截断值，不是原始 f32 的 max。
-    maximum = float(np.float16(flat.max()))
-    phase1 = _fp16(np.exp(flat - maximum))
+    maximum = rows.max(axis=1, keepdims=True).astype(np.float16).astype(np.float32)
+    phase1 = _fp16(np.exp(rows - maximum))
 
-    total = float(np.float32(phase1.astype(np.float32).sum()))
-    reciprocal = float(np.float16(1.0 / total))
-    phase4 = _fp16(phase1.astype(np.float32) * reciprocal)
+    total = phase1.astype(np.float32).sum(axis=1, dtype=np.float32)
+    reciprocal = (1.0 / total).astype(np.float16)
+    phase4 = _fp16(phase1.astype(np.float32) * reciprocal.astype(np.float32)[:, None])
 
     return SoftmaxPhases(
-        source=_fp16(flat), phase0=-maximum, phase1=phase1,
-        phase2=total, phase3=reciprocal, phase4=phase4)
+        source=_fp16(flat), phase0=-maximum.ravel(), phase1=phase1.ravel(),
+        phase2=total, phase3=reciprocal, phase4=phase4.ravel())

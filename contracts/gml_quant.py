@@ -166,10 +166,11 @@ DQ_GROUP_SIZE_DEFAULT = WEIGHT_GROUP_SIZE
 DQ_GROUP_SIZE_ATTENTION_SCORES = 1024
 
 
-def dq_group_size(numel: int, *, is_attention_scores: bool) -> int:
-    """一个 DQ 节点的分组宽度。attention scores 整条当一组，其余按 128 切。"""
+def dq_group_size(numel: int, *, is_attention_scores: bool,
+                  row_width: int | None = None) -> int:
+    """一个 DQ 节点的分组宽度。attention scores 每行一组（不给行宽时整条一组），其余按 128 切。"""
     if is_attention_scores:
-        return numel
+        return row_width if row_width is not None else numel
     return DQ_GROUP_SIZE_DEFAULT
 
 

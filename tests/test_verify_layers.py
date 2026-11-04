@@ -323,6 +323,80 @@ def test_normalisation_check_catches_an_unnormalised_output(tmp_path: Path) -> N
     assert any("Σ" in line for line in _failed(report))
 
 
+def _multi_row_softmax(tmp_path: Path) -> list[str]:
+    """写一个两行、每行 4 个元素的合法 Softmax 产物。"""
+    files = WrittenFiles(tmp_path)
+    scores = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.float16).ravel()
+    write_softmax_phases(files, 18, softmax(scores, row_width=4))
+    nodes = parse_blocks(write_gml(
+        [Node(18, {"label": "sm", "name": "sm", "op_type": "Softmax"})],
+        [], version="26.2.1"), "node")
+    return nodes
+
+
+def test_softmax_checks_accept_multiple_query_rows(tmp_path: Path) -> None:
+    """prefill 每个查询行各有一条 phase0 记录，逐行检查都应通过。"""
+    nodes = _multi_row_softmax(tmp_path)
+    report = verify.Report()
+    verify.check_softmax_reduction_encodings(tmp_path, nodes, report)
+    verify.check_softmax_is_normalised(tmp_path, nodes, report)
+    assert not _failed(report), _failed(report)
+
+
+def test_softmax_checks_reject_a_bad_second_row(tmp_path: Path) -> None:
+    """第二行的编码或归一化被写坏时要定位到行。"""
+    nodes = _multi_row_softmax(tmp_path)
+    phase0 = tmp_path / "output_buffer_phase_0_18.bin"
+    raw = bytearray(phase0.read_bytes())
+    raw[4:6] = b"\x01\x00"
+    phase0.write_bytes(bytes(raw))
+    report = verify.Report()
+    verify.check_softmax_reduction_encodings(tmp_path, nodes, report)
+    assert any("低 2 字节非零" in line for line in _failed(report))
+
+    nodes = _multi_row_softmax(tmp_path)
+    phase4 = tmp_path / "output_buffer_phase_4_18.bin"
+    values = np.fromfile(phase4, dtype=np.float16)
+    values[4:] *= np.float16(2.0)
+    values.tofile(phase4)
+    report = verify.Report()
+    verify.check_softmax_is_normalised(tmp_path, nodes, report)
+    assert any("Σ" in line for line in _failed(report))
+
+
+def test_dequantization_divides_back_weight_sf_multiplier(tmp_path: Path) -> None:
+    """落盘 scale 已乘保护倍数，校验器反量化时要除回，否则小权重会被误报。"""
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from contracts.gml_quant import WEIGHT_GROUP_SIZE
+    from quant.weights import QuantizedWeight, quantize_weight
+    from gml_bridge.writer import Node, write_gml
+
+    model = LlamaForCausalLM(LlamaConfig(
+        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64)).eval()
+    model_dir = tmp_path / "model"
+    model.save_pretrained(model_dir)
+
+    weight = model.model.layers[0].self_attn.q_proj.weight.detach().numpy()
+    base = quantize_weight(weight)
+    # 落盘 scale 乘 4、反量化除回 4，数值与不乘时一致——厂商的次正规保护口径。
+    scales = (base.scales.astype(np.float32) * 4).astype(np.float16)
+    quantized = QuantizedWeight(base.values, scales, WEIGHT_GROUP_SIZE, multiplier=4)
+    quantized.values.astype(np.int8).tofile(tmp_path / "weight_buffer_5.bin")
+    scales.tofile(tmp_path / "weight_sf_5.bin")
+
+    nodes = parse_blocks(write_gml([Node(5, {
+        "label": "a_params_5", "name": "a_params_5",
+        "weight_buffer": "weight_buffer_5.bin", "weight_sf": "weight_sf_5.bin",
+        "weight_sf_multiplier": 4,
+    })], [], version="26.2.1"), "node")
+    report = verify.Report()
+    verify.check_dequantization_recovers_weights(tmp_path, nodes, model_dir, None, report)
+    assert not _failed(report), _failed(report)
+
+
 def test_zero_point_check_catches_a_nonzero_value(tmp_path: Path) -> None:
     np.ones(1, dtype=np.int32).tofile(tmp_path / "output_zp_1.bin")
 
@@ -393,3 +467,29 @@ def test_checks_stay_silent_when_there_is_nothing_to_check(tmp_path: Path) -> No
 
     assert not report.passed
     assert not report.failed
+
+
+def test_saturation_check_reads_input_major_layout(tmp_path: Path) -> None:
+    """落盘是「输入维 × 输出维」时，按入边宽度还原后再查饱和度；不还原则判失败。"""
+    from gml_bridge.writer import Edge
+    from quant.weights import quantize_weight, to_storage_order
+
+    rng = np.random.default_rng(0)
+    weight = rng.normal(0, 0.02, (256, 512)).astype(np.float32)
+    quantized = quantize_weight(weight)
+    to_storage_order(quantized.values, weight.shape).tofile(tmp_path / "weight_buffer_2.bin")
+    quantized.scales.tofile(tmp_path / "weight_sf_2.bin")
+
+    text = write_gml(
+        [Node(1, {"label": "x", "name": "x"}),
+         Node(2, {"label": "w", "name": "w", "weight_buffer_dtype": "int4"})],
+        [Edge(1, 2, "1x1x1x512")], version="26.2.1")
+    nodes, edges = parse_blocks(text, "node"), parse_blocks(text, "edge")
+
+    report = verify.Report()
+    verify.check_group_saturation(tmp_path, nodes, report, edges=edges)
+    assert not _failed(report), "按入边宽度还原后应当通过"
+
+    report = verify.Report()
+    verify.check_group_saturation(tmp_path, nodes, report)
+    assert _failed(report), "不还原时分组错位，应当判失败"

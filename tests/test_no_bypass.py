@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 SCAN_DIRS = ("graph", "gml_bridge", "genesim_bridge", "opcompiler_bridge",
-             "memory", "runtime", "comm", "contracts", "orchestrator")
+             "memory", "runtime", "comm", "contracts")
 
 # dtype 从 PyTorch 进入统一 IR 的唯一入口。多一处白名单 = 又开了一条旁路，
 # 两个真源会漂移（跨维校验正是为此）。

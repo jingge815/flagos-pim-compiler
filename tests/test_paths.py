@@ -110,7 +110,7 @@ def test_checked_in_code_has_no_machine_absolute_paths() -> None:
     for base in (
         "tests", "scripts", "genesim_bridge", "opcompiler_bridge",
         "gml_bridge", "backend", "graph", "comm", "memory", "runtime",
-        "contracts", "orchestrator", "quant", "examples",
+        "contracts", "quant", "examples",
     ):
         folder = root / base
         if not folder.is_dir():
@@ -123,3 +123,19 @@ def test_checked_in_code_has_no_machine_absolute_paths() -> None:
             if "/media/disk/fengjingge" in path.read_text(encoding="utf-8"):
                 hits.append(str(path.relative_to(root)))
     assert not hits, f"站点绝对路径漏出了 paths.json: {hits}"
+
+
+def test_ceva_paths_are_configurable(monkeypatch, tmp_path) -> None:
+    _use_config(monkeypatch, tmp_path, {"ceva_workspace": "/customer/ceva"})
+    monkeypatch.setenv("CEVA_REFERENCE_DIR", "/override/GMLs")
+
+    assert paths.ceva_workspace() == Path("/customer/ceva")
+    assert paths.ceva_reference_dir() == Path("/override/GMLs")
+
+
+def test_ceva_embedding_is_configurable(monkeypatch, tmp_path) -> None:
+    """厂商已旋转的 embedding（标定输入用），可用环境变量覆盖。"""
+    _use_config(monkeypatch, tmp_path, {"ceva_embedding": "/c/embed_torch.pth"})
+    assert paths.ceva_embedding() == Path("/c/embed_torch.pth")
+    monkeypatch.setenv("CEVA_EMBEDDING", "/o/e.pth")
+    assert paths.ceva_embedding() == Path("/o/e.pth")

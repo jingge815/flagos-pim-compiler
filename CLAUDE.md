@@ -76,5 +76,7 @@ AI 辅助开发最容易堆出大量重复、投机、永不执行的代码。�
 ## 提交
 
 - 身份 `fengjg <fengjg@ios.ac.cn>`（已配为本仓 local identity）。不加 `Co-Authored-By`，不署 Claude/AI。
-- 仅在用户明确要求时提交；用 `git add <具体文件>`，不用 `git add .`。
+- **用户没有明确说「提交」就不准 commit**。改完只报告改动，等用户下令；上一次同意提交不代表这次也可以。
+- 提交时用 `git add <具体文件>`，不用 `git add .`。
+- 改写历史（amend、rebase、filter-branch）同样要用户明确同意。
 - 提交信息用简洁句，说明改了什么、为什么。

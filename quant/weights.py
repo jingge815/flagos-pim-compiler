@@ -17,6 +17,9 @@ from contracts.gml_quant import (
     INT4_MAX,
     INT4_MIN,
     INT4_SCALE_DIVISOR,
+    INT8_MAX,
+    INT8_MIN,
+    INT8_SCALE_DIVISOR,
     WEIGHT_GROUP_SIZE,
 )
 
@@ -32,25 +35,30 @@ class QuantizedWeight:
     values: np.ndarray
     scales: np.ndarray
     group_size: int
+    # 次正规保护倍数：落盘 scale 已乘它，FPSU 再除回（GML 的 `weight_sf_multiplier`）。
+    multiplier: int = 1
 
     def dequantize(self) -> np.ndarray:
         """还原成 f32，用来量化误差。"""
         grouped = self.values.reshape(-1, self.group_size).astype(np.float32)
-        return (grouped * self.scales.astype(np.float32)[:, None]).ravel()
+        scales = self.scales.astype(np.float32) / self.multiplier
+        return (grouped * scales[:, None]).ravel()
 
 
 def quantize_weight(
-    weight: np.ndarray, *, group_size: int = WEIGHT_GROUP_SIZE
+    weight: np.ndarray, *, group_size: int = WEIGHT_GROUP_SIZE,
+    guard_subnormal: bool = False,
 ) -> QuantizedWeight:
     """按组量化一个权重张量。
 
-    每组独立取 scale：`scale = max(|w|) / 8`，即 absmax 映射到 **8**（满量程），
-    再 clamp 到 `[-8, 7]`。
+    每组独立取 scale：`scale = max(正峰 / 7, 负峰 / 8)`，再 clamp 到 `[-8, 7]`。
+    两端各按自己的满量程定 scale，取较紧的一侧，所以两端都不饱和。
 
-    分母是 8 而不是 7，这是实测结论：分母取 7 时 `|q| = 8` 数学上不可能出现
-    （`round(absmax / (absmax/7)) = 7`），而实测 5 个权重张量共 15000 组里
-    有 7801 组（52%）含 `q = -8`。分母 8 下 absmax 那一侧会 clamp 掉 1 个码点
-    （正端 8 -> 7），代价是 1 个 LSB，换来的是与实物一致的 scale。
+    这是厂商量化器的口径：厂商第 0 层 4 个投影用它重新量化，码值 99.998%、
+    scale 99.99% 一致，absmax/8 只有 92%。
+
+    `guard_subnormal` 打开时（动态量化的 Gemm），最小 scale 落进 fp16 次正规区就整张
+    乘 `2^ceil(log2(tiny / 最小 scale))` 再存，倍数记在 `multiplier`（厂商 `save_scale` 规则）。
 
     元素数必须能被 `group_size` 整除——不能整除就抛，静默补零会让 scale 与权重
     错位，而这种错在结构校验里看不出来。
@@ -61,14 +69,60 @@ def quantize_weight(
             f"权重有 {flat.size} 个元素，不能被 group_size {group_size} 整除")
 
     grouped = flat.reshape(-1, group_size)
-    # 全零组的 scale 取 1 而不是 0：除以 0 会产出 nan，而全零权重量化后本就该是全零。
-    peak = np.abs(grouped).max(axis=1)
-    scales = np.where(peak > 0, peak / INT4_SCALE_DIVISOR, 1.0).astype(np.float16)
+    exact = _group_scales(grouped)
+    multiplier = _multiplier_for(exact) if guard_subnormal else 1
+    scales = (exact * multiplier).astype(np.float16)
 
-    quantized = np.rint(grouped / scales.astype(np.float32)[:, None])
+    # 码值按落盘 scale 还原后的有效值算，反量化与硬件看到的是同一个数。
+    effective = scales.astype(np.float32) / multiplier
+    quantized = np.rint(grouped / effective[:, None])
     values = np.clip(quantized, INT4_MIN, INT4_MAX).astype(np.int8)
 
-    return QuantizedWeight(values.ravel(), scales, group_size)
+    return QuantizedWeight(values.ravel(), scales, group_size, multiplier)
+
+
+def _group_scales(grouped: np.ndarray) -> np.ndarray:
+    """逐组精确 scale（f32）。全零组取 1：除以 0 会产出 nan，而全零权重量化后本就该是全零。"""
+    peak = np.maximum(grouped.max(axis=1) / INT4_MAX,
+                      -grouped.min(axis=1) / INT4_SCALE_DIVISOR)
+    return np.where(peak > 0, peak, 1.0)
+
+
+def _multiplier_for(scales: np.ndarray) -> int:
+    tiny = float(np.finfo(np.float16).tiny)
+    if scales.min() >= tiny:
+        return 1
+    return int(2 ** np.ceil(np.log2(tiny / scales.min()) - 1e-9))
+
+
+def subnormal_multiplier(weight: np.ndarray, *, group_size: int = WEIGHT_GROUP_SIZE) -> int:
+    """这张权重的次正规保护倍数，与 `quantize_weight(guard_subnormal=True)` 同一口径。"""
+    flat = np.ascontiguousarray(weight, dtype=np.float32).ravel()
+    return _multiplier_for(_group_scales(flat.reshape(-1, group_size)))
+
+
+def quantize_weight_int8(weight: np.ndarray) -> QuantizedWeight:
+    """int8 per-tensor 对称量化，scale = absmax / 128（输出头的静态量化口径）。
+
+    厂商输出头权重用这条规则重新量化，码值 100% 一致。
+    """
+    flat = np.ascontiguousarray(weight, dtype=np.float32).ravel()
+    peak = float(np.abs(flat).max()) if flat.size else 0.0
+    scale = np.float16(peak / INT8_SCALE_DIVISOR if peak > 0 else 1.0)
+    values = np.clip(np.rint(flat / np.float32(scale)), INT8_MIN, INT8_MAX).astype(np.int8)
+    return QuantizedWeight(values, np.full(1, scale, dtype=np.float16), flat.size)
+
+
+def to_storage_order(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """「输出维 × 输入维」的码值转成落盘的「输入维 × 输出维」（厂商 GC 按此读）。"""
+    out_features, in_features = shape
+    return np.ascontiguousarray(values.reshape(out_features, in_features).T).ravel()
+
+
+def from_storage_order(stored: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """`to_storage_order` 的逆：落盘字节还原成「输出维 × 输入维」，供核对反量化。"""
+    out_features, in_features = shape
+    return np.ascontiguousarray(stored.reshape(in_features, out_features).T).ravel()
 
 
 def quantization_error(weight: np.ndarray, quantized: QuantizedWeight) -> float:

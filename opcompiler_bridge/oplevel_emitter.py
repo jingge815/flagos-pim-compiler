@@ -43,7 +43,7 @@ from torch.fx import GraphModule, Node as FxNode
 
 from contracts import gml_hw_table as hw_table
 from contracts.graph_meta import FUSED_TAIL_META_KEY
-from contracts.unified_ir import STAGE_FUSED, require_stage
+from contracts.unified_ir import STAGE_FUSED, STATIC_QUANT_META_KEY, require_stage
 from graph.fuse_pim import RMS_NORM_META_KEY
 from graph.fuse_rope import ROPE_META_KEY
 from graph.quant_pass import DQ_META_KEY
@@ -288,6 +288,22 @@ def _emit_normalize(node: FxNode) -> tuple[str, EmittedOp] | None:
                            expected_phases=0)
 
 
+def _emit_static_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
+    """静态量化矩阵乘：int8 激活乘 int8 权重，定点累加，FPSU 转回 fp16。"""
+    out_shape = _shape_of(node)
+    src_shape = _shape_of(node.args[0])
+    if out_shape is None or src_shape is None:
+        return None
+    n = out_shape[-1]
+    m = _numel(out_shape) // n
+    func = f"{_sanitize(node.name)}__static_matmul"
+    body = matmul_kernel(func, m, src_shape[-1], n, elem_bits=8, out_dtype="f16",
+                         nmu_mode="fixed_point", scale_mode="fixed_point",
+                         fpsu_mode="fixed2float")
+    return body, EmittedOp(func=func, kind="static_matmul", fx_name=node.name,
+                           expected_phases=0)
+
+
 def _emit_fused_matmul(node: FxNode) -> tuple[str, EmittedOp] | None:
     """带尾部激活的矩阵乘 -> `pim.matmul` 加独立 `pim.lut`。
 
@@ -424,6 +440,8 @@ def emit_oplevel_mlir(gm: GraphModule) -> EmitReport:
                 candidates.append(_emit_dq_for_rope(node))
         elif DQ_META_KEY in node.meta:
             candidates.append(_emit_dq(node))
+        if not candidates and node.meta.get(STATIC_QUANT_META_KEY):
+            candidates.append(_emit_static_matmul(node))
         if not candidates and _is_softmax(node):
             candidates.append(_emit_softmax(node))
         # 带尾部激活的主算子：激活一律发成独立 pim.lut，由算子层融合折回。

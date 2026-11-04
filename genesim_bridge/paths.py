@@ -22,6 +22,9 @@ _ENV_VARS = {
     "gml_reference_dir": "GML_REFERENCE_DIR",
     "gml_llama2_reference_dir": "GML_LLAMA2_REFERENCE_DIR",
     "gml_ours_graph": "GML_OURS_GRAPH",
+    "ceva_workspace": "CEVA_WORKSPACE",
+    "ceva_reference_dir": "CEVA_REFERENCE_DIR",
+    "ceva_embedding": "CEVA_EMBEDDING",
 }
 
 # PIM 编译 pass 使用的默认硬件参数。
@@ -185,6 +188,21 @@ def gml_ours_graph(*, required: bool = True) -> Path | None:
     if path is not None or not required:
         return path
     return _resolve("gml_ours_graph")
+
+
+def ceva_workspace() -> Path:
+    """CEVA 工作区根目录（含 run_all.sh），厂商 GC 与仿真都在这里跑。"""
+    return _resolve("ceva_workspace")
+
+
+def ceva_reference_dir() -> Path:
+    """厂商 65 图根目录（只读）：runner 契约与反量化浮点权重的来源。"""
+    return _resolve("ceva_reference_dir")
+
+
+def ceva_embedding() -> Path:
+    """厂商已旋转的 embedding（`embed_torch.pth`），CEVA 标定的输入与 runner 同源。"""
+    return _resolve("ceva_embedding")
 
 
 def genesim_root(*, required: bool = True) -> Path | None:

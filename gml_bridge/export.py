@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,7 +269,8 @@ def _dq_specs(gm: GraphModule, nodes: list[Node], extra: dict | None = None,
             numel, group = slots.dq_layout(
                 last, is_attention_scores=spec.is_attention_scores,
                 group_size=spec.group_size)
-            spec = replace(spec, numel=numel, group_size=group)
+            # 一行是一个 token；prefill 一张图量化 `tokens` 行（与 GML 的 original_shape 同源）。
+            spec = replace(spec, numel=numel * slots.tokens, group_size=group)
         specs[node_id] = spec
     if extra:
         specs.update(extra)
@@ -452,7 +455,7 @@ def export_llama2(
 
 def write_runtime_files(
     artifact: GmlArtifact, out_dir: Path, *, gm: GraphModule | None = None,
-    verbose: bool = False,
+    verbose: bool = False, scales=None,
 ) -> "WrittenFiles":
     """按 GML 引用的清单把 `.bin` 写出来，并交叉校验两侧一致。
 
@@ -466,6 +469,9 @@ def write_runtime_files(
     `verbose` 打印每个 DQ 节点的标定中间态（`DynamicScalingPhases.__repr__`），
     满足需求三非功能需求4「标定中间产物要能 print 出可读文本」（评审 r4 问题1）。
     默认关闭：37 个 DQ 节点逐个打印会刷屏，正常导出不需要。
+
+    `scales`（`quant.calibration.ActivationScales`）给了时，KV cache 与静态 int8
+    入口的 scale 取它的标定值；不给则取 `calib_data` 内置常数。
     """
     from gml_bridge.runtime_files import (
         WrittenFiles,
@@ -473,6 +479,7 @@ def write_runtime_files(
         write_activation_scale,
         write_data_buffer,
         write_dq_phases,
+        write_fixed_point_scaling,
         write_fused_silu_lut,
         write_identity_lut,
         write_scaling,
@@ -489,7 +496,7 @@ def write_runtime_files(
     )
     from gml_bridge import calib_data
     from gml_bridge.phase_data import dynamic_scaling, softmax
-    from quant.weights import quantize_weight
+    from quant.weights import quantize_weight, quantize_weight_int8
 
     out_dir.mkdir(parents=True, exist_ok=True)
     files = WrittenFiles(out_dir)
@@ -519,7 +526,7 @@ def write_runtime_files(
     dq_phases = {
         n.node_id: dynamic_scaling(
             _dq_source(gm, artifact, n.node_id, spec),
-            group_size=None if spec.is_attention_scores else spec.group_size)
+            group_size=spec.group_size)
         for n in artifact.nodes
         if (spec := artifact.dq_specs.get(n.node_id)) is not None
     }
@@ -538,7 +545,8 @@ def write_runtime_files(
             write_dq_phases(
                 files, node.node_id, phases,
                 per_group_fpsu=node.fields.get("op_type")
-                == "Llama2ActivationDQ")
+                == "Llama2ActivationDQ",
+                fpsu_groups=spec.groups // slots.tokens if rewrite else None)
             # 输出 requant scale 逐字节等于 phase1（下游走跨节点引用时读它），
             # 所以直接取那一相，不另写一份。
             write_output_scale(files, node.node_id, phases.output_scale)
@@ -569,12 +577,13 @@ def write_runtime_files(
         # 变 -0.0、phase1 全 1.0、phase2 = 组长，那是「没算」而不是算出来的，
         # 与 `_dq_source` 同一类问题（设计 3.3 的判定原则）。
         if node.fields.get("op_type") == "Softmax":
-            softmax_numel = slots.seq if rewrite else elements_between.get(
+            softmax_numel = slots.seq * slots.tokens if rewrite else elements_between.get(
                 (sources.get(0), node.node_id), 1)
+            # prefill 一张图有 tokens 行，每行 seq 宽，逐行归约（与 rewrite 时的槽位同源）。
             write_softmax_phases(
                 files, node.node_id,
-                softmax(calib_data.activation_for(softmax_numel)
-                        .astype(np.float32)))
+                softmax(calib_data.activation_for(softmax_numel).astype(np.float32),
+                        row_width=slots.seq if rewrite else None))
             # **不能 continue**：Softmax 节点的 `input_buffer`/`input_sf`
             # 仍走通用路径（它在图里是一条边的消费者），同 DQ 的道理。
 
@@ -620,7 +629,7 @@ def write_runtime_files(
                     files._write(
                         value,
                         np.full(1, _kantor_scale_of(key, node, by_id,
-                                                    consumers_of),
+                                                    consumers_of, scales),
                                 dtype=np.float16))
             elif key == "RMSNorm_Add_Const":
                 # eps 取自图里读出的真实值，不假设 config.json。
@@ -632,7 +641,7 @@ def write_runtime_files(
                 # 不能各写一份——写死 1.0 会在 _output_scale_of 将来对
                 # RMSNorm 给出别的值时静默盖掉计算结果（评审 r4 问题3）。
                 write_output_scale(
-                    files, node.node_id, _output_scale_of(node, by_id),
+                    files, node.node_id, _output_scale_of(node, by_id, scales),
                     dtype=scale_dtype)
             elif _is_rope_file(key):
                 # **必须排在通用 Scaling_buffer_file 分支之前**：
@@ -652,20 +661,28 @@ def write_runtime_files(
                 # 分支算成 1.0，与同一处注释自称的 2.0 打架（评审 r7 问题 5）。
                 scaling = node.fields.get(_ATTENTION_SCALE_FIELD)
                 slot = _slot_of(key)
-                is_kv_dma = node.fields.get("op_type") == "KV_Cache_DMA"
+                mode = node.fields.get(
+                    "fpsu_mode" if slot is None else f"fpsu_mode_{slot}")
+                if mode in _FIXED_POINT_FPSU_MODES:
+                    # 定点 FPSU：缩放因子编成 int16 mul + 右移（KV DMA 进出同 scale 得 16384/14）。
+                    write_fixed_point_scaling(
+                        files, node.node_id,
+                        _fixed_point_factor(node, by_id, gm, artifact, scales, mode),
+                        slot=slot)
+                    continue
                 if scaling is not None:
                     scale_val = float(scaling)
-                elif is_kv_dma:
-                    scale_val = 2.0
                 else:
                     multiplier = int(node.fields.get("weight_sf_multiplier") or 1)
                     scale_val = 1.0 / multiplier
-                write_scaling(
-                    files, node.node_id, scale_val,
-                    post_shift=14 if is_kv_dma else 0,
-                    slot=slot)
+                write_scaling(files, node.node_id, scale_val, slot=slot)
             elif key.startswith(("Bias_buffer_file", "Scaling_PS_buffer_file")):
                 continue  # 与 Scaling_buffer_file 同一次写出（三族一起）
+            elif (key in ("output_sf", "output_zp")
+                  and re.match(r"input_(\d+_)?(sf|zp)_", value)):
+                # 输出定标引用消费者的 input_sf/zp 文件（厂商口径：入口缓冲、直连出口的
+                # 布局算子），文件属于消费者，由消费者写一次。
+                continue
             elif key.startswith("updates_") and not key.endswith("_dtype"):
                 # updates 那一路的量化参数，按本节点编号。sf 与本节点的
                 # output_sf 同一块 cache、同一个 scale（P0-2：quantize/
@@ -676,7 +693,7 @@ def write_runtime_files(
                     write_named_buffer(
                         files, value, 1, dtype=np.float16,
                         content=np.full(
-                            1, _output_scale_of(node, by_id), dtype=np.float16))
+                            1, _output_scale_of(node, by_id, scales), dtype=np.float16))
             elif "_zp" in key and not key.endswith("_dtype"):
                 # 对称量化：4 字节 int32 的 0，但文件必须存在。
                 write_zero_point(files, value)
@@ -685,7 +702,7 @@ def write_runtime_files(
                 # —— 走 write_output_scale。落到下面那个 input_sf 分支会
                 # 写成 input_sf_<id>.bin，两边都错（一个悬空、一个多余）。
                 write_output_scale(
-                    files, node.node_id, _output_scale_of(node, by_id),
+                    files, node.node_id, _output_scale_of(node, by_id, scales),
                     dtype=scale_dtype)
             elif (key.startswith("input_")
                   and value.startswith(("output_buffer", "weight_buffer"))):
@@ -716,7 +733,7 @@ def write_runtime_files(
                 # `input_` 分支已 continue），不走这里。
                 write_activation_scale(
                     files, node.node_id,
-                    _input_scale_of(node, by_id, slot),
+                    _input_scale_of(node, by_id, slot, scales),
                     slot, dtype=scale_dtype)
             elif key.startswith("input_buffer"):
                 source = sources.get(slot if slot is not None else 0)
@@ -731,7 +748,7 @@ def write_runtime_files(
                     elif slot == 2:
                         count = slots.kv_new_elems
                 elif op == "Mask" and slot == 1 and rewrite:
-                    count = slots.seq
+                    count = slots.seq * slots.tokens
                 declared = node.fields.get(
                     f"{key}_dtype" if slot is None
                     else f"input_buffer_{slot}_dtype",
@@ -741,7 +758,16 @@ def write_runtime_files(
                     dtype = np.float16
                 elif declared == "int16":
                     dtype = np.int16
-                if value == names.data_buffer(node.node_id, slot):
+                const = node.fields.get("pim_rope_const")
+                if const is not None and slot in (1, 2) and gm is not None:
+                    # prefill 的 cos/sin 是编译期常量：直接落图里的表，Registry 会嵌进去。
+                    table = _attr_tensor(gm, const[slot - 1]).detach().float().clone()
+                    if slot == 1 and const[2] == "standard":
+                        # 硬件 sin 槽是后半维取反的编码（与 decode 时 runner 传入的一致）；
+                        # 导出把 sin×符号折成了 HF 的 sin，这里还原。
+                        table[..., table.shape[-1] // 2:] *= -1
+                    files._write(value, table.numpy().astype(np.float16).ravel())
+                elif value == names.data_buffer(node.node_id, slot):
                     # 这条边的上游是图入口缓冲时，内容取那个入口自己的标定
                     # 常数（cos / sin / mask / kv_position 各一份），不是
                     # hidden state 平铺（评审 r7 问题 1）。
@@ -790,9 +816,14 @@ def write_runtime_files(
                                 count, dtype=np.int8,
                                 content=placeholder_weight(node.node_id, count))
                         if names.weight_scale(node.node_id) not in files.names_written:
+                            # 权重通路读的是 int8 KV cache 切片，scale 即那块 cache 的 scale。
+                            role = _kv_role_of(
+                                by_id.get(node.fields.get("input1_node_id")), by_id)
                             files._write(
                                 names.weight_scale(node.node_id),
-                                np.array([1.0], dtype=np.float16))
+                                np.array([1.0 if role is None else
+                                          _kv_scale(scales, is_key=role)],
+                                         dtype=np.float16))
                     continue
                 if already:
                     continue
@@ -803,16 +834,20 @@ def write_runtime_files(
                     # weight_sf_25 是单个 **fp32**（= 1/127）。
                     # 走 int4 per-group 会因 4096 % 128 的分组语义完全错位。
                     write_per_tensor_weight(files, node.node_id, tensor)
+                elif node.fields.get("weight_buffer_dtype") == "int8":
+                    # 静态量化矩阵乘（输出头）：int8 per-tensor。
+                    write_weight(files, node.node_id, quantize_weight_int8(tensor),
+                                 shape=tensor.shape)
                 else:
-                    quantized = quantize_weight(tensor)
-                    multiplier = int(node.fields.get("weight_sf_multiplier") or 1)
-                    if multiplier != 1:
-                        # 幂等：只乘一次。scale 已带倍数则不再乘。
-                        scales = quantized.scales.astype(np.float32) * multiplier
-                        quantized = type(quantized)(
-                            quantized.values, scales.astype(quantized.scales.dtype),
-                            quantized.group_size)
-                    write_weight(files, node.node_id, quantized)
+                    quantized = quantize_weight(
+                        tensor, guard_subnormal=bool(
+                            node.fields.get("use_dynamic_quantization")))
+                    declared = int(node.fields.get("weight_sf_multiplier") or 1)
+                    if quantized.multiplier != declared:
+                        raise ValueError(
+                            f"节点 {node.node_id} 声明的 weight_sf_multiplier {declared} "
+                            f"与量化得出的 {quantized.multiplier} 不一致")
+                    write_weight(files, node.node_id, quantized, shape=tensor.shape)
             elif value == names.phase_output_buffer_self(node.node_id):
                 # phase 型节点自命名的输出缓冲：装本节点的完整输出
                 # （量化后的 int8），不是某条边的数据。参考产物上它与
@@ -945,8 +980,46 @@ def _kantor_mode_key(key: str) -> str:
     return f"kantor_mode_{suffix}" if suffix else "kantor_mode"
 
 
+def _kv_scale(scales, *, is_key: bool) -> float:
+    """K/V cache 的 scale：有标定用标定，否则用 `calib_data` 内置常数。"""
+    if scales is not None:
+        return scales.kv(is_key=is_key)
+    from gml_bridge import calib_data
+    return calib_data.kv_cache_scale(is_key=is_key)
+
+
+def _static_input_scale(node: Node, scales) -> float:
+    """静态 int8 入口的标定 scale，按产生这条边的 FX 节点名取。没有标定就抛，不猜。"""
+    name = node.fields["pim_static_quant_input"]
+    if scales is None:
+        raise ValueError(f"节点 {node.node_id} 是静态 int8 入口（{name}），需要标定 scale")
+    return scales.static(name)
+
+
+# 定点 FPSU 模式：Scaling 三族是 int16 mul + 右移，不是 fp16 系数。
+_FIXED_POINT_FPSU_MODES = frozenset({"fixed_point", "fixed2float"})
+
+
+def _fixed_point_factor(node: Node, by_id, gm, artifact, scales, mode: str) -> float:
+    """定点 FPSU 要编码的缩放因子（厂商 `calculate_rescale`）。
+
+    - `fixed2float`：int 累加结果转回浮点，因子 = 输入 scale × 权重 scale；
+    - `fixed_point`：定点到定点，因子 = 输入 scale / 输出 scale（KV DMA 进出同 scale 为 1）。
+    """
+    if mode == "fixed2float":
+        from quant.weights import quantize_weight_int8
+
+        tensor = _weight_tensor(gm, artifact, node.node_id)
+        if tensor is None:
+            raise ValueError(f"节点 {node.node_id} 是 fixed2float 但取不到权重")
+        weight_sf = float(quantize_weight_int8(tensor).scales[0])
+        return _input_scale_of(node, by_id, None, scales) * weight_sf
+    return (_input_scale_of(node, by_id, None, scales)
+            / _output_scale_of(node, by_id, scales))
+
+
 def _kantor_scale_of(key: str, node: Node, by_id: dict[int, Node],
-                     consumers_of: dict[int, list[int]]) -> float:
+                     consumers_of: dict[int, list[int]], scales=None) -> float:
     """非 phase 的 Kantor scale 取值：**按族**看这一族的 `kantor_mode`。
 
     | `kantor_mode` | 取值 | 含义 |
@@ -977,11 +1050,11 @@ def _kantor_scale_of(key: str, node: Node, by_id: dict[int, Node],
             f"{mode_key!r}，判不出这一族做不做定点化")
     if str(mode) != _KANTOR_FIXED_POINT_MODE:
         return 1.0
-    own = _output_scale_of(node, by_id)
+    own = _output_scale_of(node, by_id, scales)
     if own != 1.0:
         return 1.0 / own
     is_key = _kv_cache_written_by(node, by_id, consumers_of)
-    return 1.0 / calib_data.kv_cache_scale(is_key=is_key)
+    return 1.0 / _kv_scale(scales, is_key=is_key)
 
 
 def _kv_cache_written_by(node: Node, by_id: dict[int, Node],
@@ -1004,7 +1077,10 @@ def _kv_cache_written_by(node: Node, by_id: dict[int, Node],
             downstream = by_id.get(consumer)
             if downstream is None:
                 continue
-            if downstream.fields.get("op_type") == "KV_Cache_DMA":
+            # decode 写进 KV_Cache_DMA；prefill 直接写 key/value_cache_out 出口，两者都带角色。
+            if downstream.fields.get("op_type") == "KV_Cache_DMA" or (
+                    downstream.fields.get("is_buffer")
+                    and "pim_kv_is_key" in downstream.fields):
                 roles.add(bool(downstream.fields.get("pim_kv_is_key")))
                 continue
             queue.append(consumer)
@@ -1036,7 +1112,7 @@ def _kantor_shift_of(key: str, node: Node) -> int:
     return DQ_PHASE3_SHIFT if str(mode) == _KANTOR_FIXED_POINT_MODE else 0
 
 
-def _output_scale_of(node: Node, by_id: dict[int, Node]) -> float:
+def _output_scale_of(node: Node, by_id: dict[int, Node], scales=None) -> float:
     """这个节点输出的 requant scale。
 
     输出落进 int8 的 KV cache 的那几个带真实 scale，其余留在 fp16 域故为 1.0：
@@ -1045,7 +1121,7 @@ def _output_scale_of(node: Node, by_id: dict[int, Node]) -> float:
     | --- | --- |
     | `KV_Cache_DMA` | 本节点写的是 K 还是 V cache |
     | `Split` | 从 cache 切出，继承上游 DMA 的同一个 scale |
-    | `Gemm` 的 v_proj | 输出要写进 value cache，带 requant scale |
+    | 写进 V cache 的 `Gemm` | 输出要写进 value cache，带 requant scale |
     | 其余 | 1.0 |
 
     进出同一块 cache 共用同一个 scale，所以三处都从 `calib_data.kv_cache_scale`
@@ -1058,13 +1134,14 @@ def _output_scale_of(node: Node, by_id: dict[int, Node]) -> float:
     from gml_bridge import calib_data
 
     op_type = node.fields.get("op_type")
+    if op_type == "RMSNorm_vpu" and node.fields.get("pim_static_quant_input"):
+        return _static_input_scale(node, scales)
     is_key = _kv_role_of(node, by_id)
     if is_key is not None:
-        return calib_data.kv_cache_scale(is_key=is_key)
-    if op_type == "Gemm" and "v_proj" in str(
-            node.fields.get("pim_weight_param") or ""):
-        # v_proj 的输出写进 int8 的 value cache，与那块 cache 同一个 scale。
-        return calib_data.kv_cache_scale(is_key=False)
+        return _kv_scale(scales, is_key=is_key)
+    if op_type == "Gemm" and node.fields.get("output_buffer_dtype") == "int8":
+        # 输出定点化成 int8 的投影只有写 value cache 的那一个（GML 已声明），取 V cache 的 scale。
+        return _kv_scale(scales, is_key=False)
     if op_type in _FP16_DOMAIN_OP_TYPES:
         return 1.0
     raise ValueError(
@@ -1092,7 +1169,7 @@ _LAYOUT_OP_TYPES = frozenset({"Split", "Transpose", "Reshape", "Concat"})
 
 
 def _input_scale_of(node: Node, by_id: dict[int, Node],
-                    slot: int | None) -> float:
+                    slot: int | None, scales=None) -> float:
     """一条**按本节点自命名**的输入 `input_sf` 该写什么值。
 
     定点数据的逐组 scale 属于产生它的那个 DQ，由那个 DQ 自己写盘、消费者只
@@ -1113,8 +1190,9 @@ def _input_scale_of(node: Node, by_id: dict[int, Node],
     """
     kv_role = _kv_role_of(node, by_id)
     if kv_role is not None:
-        from gml_bridge import calib_data
-        return calib_data.kv_cache_scale(is_key=kv_role)
+        return _kv_scale(scales, is_key=kv_role)
+    if node.fields.get("pim_static_quant_input"):
+        return _static_input_scale(node, scales)
 
     declared = node.fields.get(
         "input_buffer_dtype" if slot is None
@@ -1172,20 +1250,47 @@ def _quant_producer_of(node: Node, by_id: dict[int, Node]) -> int | None:
     return None
 
 
-def _kv_role_of(node: Node, by_id: dict[int, Node]) -> bool | None:
+def _kv_role_of(node: Node | None, by_id: dict[int, Node]) -> bool | None:
     """这个节点是不是 KV cache 那一路；是则返回它写/读的是 K 还是 V。
 
     `KV_Cache_DMA` 与两个 cache 出口缓冲自己带 `pim_kv_is_key`；`Split` 不带，
     要看它的上游是不是 DMA —— Q 路的 Split 上游是 RoPE，不属于这一路。
     """
+    if node is None:
+        return None
     if "pim_kv_is_key" in node.fields:
         return bool(node.fields.get("pim_kv_is_key"))
     if node.fields.get("op_type") != "Split":
         return None
+    # K 路在 DMA 与 Split 之间隔着整体转置，沿布局算子往上找。
     source = by_id.get(node.fields.get("input0_node_id"))
-    if source is None or source.fields.get("op_type") != "KV_Cache_DMA":
+    while source is not None and source.fields.get("op_type") in ("Transpose", "Reshape"):
+        source = by_id.get(source.fields.get("input0_node_id"))
+    if source is None:
         return None
-    return bool(source.fields.get("pim_kv_is_key"))
+    if source.fields.get("op_type") == "KV_Cache_DMA":
+        return bool(source.fields.get("pim_kv_is_key"))
+    # prefill 没有 DMA：上游就是写 cache 出口的那个算子（K 路 RoPE、v_proj），看它的出口角色。
+    return _feeds_cache(source, by_id)
+
+
+def _feeds_cache(node: Node, by_id: dict[int, Node]) -> bool | None:
+    """沿输出与布局算子往下，第一个 KV_Cache_DMA 或 K/V 出口的角色；都没有则 None。"""
+    stack, seen = [node], {node.node_id}
+    while stack:
+        current = stack.pop()
+        for key, value in current.fields.items():
+            if not re.fullmatch(r"output\d+_node_id", key) or value in seen:
+                continue
+            seen.add(value)
+            child = by_id.get(value)
+            if child is None:
+                continue
+            if "pim_kv_is_key" in child.fields:
+                return bool(child.fields["pim_kv_is_key"])
+            if child.fields.get("op_type") in ("Transpose", "Reshape"):
+                stack.append(child)
+    return None
 
 
 def _consumer_of(artifact, buffer_name):
@@ -1243,6 +1348,13 @@ def _epsilon_of(
         if fusion is not None and node.name == label:
             return fusion.epsilon
     return 1e-05
+
+
+def _attr_tensor(gm: GraphModule, target: str):
+    obj = gm
+    for part in target.split("."):
+        obj = getattr(obj, part)
+    return obj
 
 
 def _weight_tensor(

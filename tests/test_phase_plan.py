@@ -299,3 +299,36 @@ module {
     # `floating_point_32` 是 32 位累加通路的模式，对应卡值 2。
     assert plan.op_attrs["fpsu-mode"] == 2
     assert plan.op_attrs["activation-mode"] == 0
+
+
+_PHASES_WITH_READS = """
+module {
+  tt.func @dq(%x: tensor<1x4096xf16>) {
+    %a = pim.global_pool %x {kind = #pim.pool_kind<absmax>, phases = [#pim.phase_spec<index = 0, bytes = 64, unit = pooling>]} : tensor<1x4096xf16> -> tensor<32xf16>
+    %b = pim.lut %a {kind = #pim.lut_kind<identity>, phases = [#pim.phase_spec<index = 1, bytes = 64, unit = vpu, reads = [0]>]} : tensor<32xf16> -> tensor<32xf16>
+    %c = pim.lut %a {kind = #pim.lut_kind<reciprocal>, phases = [#pim.phase_spec<index = 2, bytes = 64, unit = vpu, reads = [0]>]} : tensor<32xf16> -> tensor<32xf16>
+    %d = pim.kantor %x, %c {phases = [#pim.phase_spec<index = 3, bytes = 4096, unit = kantor, reads = [2]>]} : tensor<1x4096xf16>, tensor<32xf16> -> tensor<1x4096xi8>
+    tt.return
+  }
+}
+"""
+
+
+def test_phase_reads_are_kept() -> None:
+    """相位读写关系保留下来：p1、p2 读 p0（扇出），p3 读 p2；没写 reads 的为空。"""
+    plan = parse_phase_plans(_PHASES_WITH_READS)["dq"]
+    assert [p.reads for p in plan.phases] == [(), (0,), (0,), (2,)]
+
+
+def test_fixed2float_fpsu_is_read_by_name() -> None:
+    """输出头的 FPSU 模式按名字读回，不靠整数卡值。"""
+    text = """
+module {
+  tt.func @head(%a: tensor<1x8xi8>, %b: tensor<8x4xi8>) {
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, fpsu = #pim.fpsu_spec<mode = fixed2float>} : tensor<1x8xi8>, tensor<8x4xi8> -> tensor<1x4xf16>
+    tt.return
+  }
+}
+"""
+    plan = parse_phase_plans(text)["head"]
+    assert plan.fpsu_mode_name == "fixed2float"

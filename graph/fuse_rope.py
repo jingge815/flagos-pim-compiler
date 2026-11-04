@@ -109,10 +109,36 @@ def _match(anchor: Node) -> RopeMatch | None:
         cos, sin = direct.args[1], rotated.args[1]
         if not (isinstance(cos, Node) and isinstance(sin, Node)):
             continue
+        absorbed = [direct, rotated] + rot_nodes
+        sin, encoding = _strip_sign_half(sin)
+        if encoding == "half_negated":
+            absorbed.append(rotated.args[1])
         return RopeMatch(
             source=source, cos=cos, sin=sin,
-            absorbed=[direct, rotated] + rot_nodes)
+            absorbed=absorbed, sin_encoding=encoding)
     return None
+
+
+def _strip_sign_half(sin: Node) -> tuple[Node, str]:
+    """认出 `sin * sign_half`（前半 +1、后半 -1 的常量），返回原始 sin 与编码。
+
+    输入 sin 的后半维已取反，乘这个符号向量是还原成 HF 编码；硬件按取反后的
+    编码直接计算，所以这一乘吸收进 RoPE，不能再做一次。
+    """
+    if not _is(sin, torch.ops.aten.mul.Tensor):
+        return sin, "standard"
+    raw, sign = sin.args[0], sin.args[1]
+    if not (isinstance(raw, Node) and isinstance(sign, Node) and sign.op == "get_attr"):
+        return sin, "standard"
+    value = getattr(sign.graph.owning_module, str(sign.target), None)
+    if not isinstance(value, torch.Tensor) or value.dim() != 1:
+        return sin, "standard"
+    half = value.shape[0] // 2
+    expected = torch.ones_like(value)
+    expected[half:] = -1
+    if not torch.equal(value, expected):
+        return sin, "standard"
+    return raw, "half_negated"
 
 
 def fuse_rope(gm: GraphModule) -> RopeReport:

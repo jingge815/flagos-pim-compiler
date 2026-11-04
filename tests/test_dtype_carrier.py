@@ -167,16 +167,12 @@ def test_buffer_dtypes_derive_from_the_single_source() -> None:
 
 
 def test_encoding_tables_only_key_on_known_dtypes() -> None:
-    """两张编码表的键必须是真源子集。
+    """编码表的键必须是真源子集。
 
-    它们的**值**是两套不同的编号（DT_FP16=1 vs DATA_EXTENSION["int8"]=1），
-    刻意不归一；但**键**必须来自同一个类型集合，否则会出现
-    「某处认识 bf16 而另一处不认识」的分裂。
+    **键**必须来自同一个类型集合，否则会出现「某处认识 bf16 而另一处不认识」
+    的分裂。
     """
-    from orchestrator.layer_fields import DT_FP16, DT_FP32, DT_INT8
-
     assert set(DATA_EXTENSION) <= ELEMENT_DTYPES
-    assert DT_INT8 == 0 and DT_FP16 == 1 and DT_FP32 == 3
     assert {"int8", "float16", "float32"} <= ELEMENT_DTYPES
 
 

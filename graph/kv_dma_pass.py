@@ -34,6 +34,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from contracts.graph_meta import (
+    ABSORBED_META_KEY,
     HEAD_INDEX_META_KEY,
     HEAD_ROLE_META_KEY,
     KV_DMA_META_KEY,
@@ -90,6 +91,127 @@ def insert_kv_dma_and_split(gm: GraphModule) -> KvDmaReport:
     """
     report = KvDmaReport()
 
+    copies = [n for n in gm.graph.nodes
+              if n.target is torch.ops.aten.index_copy.default]
+    if copies:
+        # 图里有真实的 cache 原地更新，直接认它当 DMA。
+        _mark_cache_updates(gm, copies, report)
+    elif _rope_reaches_output(gm):
+        # K 直接作为图输出（由调用方写 cache），不插 DMA，只整理换轴。
+        _arrange_prefill(gm)
+    else:
+        _insert_dma_after_rope(gm, report)
+    _insert_splits(gm, report)
+    gm.graph.lint()
+    gm.recompile()
+    return report
+
+
+def _rope_reaches_output(gm: GraphModule) -> bool:
+    """图输出里有没有经布局算子直接来自 RoPE 的张量（即 K 作为图输出）。"""
+    output = next(n for n in gm.graph.nodes if n.op == "output")
+    return any(_feeds_from_rope(v) for v in output.all_input_nodes)
+
+
+def _feeds_from_rope(node: Node) -> bool:
+    """沿布局算子往上，源头是否是一条 RoPE。"""
+    current = node
+    while isinstance(current, Node):
+        if ROPE_META_KEY in current.meta:
+            return True
+        if current.target not in (torch.ops.aten.transpose.int,
+                                  torch.ops.aten.permute.default,
+                                  torch.ops.aten.view.default):
+            return False
+        current = current.args[0]
+    return False
+
+
+def _mark_cache_updates(gm: GraphModule, copies: list[Node],
+                        report: KvDmaReport) -> None:
+    """`index_copy(cache, 2, pos, new)` 标成 KV_Cache_DMA，位置下标链并入 DMA。
+
+    K 侧在 DMA 之后补一个整体转置喂 Split，逐头的 Kᵀ 因此变成恒等、删掉；
+    Q 侧 RoPE 之后的转置折进 RoPE 节点（GML 的 `transpose 1`）。拓扑与厂商一致：
+    RoPE(K) → Transpose → DMA → Transpose → Split，V 为 Reshape → Transpose → DMA → Split。
+    """
+    for copy in copies:
+        is_key = _feeds_from_rope(copy.args[3])
+        copy.meta[KV_DMA_META_KEY] = KvDmaSpec(is_key=is_key, numel=_numel_of(copy))
+        stack = [copy.args[2]]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Node) and current.op == "call_function":
+                current.meta[ABSORBED_META_KEY] = True
+                stack.extend(current.all_input_nodes)
+        report.kv_dma += 1
+        if is_key:
+            _transpose_key_once(gm, copy)
+
+    # Q：不进 cache 的那条 RoPE，其后的换轴由 RoPE 节点自己完成。
+    for node in gm.graph.nodes:
+        if ROPE_META_KEY not in node.meta:
+            continue
+        users = list(node.users)
+        if (len(users) == 1 and users[0].target is torch.ops.aten.transpose.int
+                and not any(KV_DMA_META_KEY in u.meta for u in users[0].users)):
+            users[0].meta[ABSORBED_META_KEY] = True
+
+
+def _arrange_prefill(gm: GraphModule) -> None:
+    """K/V 作为图输出时的换轴：Q 的换轴折进 RoPE；K 逐头 slice 改吃一个整体 Kᵀ。"""
+    for node in gm.graph.nodes:
+        if ROPE_META_KEY not in node.meta:
+            continue
+        transposes = [u for u in node.users
+                      if u.target is torch.ops.aten.transpose.int]
+        if len(transposes) != 1:
+            continue
+        sliced = [u for u in transposes[0].users
+                  if u.meta.get(HEAD_ROLE_META_KEY) == ROLE_SPLIT]
+        if not sliced:
+            continue
+        if _slices_feed_key(sliced):
+            # K：RoPE 直接分出两个换轴，[0,2,1,3] 出 cache、[0,2,3,1] 喂 Split，
+            # 两者并列而不是串联，省掉一次串行换轴。
+            _transpose_key_once(gm, transposes[0], source=node, perm=(0, 2, 3, 1))
+        else:
+            transposes[0].meta[ABSORBED_META_KEY] = True
+
+
+def _slices_feed_key(slices: list[Node]) -> bool:
+    """逐头 slice 后面跟着最后两维转置，就是 QKᵀ 的 K 侧。"""
+    return any(u.target is torch.ops.aten.transpose.int
+               and tuple(u.args[1:]) == (-2, -1)
+               for s in slices for u in s.users)
+
+
+def _transpose_key_once(gm: GraphModule, copy: Node, *, source: Node | None = None,
+                        perm: tuple[int, ...] | None = None) -> None:
+    """逐头 Kᵀ 合成一个整体转置。给了 `source`/`perm` 时从 `source` 一步换到位。"""
+    slices = [u for u in copy.users
+              if u.meta.get(HEAD_ROLE_META_KEY) == ROLE_SPLIT]
+    if not slices:
+        return
+    with gm.graph.inserting_after(copy):
+        if source is None:
+            whole = gm.graph.call_function(torch.ops.aten.transpose.int, (copy, -2, -1))
+        else:
+            whole = gm.graph.call_function(torch.ops.aten.permute.default, (source, list(perm)))
+    value = copy.meta.get("val")
+    whole.meta["val"] = value.transpose(-2, -1) if value is not None else None
+    for sliced in slices:
+        sliced.replace_input_with(copy, whole)
+        if sliced.meta.get("val") is not None:
+            sliced.meta["val"] = sliced.meta["val"].transpose(-2, -1)
+        for user in list(sliced.users):
+            if (user.target is torch.ops.aten.transpose.int
+                    and tuple(user.args[1:]) == (-2, -1)):
+                user.replace_all_uses_with(sliced)
+                gm.graph.erase_node(user)
+
+
+def _insert_dma_after_rope(gm: GraphModule, report: KvDmaReport) -> None:
     # ---- KV_Cache_DMA：每条 RoPE 链之后一个 ----
     # 实测 2 个（K 一个、V 一个）。RoPE 折出来的锚点正好是 Q/K 各一个，
     # 取 K 那一路 —— Q 不进 cache。两个变体里带 DQ 的那个是 K。
@@ -126,6 +248,8 @@ def insert_kv_dma_and_split(gm: GraphModule) -> KvDmaReport:
             user.replace_input_with(anchor, node)
         report.kv_dma += 1
 
+
+def _insert_splits(gm: GraphModule, report: KvDmaReport) -> None:
     # ---- Split：每组逐头 slice 合成一个 ----
     # 逐头展开给每个 slice 打了 ROLE_SPLIT + 头下标。按**被切的张量**分组，
     # 每组一个 Split（实测 3 个：Q/K/V 各一个）。
@@ -147,7 +271,3 @@ def insert_kv_dma_and_split(gm: GraphModule) -> KvDmaReport:
         for sliced in slices:
             sliced.replace_input_with(source, node)
         report.splits += 1
-
-    gm.graph.lint()
-    gm.recompile()
-    return report

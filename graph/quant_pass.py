@@ -47,6 +47,7 @@ from contracts.graph_meta import (
     HEAD_ROLE_META_KEY,
 )
 from contracts.ir_payloads import DynamicScalingSpec
+from contracts.unified_ir import STATIC_QUANT_META_KEY
 from graph.split_heads import ROLE_MATMUL_PV, ROLE_MATMUL_QK
 
 # 吃激活的矩阵乘。matmul1 排除在外：它的两个 operand 都已是定点。
@@ -107,6 +108,9 @@ def _needs_dq(node: Node) -> bool:
     """
     if node.meta.get(ABSORBED_META_KEY):
         return False
+    # 静态量化的矩阵乘：上游直接给 int8，不插 DQ。
+    if node.meta.get(STATIC_QUANT_META_KEY):
+        return False
     if node.target not in _MATMUL_TARGETS:
         return False
     return node.meta.get(HEAD_ROLE_META_KEY) != ROLE_MATMUL_QK
@@ -128,9 +132,12 @@ def _insert_one(
         report.skipped.append(f"{consumer.name}: 取不到 {source.name} 的形状")
         return False
 
-    # attention scores 那一路整条当一组（实测 32 个节点 group_size=1024）。
+    # attention scores 每个查询 token 一行、一行一组（decode 只有一行，
+    # 即实测的 group_size=1024）。
     is_scores = consumer.meta.get(HEAD_ROLE_META_KEY) == ROLE_MATMUL_PV
-    group_size = dq_group_size(numel, is_attention_scores=is_scores)
+    shape = getattr(source.meta.get("val"), "shape", None)
+    row = int(shape[-1]) if shape is not None and len(shape) else None
+    group_size = dq_group_size(numel, is_attention_scores=is_scores, row_width=row)
     if numel % group_size:
         report.skipped.append(
             f"{consumer.name}: {numel} 不能被 group_size {group_size} 整除")

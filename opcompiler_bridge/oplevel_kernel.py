@@ -104,7 +104,8 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
                   scale_mode: str = "floating_point",
                   sf_multiplier: int = 1,
                   fp16: bool = False,
-                  trailing_activation: str | None = None) -> str:
+                  trailing_activation: str | None = None,
+                  fpsu_mode: str | None = None) -> str:
     """整算子矩阵乘，可带按组反量化累加。
 
     `trailing_activation` 给了就把激活发成矩阵乘唯一用户的独立 `pim.lut`，
@@ -151,9 +152,12 @@ def matmul_kernel(func: str, m: int, k: int, n: int,
                    f"role = model_weight, elemBits = {elem_bits}, "
                    f"groupSize = {group_size}{extra}>")
     act = ""
+    # 显式的 FPSU 模式（输出头的 fixed2float）是算子的数值选择，FlagTree 保留不改。
+    if fpsu_mode:
+        act += f", fpsu = #pim.fpsu_spec<mode = {fpsu_mode}>"
     if activation:
         from genesim_bridge.ir_cost import fused_act_spec_attr
-        act = f", {fused_act_spec_attr(str(activation).lower())}"
+        act += f", {fused_act_spec_attr(str(activation).lower())}"
     if activation and trailing_activation:
         raise ValueError("activation 与 trailing_activation 只能给一个")
     # 独立激活接在矩阵乘结果后面，形状与结果相同。

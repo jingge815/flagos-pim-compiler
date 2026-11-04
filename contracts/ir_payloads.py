@@ -43,6 +43,9 @@ class RopeMatch:
     cos: Node
     sin: Node
     absorbed: list[Node] = field(default_factory=list)
+    # "half_negated"：输入 sin 的后半维已取反，图里先乘符号向量还原，
+    # 这一乘被吸收，GML 直接绑定原始 sin。
+    sin_encoding: str = "standard"
 
 
 @dataclass

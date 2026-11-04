@@ -153,12 +153,13 @@ def test_reduction_phases_land_on_the_right_unit(expanded) -> None:
 def test_dq_group_widths_follow_tensors(expanded) -> None:
     """分组宽度按张量变化，不是常量。
 
-    实测三种：hidden 512 组、MLP 1376 组、attention scores 1 组。
+    实测三种：hidden 512 组、MLP 1376 组、attention scores 每个查询 token 一组
+    （这里 SEQ_LEN 行；厂商 prefill 第 0 层 GML 的 32 个 score DQ 组宽都是 S=1024）。
     每组一个 fp16 统计量，所以 phase0 的字节数 = 组数 × 2。
     """
     report, plans = expanded
     group_bytes = {plans[op.func].phases[0].bytes for op in report.by_kind("dq")}
-    assert group_bytes == {512 * 2, 1376 * 2, 1 * 2}
+    assert group_bytes == {512 * 2, 1376 * 2, SEQ_LEN * 2}
 
 
 def test_rope_phases_are_force_consecutive(expanded) -> None:

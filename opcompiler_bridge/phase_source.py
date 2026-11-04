@@ -261,6 +261,9 @@ def cross_check(source: PhaseSource) -> list[PhaseMismatch]:
     }
     # 归约相的 kind：DQ 用 absmax（组内对称动态范围），Softmax 用 max。
     expected_first_reduction = {"dq": "absmax", "softmax": "max"}
+    # 跨相依赖：DQ 的 scale 与倒数都由 p0 的 absmax 得出（扇出），Softmax 的
+    # 归一化读 exp 与倒数和。IR 丢了 reads 也要报出来。
+    expected_reads = {"dq": {1: (0,), 2: (0,)}, "softmax": {4: (1, 3)}}
 
     mismatches: list[PhaseMismatch] = []
     for fx_name, kinds in sorted(source.by_node.items()):
@@ -280,6 +283,14 @@ def cross_check(source: PhaseSource) -> list[PhaseMismatch]:
             # 值字段：展开器填了的相位，既不能蒸发成 None，也不能与常量表
             # 的数字对不上——只拦 None 会让「改了窗口但 GML 不变」溜过去。
             _check_phase_numbers(fx_name, kind, plan, mismatches)
+            reads_want = expected_reads.get(kind)
+            if reads_want:
+                for phase in plan.phases:
+                    want_reads = reads_want.get(phase.index, ())
+                    if phase.reads != want_reads:
+                        mismatches.append(PhaseMismatch(
+                            fx_name, kind, f"phase{phase.index}.reads",
+                            phase.reads, want_reads))
             for phase in plan.phases:
                 if phase.op == "pim.lut" and phase.flp_min is None:
                     mismatches.append(PhaseMismatch(

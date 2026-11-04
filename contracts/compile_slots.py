@@ -19,6 +19,8 @@ class CompileSlots:
     head_dim: int = 128
     seq: int = 1024
     heads: int = 32
+    # 查询 token 数：decode 为 1，CEVA prefill 为整段 prompt 长度。
+    tokens: int = 1
 
     @classmethod
     def from_config(cls, config, *, max_seq: int = 1024) -> "CompileSlots":

@@ -1053,3 +1053,31 @@ def test_the_real_pipeline_leaves_no_unfused_activation() -> None:
     remaining = [n.name for n in gm.graph.nodes
                  if n.op == "call_function" and n.target in ACTIVATIONS]
     assert remaining == [], f"融合后仍有未折的激活：{remaining}"
+
+
+def test_dq_specs_cover_every_query_token() -> None:
+    """prefill 一张图量化 T 个 token：DQ 规格的元素数是一行 × T，与 GML 的 original_shape 一致。"""
+    import dataclasses
+
+    import torch
+
+    from contracts.compile_slots import DEFAULT_SLOTS
+    from contracts.ir_payloads import DynamicScalingSpec
+    from gml_bridge.export import _dq_specs
+    from gml_bridge.writer import Node
+    from graph.quant_pass import DQ_META_KEY
+
+    class Net(torch.nn.Module):
+        def forward(self, x):
+            return x * 2.0
+
+    gm = torch.export.export(Net(), (torch.randn(1, 8, 4096),)).module()
+    target = next(n for n in gm.graph.nodes if n.op == "call_function")
+    target.meta[DQ_META_KEY] = DynamicScalingSpec(group_size=128, numel=8 * 4096,
+                                                  is_attention_scores=False)
+    nodes = [Node(5, {"pim_fx_name": target.name})]
+    slots = dataclasses.replace(DEFAULT_SLOTS, tokens=8)
+    spec = _dq_specs(gm, nodes, slots=slots, rewrite=True)[5]
+    assert (spec.numel, spec.group_size) == (8 * 4096, 128)
+    spec = _dq_specs(gm, nodes, slots=DEFAULT_SLOTS, rewrite=True)[5]
+    assert spec.numel == 4096

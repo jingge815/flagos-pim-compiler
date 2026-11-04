@@ -1,5 +1,7 @@
 # prepare_out 域确认表（给甲方填空）
 
+> 自研生成职责已废止（2026-10-29，design-ceva-llama2-7b-20261028 §4.14）：prepare_out 由厂商 GC/L2A 生成，本仓不再产出；本文仅作历史记录。
+
 面向：Ceva-NeuPro-M × Llama2-7B W4A8 decode 单层（block_0）  
 样例：`llama2_w4a8_decode_block_0/prepare_out`（`net.ini` + `txt_files/` 424 个文件）  
 配套：`parser_output/` 二进制常量、`relay2gml_graph.gml`（200 个节点）、`Ceva-NeuPro-M High-Level ArchSpec V1.6.6.GA`、`VBU-GML Structure`  

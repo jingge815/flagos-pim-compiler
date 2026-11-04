@@ -16,12 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from contracts import gml_names as names
-from contracts.gml_lut import (
-    synth_exp,
-    synth_identity,
-    synth_reciprocal,
-    synth_silu,
-)
+from contracts.pwla import pwla_table
 from contracts.gml_quant import INT8_MAX, INT8_MIN, lut_identity
 from gml_bridge.phase_data import (
     DQ_PHASE0_BIAS,
@@ -31,7 +26,7 @@ from gml_bridge.phase_data import (
     DynamicScalingPhases,
     SoftmaxPhases,
 )
-from quant.weights import QuantizedWeight
+from quant.weights import QuantizedWeight, to_storage_order
 
 
 @dataclass
@@ -71,13 +66,18 @@ class WrittenFiles:
 
 
 def write_weight(
-    files: WrittenFiles, node_id: int, quantized: QuantizedWeight
+    files: WrittenFiles, node_id: int, quantized: QuantizedWeight,
+    shape: tuple[int, int] | None = None,
 ) -> None:
     """写一个节点的权重与它的 per-group scale。
 
     权重按**本节点**编号——它属于节点自己，不属于某条边（见规则 2）。
+    给了 `shape`（输出维, 输入维）时码值按「输入维 × 输出维」落盘，scale 不变。
     """
-    files._write(names.weight_buffer(node_id), quantized.values)
+    values = quantized.values
+    if shape is not None:
+        values = to_storage_order(values, shape)
+    files._write(names.weight_buffer(node_id), values)
     files._write(names.weight_scale(node_id), quantized.scales)
 
 
@@ -245,6 +245,11 @@ def calibration_buffer(
     return np.clip(quantized, info.min, info.max).astype(dtype)
 
 
+def _lut(kind: str) -> np.ndarray:
+    """PWLA 拟合出的 288 字节查找表（`contracts.pwla`，与厂商拟合流程一致）。"""
+    return np.frombuffer(pwla_table(kind), dtype=np.uint8)
+
+
 def write_identity_lut(files: WrittenFiles, node_id: int) -> None:
     """写一张恒等 LUT。
 
@@ -284,6 +289,38 @@ def write_scaling(
         names.fpsu_bias(node_id, slot), np.array([bias], dtype=np.float32))
 
 
+# 定点 FPSU：16 位有符号 mul，右移 0..31（厂商 `Mul_Shift_Calculator` 口径）。
+_FPSU_MUL_LIMIT = 2 ** 15 - 1
+_FPSU_MAX_SHIFT = 32
+
+
+def fpsu_mul_shift(factor: float) -> tuple[int, int]:
+    """把定点 FPSU 的缩放因子编成 (mul, 右移)：取 mul 不溢出 16 位的最大右移，精度最高。
+
+    32767 是合法的 int16 上限，不能被排除；所有右移都只能得到零乘数时说明因子
+    低于可表示范围，必须报错而不是静默写零。
+    """
+    if factor <= 0:
+        raise ValueError(f"FPSU 缩放因子必须为正，实际 {factor}")
+    for shift in range(_FPSU_MAX_SHIFT - 1, -1, -1):
+        mul = int(np.round(factor * 2.0 ** shift))
+        if 0 < mul <= _FPSU_MUL_LIMIT:
+            return mul, shift
+    if factor * 2.0 ** (_FPSU_MAX_SHIFT - 1) >= _FPSU_MUL_LIMIT:
+        raise ValueError(f"FPSU 缩放因子 {factor} 过大，16 位 mul 放不下")
+    raise ValueError(f"FPSU 缩放因子 {factor} 过小，右移 31 位后 mul 仍为零")
+
+
+def write_fixed_point_scaling(
+    files: WrittenFiles, node_id: int, factor: float, slot: int | None = None,
+) -> None:
+    """定点 FPSU（`fixed_point` / `fixed2float`）的三族：int16 mul、右移、fp32 bias=0。"""
+    mul, shift = fpsu_mul_shift(factor)
+    files._write(names.fpsu_scale(node_id, slot), np.array([mul], dtype=np.int16))
+    files._write(names.fpsu_post_shift(node_id, slot), np.array([shift], dtype=np.uint8))
+    files._write(names.fpsu_bias(node_id, slot), np.zeros(1, dtype=np.float32))
+
+
 def write_zero_point(files: WrittenFiles, name: str) -> None:
     """写一个 zero-point 文件：int32 的 0。
 
@@ -295,7 +332,7 @@ def write_zero_point(files: WrittenFiles, name: str) -> None:
 
 def write_dq_phases(
     files: WrittenFiles, node_id: int, phases: DynamicScalingPhases,
-    *, per_group_fpsu: bool = False
+    *, per_group_fpsu: bool = False, fpsu_groups: int | None = None
 ) -> None:
     """写一个 DynamicScaling 节点的四相：缓冲、定标、LUT、Kantor 系数。
 
@@ -309,7 +346,8 @@ def write_dq_phases(
     只是重复 `groups` 份。
     """
     groups = phases.phase1.size
-    fpsu_width = groups if per_group_fpsu else 1
+    # 逐组 FPSU 按一行（一个 token）的组数发：prefill 多行时厂商仍只发一行那么宽。
+    fpsu_width = (fpsu_groups or groups) if per_group_fpsu else 1
 
     # 各相的输入缓冲。**四相各有一个**，尺寸各不相同 —— 每一相的输入就是
     # 上一相的输出，只有 p0 与 p3 吃完整张量。实测节点 12（4096 元素 / 32 组）：
@@ -353,8 +391,8 @@ def write_dq_phases(
             np.full(fpsu_width, scale, dtype=np.float16))
 
     # p1 走恒等表，p2 走倒数表。两张都自行合成。
-    files._write(names.phase_lut(node_id, 1), synth_identity())
-    files._write(names.phase_lut(node_id, 2), synth_reciprocal())
+    files._write(names.phase_lut(node_id, 1), _lut("identity"))
+    files._write(names.phase_lut(node_id, 2), _lut("reciprocal"))
 
     # p3 的 Kantor 系数：scale 等于 p2、shift 恒为 -8、bias 为 0。
     files._write(names.phase_kantor_scale(node_id, 3), phases.kantor_scale)
@@ -412,10 +450,10 @@ def write_softmax_phases(
     # 猜错了），输出是倒数。
     files._write(
         names.phase_input_buffer(node_id, 3),
-        np.full(1, phases.phase2, dtype=np.float32))
+        np.asarray(phases.phase2, dtype=np.float32))
     files._write(
         names.phase_output_buffer(node_id, 3),
-        np.full(1, phases.phase3, dtype=np.float16))
+        np.asarray(phases.phase3, dtype=np.float16))
 
     # phase4：输入再读一次 phase1 的输出（exp 数组），输出是归一化后的
     # softmax 结果。
@@ -443,10 +481,9 @@ def write_softmax_phases(
             names.phase_fpsu_post_shift(node_id, phase),
             np.zeros(1, dtype=np.uint8))
 
-    # p1 过 exp 表（占位，见 synth_exp 的说明——数值路径本来就不经过它）、
-    # p3 过倒数表。
-    files._write(names.phase_lut(node_id, 1), synth_exp())
-    files._write(names.phase_lut(node_id, 3), synth_reciprocal())
+    # p1 过 exp 表、p3 过倒数表。
+    files._write(names.phase_lut(node_id, 1), _lut("softmax_exp"))
+    files._write(names.phase_lut(node_id, 3), _lut("reciprocal"))
 
 
 def write_rms_norm_epsilon(files: WrittenFiles, node_id: int, epsilon: float) -> None:
@@ -457,7 +494,7 @@ def write_rms_norm_epsilon(files: WrittenFiles, node_id: int, epsilon: float) ->
 
 def write_fused_silu_lut(files: WrittenFiles, node_id: int) -> None:
     """写融合进 Gemm 的 SiLU 表。"""
-    files._write(names.activation_lut(node_id), synth_silu())
+    files._write(names.activation_lut(node_id), _lut("silu"))
 
 
 def verify_against_graph(files: WrittenFiles, referenced: set[str]) -> None:

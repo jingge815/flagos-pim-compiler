@@ -35,7 +35,7 @@ SOFTMAX_NODES = [18, 39]
 
 # 这些文件与实物**有意不同**，原因各自明确，不参与字节级比对。
 #
-# - LUT：我方自行合成，精度优于实物（倒数表误差 0.045% vs 0.387%）
+# - LUT：参考产物是合成数据，表与厂商 PWLA 拟合结果不同（逐字节核对见 test_pwla.py）
 # - Softmax 各相：硬件走 31 段 PWL exp 表，与精确 exp 差 0.7%
 # - DQ phase3：fp16 舍入使少量元素差 ±1（实测 99.4% 逐字节相同）
 _EXPECTED_TO_DIFFER = ("LUT_phase_2", "LUT_phase_3", "activation_lut_file")
@@ -321,3 +321,65 @@ def test_total_bytes_is_tracked(written: WrittenFiles) -> None:
         (written.directory / name).stat().st_size
         for name in written.names_written)
     assert written.total_bytes == actual
+
+
+def test_luts_come_from_the_pwla_generator(tmp_path: Path) -> None:
+    """DQ 两张表、Softmax 两张表与融合 SiLU 表都取 PWLA 拟合结果（与厂商逐字节一致）。"""
+    from contracts.pwla import pwla_table
+
+    files = WrittenFiles(tmp_path)
+    source = np.linspace(-3, 3, 256, dtype=np.float32).astype(np.float16)
+    write_dq_phases(files, 12, dynamic_scaling(source, group_size=128))
+    write_softmax_phases(files, 18, softmax(source))
+    write_fused_silu_lut(files, 195)
+    expected = {
+        "LUT_phase_1_12.bin": "identity", "LUT_phase_2_12.bin": "reciprocal",
+        "LUT_phase_1_18.bin": "softmax_exp", "LUT_phase_3_18.bin": "reciprocal",
+        "activation_lut_file_195.bin": "silu",
+    }
+    for name, kind in expected.items():
+        assert (tmp_path / name).read_bytes() == pwla_table(kind), name
+
+
+def test_softmax_phases_reduce_per_row(tmp_path: Path) -> None:
+    """多行（prefill 的 T 个查询）逐行归约：phase0/2/3 与 Bias_1、Scaling_4 各 T 个。"""
+    from gml_bridge.phase_data import pack_fp16_in_high_half
+
+    rows = np.array([[0.0, 1.0, 2.0, 3.0], [5.0, 5.0, 5.0, 5.0]], dtype=np.float32)
+    phases = softmax(rows, row_width=4)
+    files = WrittenFiles(tmp_path)
+    write_softmax_phases(files, 7, phases)
+
+    out1 = np.fromfile(tmp_path / "output_buffer_phase_1_7.bin", np.float16).reshape(2, 4)
+    np.testing.assert_allclose(out1[1], 1.0)
+    assert (tmp_path / "output_buffer_phase_0_7.bin").read_bytes() == (
+        pack_fp16_in_high_half(-3.0) + pack_fp16_in_high_half(-5.0))
+    assert (tmp_path / "Bias_buffer_phase_1_7.bin").stat().st_size == 8
+    sums = np.fromfile(tmp_path / "output_buffer_phase_2_7.bin", np.float32)
+    np.testing.assert_allclose(sums[1], 4.0)
+    recip = np.fromfile(tmp_path / "Scaling_buffer_phase_4_7.bin", np.float16)
+    np.testing.assert_allclose(recip[1], 0.25)
+    out4 = np.fromfile(tmp_path / "output_buffer_phase_4_7.bin", np.float16).reshape(2, 4)
+    np.testing.assert_allclose(out4.sum(axis=1), 1.0, atol=2e-3)
+    assert (tmp_path / "Bias_buffer_phase_0_7.bin").stat().st_size == 4
+
+
+def test_single_row_softmax_bytes_unchanged() -> None:
+    """单行时（decode）字节与原口径相同：phase0/2/3 都是标量。"""
+    source = np.linspace(-3, 3, 64, dtype=np.float32)
+    one = softmax(source)
+    rows = softmax(source, row_width=64)
+    assert one.phase0_bytes == rows.phase0_bytes and one.phase2_bytes == rows.phase2_bytes
+    assert one.phase4_scale == rows.phase4_scale
+
+
+def test_rope_dq_fpsu_width_is_one_row(tmp_path: Path) -> None:
+    """RoPE-DQ 逐组 FPSU 三族按一行的组数发（prefill 多行时厂商仍是 32 组，不乘行数）。"""
+    files = WrittenFiles(tmp_path)
+    source = np.linspace(-3, 3, 4 * 512, dtype=np.float32).astype(np.float16)
+    write_dq_phases(files, 22, dynamic_scaling(source, group_size=128),
+                    per_group_fpsu=True, fpsu_groups=4)
+    assert (tmp_path / "Scaling_buffer_phase_3_22.bin").stat().st_size == 4 * 2
+    assert (tmp_path / "Bias_buffer_phase_0_22.bin").stat().st_size == 4 * 4
+    assert (tmp_path / "output_sf_22.bin").exists() is False
+    assert (tmp_path / "output_buffer_phase_1_22.bin").stat().st_size == 16 * 2

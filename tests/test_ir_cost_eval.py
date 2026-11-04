@@ -967,3 +967,81 @@ def test_stale_fused_kernels_are_rejected(tmp_path):
         "tt.dot %a, %b {activation = #pim.act_spec<kind = silu>} : tensor<1x32xf16>"
     )
     assert fused_kernels_missing_act_spec(sidecar) == []
+
+
+def test_refine_sidecar_is_named_after_ir_level(tmp_path, monkeypatch):
+    """没有 GPU 时精化走 oplevel，sidecar 要按档位命名，不能覆盖 pimir 那份。"""
+    from scripts.run_full_pipeline import step_a2_refine_pimir_ir, _PIMIR_IR_NAME
+
+    genesim = tmp_path / "genesim"
+    (genesim / "models").mkdir(parents=True)
+    ir = genesim / "models" / "llama2_7b.ir"
+    ir.write_text(json.dumps({"operators": [{"op_id": 0, "op_type": "GEMM"}]}))
+    captured = {}
+
+    def fake_run(cmd, cwd, log_path):
+        captured["cmd"] = cmd
+        (genesim / "models" / _PIMIR_IR_NAME).write_text(ir.read_text())
+
+    monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
+    monkeypatch.setattr("scripts.run_full_pipeline._refine_ir_level", lambda: "oplevel")
+    step_a2_refine_pimir_ir(genesim, ir, tmp_path)
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--sidecar") + 1].endswith("llama2_7b_oplevel_extensions.json")
+    assert cmd[cmd.index("--ir-level") + 1] == "oplevel"
+
+
+def _refine_setup(tmp_path, sidecar_level):
+    """已有编号一致的精化 IR，外加一份指定档位的 sidecar。"""
+    from scripts.run_full_pipeline import _PIMIR_IR_NAME
+
+    genesim = tmp_path / "genesim"
+    (genesim / "models").mkdir(parents=True)
+    ir = genesim / "models" / "llama2_7b.ir"
+    payload = json.dumps({"operators": [{"op_id": 0, "op_type": "GEMM"}]})
+    ir.write_text(payload)
+    (genesim / "models" / _PIMIR_IR_NAME).write_text(payload)
+    if sidecar_level is not None:
+        (genesim / "models" / f"llama2_7b_{sidecar_level}_extensions.json").write_text(
+            json.dumps({"ir_level": sidecar_level}))
+    return genesim, ir
+
+
+def _refine_calls(tmp_path, monkeypatch, sidecar_level, level):
+    from scripts.run_full_pipeline import _PIMIR_IR_NAME, step_a2_refine_pimir_ir
+
+    genesim, ir = _refine_setup(tmp_path, sidecar_level)
+    calls = []
+
+    def fake_run(cmd, cwd, log_path):
+        calls.append(cmd)
+        (genesim / "models" / _PIMIR_IR_NAME).write_text(ir.read_text())
+
+    monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
+    monkeypatch.setattr("scripts.run_full_pipeline._refine_ir_level", lambda: level)
+    step_a2_refine_pimir_ir(genesim, ir, tmp_path)
+    return calls
+
+
+def test_refine_reruns_when_only_other_level_sidecar_exists(tmp_path, monkeypatch):
+    """上次 GPU 跑出了 pimir，这次无 GPU 走 oplevel：IR 编号一致也要重新精化。"""
+    calls = _refine_calls(tmp_path, monkeypatch, "pimir", "oplevel")
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[cmd.index("--ir-level") + 1] == "oplevel"
+
+
+def test_refine_reruns_when_sidecar_level_disagrees(tmp_path, monkeypatch):
+    """同名 sidecar 里记的档位与本次不符（旧版错名写入），也要重新精化。"""
+    from scripts.run_full_pipeline import _PIMIR_IR_NAME  # noqa: F401
+
+    genesim, _ = _refine_setup(tmp_path, None)
+    (genesim / "models" / "llama2_7b_oplevel_extensions.json").write_text(
+        json.dumps({"ir_level": "pimir"}))
+    calls = _refine_calls(tmp_path / "b", monkeypatch, None, "oplevel")
+    assert len(calls) == 1
+
+
+def test_refine_skips_when_same_level_sidecar_exists(tmp_path, monkeypatch):
+    """IR 编号一致、本档位的 sidecar 在且档位相符：跳过，与原行为一致。"""
+    assert _refine_calls(tmp_path, monkeypatch, "oplevel", "oplevel") == []

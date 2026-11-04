@@ -43,9 +43,8 @@ def test_one_scale_per_group() -> None:
 def test_error_matches_four_bit_precision() -> None:
     """int4 只有 16 级，峰值相对误差应在十几个百分点以内。
 
-    分母 8 下的上界是 **0.125**（正端 `+absmax -> 8` clamp 成 7，吃满一个
-    量化步长），不是半步的 0.0625。这条只能拦量级性错误，
-    抓不到分组轴错误——那个靠下面的饱和度探针。
+    两端都不饱和，误差上界是半个量化步长（约 0.0625 + fp16 舍入）。这条只能拦
+    量级性错误，抓不到分组轴错误——那个靠下面的饱和度探针。
     """
     for shape in [(4096, 4096), (128, 256), (11008, 4096)]:
         weight = _weight(shape)
@@ -113,8 +112,7 @@ def test_requantization_is_stable_under_a_fixed_scale() -> None:
 
     这是量化方向正确的判据：`q -> q*sf -> q` 是恒等。
 
-    注意这里**固定 sf**，而不是让第二轮重新推导 sf。分母改成 8 之后，
-    「反量化再完整量化一遍」**不再是恒等**，原因见下一个测试。
+    第二轮重新推导 sf 的完整往返见 `test_quantize_is_idempotent_on_its_own_output`。
     """
     weight = _weight((1024, 128))
     quantized = quantize_weight(weight)
@@ -126,31 +124,72 @@ def test_requantization_is_stable_under_a_fixed_scale() -> None:
     assert again.ravel().tobytes() == quantized.values.tobytes()
 
 
-def test_full_round_trip_shifts_only_positive_peaked_groups() -> None:
-    """完整往返（含重新推导 scale）在正峰组上不恒等，这是分母 8 的必然结果。
+def test_scale_takes_the_tighter_side_of_the_asymmetric_range() -> None:
+    """scale = max(正峰/7, 负峰/8)：两端都不饱和，正峰组映射到 7、负峰组映射到 -8。
 
-    机制：分母 8 让组内 absmax 映射到 8，但 int4 上界是 7。
-      - 峰在**负**侧：`-absmax -> -8`，落在值域内，clamp 不触发，
-        反量化后组 absmax 仍是 `8*sf`，第二轮推出同一个 sf，往返恒等。
-      - 峰在**正**侧：`+absmax -> 8` 被 clamp 成 **7**，反量化后组 absmax
-        变成 `7*sf`，第二轮推出 `sf2 = 7*sf/8`，量化值整体放大 8/7 —— 不恒等。
-
-    钉住这条是为了说明它是**已知的、由不对称值域决定的**，不是量化实现的 bug。
-    参考产物同样如此：`weight_buffer_195` 的 352256 组里含 `-8` 的占 58.5%、
-    含 `+8` 的占 0，且 absmax 落负侧的组占 87.2%。
+    厂商 GML 第 0 层 4 个投影用这条规则重新量化，码值 99.998% 一致、scale 99.99% 一致；
+    absmax/8 只有 92%。
     """
+    weight = np.zeros((2, WEIGHT_GROUP_SIZE), dtype=np.float32)
+    weight[0, :2] = (0.7, -0.4)      # 正峰组：0.7/7 = 0.1 > 0.4/8
+    weight[1, :2] = (0.2, -0.8)      # 负峰组：0.8/8 = 0.1 > 0.2/7
+    quantized = quantize_weight(weight)
+
+    np.testing.assert_allclose(quantized.scales.astype(np.float32), [0.1, 0.1], rtol=1e-3)
+    grouped = quantized.values.reshape(2, -1)
+    assert grouped[0].max() == INT4_MAX and grouped[1].min() == INT4_MIN
+
+
+def test_quantize_is_idempotent_on_its_own_output() -> None:
+    """反量化后再完整量化一遍回到原码值：两端都按各自满量程定 scale，不再漂移。"""
     weight = _weight((256, 128))
     quantized = quantize_weight(weight)
     again = quantize_weight(quantized.dequantize())
 
-    grouped = weight.reshape(-1, WEIGHT_GROUP_SIZE)
-    peak_is_negative = grouped.min(axis=1) == -np.abs(grouped).max(axis=1)
+    assert again.values.tobytes() == quantized.values.tobytes()
 
-    first = quantized.values.reshape(-1, WEIGHT_GROUP_SIZE)
-    second = again.values.reshape(-1, WEIGHT_GROUP_SIZE)
-    stable = np.array([
-        np.array_equal(first[i], second[i]) for i in range(len(first))])
 
-    # 负峰组必须全部稳定；不稳定的组必须全是正峰组。
-    assert stable[peak_is_negative].all()
-    assert not stable[~peak_is_negative].all(), "正峰组应当出现漂移"
+def test_int8_per_tensor_uses_absmax_over_128() -> None:
+    """输出头权重：int8 per-tensor，scale = absmax/128（厂商 head 码值 100% 一致）。"""
+    from quant.weights import quantize_weight_int8
+
+    weight = np.array([0.5, -1.28, 0.64], dtype=np.float32)
+    quantized = quantize_weight_int8(weight)
+
+    assert quantized.scales.shape == (1,)
+    assert float(quantized.scales[0]) == pytest.approx(0.01, rel=1e-3)
+    assert quantized.values.tolist() == [50, -128, 64]
+
+
+def test_subnormal_scales_get_a_power_of_two_multiplier() -> None:
+    """最小 scale 低于 fp16 最小正规数时整张乘 2^k，落盘 scale 全部回到正规区。
+
+    厂商规则（relay2gml `save_scale`）：k = ceil(log2(tiny / min_scale))。
+    厂商第 0 层 q_proj 最小 scale 约 4.1e-5，得到倍数 2，与厂商 GML 的字段一致。
+    """
+    tiny = float(np.finfo(np.float16).tiny)
+    weight = np.zeros((2, WEIGHT_GROUP_SIZE), dtype=np.float32)
+    weight[0, 0] = -8 * tiny * 0.3       # 该组 scale = 0.3 * tiny，需要乘 4
+    weight[1, 0] = -8 * 0.01
+    quantized = quantize_weight(weight, guard_subnormal=True)
+
+    assert quantized.multiplier == 4
+    assert (quantized.scales.astype(np.float32) >= tiny).all()
+    np.testing.assert_allclose(quantized.dequantize(), weight.ravel(), rtol=1e-3, atol=1e-9)
+
+
+def test_normal_scales_keep_multiplier_one() -> None:
+    quantized = quantize_weight(_weight((64, 128)), guard_subnormal=True)
+    assert quantized.multiplier == 1
+
+
+def test_subnormal_multiplier_matches_quantizer() -> None:
+    """序列化侧只拿倍数、不拿码值，必须与写盘那次量化得出同一个数。"""
+    from quant.weights import subnormal_multiplier
+
+    tiny = float(np.finfo(np.float16).tiny)
+    for scale in (0.3 * tiny, 0.9 * tiny, 1.0):
+        weight = np.zeros((1, WEIGHT_GROUP_SIZE), dtype=np.float32)
+        weight[0, 0] = -8 * scale
+        assert subnormal_multiplier(weight) == quantize_weight(
+            weight, guard_subnormal=True).multiplier

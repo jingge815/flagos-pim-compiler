@@ -487,7 +487,7 @@ def check_luts(out_dir: Path, nodes: list[str], report: Report) -> None:
 
 def check_dequantization_recovers_weights(
     out_dir: Path, nodes: list[str], model_dir: Path, layers: int | None,
-    report: Report,
+    report: Report, edges: list[str] | None = None,
 ) -> None:
     """把量化权重反量化，与原始 f32 权重比相对误差。
 
@@ -522,12 +522,15 @@ def check_dequantization_recovers_weights(
         if not (weight_path.is_file() and scale_path.is_file()):
             continue
 
-        quantized = np.fromfile(weight_path, dtype=np.int8)
+        quantized = _output_major(np.fromfile(weight_path, dtype=np.int8),
+                                  field(block, "node_id"), edges)
         scales = np.fromfile(scale_path, dtype=np.float16).astype(np.float32)
-        recovered = (
-            quantized.reshape(-1, WEIGHT_GROUP_SIZE).astype(np.float32)
-            * scales[:, None]
-        ).ravel()
+        # 落盘 scale 乘过保护倍数，反量化要除回；规则与 QuantizedWeight.dequantize 共用。
+        from quant.weights import QuantizedWeight
+
+        multiplier = int(field(block, "weight_sf_multiplier") or 1)
+        recovered = QuantizedWeight(
+            quantized, scales, WEIGHT_GROUP_SIZE, multiplier=multiplier).dequantize()
 
         # 找元素数相同的候选原始权重，取误差最小的那个当匹配。
         best: float | None = None
@@ -801,11 +804,12 @@ def check_dq_phase_constants(out_dir: Path, nodes: list[str], report: Report) ->
 def check_softmax_reduction_encodings(
     out_dir: Path, nodes: list[str], report: Report
 ) -> None:
-    """Softmax 两个归约相的 4 字节编码不同，且两处运行时落点成立。
+    """Softmax 两个归约相的编码不同，且两处运行时落点成立。
 
-        phase0  fp16 位模式放**高 2 字节**，低 2 字节为 0
-        phase2  真正的 fp32
+        phase0  每行一条 4 字节记录：fp16 位模式放**高 2 字节**，低 2 字节为 0
+        phase2  每行一个真正的 fp32
 
+    prefill 的每个查询行各有一条 phase0 记录，所以按 4 字节记录数确定行数。
     落点：`Bias_buffer_phase_1 == phase0 输出`、`Scaling_buffer_phase_4 == phase3 输出`。
     这两条必须按构造成立——硬编码常量（比如 -30.75）会在这里被抓住。
     """
@@ -822,8 +826,15 @@ def check_softmax_reduction_encodings(
 
         checked += 1
         raw = phase0.read_bytes()
-        if len(raw) != 4 or raw[:2] != b"\x00\x00":
-            bad_encoding.append(f"节点 {node_id}: phase0 低 2 字节非零")
+        rows, remainder = divmod(len(raw), 4)
+        if remainder or not rows:
+            bad_encoding.append(
+                f"节点 {node_id}: phase0 长度 {len(raw)} 不是 4 字节记录的整数倍")
+        else:
+            for row in range(rows):
+                if raw[4 * row:4 * row + 2] != b"\x00\x00":
+                    bad_encoding.append(f"节点 {node_id} 第 {row} 行: 低 2 字节非零")
+                    break
 
         bias1 = out_dir / f"Bias_buffer_phase_1_{node_id}.bin"
         if bias1.is_file() and bias1.read_bytes() != raw:
@@ -847,7 +858,7 @@ def check_softmax_reduction_encodings(
 def check_softmax_is_normalised(
     out_dir: Path, nodes: list[str], report: Report
 ) -> None:
-    """Softmax 的 phase4 之和必须约等于 1——最基本的数值自洽。"""
+    """Softmax 的 phase4 每个查询行之和必须约等于 1——最基本的数值自洽。"""
     bad = []
     checked = 0
     for block in nodes:
@@ -858,15 +869,44 @@ def check_softmax_is_normalised(
         if not path.is_file():
             continue
         checked += 1
-        total = float(np.fromfile(path, dtype=np.float16).astype(np.float32).sum())
-        if abs(total - 1.0) > 5e-3:
-            bad.append(f"节点 {node_id}: Σ = {total:.5f}")
+        values = np.fromfile(path, dtype=np.float16).astype(np.float32)
+        # 行数取 phase0 的 4 字节记录数；没有 phase0 时按单行处理（decode）。
+        phase0 = out_dir / f"output_buffer_phase_0_{node_id}.bin"
+        rows = len(phase0.read_bytes()) // 4 if phase0.is_file() else 1
+        if rows <= 0 or values.size % rows:
+            bad.append(f"节点 {node_id}: {values.size} 个元素不能分成 {rows} 行")
+            continue
+        for row, total in enumerate(values.reshape(rows, -1).sum(axis=1)):
+            if abs(float(total) - 1.0) > 5e-3:
+                bad.append(f"节点 {node_id} 第 {row} 行: Σ = {total:.5f}")
 
     if checked:
         report.check(f"{checked} 个 Softmax 输出归一", not bad, "; ".join(bad[:4]))
 
 
-def check_group_saturation(out_dir: Path, nodes: list[str], report: Report) -> None:
+def _input_width(node_id, edges) -> int | None:
+    """节点入边形状的最后一维，即矩阵乘的输入维；没有入边时返回 None。"""
+    for edge in edges or ():
+        if field(edge, "target") == node_id and field(edge, "dims"):
+            return int(str(field(edge, "dims")).split("x")[-1])
+    return None
+
+
+def _output_major(weights: np.ndarray, node_id, edges) -> np.ndarray:
+    """落盘的「输入维 × 输出维」还原成按组连续的「输出维 × 输入维」。
+
+    给了边才还原：边是唯一能知道输入维的地方，旧的「输出 × 输入」产物不传边。
+    """
+    width = _input_width(node_id, edges)
+    if edges is None or not width or weights.size % width:
+        return weights
+    from quant.weights import from_storage_order
+
+    return from_storage_order(weights, (weights.size // width, width))
+
+
+def check_group_saturation(out_dir: Path, nodes: list[str], report: Report,
+                           edges: list[str] | None = None) -> None:
     """每组的 `max|q|` 必须触到满量程边界——定位分组轴错误的探针。
 
     对称量化下组内 absmax 必然映射到满量程（分母 8），所以每组的 `max|q|` 只能是
@@ -897,7 +937,8 @@ def check_group_saturation(out_dir: Path, nodes: list[str], report: Report) -> N
         if field(block, "weight_buffer_dtype") != "int4":
             continue
 
-        weights = np.fromfile(weight_path, dtype=np.int8)
+        weights = _output_major(
+            np.fromfile(weight_path, dtype=np.int8), node_id, edges)
         groups = scale_path.stat().st_size // 2
         if not groups or weights.size % groups:
             continue
@@ -915,14 +956,106 @@ def check_group_saturation(out_dir: Path, nodes: list[str], report: Report) -> N
             f"{checked} 个 int4 权重每组用满量程", not bad, "; ".join(bad[:4]))
 
 
+def check_ceva_manifest(manifest_path: Path, report: Report) -> None:
+    """CEVA 包：每个文件都必须是我方生成（role=generated），尺寸与摘要与落盘一致。
+
+    出现 `imported`（复制厂商字节）即判失败：交付要求 GML 涉及的 bin 全部由我方编译生成。
+    清单之外还要核对：GML 引用集、落盘集与登记集三者相等；每个 bin 与参考图同节点同字段
+    的文件尺寸相同（GC 按尺寸分配）；标成完整的包覆盖参考目录的全部子图。
+    """
+    import json
+
+    from gml_bridge import ceva
+
+    manifest = json.loads(Path(manifest_path).read_text())
+    root = Path(manifest_path).parent
+    graphs = manifest.get("graphs", [])
+    report.check("包里至少有一张图", bool(graphs))
+    reference = Path(manifest.get("reference_root", ""))
+    if manifest.get("complete"):
+        report.check("complete=true 的包覆盖参考目录全部子图且生成口径一致",
+                     ceva.bundle_complete(reference, graphs,
+                                          manifest.get("generation_digest")))
+    for graph in graphs:
+        directory = root / graph["directory"]
+        label = graph["directory"]
+        foreign, bad, checked = [], [], 0
+        for entry in graph["files"]:
+            path = directory / entry["path"]
+            if entry.get("role") != "generated":
+                foreign.append(entry["path"])
+            if not path.is_file():
+                bad.append(f"{entry['path']} 不存在")
+                continue
+            checked += 1
+            if path.stat().st_size != entry["size_bytes"]:
+                bad.append(f"{entry['path']} 尺寸 {path.stat().st_size} != {entry['size_bytes']}")
+            elif hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+                bad.append(f"{entry['path']} 摘要与清单不符")
+        report.check(f"{label} 全部文件由我方生成", not foreign,
+                     f"{len(foreign)} 个不是 generated，如 {foreign[:2]}" if foreign
+                     else f"{checked} 个文件")
+        report.check(f"{label} 文件尺寸与摘要与清单一致", not bad, "; ".join(bad[:2]))
+        _check_ceva_graph_files(graph, directory, reference, report)
+
+
+def _check_ceva_graph_files(graph: dict, directory: Path, reference: Path,
+                            report: Report) -> None:
+    """一张图：GML/IO_info 已登记；引用集 = 落盘集 = 登记集；bin 尺寸与参考同字段文件一致。"""
+    from gml_bridge import ceva
+
+    label = graph["directory"]
+    registered = {entry["path"] for entry in graph["files"]}
+    report.check(f"{label} 登记了 GML 与 IO_info",
+                 {ceva.GML_NAME, "IO_info.txt"} <= registered)
+    if not (directory / ceva.GML_NAME).is_file():
+        return
+    vendor_dir = ceva.graph_dir(reference, graph["stage"], graph["layer_id"]) / ceva.RUNTIME_DIR
+    ours = ceva.parse_vendor_graph(directory)
+    vendor = ceva.parse_vendor_graph(vendor_dir)
+    referenced = {name for node in ours.nodes.values()
+                  for path, name in ceva._file_fields({**node["fields"], **node["nested"]})
+                  if not ceva._DEBUG_FIELD.search(path)}
+    written = {p.name for p in directory.glob("*.bin")}
+    bins = {name for name in registered if name.endswith(".bin")}
+    same = referenced == written == bins
+    report.check(f"{label} GML 引用集、落盘集、登记集一致", same, "" if same else
+                 f"引用未落盘 {sorted(referenced - written)[:2]}，引用未登记 "
+                 f"{sorted(referenced - bins)[:2]}，多出 {sorted((written | bins) - referenced)[:2]}")
+    # 按语义键与字段路径找参考图的同一个文件；参考图没有该字段的不比。
+    wrong = []
+    for key, node in ours.nodes.items():
+        theirs = vendor.nodes.get(key)
+        if theirs is None:
+            wrong.append(f"参考图没有节点 {key}")
+            continue
+        their_files = dict(ceva._file_fields({**theirs["fields"], **theirs["nested"]}))
+        for path, name in ceva._file_fields({**node["fields"], **node["nested"]}):
+            if ceva._DEBUG_FIELD.search(path) or path not in their_files \
+                    or not (directory / name).is_file():
+                continue
+            size = (directory / name).stat().st_size
+            want = (vendor_dir / their_files[path]).stat().st_size
+            if size != want:
+                wrong.append(f"{name} {size}B，参考 {their_files[path]} {want}B")
+    report.check(f"{label} bin 尺寸与参考图同字段文件一致", not wrong, "; ".join(wrong[:2]))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--ceva-manifest", type=Path, default=None,
+                        help="CEVA 包的 bundle.json：核对全部文件由我方生成、尺寸与摘要一致")
     parser.add_argument("--model", type=Path, default=None,
                         help="7B 模型目录，给了就做反量化比对")
     parser.add_argument("--layers", type=int, default=None,
                         help="模型只取前 N 层，要与导出时一致")
     args = parser.parse_args()
+
+    if args.ceva_manifest is not None:
+        report = Report()
+        check_ceva_manifest(args.ceva_manifest, report)
+        return report.summary()
 
     gml_path = args.out_dir / "relay2gml_graph.gml"
     if not gml_path.is_file():
@@ -960,7 +1093,7 @@ def main() -> int:
     check_weight_hashes(args.out_dir, nodes, report)
 
     # 第四层：量化数学自洽（不需要模型）
-    check_group_saturation(args.out_dir, nodes, report)
+    check_group_saturation(args.out_dir, nodes, report, edges=edges)
     check_dq_phase_math(args.out_dir, nodes, report)
     check_dq_phase_constants(args.out_dir, nodes, report)
     check_softmax_reduction_encodings(args.out_dir, nodes, report)
@@ -968,7 +1101,7 @@ def main() -> int:
 
     if args.model:
         check_dequantization_recovers_weights(
-            args.out_dir, nodes, args.model, args.layers, report)
+            args.out_dir, nodes, args.model, args.layers, report, edges=edges)
 
     return report.summary()
 

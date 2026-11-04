@@ -268,243 +268,6 @@ def _check_identical_without_opcompiler(graph, fusion, artifact,
             notes=diff[:6])
 
 
-def _l2a_version() -> str:
-    """`l2a_version.txt` 的内容。
-
-    参考是 `0.0.0-c45e54f`（版本号 + git 短哈希），来自对方的 L2Analyzer。
-    我方不是 L2A，写本仓标识 + 短哈希，格式对齐、来源注明。
-    """
-    import subprocess
-    try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "--short=7", "HEAD"],
-            cwd=Path(__file__).resolve().parent.parent,
-            capture_output=True, text=True, timeout=5).stdout.strip()
-    except Exception:
-        sha = ""
-    return f"0.0.0-{sha}" if sha else "0.0.0-unknown"
-
-
-def _check_bin_references_closed(txt_dir: Path, bin_dir: Path,
-                                 log: CheckLog) -> None:
-    """prepare_out 的 txt 引用的 `.bin` 必须都在磁盘上（悬空引用会让底层
-    编译器的仿真器读不到缓冲）。
-
-    参考产物在这一项上是 0 缺失——这是「可在仿真器上正常执行」的最低要求，
-    见 docs/prepare_out-代码评审-20260920.md §3.1。
-    """
-    referenced: set[str] = set()
-    for path in txt_dir.glob("*.txt"):
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ":" not in line:
-                continue
-            _, _, value = line.partition(":")
-            value = value.strip()
-            if value.endswith(".bin"):
-                referenced.add(value)
-    on_disk = {p.name for p in bin_dir.glob("*.bin")}
-    missing = sorted(referenced - on_disk)
-    log.add("txt 引用的 bin 全部存在", not missing,
-            f"{len(referenced)} 个引用，缺失 {len(missing)} 个",
-            notes=missing[:10])
-
-    # 反向也要查：磁盘上有但没人引用的 bin 说明命名或落盘逻辑多写了一份
-    # ——不是致命问题（不会让仿真器读不到东西），但如实报告，同时也是
-    # 「陈旧文件掩盖真实缺失」的防线（配合上面写盘前清空 `out_dir/*.bin`，
-    # 复核 20260921 §2.5）。GML 自己的 .bin（权重、scale 等）不会出现在
-    # txt 里（那些是 GML 侧交叉校验的范畴，见 verify_against_graph），
-    # 所以这里只报告数字，不算失败项。
-    extra = sorted(on_disk - referenced)
-    log.add("盘上 bin 全部被 txt 引用（信息项，不计入失败）", True,
-            f"{len(extra)} 个未被 txt 引用（多为 GML 侧权重/scale，不算错）",
-            notes=extra[:5])
-
-
-def _check_dual_slot_offsets_disjoint(txt_dir: Path, log: CheckLog) -> None:
-    """双输入层的两个 L2 输入槎必须落在不重叠的地址区间。
-
-    `L2 input buffer offset 0 == offset 1` 意味着两块输入缓冲互相覆盖，
-    不是「分配策略不同」，见 docs/prepare_out-代码评审-20260920.md §3.2。
-    """
-    bad: list[str] = []
-    undersized: list[str] = []
-    checked = 0
-    for path in sorted(txt_dir.glob("*.txt")):
-        fields: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ":" not in line:
-                continue
-            key, _, value = line.partition(":")
-            fields[key.rstrip()] = value.strip()
-        off0 = fields.get("L2 input buffer offset 0")
-        off1 = fields.get("L2 input buffer offset 1")
-        if off0 is None or off1 is None:
-            continue
-        checked += 1
-        size0 = fields.get("L2 input buffer size 0")
-        size1 = fields.get("L2 input buffer size 1")
-        o0, o1 = int(off0), int(off1)
-        s0 = int(size0) if size0 is not None else 0
-        # 复核 20260921 发现：原来两次判断都用 s0，size1 != size0 时会漏判
-        # 重叠（例如槎 1 比槎 0 宽，槎 0 的区间判定为不重叠，但槎 1 的实际
-        # 尾端已经越过槎 0 的起点）。两个方向必须各用自己的尺寸。
-        s1 = int(size1) if size1 is not None else s0
-        if o0 == o1 or (o0 < o1 < o0 + s0) or (o1 < o0 < o1 + s1):
-            bad.append(f"{path.name}: offset0={o0} offset1={o1} "
-                      f"size0={s0} size1={s1}")
-        if s1 <= 0:
-            undersized.append(f"{path.name}: size1={s1}")
-    log.add("双输入层 L2 offset 0/1 不重叠", not bad,
-            f"{checked} 层双输入，{len(bad)} 层重叠", notes=bad[:10])
-    log.add("双输入层 L2 size1 为正", not undersized,
-            f"{checked} 层，{len(undersized)} 层 size1<=0",
-            notes=undersized[:5])
-
-
-def _check_bin_sizes_match_slots(bin_dir: Path, log: CheckLog) -> None:
-    """运行期 bin 按编译期槽位落盘：MatMul 权重 131072、KV cache 4MB。"""
-    from contracts.compile_slots import DEFAULT_SLOTS
-    slots = DEFAULT_SLOTS
-    bad: list[str] = []
-    weights = list(bin_dir.glob("weight_buffer_*.bin"))
-    small = [p.name for p in weights if p.stat().st_size == 65536]
-    ok = [p for p in weights if p.stat().st_size == slots.bmm_weight_elems]
-    if small:
-        bad.append(f"MatMul 权重仍是 65536B：{small[:3]}")
-    caches = list(bin_dir.glob("input_buffer_0_*.bin"))
-    kv = [p for p in caches if p.stat().st_size == slots.kv_cache_elems]
-    log.add("MatMul 权重按 S×hd 落盘", not small,
-            f"{len(ok)} 个 {slots.bmm_weight_elems}B，{len(small)} 个仍 65536B",
-            notes=small[:5])
-    log.add("KV cache 平面按 nh×S×hd 落盘",
-            any(p.stat().st_size == slots.kv_cache_elems for p in caches)
-            or not caches,
-            f"{len(kv)} 个 {slots.kv_cache_elems}B")
-
-
-def _run_orchestrator(artifact, phase_source, out_dir: Path,
-                      log: CheckLog, *, decode_block_only: bool = False) -> None:
-    """跑编排器，把层参数骨架与 net.ini 写到 `<out-dir>/prepare_out/`。
-
-    编排器在链路里是 GML **之后**的独立一段，不回填 GML——参考产物 616 个
-    键名里搜不到任何编排类字段，对方 PDF 也注明 `prev_task`/`next_task` 由
-    L2A 自己推导。
-    """
-    from orchestrator.plan import orchestrate
-
-    print("\n编排器:")
-    plan = orchestrate(artifact, phase_source=phase_source,
-                       decode_block_only=decode_block_only)
-
-    log.add("层展开", True, f"{plan.expand.total} 层"
-            f"（非逐头 {len(plan.expand.non_per_head)}、"
-            f"逐头 {len(plan.expand.per_head)}）")
-
-    # 不认识的 op_type 会静默少层，必须报出来。
-    log.add("全部 op_type 都能展开", not plan.expand.unknown,
-            "无未识别" if not plan.expand.unknown
-            else f"{len(plan.expand.unknown)} 个未识别",
-            notes=plan.expand.unknown[:5])
-
-    # Layer ID 撞号会让两层写同一个文件。
-    ids = [i.layer_id for i in plan.identity.identities]
-    log.add("Layer ID 唯一", len(ids) == len(set(ids)),
-            f"{len(ids)} 个，唯一 {len(set(ids))} 个")
-
-    # L2 offset 必须按 16 对齐（文档步骤 C）。
-    misaligned = [n for n, o in plan.l2.offsets.items() if o % 16]
-    log.add("L2 offset 16 字节对齐", not misaligned,
-            f"{len(plan.l2.offsets)} 块全对齐" if not misaligned
-            else f"{len(misaligned)} 块未对齐", notes=misaligned[:5])
-
-    log.add("L2 地址分配", True,
-            f"{plan.l2.buffers} 块 → {plan.l2.slots} 槽"
-            f"（复用率 {plan.l2.reuse_ratio:.1%}），"
-            f"数据区 {plan.l2.top} 字节")
-
-    prepare_out = out_dir / "prepare_out"
-    txt_dir = prepare_out / "txt_files"
-    txt_dir.mkdir(parents=True, exist_ok=True)
-    for stale in txt_dir.glob("*.txt"):
-        stale.unlink()
-    (prepare_out / "net.ini").write_text(plan.net_ini_text)
-
-    # 两个版本戳：参考里**没有结尾换行**（6 字节 `19.2.0`、13 字节
-    # `0.0.0-c45e54f`），也是整个 txt_files 里唯一不带 CRLF 的两个文件。
-    from contracts.gml_quant import GML_VERSION
-    (txt_dir / "gml_version.txt").write_text(GML_VERSION)
-    (txt_dir / "l2a_version.txt").write_text(_l2a_version())
-    for name, text in plan.layer_texts.items():
-        (txt_dir / name).write_text(text)
-
-    # RoPE 语义中间态（`{label}_cos.bin`）只在 txt 引用、不进 GML，这里补写。
-    _write_txt_only_bins(txt_dir, out_dir, artifact)
-
-    listed = sum(1 for line in plan.net_ini_text.splitlines()
-                 if line.startswith("layer = "))
-    log.add("net.ini 列出全部层", listed == len(plan.layer_texts),
-            f"{listed} 行 vs {len(plan.layer_texts)} 层 txt")
-    log.add("txt_files 文件数", True,
-            f"{len(plan.layer_texts)} 层 + 2 个版本戳")
-    log.add("编排器产物落盘", True, f"{prepare_out}/net.ini、txt_files/")
-
-    _check_bin_references_closed(txt_dir, out_dir, log)
-    _check_dual_slot_offsets_disjoint(txt_dir, log)
-    _check_bin_sizes_match_slots(out_dir, log)
-    _check_l2_alloc_covers_declared(txt_dir, plan.l2, log)
-    _check_parser_families(out_dir, log)
-
-
-def _write_txt_only_bins(txt_dir: Path, bin_dir: Path, artifact) -> None:
-    """txt 引用了但 GML 没声明的语义 bin（RoPE `_cos/_sin`）。"""
-    import numpy as np
-    from contracts.compile_slots import DEFAULT_SLOTS
-
-    referenced: set[str] = set()
-    for path in txt_dir.glob("*.txt"):
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ":" not in line:
-                continue
-            value = line.split(":", 1)[1].strip()
-            if value.endswith(".bin"):
-                referenced.add(value)
-    on_disk = {p.name for p in bin_dir.glob("*.bin")}
-    slots = getattr(artifact, "slots", None) or DEFAULT_SLOTS
-    for name in referenced - on_disk:
-        if name.endswith(("_cos.bin", "_sin.bin")):
-            np.zeros(slots.head_dim, dtype=np.float16).tofile(bin_dir / name)
-
-
-def _check_l2_alloc_covers_declared(txt_dir: Path, l2, log: CheckLog) -> None:
-    """每层声明的 L2 size 不能大于分配器给同一 offset 的槽尺寸。"""
-    bad: list[str] = []
-    checked = 0
-    sizes = getattr(l2, "slot_sizes", {}) or {}
-    for path in sorted(txt_dir.glob("*.txt")):
-        fields: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if ":" not in line:
-                continue
-            key, _, value = line.partition(":")
-            fields[key.rstrip()] = value.strip()
-        pairs = [
-            ("L2 input buffer size 0", "L2 input buffer offset 0"),
-            ("L2 input buffer size 1", "L2 input buffer offset 1"),
-            ("L2 output buffer size", "L2 output buffer offset"),
-        ]
-        for size_key, off_key in pairs:
-            if size_key not in fields or off_key not in fields:
-                continue
-            checked += 1
-            size = int(fields[size_key])
-            off = int(fields[off_key])
-            room = sizes.get(off, 0)
-            if room and size > room:
-                bad.append(f"{path.name}: {size_key}={size} > slot@{off}={room}")
-    log.add("L2 分配 ≥ 声明尺寸", not bad,
-            f"{checked} 处声明，{len(bad)} 处欠分配", notes=bad[:8])
-
-
 def _family(name: str) -> str:
     return re.sub(r"\d+", "#", name)
 
@@ -617,10 +380,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="跑一遍算子编译器（FlagTree）取回相位模板，与 GML "
                              "侧静态表交叉校验。**不改变产物**：加与不加导出的 "
                              "GML 必须逐字节相同，不同就是有一侧算错了")
+    # CEVA 链路：按厂商 65 图逐层导出，参数取自厂商同名子图。
+    parser.add_argument("--ceva-reference", type=Path, default=None,
+                        help="厂商 65 图根目录（只读）。给出即进入 CEVA 模式")
+    parser.add_argument("--stage", choices=("all", "prefill", "decode", "lm_head"),
+                        default="all", help="CEVA 模式只导某一阶段，调试用")
+    parser.add_argument("--layer-index", type=int, default=None,
+                        help="CEVA 模式只导某一层，调试用")
+    # 旧的自研 prepare_out 支线已删除，net.ini 由厂商 GC/L2A 生成。
     parser.add_argument("--orchestrate", action="store_true",
-                        help="跑编排器：层展开、Layer ID 发号、L2 地址分配、"
-                             "net.ini 执行序与 txt_files。产物写到 "
-                             "<out-dir>/prepare_out/。同样不改变 GML")
+                        help=argparse.SUPPRESS)
     # 默认裁掉末尾 RMSNorm + lm_head + DQ：参考产物就是纯 decode block，
     # 带这一步导出的 node/edge 与它精确一致。整网导出走下面的反向开关。
     parser.add_argument("--no-decode-block-only", dest="decode_block_only",
@@ -631,7 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.orchestrate:
+        parser.error("--orchestrate 已删除：prepare_out 由厂商 GC 生成，"
+                     "CEVA 链路用 --ceva-reference")
+
+    if args.ceva_reference is not None:
+        if not args.use_opcompiler:
+            # 设计 3.2：CEVA 链路的相位必须来自 FlagTree，并校验跨相依赖。
+            parser.error("--ceva-reference 必须同时给 --use-opcompiler")
+        return _main_ceva(args)
 
     from contracts.compile_slots import CompileSlots
     from runtime.compile import export_annotated_graph
@@ -650,7 +429,7 @@ def main() -> int:
     log = CheckLog()
 
     phase_source = None
-    if args.use_opcompiler or args.orchestrate:
+    if args.use_opcompiler:
         phase_source = _run_opcompiler(graph, log)
         if phase_source is None:
             # 算子编译器跑不起来，后面几项都依赖它，无法继续。
@@ -703,10 +482,6 @@ def main() -> int:
             graph, fusion, phase_source, artifact, log,
             decode_block_only=args.decode_block_only, slots=slots)
 
-    if args.orchestrate:
-        _run_orchestrator(artifact, phase_source, args.out_dir, log,
-                          decode_block_only=args.decode_block_only)
-
     # 权值指纹在**检查跑完之后**补：它要与刚落盘的权值 bin 字节对上，而那些
     # 字节写盘时才成形；提前补进 `artifact.text` 会让上面两条不变量检查比到
     # 一份带指纹的文本，比的就不是同一件事了。补完重出文本，GML 最后落盘。
@@ -721,6 +496,25 @@ def main() -> int:
           f"{files.total_bytes / 1e6:.2f} MB")
 
     return log.verdict()
+
+
+def _main_ceva(args) -> int:
+    """CEVA 模式：逐图导出 GML + IO_info + bin，并写清单 bundle.json。
+
+    权重先取厂商反量化浮点（已旋转、norm 已折叠）装进模型，bin 全部由我方重新生成。
+    """
+    from gml_bridge import ceva
+    from gml_bridge.ceva import bundle_targets
+
+    model = _load_model(args.layers)
+    ceva.load_vendor_checkpoint(model, args.ceva_reference, include_head=True)
+    targets = bundle_targets(args.stage, args.layer_index,
+                             model.config.num_hidden_layers)
+    print(f"CEVA 导出 {len(targets)} 张子图 -> {args.out_dir}")
+    manifest = ceva.export_ceva_bundle(model, args.ceva_reference, args.out_dir, targets,
+                                       use_opcompiler=args.use_opcompiler)
+    print(f"清单: {manifest}")
+    return 0
 
 
 if __name__ == "__main__":

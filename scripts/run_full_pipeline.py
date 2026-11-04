@@ -31,6 +31,15 @@
     # A/B 对照：同一份 sidecar，关掉本地分片形状再跑一次
     python scripts/run_full_pipeline.py --num-stages 4 --ab-compare
 
+CEVA 后端（我方 GML/bin 走厂商 GC 与 CEVA 仿真）：
+
+    bash scripts/run_ceva_pipeline.sh --run-name ours_e2e --decode-steps 10
+
+    启动脚本自动加载 paths.json 中的编译环境。主流程导出 65 张子图并强制走
+    FlagTree → 来源清单校验 → 工作区 run_all.sh --gml-bundle（GC、DDR、仿真、判定）。
+    我方 bin 默认用 --token-check warn；需要逐 token 一致时显式传 strict。
+    整轮约 10 小时，建议 nohup 后台运行。
+
 每一步跑完都会核对产物，不满足就直接失败——这个脚本的用途是回答「链路通没通」，
 所以任何一段静默退化都必须变成非零退出码。
 """
@@ -50,7 +59,8 @@ from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from genesim_bridge.paths import genesim_models_dir, genesim_root, llama2_7b_model_dir
+from genesim_bridge.paths import (ceva_reference_dir, ceva_workspace, genesim_models_dir,
+                                  genesim_root, llama2_7b_model_dir)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 # 七个投影，缺一个都说明 IR 或匹配退化了。
@@ -154,15 +164,21 @@ def step_a2_refine_pimir_ir(
     if placement is not None and Path(placement).is_file():
         placement_data = json.loads(Path(placement).read_text())
         fusion_requested = bool(placement_data.get("fused_activations"))
+    # sidecar 按实际档位命名：无 GPU 时走 oplevel，不能覆盖 pimir 那份。
+    ir_level = _refine_ir_level()
+    sidecar = genesim / "models" / f"llama2_7b_{ir_level}_extensions.json"
+    # 跳过还要求本档位的 sidecar 在且自报档位相符：换了档位（有无 GPU）就重新精化。
+    sidecar_ok = (sidecar.is_file()
+                  and json.loads(sidecar.read_text()).get("ir_level") == ir_level)
     if (pimir_ir.is_file() and _ir_op_ids(pimir_ir) == _ir_op_ids(ir_path)
-            and not fusion_requested):
-        print(f"    精化 IR 与图骨架同套编号（{pimir_ir.name}），跳过重新精化")
+            and not fusion_requested and sidecar_ok):
+        print(f"    精化 IR 与图骨架同套编号（{pimir_ir.name}），{ir_level} sidecar 在，跳过重新精化")
         return pimir_ir
     cmd = [
         "python", "scripts/refine_ir_with_flagtree.py",
         "--ir", str(ir_path), "--out-ir", str(pimir_ir),
-        "--sidecar", str(genesim / "models" / "llama2_7b_pimir_extensions.json"),
-        "--seq-len", _REFINE_SEQ_LEN, "--ir-level", _refine_ir_level(),
+        "--sidecar", str(sidecar),
+        "--seq-len", _REFINE_SEQ_LEN, "--ir-level", ir_level,
     ]
     # 放置 sidecar 里带图编译器的融合清单。没有它就按未融合算，会把已被吸收的
     # 激活再计一遍——所以必须在放置导出之后跑，并且把这份 sidecar 传进来。
@@ -667,9 +683,49 @@ def verify_trace_provenance(genesim: Path) -> None:
 
 
 
+def ceva_verdict(verdict_path: Path) -> list[str]:
+    """读 run_all 的判定报告，返回 token 行；结论不是 PASS 就失败。"""
+    if not verdict_path.is_file():
+        raise StepFailed(f"没有判定报告 {verdict_path}")
+    text = verdict_path.read_text()
+    if "结论: PASS" not in text or "[FAIL]" in text or "[SKIP]" in text:
+        raise StepFailed(f"CEVA 判定未通过：{verdict_path}")
+    return [line for line in text.splitlines() if "token 与 baseline" in line]
+
+
+def run_ceva(args: argparse.Namespace, log_dir: Path) -> Path:
+    """CEVA 后端：我方导出 65 图，交给工作区 run_all.sh 编译、仿真并判定。"""
+    workspace = ceva_workspace()
+    bundle = workspace / "bundles" / args.run_name
+    verdict_path = workspace / "runs" / args.run_name / "results" / "verdict.txt"
+    print("\n[1] 图编译器导出 65 张 CEVA 子图（厂商反量化权重作 checkpoint，bin 全部我方生成）")
+    _run([sys.executable, "scripts/export_gml.py", "--ceva-reference", str(ceva_reference_dir()),
+          "--use-opcompiler", "--out-dir", str(bundle)],
+         cwd=_REPO_ROOT, log_path=log_dir / "ceva_export.log")
+    print("\n[2] 清单校验（全部文件由我方生成，尺寸与摘要一致）")
+    _run([sys.executable, "scripts/verify_gml_artifact.py", str(bundle),
+          "--ceva-manifest", str(bundle / "bundle.json")],
+         cwd=_REPO_ROOT, log_path=log_dir / "ceva_manifest.log")
+    print("\n[3] 厂商 GC → DDR 布局 → CEVA 仿真 → token 判定")
+    _run(["bash", "run_all.sh", "-n", args.run_name, "--gml-bundle", str(bundle),
+          "-s", str(args.decode_steps), "--token-check", args.token_check],
+         cwd=workspace, log_path=log_dir / "ceva_run_all.log")
+    for line in ceva_verdict(verdict_path):
+        print(f"    {line.strip()}")
+    return verdict_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--backend", choices=("genesim", "ceva"), default="genesim",
+                        help="genesim=多 DPU 代价仿真；ceva=我方 GML 走厂商 GC 与 CEVA 仿真")
+    parser.add_argument("--run-name", default=None,
+                        help="CEVA 后端的实验名，包与运行目录都按它命名")
+    parser.add_argument("--token-check", choices=("strict", "warn"), default="warn",
+                        help="CEVA：strict 要求 token 与厂商基线一致；warn 不一致只告警（默认）")
+    parser.add_argument("--decode-steps", type=int, default=10,
+                        help="CEVA 后端的 decode 步数，至少 1（厂商基线为 10）")
     parser.add_argument("--num-stages", type=int, default=4,
                         help="流水段数：1=纯张量并行，num_dpus=纯流水")
     parser.add_argument("--num-dpus", type=int, default=8)
@@ -694,6 +750,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.backend == "ceva":
+        if not args.run_name:
+            print("错误: --backend ceva 需要 --run-name", file=sys.stderr)
+            return 2
+        if args.decode_steps < 1:
+            print("错误: CEVA 全流程至少需要 1 步 decode", file=sys.stderr)
+            return 2
+        log_dir = Path(args.log_dir) if args.log_dir else _REPO_ROOT / "test-results" / f"ceva-{args.run_name}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            verdict_path = run_ceva(args, log_dir)
+            token_lines = ceva_verdict(verdict_path)
+        except StepFailed as exc:
+            print(f"\n失败: {exc}", file=sys.stderr)
+            return 1
+        print("\nCEVA 全流程通过：图编译 → 算子编译 → GML/bin 生成 → 厂商 GC → CEVA 仿真")
+        # 告警档的 PASS 只说明仿真正常，token 是否与基线一致要单独报。
+        matched = bool(token_lines) and all(line.lstrip().startswith("[PASS]")
+                                            for line in token_lines)
+        print("token 对拍：通过（与厂商基线逐个一致）" if matched
+              else "token 对拍：告警（与厂商基线不一致，见判定报告）")
+        print(f"判定报告: {verdict_path}")
+        return 0
     if args.num_dpus % args.num_stages:
         print(f"错误: num_stages={args.num_stages} 不能整除 num_dpus={args.num_dpus}",
               file=sys.stderr)
