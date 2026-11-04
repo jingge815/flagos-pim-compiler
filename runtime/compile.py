@@ -265,7 +265,9 @@ def compile_llama2(
     for gm in [*prefill_gms.values(), decode_gm]:
         fuse_rms_norms(gm)
 
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    # Qwen3 显式声明 head_dim 且可以不等于 hidden/heads；未声明的架构（Llama、
+    # Qwen2）才按老口径推导。
+    head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
     # KV 几何与序列长度无关，用最长桶的图推一次即可。
     kv_specs = kv_specs_from_strategy(
         prefill_gms[prefill_seq_len],

@@ -63,6 +63,7 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | --- | --- | --- | --- |
 | torch/transformers 环境 | `pytorch_env_script` | 全部 | 导入即报错 |
 | 真实 Llama-2-7B（fp16，约 13 GB） | `llama2_7b_model_dir` | 所有 `*_llama2_7b.py`、`test_phase_source.py`、`test_gml_depends_on_opcompiler.py`、`test_oplevel_emitter_live.py` | 一般 SKIP；`test_gml_depends_on_opcompiler` 有 1 条会 ERROR |
+| 真实 Qwen3-8B（fp16，约 16 GB） | `qwen3_8b_model_dir` | `test_qwen3_8b_real.py` | SKIP |
 | ResNet50 GML 参考产物 | `gml_reference_dir` | `test_gml_reference.py`、`test_gml_names.py` | SKIP |
 | llama2 decode-block 参考产物 | `gml_llama2_reference_dir` | `test_runtime_files_phases.py`、`test_gml_llama2_reference.py`、`test_gml_quant.py`、`test_gml_hw_table.py`、`test_gml_coverage.py`、**`test_gml_lut.py`**、**`test_phase_data.py`**、**`test_verify_layers.py`** | 前四个 SKIP；**后三个直接 ERROR** |
 | 本机最近一次 decode-block 导出图 | `gml_ours_graph`（当前未配置） | `test_gml_node_parity.py` | SKIP（整文件） |
@@ -189,7 +190,8 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | `test_prefill_buckets.py` | 21 | prefill 分桶：桶表排序、按最短可容纳原则选桶、跨桶 token 一致、各桶共享权重与 KV 布局、融合 vs 强制主机 | 小模型 | 桶几何查 `compile_llama2(prefill_seq_lens=)`；选桶查 `prefill_bucket` |
 | `test_chunked_prefill.py` | 12（2 条 `slow`） | 分块 prefill：各种切法与整段逐 token 一致、主机两遍路径同样一致、交错请求互不干扰、中间段不采样、3000 token 的 64/512 切法（slow） | 小模型（slow 用 3072 长度图，约 8 分钟/用例） | 位置错先查 `prefill_chunk` 的 `pos`/`position_ids` 与 `_host_paged_attention` 的绝对位置掩码 |
 | `test_profile_execution.py` | 6 | vLLM 调度采集：效率/并发/窗口冲突、空步不计均值、中途失败不串步、stop 还原方法 | 无 | 失败先看 `scripts/profile_execution.py` 的 `_VllmProfiler` 步号过滤；并发类用例靠线程，慢机器上慎调阈值 |
-| `test_architectures.py` | 9 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling` 与真滑窗点名拒绝、Qwen2 配置放行、GQA（4 Q 头 / 2 KV 头）的 KV 布局 / prefill 对拍 HF / 两请求 token 一致、带偏置 Qwen2 贪心生成与 HF `generate` 一致 | 小模型（GQA、Qwen2 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束；Qwen2 生成分叉先查偏置是否进 MRAM |
+| `test_architectures.py` | 10 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling` 与真滑窗点名拒绝、Qwen2 配置放行、GQA（4 Q 头 / 2 KV 头）的 KV 布局 / prefill 对拍 HF / 两请求 token 一致、带偏置 Qwen2 贪心生成与 HF `generate` 一致、Qwen3（qk-norm + 显式 head_dim + 无偏置 qkv）贪心生成与 HF 一致 | 小模型（GQA、Qwen2/Qwen3 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束；Qwen2 生成分叉先查偏置是否进 MRAM；Qwen3 的 head_dim 不等于 hidden/heads，KV 切分按 `config.head_dim` 对齐 |
+| `test_qwen3_8b_real.py` | 1 | 真实 Qwen3-8B：注册表加载 → 8 DPU 切分编译 → 贪心生成与 HF `generate` 逐 token 一致 | 真 8B 权重（`qwen3_8b_model_dir`） | 生成分叉先查 `compile.py` 的 head_dim 取值是否用了 `config.head_dim`；Tied 词嵌入（1.7B 一类小模型）目前不支持 |
 | `test_step_stats.py` | 4 | 每步指标：wave 取整与最宽值、共用块去重占用、日志字段、真实 vLLM 下 `PIM_LOG_STEPS` 有输出且 `PIM_PROFILE` 两套采集器都有数据 | 小模型 + vLLM | 日志没有输出先查 `PIM_LOG_STEPS` 是否生效；采不到步查 `profile_vllm` 的 `_step` 签名是否跟 worker 对齐 |
 
 ### 4.7 GML 导出、格式与校验

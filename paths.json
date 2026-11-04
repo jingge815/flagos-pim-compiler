@@ -2,6 +2,7 @@
   "_comment": "入库模板。站点绝对路径写到 paths.local.json（不入库），或用同名环境变量覆盖。",
   "pytorch_env_script": null,
   "llama2_7b_model_dir": null,
+  "qwen3_8b_model_dir": null,
   "flagtree_prefix": null,
   "genesim_root": null,
   "gml_reference_dir": null,

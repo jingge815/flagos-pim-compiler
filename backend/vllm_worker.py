@@ -15,8 +15,8 @@
 - 能力矩阵在启动期（`validate_engine_config`）与请求期
   （`validate_new_request` / `validate_scheduler_output`）校验，不支持的能力
   不会静默算错。
-- 架构白名单在 `backend/architectures.py`：目前有 Llama 与 Qwen2（含 GQA 与标准 RoPE），
-  其它架构、位置缩放与滑窗注意力在启动期拒绝。
+- 架构白名单在 `backend/architectures.py`：目前有 Llama 与 Qwen2/Qwen3（含 GQA 与标准
+  RoPE），其它架构、位置缩放与滑窗注意力在启动期拒绝。
 - 运行时指标由 `PIM_LOG_STEPS` 每 N 步打印一行，`PIM_PROFILE=1` 在退出时打印
   请求级调度报告与各 DPU 忙碌时间。
 """

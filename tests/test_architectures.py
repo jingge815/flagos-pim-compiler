@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 import torch
 from transformers import (
-    LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM)
+    LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM,
+    Qwen3Config, Qwen3ForCausalLM)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -59,6 +60,7 @@ def test_unknown_architecture_lists_supported() -> None:
         validate_engine_config(**_configs(SimpleNamespace(model_type="gpt2")))
 
     assert "llama" in str(excinfo.value) and "qwen2" in str(excinfo.value)
+    assert "qwen3" in str(excinfo.value)
 
 
 def test_qwen2_config_passes() -> None:
@@ -201,6 +203,44 @@ def test_qwen2_generate_matches_hf(qwen2_model) -> None:
     model, path = qwen2_model
     loaded = ARCHITECTURES["qwen2"].load(str(path))
     strategy = ARCHITECTURES["qwen2"].strategy(NUM_DPUS, loaded.config)
+    compiled, backend = _compile_and_load(
+        loaded, strategy, num_request_slots=1, num_parallel_slots=1)
+
+    prompt = torch.tensor(PROMPTS[0])
+    got = run_decode_loop(
+        compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,
+        eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of)
+    ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
+                         do_sample=False)
+    assert got == ref[0][len(PROMPTS[0]):].tolist()
+
+
+@pytest.fixture(scope="module")
+def qwen3_model(tmp_path_factory):
+    """小 Qwen3：head_dim 显式且不等于 hidden/heads（Qwen3 的解耦特性），
+    q/k 的 RMSNorm 权重显式随机化（默认全 1，随机化才能测到装载路径）。"""
+    torch.manual_seed(2)
+    model = Qwen3ForCausalLM(Qwen3Config(
+        max_position_embeddings=MAX_SEQ, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=NUM_LAYERS, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=32, vocab_size=128,
+    )).eval().to(torch.float16)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.self_attn.q_norm.weight.normal_(1.0, 0.1)
+            layer.self_attn.k_norm.weight.normal_(1.0, 0.1)
+    path = tmp_path_factory.mktemp("qwen3")
+    model.save_pretrained(path)
+    return model, path
+
+
+def test_qwen3_generate_matches_hf(qwen3_model) -> None:
+    """Qwen3（qk-norm + 无偏置 qkv + 显式 head_dim）贪心生成与 HF 逐 token 一致。"""
+    model, path = qwen3_model
+    assert model.config.head_dim != model.config.hidden_size // model.config.num_attention_heads
+
+    loaded = ARCHITECTURES["qwen3"].load(str(path))
+    strategy = ARCHITECTURES["qwen3"].strategy(NUM_DPUS, loaded.config)
     compiled, backend = _compile_and_load(
         loaded, strategy, num_request_slots=1, num_parallel_slots=1)
 
