@@ -33,6 +33,9 @@ python -m pytest tests/test_spec_prop_llama2_7b.py -q -s
 
 # 显式跑慢速用例（GeneSim 端到端仿真，十几分钟）
 python -m pytest tests/test_genesim_simulation.py -q -m slow
+
+# 并行加速（一次性安装：pip install pytest-xdist；见 6.5 节选 worker 数）
+OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 8
 ```
 
 `pytest.ini` 里只有一条全局约定：`addopts = -m "not slow"`。`slow` 标记目前只用在 `test_genesim_simulation.py::test_simulation_produces_a_summary`。
@@ -309,6 +312,32 @@ python -m pytest tests/test_x.py -q -k "not slow"  # 文件内排除慢用例
 python -m pytest tests/test_x.py -q -rs         # 列出跳过原因
 python -m pytest tests/test_x.py -q --tb=long   # 完整回溯
 ```
+
+### 6.5 并行运行（pytest-xdist）
+
+先 `pip install pytest-xdist`，然后加 `-n <worker 数>`；重用例多时建议配
+`OMP_NUM_THREADS=16`，避免每个 worker 都起满全部核的线程池。
+
+```bash
+OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 8
+```
+
+- **报告不受影响**：`conftest.py` 检测 xdist worker（`workerinput`），worker 不写
+  `pytest-latest.md`，全部结果转发给主控进程汇总成同一份报告；串行语义不变。
+- **编译缓存安全**：`.opcompiler_cache` 用 flock + 原子替换，多 worker 同 key
+  编译会串行并复用第一份产物，不同 key 完全并行。
+- **worker 数受内存限制**：真 7B 用例单条峰值约 32GB（模型 14GB + 运行时），
+  `-n N` 最坏峰值 ≈ N × 32GB。本机（152 核 / 1TB）用 `-n 8` 约 256GB，安全。
+- **别用 `-n auto`**：会把 worker 拉到 152，多个真 7B 用例同时加载模型可能压爆内存。
+- **实测**（本机，`-k llama2_7b` 48 条）：串行 6272s → `-n 8` 4304s（1.46×）。
+  差距来自调度（长用例与其他重用例共享 worker）与并发 setup 膨胀；重用例分散到
+  专属 worker（加大 `-n`、重用例文件放参数最前）可逼近下述单条用例地板。
+- **提速上限被单条用例钉死**：`test_opcompiler_e2e_llama2_7b[tp1_pp8]` 一条约
+  2760s，是**被测内核的真实执行期**——tp1_pp8 每层跑全宽 linear（实测编译内核
+  M=22/N=4096 单次 2.0s、M=1 单次 0.23s；tp8_pp1 的 1/8 宽只要 0.13s/0.02s），
+  32 层 × 7 个 linear × 17 遍前向，属 PIM 目标机内核速度，不是测试框架浪费。
+  想突破它只能减少该用例的解码步数或优化内核代码生成，与并行化无关。
+- 没有单条巨石用例的子集（全量轻用例、单模块回归）加速比会高得多。
 
 ---
 

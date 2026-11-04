@@ -20,6 +20,11 @@ def _restore_grad_mode():
     torch.set_grad_enabled(_INITIAL_GRAD)
 
 
+def _is_xdist_worker(config) -> bool:
+    """是否是 pytest-xdist 的 worker 进程；报告统一由主控进程写。"""
+    return hasattr(config, "workerinput")
+
+
 @dataclass
 class TestResult:
     nodeid: str
@@ -31,6 +36,8 @@ class TestResult:
 def pytest_sessionstart(session):
     global _REPORT_STATE, _INITIAL_GRAD
     _INITIAL_GRAD = torch.is_grad_enabled()
+    if _is_xdist_worker(session.config):
+        return
     root = Path(session.config.rootpath)
     out_dir = root / "test-results"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -45,6 +52,8 @@ def pytest_sessionstart(session):
 
 
 def pytest_collection_modifyitems(session, config, items):
+    if _REPORT_STATE is None:
+        return
     state = _REPORT_STATE
     for item in sorted(items, key=lambda value: value.nodeid):
         state["ordered"].append(item.nodeid)
@@ -52,10 +61,15 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_runtest_logreport(report):
-    if _REPORT_STATE is None or report.nodeid not in _REPORT_STATE["results"]:
+    if _REPORT_STATE is None:
         return
     state = _REPORT_STATE
-    result = state["results"][report.nodeid]
+    result = state["results"].get(report.nodeid)
+    if result is None:
+        # xdist 主控没有亲自收集该用例时，按报告到达顺序补建条目。
+        result = TestResult(report.nodeid)
+        state["results"][report.nodeid] = result
+        state["ordered"].append(report.nodeid)
     if report.when == "call":
         result.duration = report.duration
         result.status = (
@@ -71,6 +85,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if _REPORT_STATE is None:
+        return
     state = _REPORT_STATE
     ended = datetime.now()
     elapsed = time.perf_counter() - state["perf"]
