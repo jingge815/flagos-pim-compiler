@@ -131,6 +131,9 @@ class NumpyBackend:
         self._stream_locks: dict[tuple[int, int], Lock] = {}
         self._stream_tail: dict[tuple[int, int], Future[object]] = {}
         self._stream_meta_lock = Lock()
+        # MoE 动态分派：键 (lane_key, dispatch_cmd_id)，值是本步无 token 命中的
+        # 专家集合。空字典 = 不跳过任何命令，行为与引入前一致。
+        self.gate_skips: dict[tuple[int, int], set[int]] = {}
         self._events_by_id: dict[int, Event] = {}
         self._ctx_local = threading.local()
         self._dpu_set: DpuSet = dpu_alloc(
@@ -221,6 +224,11 @@ class NumpyBackend:
         if cmd.op == "launch":
             kernel = self._kernels.lookup(str(cmd.payload["kernel"]))
             tracker = HazardTracker()
+            # MoE 动态分派：专家 launch 带 gate 字段时，运行期可能被 dispatch 置入跳过集。
+            gate = (
+                (lane_key, int(cmd.payload["gate"]), int(cmd.payload["expert"]))
+                if "gate" in cmd.payload else None
+            )
 
             def run_with_tracker(dpu_id: int = int(cmd.dpu_id), cmd: Command = cmd,
                                   tracker: HazardTracker = tracker) -> object:
@@ -232,7 +240,9 @@ class NumpyBackend:
 
             event = Event(
                 "dpu",
-                self._submit_on_dpu(int(cmd.dpu_id), lane_key, deps, ctx, run_with_tracker),
+                self._submit_on_dpu(int(cmd.dpu_id), lane_key, deps, ctx,
+                                    run_with_tracker, gate=gate,
+                                    zero_writes=cmd.writes),
             )
         elif cmd.op == "dma_in":
             data = np.ascontiguousarray(np.asarray(cmd.payload["data"])).copy()
@@ -289,6 +299,8 @@ class NumpyBackend:
         ctx: ExecutionContext | None,
         fn: Callable[..., object],
         *args: object,
+        gate: tuple[int, int, int] | None = None,
+        zero_writes: list | None = None,
     ) -> Future[object]:
         key = (lane_key, dpu_id)
         with self._stream_meta_lock:
@@ -303,6 +315,17 @@ class NumpyBackend:
                     prev.result()
                 for dep in deps:
                     dep.result()
+                # MoE 动态分派：等完 deps（含 dispatch）再看跳过集——本步无
+                # token 命中的专家不发内核，输出区写零（语义=该专家贡献为 0）。
+                # 必须写零而不是留旧值：下游仍会读这块缓冲乘路由权重 0，
+                # 旧值若是 inf/nan（如 fp16 归约溢出残留），inf×0=nan 会毒化累加。
+                if gate is not None and gate[2] in self.gate_skips.get(
+                        (gate[0], gate[1]), ()):
+                    for access in zero_writes or ():
+                        self.write_local(
+                            dpu_id, access.offset,
+                            np.zeros(access.length, dtype=np.uint8))
+                    return None
                 with self._install_context(ctx):
                     return fn(*args)
 
@@ -324,6 +347,11 @@ class NumpyBackend:
 
     def _current_context(self) -> ExecutionContext | None:
         return getattr(self._ctx_local, "ctx", None)
+
+    def current_lane_key(self) -> int:
+        """当前安装上下文的泳道键；无上下文（串行路径）为 0。"""
+        ctx = self._current_context()
+        return 0 if ctx is None else int(ctx.lane_key)
 
     def _run_host_or_dma(self, cmd: Command, deps: list[Future[object]],
                          ctx: ExecutionContext | None) -> object:

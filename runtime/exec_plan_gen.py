@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -18,6 +19,51 @@ from contracts.graph_meta import DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, REDIS
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.op_semantics import RMS_NORM_KERNEL
 from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY
+
+# MoE 动态分派开关：PIM_MOE_DISPATCH=0 关闭（退回稠密模拟全专家执行），用于 A/B 对比。
+_MOE_DISPATCH = os.environ.get("PIM_MOE_DISPATCH", "1") != "0"
+
+
+def _moe_layer_of(node: Node, marker: str) -> int | None:
+    """沿上游找第一个含 marker 的 get_attr 权重，返回所属层号。"""
+    seen, stack = set(), [node]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur.op == "get_attr" and marker in str(cur.target):
+            part = str(cur.target).split(".")
+            return int(part[part.index("layers") + 1])
+        stack.extend(a for a in cur.args if hasattr(a, "op"))
+    return None
+
+
+def _moe_expert_of(node: Node) -> tuple[int, int] | None:
+    """专家 linear 的 (layer, expert)；权重 get_attr 形如 layers.L.mlp.experts.E.*。"""
+    for arg in node.args:
+        if getattr(arg, "op", None) == "get_attr" and ".mlp.experts." in str(arg.target):
+            part = str(arg.target).split(".")
+            return int(part[part.index("layers") + 1]), int(part[part.index("experts") + 1])
+    return None
+
+
+def _emit_moe_dispatch(builder, layer: int, route_cmd_id: int) -> int:
+    """发一个 dispatch host_op：读路由张量，把本步无 token 命中的专家写进跳过集。
+
+    跳过集键 (lane_key, 本命令号)：并发窗口各写各的，互不覆盖；被跳过的
+    专家 launch 已 waits 本命令，读到的一定是本步的结果。
+    """
+    def fn(hal, cmd):
+        routing = hal.result_of(route_cmd_id)
+        lane = hal.current_lane_key()
+        hit = (routing != 0).any(dim=0)
+        hal.gate_skips[(lane, cmd.id)] = {
+            int(i) for i in (~hit).nonzero().flatten().tolist()}
+
+    return builder.append(
+        "host_op", None, {"node": f"moe_dispatch_{layer}", "fn": fn},
+        [], [], [route_cmd_id]).id
 
 _REDISTRIBUTE_OP = {
     "all_reduce": "host_reduce",
@@ -372,6 +418,8 @@ def build_execution_plan(
     builder = _PlanBuilder(gm_root, pending_readers)
     by_name = {n.name: n for n in nodes}
     output_cmd_id = -1
+    # MoE 动态分派：层号 → 本层 dispatch host_op 的命令号。
+    dispatch_by_layer: dict[int, int] = {}
     for node in nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
@@ -495,6 +543,13 @@ def build_execution_plan(
                     info = sdpa_info_of(node)
                     if info is not None:
                         payload["sdpa"] = info
+                # MoE 动态分派：专家 linear 打上 (gate=本层 dispatch, expert) 标签，
+                # 并把 dispatch 加进 waits——运行期先看跳过集再决定发不发内核。
+                expert = _moe_expert_of(node) if _MOE_DISPATCH else None
+                if expert is not None and expert[0] in dispatch_by_layer:
+                    payload["gate"] = dispatch_by_layer[expert[0]]
+                    payload["expert"] = expert[1]
+                    waits = waits + [payload["gate"]]
                 cmd = builder.append(
                     "launch", dpu_id, payload,
                     reads, [write], waits,
@@ -507,5 +562,11 @@ def build_execution_plan(
         # 生成主机计算命令。
         cmd = _emit_host_op(builder, node, host_handler_of)
         builder.register_reader(node.name, None, cmd.id)
+        # MoE 门控的 scatter 落地后紧跟一个 dispatch：读 routing 结果，
+        # 把本步无 token 命中的专家写进跳过集（专家 launch 已 waits 本命令）。
+        if _MOE_DISPATCH and node.target == torch.ops.aten.scatter.src:
+            layer = _moe_layer_of(node, "mlp.gate.weight")
+            if layer is not None:
+                dispatch_by_layer[layer] = _emit_moe_dispatch(builder, layer, cmd.id)
 
     return CompiledPlan(plan=ExecutionPlan(commands=builder.commands), output_cmd_id=output_cmd_id)
