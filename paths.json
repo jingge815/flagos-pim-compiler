@@ -3,6 +3,7 @@
   "pytorch_env_script": null,
   "llama2_7b_model_dir": null,
   "qwen3_8b_model_dir": null,
+  "qwen3_30b_model_dir": null,
   "flagtree_prefix": null,
   "genesim_root": null,
   "gml_reference_dir": null,

@@ -22,6 +22,8 @@ LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
     ("q_proj.bias", "col"),
     ("k_proj.bias", "col"),
     ("v_proj.bias", "col"),
+    # MoE router：按专家维列切，各 DPU 出 E/tp 份 logits，host all_gather 后门控。
+    ("mlp.gate.weight", "col"),
 )
 
 

@@ -20,6 +20,7 @@ _ENV_VARS = {
     "pytorch_env_script": "PYTORCH_ENV_SCRIPT",
     "llama2_7b_model_dir": "LLAMA2_7B_MODEL_DIR",
     "qwen3_8b_model_dir": "QWEN3_8B_MODEL_DIR",
+    "qwen3_30b_model_dir": "QWEN3_30B_MODEL_DIR",
     "flagtree_prefix": "FLAGTREE_PREFIX",
     "genesim_root": "GENESIM_ROOT",
     "gml_reference_dir": "GML_REFERENCE_DIR",
@@ -112,6 +113,14 @@ def qwen3_8b_model_dir(*, required: bool = True) -> Path | None:
     if path is not None or not required:
         return path
     return _resolve("qwen3_8b_model_dir")
+
+
+def qwen3_30b_model_dir(*, required: bool = True) -> Path | None:
+    """真实 Qwen3-30B-A3B（MoE）权重目录；外部依赖测试可传 ``required=False``。"""
+    path = _configured_path("qwen3_30b_model_dir")
+    if path is not None or not required:
+        return path
+    return _resolve("qwen3_30b_model_dir")
 
 
 def gml_reference_dir(*, required: bool = True) -> Path | None:

@@ -50,6 +50,13 @@ head_dim=16 后，`kv_specs_from_placement` 把 k_proj 分片切出了 16 个"KV
 
 ## 当前不足
 
+- **只覆盖 Qwen3 dense 线**（`Qwen3ForCausalLM`，`model_type="qwen3"`）。
+  Qwen3 MoE 线（30B-A3B / 235B-A22B，`model_type="qwen3_moe"`）是另一类架构，
+  未适配：白名单按 `model_type` 精确匹配，MoE 权重目录在启动期被拒绝，不会
+  静默算错。绕过校验也走不通——MoE 的 top-k 分派是数据依赖形状，
+  `torch.export` 直接报 `data-dependent expression`。真正支持需要：shape-static
+  的 MoE 前向导出、`topk`/`gather`/`index_select` 的图规则、专家权重的放置
+  策略（专家并行或复制）、MoE 分发/归约内核、以及 30B 级专家权重的内存规划。
 - **Tied 词嵌入（1.7B / 0.6B / 4B 小模型）仍不支持**：tied 导出里 lm_head 直接
   消费 `embed_tokens.weight`，`spec_prop` 要求被 linear 消费的权重有切分规则，
   而 embed_tokens 同时被 embedding 查表消费，需要 vocab 并行语义（Qwen2 时代

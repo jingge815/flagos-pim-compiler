@@ -11,7 +11,7 @@ import pytest
 import torch
 from transformers import (
     LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM,
-    Qwen3Config, Qwen3ForCausalLM)
+    Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -60,7 +60,7 @@ def test_unknown_architecture_lists_supported() -> None:
         validate_engine_config(**_configs(SimpleNamespace(model_type="gpt2")))
 
     assert "llama" in str(excinfo.value) and "qwen2" in str(excinfo.value)
-    assert "qwen3" in str(excinfo.value)
+    assert "qwen3" in str(excinfo.value) and "qwen3_moe" in str(excinfo.value)
 
 
 def test_qwen2_config_passes() -> None:
@@ -78,6 +78,14 @@ def test_qwen2_sliding_window_still_rejected() -> None:
         sliding_window=4096, use_sliding_window=True)
     with pytest.raises(ValueError, match="sliding_window"):
         validate_engine_config(**_configs(hf_config))
+
+
+def test_qwen3_moe_config_passes() -> None:
+    """Qwen3 MoE（model_type=qwen3_moe）在白名单内，启动期放行。"""
+    hf_config = SimpleNamespace(
+        model_type="qwen3_moe", rope_scaling=None,
+        sliding_window=None, use_sliding_window=False)
+    validate_engine_config(**_configs(hf_config))
 
 
 def test_rope_scaling_rejected() -> None:
@@ -251,3 +259,112 @@ def test_qwen3_generate_matches_hf(qwen3_model) -> None:
     ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
                          do_sample=False)
     assert got == ref[0][len(PROMPTS[0]):].tolist()
+
+
+def test_static_moe_forward_matches_hf() -> None:
+    """静态 MoE 前向改写与 HF 原版逐元素一致（两种 norm_topk_prob 语义）。"""
+    from backend.architectures import make_static_moe_forward
+
+    for norm_topk_prob in (False, True):
+        torch.manual_seed(3)
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+            max_position_embeddings=MAX_SEQ, hidden_size=64,
+            moe_intermediate_size=32, num_hidden_layers=1,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+            vocab_size=128, num_experts=8, num_experts_per_tok=2,
+            norm_topk_prob=norm_topk_prob,
+        )).eval().to(torch.float16)
+        blk = model.model.layers[0].mlp
+        x = torch.randn(1, 5, 64, dtype=torch.float16)
+        with torch.no_grad():
+            ref, _ = blk(x)
+            got, _ = make_static_moe_forward(blk)(x)
+        diff = float((got.float() - ref.float()).abs().max())
+        assert diff < 1e-3, f"norm_topk_prob={norm_topk_prob}: max|Δ|={diff}"
+
+
+def test_moe_gate_ops_stay_on_host() -> None:
+    """MoE 门控链算子（topk/softmax/sum/scatter/zeros_like）分区后留在主机。"""
+    from backend.architectures import make_static_moe_forward
+    from contracts.graph_meta import DEVICE_HOST, DEVICE_META_KEY
+    from runtime.compile import export_annotated_graph
+
+    torch.manual_seed(4)
+    model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+        max_position_embeddings=MAX_SEQ, hidden_size=64, moe_intermediate_size=32,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=32, vocab_size=128, num_experts=4, num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )).eval().to(torch.float16)
+    for layer in model.model.layers:
+        layer.mlp.forward = make_static_moe_forward(layer.mlp)
+
+    gm = export_annotated_graph(
+        model, 4, torch.arange(4, dtype=torch.long).unsqueeze(0))
+    gate_ops = {
+        "topk.default", "softmax.int", "sum.dim_IntList",
+        "scatter.src", "zeros_like.default",
+    }
+    seen = set()
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+        name = str(node.target).split("aten.")[-1]
+        if name in gate_ops:
+            seen.add(name)
+            assert node.meta[DEVICE_META_KEY] == DEVICE_HOST, f"{name} 应留主机"
+    assert seen == gate_ops, f"图里应出现全部门控算子，缺 {gate_ops - seen}"
+
+
+def test_moe_weight_rules() -> None:
+    """MoE 权重切分规则：router 列切，专家 SwiGLU 复用既有规则。"""
+    from graph.strategy import llama_strategies
+
+    strategy = llama_strategies(
+        NUM_DPUS, num_heads=4, num_kv_heads=2, intermediate_size=32,
+        vocab_size=128, num_layers=NUM_LAYERS)[0]
+    assert strategy.match("model.model.layers.0.mlp.gate.weight") == "col"
+    assert strategy.match("model.model.layers.0.mlp.experts.3.gate_proj.weight") == "col"
+    assert strategy.match("model.model.layers.0.mlp.experts.3.up_proj.weight") == "col"
+    assert strategy.match("model.model.layers.0.mlp.experts.3.down_proj.weight") == "row"
+
+
+@pytest.fixture(scope="module")
+def qwen3_moe_model(tmp_path_factory):
+    """小 Qwen3 MoE：8 专家 top-2、GQA、head_dim=32、门控重归一化。"""
+    torch.manual_seed(5)
+    model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+        max_position_embeddings=MAX_SEQ, hidden_size=64, moe_intermediate_size=32,
+        num_hidden_layers=NUM_LAYERS, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=32, vocab_size=128, num_experts=8, num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )).eval().to(torch.float16)
+    path = tmp_path_factory.mktemp("qwen3_moe")
+    model.save_pretrained(path)
+    return model, path
+
+
+def test_qwen3_moe_generate_matches_hf(qwen3_moe_model) -> None:
+    """Qwen3 MoE 走注册表加载（含静态化）与切分，贪心生成与 HF 逐 token 一致。"""
+    model, path = qwen3_moe_model
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ARCHITECTURES["qwen3_moe"].strategy(NUM_DPUS, loaded.config)
+    compiled, backend = _compile_and_load(
+        loaded, strategy, num_request_slots=1, num_parallel_slots=1)
+
+    prompt = torch.tensor(PROMPTS[0])
+    got = run_decode_loop(
+        compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,
+        eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of)
+    ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
+                         do_sample=False)
+    assert got == ref[0][len(PROMPTS[0]):].tolist()
+
+
+def test_qwen3_30b_model_dir_configured() -> None:
+    """站点路径键 qwen3_30b_model_dir 可解析（30B 用例的前置条件）。"""
+    from genesim_bridge.paths import qwen3_30b_model_dir
+
+    path = qwen3_30b_model_dir(required=False)
+    assert path is not None, "paths.local.json 缺 qwen3_30b_model_dir"
+    assert path.is_dir()
