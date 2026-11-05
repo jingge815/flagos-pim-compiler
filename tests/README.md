@@ -194,6 +194,7 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | `test_qwen3_8b_real.py` | 1 | 真实 Qwen3-8B：注册表加载 → 8 DPU 切分编译 → 贪心生成与 HF `generate` 逐 token 一致 | 真 8B 权重（`qwen3_8b_model_dir`） | 生成分叉先查 `compile.py` 的 head_dim 取值是否用了 `config.head_dim`；Tied 词嵌入（1.7B 一类小模型）目前不支持 |
 | `test_qwen3_30b_real.py` | 1 | 真实 Qwen3-30B-A3B（MoE，48 层 × 128 专家）：注册表加载（静态化）→ tp4_pp2 编译 → 贪心生成与 HF 逐 token 一致（实测 8:43:25，稠密模拟 16× 计算量） | 真 30B 权重（`qwen3_30b_model_dir`） | 编译超时属预期（~4.7 万节点/图）；执行慢是稠密模拟本性，开 `PIM_MOE_DISPATCH` 看 P1 分派 |
 | `test_moe_dispatch.py` | 9 | MoE 动态分派：gate 跳过集（含泳道键隔离、跳过写零防 inf×0=nan）、计划携带 dispatch/expert 标签、端到端跳过数与生成对拍、开关 A/B 一致、双请求并发一致 | 小模型 | 跳过集为空先查 `PIM_MOE_DISPATCH`；分叉先看被跳过命令是否写零了输出区 |
+| `test_moe_ep.py` | 1+1 xfail | 专家并行（PP×EP）：ep_width 校验、专家单 DPU 整块/attention 段内复制、累加链 host 聚合；16 DPU 端到端因跨段竞态 xfail（≤4 DPU 精确） | 小模型 | ≥8 DPU 数值漂移看 implement 文档 K3（跨段重分布竞态，未定位） |
 | `test_step_stats.py` | 4 | 每步指标：wave 取整与最宽值、共用块去重占用、日志字段、真实 vLLM 下 `PIM_LOG_STEPS` 有输出且 `PIM_PROFILE` 两套采集器都有数据 | 小模型 + vLLM | 日志没有输出先查 `PIM_LOG_STEPS` 是否生效；采不到步查 `profile_vllm` 的 `_step` 签名是否跟 worker 对齐 |
 
 ### 4.7 GML 导出、格式与校验

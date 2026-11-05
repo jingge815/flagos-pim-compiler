@@ -107,3 +107,34 @@ P0-b 的 30B 端到端等模型下载完成后验收；P1 两项未开始。
 | Q2 | P1-a 动态分派原语（§4.8） | 未开始 | |
 | Q3 | P1-b 专家并行 ep_width（§4.9） | 未开始 | |
 | Q4 | `-k llama2_7b` 回归门槛结果回填 4.3 | 已关闭 | 48 passed（0:53:44），与基线一致 |
+
+## 八、P1-b 补充记录（2026-11-05 第二轮）
+
+### 8.1 完成状态
+部分完成：EP 放置机制全部落地且 ≤4 DPU 精确；≥8 DPU 存在跨段竞态未定位，
+16 DPU 端到端用例以 `xfail(strict=True)` 守护（修复后自动报警提示移除标记）。
+
+### 8.2 已完成
+| 项 | 内容 | 验证 |
+|---|---|---|
+| ShardStrategy.ep_width | 校验、tp_width 收窄、stage_width 解耦、ep_dpu_of_expert 轮转 | test_shard_strategy_ep_width |
+| EP 权重放置 | 专家单 DPU 整块、attention/router/lm_head 段内 REPLICATE | test_ep_weight_specs_and_host_aggregation |
+| 传播扩展 | REPLICATE 输出 DPU 集取输入交集；REPLICATE 超集免搬运；linear 整块权重规则 | 同上 + 176 条核心回归 |
+| MoE 累加链 host 聚合 | remark 按「experts 祖先层==节点归属层」精确圈定 | test_moe_ep 全部 |
+| KV 段内复制 | kv_specs EP 分支（每 DPU 全头本段层） | ≤4 DPU 用例 |
+
+### 8.3 已知问题（K3，未关闭）
+**≥8 DPU 跨段竞态**。证据链：
+- pp1ep2 / pp1ep4 / pp2ep2（≤4 DPU）：prefill 12/12 精确（~5e-04）、decode 10/10 一致；
+- pp2ep4 → NaN、pp4ep2 / pp4ep4 误差 **4.27e-03~2.42e-02 逐次漂移**（同进程同权重，
+  排除确定性数值 bug）；误差按段数放大（层 0 精确 6.1e-05，层 1 起 ~4e-03，层 3 ~9e-02）；
+- 与动态分派无关（PIM_MOE_DISPATCH=0 复现）。
+怀疑方向：跨段重分布边（dpu→host 单副本收集 / host→dpu 回写）在 ≥10 worker 并发下
+的 waits 覆盖与 (lane, dpu) 折叠的交互；线程池大小 = min(64, num_dpus+2) 是暴露阈值。
+
+### 8.4 过程中修复（先红后绿）
+| 编号 | 问题 | 修复 |
+|---|---|---|
+| I6 | remark 首版把 MoE 下游全部 mul/add 扫进 host（下层的 RMSNorm 走 host fp16 mean，精度低于内核 fp32 累加，近平的门控 argmax 翻转） | 按「experts 祖先层==归属层」圈定 |
+| I7 | pinned 专家权重被「REPLICATE→REPLICATE 不同 DPU 集」拒重分布 | 发射面交集 + 超集免搬运 |
+| I8 | `_moe_layer_of` 跨模块误用（NameError） | 用 spec_prop 既有 `_layer_of_node` |

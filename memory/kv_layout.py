@@ -195,6 +195,22 @@ def kv_specs_from_strategy(
 ) -> dict[int, KVRegionSpec]:
     """按切分策略为每台 DPU 生成层和 KV head 的缓存规格。"""
     specs: dict[int, KVRegionSpec] = {}
+    if getattr(strategy, "ep_width", 1) > 1:
+        # PP×EP（路线 B）：attention/KV 在段内 REPLICATE——每台 DPU 持有本段
+        # 全部层的全部 KV 头（各份内容相同）。k_proj 是 REPLICATE，不走按头切。
+        group = num_q_heads // num_kv_heads
+        for stage in range(strategy.num_stages):
+            layers = strategy.layers_of_stage(stage, num_layers)
+            for dpu_id in strategy.dpus_of_stage(stage):
+                specs[dpu_id] = KVRegionSpec(
+                    dpu_id=dpu_id, layers=list(layers),
+                    kv_heads=list(range(num_kv_heads)),
+                    q_heads_by_kv={h: list(range(h * group, (h + 1) * group))
+                                   for h in range(num_kv_heads)},
+                    max_seq=max_seq, head_dim=head_dim, dtype_bytes=dtype_bytes,
+                    kv_base=kv_base, slot_tokens=slot_tokens,
+                )
+        return specs
     for stage in range(strategy.num_stages):
         layers = strategy.layers_of_stage(stage, num_layers)
         stage_specs = [_k_proj_spec_of_layer(gm, layer) for layer in layers]

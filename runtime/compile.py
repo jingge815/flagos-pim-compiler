@@ -258,6 +258,11 @@ def compile_llama2(
     decode_gm = export_annotated_graph(
         model, 1, torch.tensor([[0]], dtype=torch.long), dtype=dtype
     )
+    # PP×EP：专家输出落在互不相交的 DPU，先把 MoE 累加链改标 host 再传播规格。
+    if getattr(strategy, "ep_width", 1) > 1:
+        from graph.spec_prop import remark_moe_aggregation_for_ep
+        for gm in [*prefill_gms.values(), decode_gm]:
+            remark_moe_aggregation_for_ep(gm)
     prefill_edges_of = {
         seq_len: propagate_specs(gm, strategy) for seq_len, gm in prefill_gms.items()}
     decode_edges = propagate_specs(decode_gm, strategy)

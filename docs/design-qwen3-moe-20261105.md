@@ -345,7 +345,15 @@ token 一致；P1 记录加速比；Llama/Qwen3-8B 既有用例结果不变。
 
 ## 九、待确认事项
 1. `_rule_weighted_partial` 是否必要：若既有 mul.Tensor 规则已覆盖
-   Partial×Replicate，则删除（P0-a 编码时以小模型实测定）。
+   Partial×Replicate，则删除（P0-a 编码时以小模型实测定）。【已关闭：实测
+   既有规则覆盖，未新增】
 2. 30B 编译耗时若超出可接受范围（>30 分钟），是否引入「专家子图复用」优化
-   ——默认不做，先测再说。
+   ——默认不做，先测再说。【已验证：全程 8:43:25，瓶颈在稠密模拟执行而非编译】
 3. P1 gate 原语是否同步暴露给 `hal_vendor`（当前为 stub，暂不需要）。
+4. **§4.9 路线修正（2026-11-05 经用户确认）**：实施盘点发现 TP×EP 复合放置
+   与现有契约冲突三处（spec 的 Shard 假设分片互斥、`comm/lowering` 的
+   all_gather 假设分片不相交、KV 覆盖检查要求每头恰好一次）。本轮改为
+   **PP×EP（tp=1）**：专家整块落单 DPU；attention/KV/路由器在段内 REPLICATE
+   （30B 类模型 attention 仅占 6% 权重，复制代价小）；跨 DPU 专家求和把
+   MoE 累加子链改标 HOST 走 host 聚合。16 DPU 以 pp4×ep4 验证。TP×EP
+   复合放置（attention Shard(tp)×Replicate(ep)、EP 感知通信）列为后续课题。
