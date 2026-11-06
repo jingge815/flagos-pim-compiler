@@ -147,3 +147,18 @@ dpu0@161024 未等 gather cmd139）。修复后 16 DPU 端到端 6/6 通过（�
 | I7 | pinned 专家权重被「REPLICATE→REPLICATE 不同 DPU 集」拒重分布 | 发射面交集 + 超集免搬运 |
 | I8 | `_moe_layer_of` 跨模块误用（NameError） | 用 spec_prop 既有 `_layer_of_node` |
 | I9 | K3 竞态：dpu→host 收集的设备侧读区对 WAR 链不可见 | `register_reader` 登记键 (名, None) 与 `_war_waits` 查询键 (名, dpu) 键形不匹配 | 读区按 (redist:eNN, 读 DPU) 登记 | `runtime/exec_plan_gen.py`（`_emit_redistribute`） | test_dpu_to_host_reads_are_war_protected、test_ep_16_dpu_generate_matches_hf |
+
+## 九、P1-1 加速比记录（2026-11-06 验收补全）
+
+30B 端到端（同一用例、同一机器、dispatch 开关对比）：
+
+| 配置 | 墙钟 | CPU |
+|---|---|---|
+| PIM_MOE_DISPATCH=0（稠密模拟） | 8:43:25 | 104% |
+| PIM_MOE_DISPATCH=1（默认，动态分派） | **7:58:51** | 101% |
+
+墙钟加速 1.09×。该用例墙钟由固定开销主导：57GB 权重装载、~4.7 万节点图×2 的编译、
+HF 参考生成（与分派无关）；decode 仅 6 步（每步跳 120/128 专家）、prefill T=8×top-8
+仅命中约半数专家——执行期的分派节省（decode 专家计算 ~1/16）被固定成本掩盖。
+小模型侧的跳过语义与计数断言见 `test_moe_dispatch.py`；纯执行期加速的干净测量
+应剔除装载/编译/HF 参考后单独计时（后续课题）。
