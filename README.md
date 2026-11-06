@@ -317,6 +317,7 @@ python -m pytest tests/test_vllm_compat.py -q
 - `docs/runtime-windows-20261102.md` — 运行期窗口选择与设备端分配器接口设计
 - `docs/qwen2-support-20261102.md` — 接入 Qwen2（偏置链路）与 GQA 缓存覆盖修复
 - `docs/bench-regression-20261102.md` — 基准回归门限：`verify.sh --bench` 与基线文件
+- `docs/weekly-20261102.md` — 周报（10-27 → 11-02）：与 10-26 汇报逐条对照的进度
 - `docs/<module>.md` — 各模块接口与设计决策
 
 ## 开发约定
