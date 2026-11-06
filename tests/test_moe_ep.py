@@ -87,11 +87,6 @@ def test_ep_weight_specs_and_host_aggregation(ep_model_dir) -> None:
     assert host_agg, "累加链应改标 host"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="≥8 DPU 的跨段竞态未定位：误差非确定（4e-03~2e-02）且随段数放大；"
-           "≤4 DPU（pp1ep2/pp1ep4/pp2ep2）prefill/decode 全部精确。",
-)
 def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
     """16 DPU pp4×ep4：贪心生成与 HF 逐 token 一致，专家映射均衡。"""
     from collections import Counter
@@ -140,3 +135,56 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
             strategy.ep_dpu_of_expert(layer, e, NUM_LAYERS)
             for e in range(NUM_EXPERTS))
         assert max(counts.values()) - min(counts.values()) <= 1
+
+
+def test_dpu_to_host_reads_are_war_protected(ep_model_dir) -> None:
+    """dpu→host 重分布的读区必须登记在（消费者名, 读取 DPU）上：激活区复用时，
+    后写者要 WAR 等它——否则 gather 可能读到被覆盖的旧值（K3 竞态）。"""
+    from collections.abc import Iterable
+
+    from contracts.graph_meta import DEVICE_HOST
+    from contracts.op_contract import PIMHardwareConfig
+    from graph.strategy import ShardStrategy
+    from memory.mem_planner import HwBudget
+    from runtime.compile import compile_llama2
+
+    model, path = ep_model_dir
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ShardStrategy(
+        name="pp2ep4", num_dpus=8, num_stages=2, ep_width=4,
+        weight_rules=ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config).weight_rules,
+    )
+    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    compiled = compile_llama2(
+        loaded, strategy, prefill_seq_len=4, max_seq=16,
+        hw=hw, hardware=PIMHardwareConfig(
+            num_dpus=8, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+            wram_bytes_per_dpu=65536, dma_align=64),
+        num_request_slots=1, num_parallel_slots=1)
+
+    for plan_obj in compiled.prefill_plans[4]:
+        cmds = plan_obj if isinstance(plan_obj, Iterable) and hasattr(plan_obj, "__iter__") and not hasattr(plan_obj, "commands") else plan_obj.commands
+        edges = {e.edge_id: e for e in compiled.prefill_edges}
+        by_id = {c.id: c for c in cmds}
+        gathers = [c for c in cmds
+                   if c.op in ("host_concat", "host_reduce")
+                   and c.payload.get("edge_id") in edges
+                   and edges[c.payload["edge_id"]].dst_loc.get("device") == DEVICE_HOST]
+        assert gathers, "应存在 dpu→host 收集命令"
+        violations = []
+        for g in gathers:
+            edge = edges[g.payload["edge_id"]]
+            for r in g.reads:
+                for w in cmds:
+                    if w.id <= g.id or w.op == "host_op":
+                        continue
+                    for wa in w.writes:
+                        if wa.loc != r.loc or (wa.offset + wa.length <= r.offset
+                                               or r.offset + r.length <= wa.offset):
+                            continue
+                        # 同 DPU 后写者必须显式等 gather（gather 是 host 命令，不在 DPU 泳道链上）。
+                        if g.id not in w.waits:
+                            violations.append(
+                                f"cmd{w.id}({w.payload.get('node')}) 重写 {r.loc}@{r.offset} "
+                                f"未等 gather cmd{g.id}({edge.src}->{edge.dst})")
+        assert not violations, "\n".join(violations[:5])

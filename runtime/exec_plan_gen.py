@@ -365,6 +365,12 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
     builder.register_reader(f"redist:e{edge.edge_id}", None, cmd.id)
     for w in writes:
         builder.register_reader(f"redist:e{edge.edge_id}", w.loc[1], cmd.id)
+    # 读区也要登记：内存规划的 WAR 链把重分布边记作 `redist:eNN` 读者名，
+    # 按（读者名, 读取 DPU）查命令号；原先只登记 (名, None)，键形对不上，
+    # 激活区复用的后写者查不到——dpu→host 收集是 host 命令，不在 DPU 泳道
+    # 链上，没有这条 WAR 就裸奔（K3 竞态，≥8 worker 下必现）。
+    for r in reads:
+        builder.register_reader(f"redist:e{edge.edge_id}", r.loc[1], cmd.id)
 
 
 def _emit_host_op(builder: _PlanBuilder, node: Node, host_handler_of: HostHandlerFn | None) -> Command:

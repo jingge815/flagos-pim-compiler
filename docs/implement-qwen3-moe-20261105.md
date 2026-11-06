@@ -123,8 +123,16 @@ P0-b 的 30B 端到端等模型下载完成后验收；P1 两项未开始。
 | MoE 累加链 host 聚合 | remark 按「experts 祖先层==节点归属层」精确圈定 | test_moe_ep 全部 |
 | KV 段内复制 | kv_specs EP 分支（每 DPU 全头本段层） | ≤4 DPU 用例 |
 
-### 8.3 已知问题（K3，未关闭）
-**≥8 DPU 跨段竞态**。证据链：
+### 8.3 已知问题 K3（2026-11-06 已关闭）
+**根因**：`_emit_redistribute` 把重分布命令登记为 `(redist:eNN, None)`，而内存规划
+的 WAR 链按 `(读者名, 读取 DPU 整数)` 查 `reader_cmds`——键形不匹配，dpu→host
+收集的设备侧读区对后写者不可见；收集是 host 命令、不在 DPU 泳道链上，激活区复用
+的写者不等它就覆盖（TP 路径同样存在，靠低并发时序掩盖）。修复：读区按
+`(redist:eNN, 读 DPU)` 登记（`runtime/exec_plan_gen.py::_emit_redistribute`）。
+守护测试 `test_dpu_to_host_reads_are_war_protected`（修复前红：cmd141 重写
+dpu0@161024 未等 gather cmd139）。修复后 16 DPU 端到端 6/6 通过（此前 10/10 失败）。
+
+原证据链（保留）：
 - pp1ep2 / pp1ep4 / pp2ep2（≤4 DPU）：prefill 12/12 精确（~5e-04）、decode 10/10 一致；
 - pp2ep4 → NaN、pp4ep2 / pp4ep4 误差 **4.27e-03~2.42e-02 逐次漂移**（同进程同权重，
   排除确定性数值 bug）；误差按段数放大（层 0 精确 6.1e-05，层 1 起 ~4e-03，层 3 ~9e-02）；
@@ -138,3 +146,4 @@ P0-b 的 30B 端到端等模型下载完成后验收；P1 两项未开始。
 | I6 | remark 首版把 MoE 下游全部 mul/add 扫进 host（下层的 RMSNorm 走 host fp16 mean，精度低于内核 fp32 累加，近平的门控 argmax 翻转） | 按「experts 祖先层==归属层」圈定 |
 | I7 | pinned 专家权重被「REPLICATE→REPLICATE 不同 DPU 集」拒重分布 | 发射面交集 + 超集免搬运 |
 | I8 | `_moe_layer_of` 跨模块误用（NameError） | 用 spec_prop 既有 `_layer_of_node` |
+| I9 | K3 竞态：dpu→host 收集的设备侧读区对 WAR 链不可见 | `register_reader` 登记键 (名, None) 与 `_war_waits` 查询键 (名, dpu) 键形不匹配 | 读区按 (redist:eNN, 读 DPU) 登记 | `runtime/exec_plan_gen.py`（`_emit_redistribute`） | test_dpu_to_host_reads_are_war_protected、test_ep_16_dpu_generate_matches_hf |
