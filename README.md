@@ -107,7 +107,7 @@ GeneSim 侧的 `scripts/refine_ir_with_flagtree.py` 用 `PIM_COMPILER_ROOT` 指�
 不直接使用厂商自带的 GML、bin 或旧 Registry：
 
 ```bash
-cd /data/fjg/flagOS/flagos-pim-compiler
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
 bash scripts/run_ceva_pipeline.sh --run-name ours_e2e --decode-steps 10
 ```
 

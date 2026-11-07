@@ -263,8 +263,8 @@
 
 第十、十一轮评审修复后（11-03）：
 - 按用户指定同时处理两份评审，重叠项合并为 5 项；无不成立或遗留项。三项验收逻辑先由行为测试确认失败再修复；归档先由摘要一致性测试确认失败再更新；索引先查缺项再补文档。
-- CEVA 全量回归：在 CEVA 仓先 `source /data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh`，执行 `python -m pytest tests/ -q`，51 passed、0 failed、0 skipped（5.59 秒）。
-- FlagTree 全量 lit：`source /data/fjg/flagOS/flagOS-installed/flagTree/env-flagtree.sh` 后执行 `/data/fjg/flagOS/flagOS-installed/flagTree/python-3.10.20/bin/lit /data/fjg/flagOS/flagOS-installed/flagTree/build/flagtree-cmake/test --no-progress-bar`，265 passed、0 failed（1.28 秒）。
+- CEVA 全量回归：在 CEVA 仓先 `source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh`，执行 `python -m pytest tests/ -q`，51 passed、0 failed、0 skipped（5.59 秒）。
+- FlagTree 全量 lit：`source /data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/env-flagtree.sh` 后执行 `/data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/python-3.10.20/bin/lit /data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/build/flagtree-cmake/test --no-progress-bar`，265 passed、0 failed（1.28 秒）。
 - 图编译器相关回归：加载 `paths.json` 的 PyTorch 环境后执行 `python -m pytest tests/test_ceva_export.py tests/test_quant_weights.py tests/test_quant_calibration.py tests/test_runtime_files.py tests/test_runtime_files_phases.py tests/test_gml_from_fx.py tests/test_verify_layers.py tests/test_phase_plan.py tests/test_phase_source.py tests/test_pwla.py -q`，272 passed、0 failed、0 skipped（52.20 秒）。
 - 整包校验命令（图编译器仓，同一环境）：`python scripts/verify_gml_artifact.py /data/fjg/ceva/bundles/ours_e2e --ceva-manifest /data/fjg/ceva/bundles/ours_e2e/bundle.json`，327/327 通过。65 图、199353 个登记文件全部 generated；本轮重新计算的图编译器版本 `bf5b8a5+4408a5affe03`、FlagTree 摘要 `9615b69ba9d7` 均与包一致。逐图调用现有 `already_compiled`，65/65 图的 GC 输入、Registry 和编译环境摘要均匹配。
 - 现有硬件结果复核命令（CEVA 仓）：`TOKEN_CHECK=warn GML_BUNDLE=/data/fjg/ceva/bundles/ours_e2e python3 scripts/verify_run.py runs/ours_e2e baseline`，22 项中 20 PASS、2 WARN、0 FAIL/SKIP。实际 10 步、11 个合法 token，告警仍是量化造成的 token 分叉与 lm_head cycles +22.2%。

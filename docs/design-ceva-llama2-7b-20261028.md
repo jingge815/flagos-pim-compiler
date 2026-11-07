@@ -622,8 +622,8 @@ A 阶段同时用 decode 第 17 层抽查，确认语义键可以跨层复用。
 单层验证（A～C 阶段）：
 
 ```bash
-cd /data/fjg/flagOS/flagos-pim-compiler
-source /data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
+source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh
 python scripts/export_gml.py --ceva-reference "$CEVA_REF" --stage decode --layer-index 0 \
   --use-opcompiler --out-dir "$CEVA_BUNDLE"
 cd /data/fjg/ceva
@@ -646,8 +646,8 @@ bash run_all.sh -n ours_full10 --gml-bundle "$CEVA_BUNDLE" -s 10
 图编译器回归：
 
 ```bash
-cd /data/fjg/flagOS/flagos-pim-compiler
-source /data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
+source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh
 python -m pytest tests/ -q -k "not llama2_7b"
 python -m pytest tests/ -q -k "llama2_7b"   # 仅最终，2～3 小时
 ```

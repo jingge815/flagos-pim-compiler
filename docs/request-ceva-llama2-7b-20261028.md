@@ -29,9 +29,9 @@ CEVA 仿真的是 1 个 NPM 核，核内有 4 个 engine，每个 engine 配 1 �
 
 | 前缀 | 根目录 |
 | --- | --- |
-| G（默认） | `/data/fjg/flagOS/flagos-pim-compiler` |
-| F | `/data/fjg/flagOS/flagOS-installers/FlagTree` |
-| S | `/data/fjg/flagOS/genesim` |
+| G（默认） | `/data/fjg/pengcheng/flagOS/flagos-pim-compiler` |
+| F | `/data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree` |
+| S | `/data/fjg/pengcheng/flagOS/genesim` |
 | C | `/data/fjg/ceva` |
 | V | `/home/jgfeng/ceva/392111_E2E_Llama2_package/full_release_package/gc_release_package/vbu_ctp_apps` |
 | R | `/home/jgfeng/ceva/gmls-device-1024/392111_E2E_Llama2_GMLs/GMLs`（厂商 65 图） |
@@ -170,8 +170,8 @@ CEVA 仿真的是 1 个 NPM 核，核内有 4 个 engine，每个 engine 配 1 �
 图编译器修改按以下命令回归：
 
 ```bash
-cd /data/fjg/flagOS/flagos-pim-compiler
-source /data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
+source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh
 python -m pytest tests/ -q -k "not llama2_7b"
 # 仅最终验证，预计 2～3 小时
 python -m pytest tests/ -q -k "llama2_7b"
@@ -193,10 +193,10 @@ python -m pytest tests/ -q -k "llama2_7b"
 原始prompt信息:
 背景：
 1.已初步完成面向存算一体编译器的AI编译器研发，版本在：
-/data/fjg/flagOS/flagos-pim-compiler  图编译器
-/data/fjg/flagOS/genesim  模拟器
-/data/fjg/flagOS/flagOS-installers/FlagTree  算子编译器
-/data/fjg/flagOS/flagOS-installers/ 0-install-flagtree.sh，安装脚本。
+/data/fjg/pengcheng/flagOS/flagos-pim-compiler  图编译器
+/data/fjg/pengcheng/flagOS/genesim  模拟器
+/data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree  算子编译器
+/data/fjg/pengcheng/flagOS/flagOS-installers/ 0-install-flagtree.sh，安装脚本。
 当前版本只是能够在genesim模拟器中运行，同时也能生成gml格式文件。
 2.在甲方的需求是能够让上述AI编译器生成gml格式文件，走通他们的硬件模拟器ceva。ceva相关资料：/data/fjg/ceva。相关脚本在scripts以及run_all.sh。注意尽量不要动：/home/jgfeng/ceva中的原始资料，这个是需要比对的。目前初步运行/data/fjg/ceva，能够用厂商原来提供的gml原始文件走通llama2 7b在ceva硬件仿真器的模拟。
 
@@ -215,7 +215,7 @@ python -m pytest tests/ -q -k "llama2_7b"
 验证：
 1.核心验证：能够让存算一体编译器生成的gml以及配套文件，走通甲方的ceva硬件仿真器，走通llama2 7b的推理全流程；
 2.存算一体编译器验证：
-cd /data/fjg/flagOS/flagos-pim-compiler
-source /data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
+source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh
 python -m pytest tests/ -q -k "not llama2_7b" , 图编译器修改，主要用这个验证；
 python -m pytest tests/ -q -k "llama2_7b" ，这个运行时间要2-3个小时，只是最后验证，平常不验证。

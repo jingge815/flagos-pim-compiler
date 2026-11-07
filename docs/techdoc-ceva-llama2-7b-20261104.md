@@ -292,7 +292,7 @@ class PhasePlan:
 复现命令：
 
 ```bash
-cd /data/fjg/flagOS/flagos-pim-compiler
+cd /data/fjg/pengcheng/flagOS/flagos-pim-compiler
 source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
 python -m pytest tests/test_ceva_export.py tests/test_quant_weights.py \
   tests/test_quant_calibration.py tests/test_runtime_files.py \
@@ -309,9 +309,9 @@ TOKEN_CHECK=warn GML_BUNDLE=/data/fjg/ceva/bundles/ours_e2e \
 bash run_all.sh -n ours_e2e --gml-bundle /data/fjg/ceva/bundles/ours_e2e \
   -s 10 --token-check warn --orig-check external --from 7 --to 7
 
-source /data/fjg/flagOS/flagOS-installed/flagTree/env-flagtree.sh
-/data/fjg/flagOS/flagOS-installed/flagTree/python-3.10.20/bin/lit \
-  /data/fjg/flagOS/flagOS-installed/flagTree/build/flagtree-cmake/test \
+source /data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/env-flagtree.sh
+/data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/python-3.10.20/bin/lit \
+  /data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/build/flagtree-cmake/test \
   --no-progress-bar
 ```
 

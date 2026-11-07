@@ -1,10 +1,10 @@
 {
-  "pytorch_env_script": "/data/fjg/flagOS/flagOS-installed/pytorch/env-pytorch.sh",
-  "llama2_7b_model_dir": "/data/fjg/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf",
-  "flagtree_prefix": "/data/fjg/flagOS/flagOS-installed/flagTree",
-  "genesim_root": "/data/fjg/flagOS/genesim",
-  "gml_reference_dir": "/data/fjg/flagOS/xinfangzhou-resource",
-  "gml_llama2_reference_dir": "/data/fjg/flagOS/xinfangzhou-resource/model_layers_0_decode_v2/parser_output/tvmgen_default_nprm_main_0/runtime_files",
+  "pytorch_env_script": "/data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh",
+  "llama2_7b_model_dir": "/data/fjg/pengcheng/flagOS/flagOS-installed/model-inference/models/Llama-2-7b-hf",
+  "flagtree_prefix": "/data/fjg/pengcheng/flagOS/flagOS-installed/flagTree",
+  "genesim_root": "/data/fjg/pengcheng/flagOS/genesim",
+  "gml_reference_dir": "/data/fjg/pengcheng/flagOS/xinfangzhou-resource",
+  "gml_llama2_reference_dir": "/data/fjg/pengcheng/flagOS/xinfangzhou-resource/model_layers_0_decode_v2/parser_output/tvmgen_default_nprm_main_0/runtime_files",
   "ceva_workspace": "/data/fjg/ceva",
   "ceva_reference_dir": "/home/jgfeng/ceva/gmls-device-1024/392111_E2E_Llama2_GMLs/GMLs",
   "ceva_embedding": "/home/jgfeng/ceva/392111_E2E_Llama2_package/Llama_end_to_end/InputBinCreator/weights/llama2/embed_torch.pth"

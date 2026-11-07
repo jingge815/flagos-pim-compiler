@@ -41,6 +41,6 @@
 ### 问题5（低）：方言索引未同步，导致维护口径滞后
 **问题说明**：FlagTree `claude.md` 第 3、112～116 行规定，修改代码后必须同步更新该文件与 `README.md`，属性变化还要更新检索指引。本次新增了 `fixed2float` FPSU 模式并放开 int8 模型权重，修改了 5 个方言实现文件和 3 个 lit 文件，但 `claude.md` 与 `README.md` 均无未提交变更，现有索引仍不能说明输出头的 int8 静态量化及显式 FPSU 保留规则，不符合仓库明确的文档维护约束。
 
-**涉及文件**：`/data/fjg/flagOS/flagOS-installers/FlagTree/include/triton/Dialect/TritonPIM/IR/PIMAttrDefs.td`；`lib/Dialect/TritonPIM/IR/Ops.cpp`；`lib/Dialect/TritonPIM/Transforms/ExpandPhases.cpp`；`claude.md:3,39,49,89,112-116`；`README.md`。
+**涉及文件**：`/data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree/include/triton/Dialect/TritonPIM/IR/PIMAttrDefs.td`；`lib/Dialect/TritonPIM/IR/Ops.cpp`；`lib/Dialect/TritonPIM/Transforms/ExpandPhases.cpp`；`claude.md:3,39,49,89,112-116`；`README.md`。
 
 **修改思路**：在方言索引中补充 `fixed2float`、int8 模型权重的配套约束及显式 FPSU 保留行为，并在 `README.md` 同步对应能力说明；只更新实际已实现的语义，不增加新的设计分支。
