@@ -103,7 +103,7 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         producer="graph.fuse_rope:fuse_rope",
         # `graph.kv_dma_pass` 用 `ROPE_META_KEY in n.meta` 判断（不是 `.meta[...]`
         # 取数），漏登记过一次 —— 这一栏是排查取数点时唯一的索引。
-        consumers=("gml_bridge.from_fx", "gml_bridge.export",
+        consumers=("gml_bridge.from_fx",
                    "graph.kv_dma_pass",
                    "opcompiler_bridge.oplevel_emitter")),
     MetaKeySpec(
@@ -146,7 +146,7 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         HEAD_INDEX_META_KEY, (DIM_OP_SEMANTICS, DIM_PLACEMENT), "int",
         producer="graph.split_heads:split_attention_heads",
         consumers=("graph.kv_dma_pass", "graph.quant_pass",
-                   "gml_bridge.from_fx", "opcompiler_bridge.oplevel_emitter"),
+                   "gml_bridge.from_fx"),
         note="头下标，GML 落成 split_channel_number；也指示本地分片落在哪台 DPU"),
     MetaKeySpec(
         STATIC_QUANT_META_KEY, (DIM_OP_SEMANTICS, DIM_DTYPE), "bool",

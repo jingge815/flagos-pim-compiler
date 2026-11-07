@@ -425,3 +425,31 @@ def kv_cache_kernel(func: str, value_shape: tuple[int, ...], cache_elems: int,
        : {value_ty}, {cache_ty}, i32
     tt.return
   }}"""
+
+
+def paged_attn_kernel(func: str, q_shape: tuple[int, int], cache_elems: int,
+                      max_blocks: int, slot_tokens: int, slot_elems: int,
+                      scale: float) -> str:
+    """分页注意力：一台 DPU 上一个头的 QK / softmax / PV。
+
+    块表与缓存都是「指针进去」，内核自己按逻辑块号查物理槽循环。`kOff`、
+    `vOff`、`pos`、`numBlocks`、`numTokens` 是按值传的 i32 —— 它们随请求变，
+    当常量写进 IR 会让每次一步都要重编一个内核。
+
+    槽几何（`slotTokens` / `slotElems`）与缩放（`scale`）是编译期常量：同一台
+    DPU 上所有层、所有头的槽长一样，唯一的差别是 `kOff` / `vOff`。
+
+    `scale` 按 Python 的最短往返表示打印，它与主机参考是同一个双精度值。
+    """
+    tokens, head_dim = q_shape
+    q_ty = _tensor(q_shape, _F16)
+    cache_ty = f"!pim.memdesc<{cache_elems}x{_F16}, #pim.mram>"
+    bt_ty = _tensor((max_blocks,), "i32")
+    return f"""  tt.func @{func}(%q: {q_ty}, %c: {cache_ty}, %bt: {bt_ty},
+                     %ko: i32, %vo: i32, %pos: i32, %nb: i32, %nt: i32) {{
+    %y = pim.paged_attn %q, %c, %bt, %ko, %vo, %pos, %nb, %nt
+        {{slotTokens = {slot_tokens} : i64, slotElems = {slot_elems} : i64,
+         scale = {float(scale)!r} : f64}}
+       : {q_ty}, {cache_ty}, {bt_ty}, i32, i32, i32, i32, i32 -> {q_ty}
+    tt.return
+  }}"""

@@ -183,3 +183,24 @@ def test_format_strategy_is_readable() -> None:
     assert "4 stage × tp2" in text
     assert "stage0: dpus=[0, 1] layers=[0..7]（8 层）" in text
     assert "stage3: dpus=[6, 7] layers=[24..31]（8 层）" in text
+
+
+def test_shard_strategy_ep_width() -> None:
+    """专家并行宽 ep_width：tp_width 随之收窄，段切片宽不变；非法组合报错。"""
+    from graph.strategy import ShardStrategy
+
+    # pp4×ep4：16 DPU、4 段，每段 4 台各持不同专家；tp=1。
+    s = ShardStrategy(name="tp1_pp4_ep4", num_dpus=16, num_stages=4, ep_width=4)
+    assert s.tp_width == 1
+    assert s.kind == "pipeline"
+    assert s.dpus_of_stage(0) == (0, 1, 2, 3)  # 段宽 = 16/4 = 4，与 tp_width 解耦
+    assert s.stage_of_dpu(5) == 1
+    # 默认 ep_width=1：与既有行为完全一致。
+    classic = ShardStrategy(name="tp4_pp2", num_dpus=8, num_stages=2)
+    assert classic.tp_width == 4 and classic.dpus_of_stage(0) == (0, 1, 2, 3)
+    # 非法：num_dpus 不能被 num_stages*ep_width 整除。
+    with pytest.raises(ValueError, match="ep_width"):
+        ShardStrategy(name="bad", num_dpus=16, num_stages=4, ep_width=3)
+    # 本轮约束：ep_width>1 时必须 tp=1（TP×EP 复合放置是后续课题）。
+    with pytest.raises(ValueError, match="tp"):
+        ShardStrategy(name="bad_tp_ep", num_dpus=16, num_stages=2, ep_width=4)

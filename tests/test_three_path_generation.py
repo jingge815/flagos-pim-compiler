@@ -40,6 +40,11 @@ _REQUESTS = {
                     out_dtype="float32"),
     "normalize": dict(op="normalize", arg_shapes=[(4, 172)]),
     "reduce": dict(op="reduce", arg_shapes=[(4, 172)], group_size=1),
+    # 一个头的注意力：q 是 `(tokens, head_dim)`，槽里 k、v 各占一段。
+    "paged_attn": dict(op="paged_attn",
+                       arg_shapes=[(4, 172), (4 * 1376,), (2,)],
+                       slot_tokens=4, slot_elems=1376,
+                       scale=1.0 / 172 ** 0.5),
     "linear": dict(op="linear", arg_shapes=[(4, 512), (172, 512)], dtype="float16"),
 }
 
@@ -166,6 +171,31 @@ def _run_pair(op, spec, f16, call, rng, fn):
         scale = np.array([1.0 / shapes[0][-1]], dtype=np.float32)
         ref = x.astype(np.float32).mean(axis=-1, keepdims=True).astype(np.float16)
         return call([x, scale], ref.shape), ref
+    if op == "paged_attn":
+        # 块表乱序：逻辑块 0 指到物理槽 1，值必须从那个槽里取。
+        q = f16(shapes[0])
+        cache = f16(shapes[1])
+        tokens, head_dim = q.shape
+        slot_tokens, slot_elems = spec["slot_tokens"], spec["slot_elems"]
+        plane = slot_tokens * head_dim
+        table = np.array([1, 3], dtype=np.int32)
+        out = np.zeros(q.shape, dtype=np.float16)
+        fn(q.ctypes.data_as(ctypes.c_void_p),
+           cache.ctypes.data_as(ctypes.c_void_p),
+           table.ctypes.data_as(ctypes.c_void_p),
+           ctypes.c_int32(0), ctypes.c_int32(plane),
+           ctypes.c_int32(0), ctypes.c_int32(1), ctypes.c_int32(tokens),
+           out.ctypes.data_as(ctypes.c_void_p))
+        base = int(table[0]) * slot_elems
+        kb = cache[base:base + plane].reshape(slot_tokens, head_dim)[:tokens]
+        vb = cache[base + plane:base + 2 * plane].reshape(slot_tokens, head_dim)[:tokens]
+        scores = ((q.astype(np.float32) @ kb.T.astype(np.float32))
+                  .astype(np.float16).astype(np.float32) * spec["scale"])
+        causal = np.triu(np.full((tokens, tokens), -np.inf, dtype=np.float32), k=1)
+        weights = np.stack([mirror.softmax(mirror.mask(scores[t], causal[t]))
+                            for t in range(tokens)])
+        return out, (weights.astype(np.float32) @ vb.astype(np.float32)
+                     ).astype(np.float16)
     if op == "normalize":
         x, gamma = f16(shapes[0]), np.ones(shapes[0][-1], dtype=np.float16)
         eps = np.array([1e-5], dtype=np.float32)
@@ -187,7 +217,8 @@ def test_numpy_and_genesim_artifacts(op: str) -> None:
         op=spec["op"], arg_shapes=spec["arg_shapes"],
         hardware=DEFAULT_HARDWARE_CONFIG, dtype=spec.get("dtype", "float16"),
         kind=spec.get("kind"), group_size=spec.get("group_size"),
-        out_dtype=spec.get("out_dtype"),
+        out_dtype=spec.get("out_dtype"), slot_tokens=spec.get("slot_tokens"),
+        slot_elems=spec.get("slot_elems"), scale=spec.get("scale"),
     )
     result = compile_op(request, force=True)
     assert Path(result.so_path).is_file(), f"{op} 没有生成 numpy 内核"

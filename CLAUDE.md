@@ -5,12 +5,12 @@
 ## 环境
 
 ```bash
-source "$(python3 -c 'import json; print(json.load(open("paths.json"))["pytorch_env_script"])')"
+source "$(python3 -c 'import json; print(json.load(open("paths.local.json"))["pytorch_env_script"])')"
 ```
 
 torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 shell 都要先 source**，否则 `import torch` 失败。
 
-站点绝对路径只写在 `paths.json`（可用同名环境变量覆盖）。测试和脚本禁止再写 `/media/disk/...`。
+站点绝对路径写在 `paths.local.json`（由入库模板 `paths.json` 复制，已被 gitignore；同名环境变量优先级最高）。测试和脚本禁止再写 `/media/disk/...`。
 
 ## 技术方案
 
@@ -72,6 +72,13 @@ AI 辅助开发最容易堆出大量重复、投机、永不执行的代码。�
 ## 文档
 
 每次研发后在 `docs/<module>-日期.md` 留一份文档，概述修改内容，增删修改文件或函数，关键结构体，描述通俗易懂，拒绝中英文混合，除非英文专有名词，推荐画流程图，或者表格，描述已实施的测试，当前存在的不足。
+
+## 执行并行（Phase 1）
+
+- 多个请求按 wave 并发：每请求一份激活窗口（统一步长 `act_stride`）和一份块表窗口；窗口数 `num_parallel_slots`（vLLM 取 `PIM_PARALLEL_SLOTS`，默认 2，受 `num_request_slots` 限制）。
+- `runtime/binding.py::bind_plan` 只平移激活地址和块表基址；`payload["mram_offset"]` 永不平移，它是内核编译缓存键，靠它让所有窗口共享同一份内核。
+- 泳道按 `(lane_key, dpu_id)`：同一请求内部严格 FIFO（泳道折叠前提），不同请求在同一 DPU 上可交错。`submit(cmd, ctx)` 传 `ExecutionContext`；不传 ctx 走旧的全局路径。
+- 内存代价是激活区与块表都 ×P；超预算时编译期报 per-DPU 错误。详见 `docs/executor-parallel-phase1-20261026.md`。
 
 ## 提交
 

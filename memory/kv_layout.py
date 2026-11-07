@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from numbers import Integral
-from typing import Literal
 
 import numpy as np
 
-from contracts.exec_plan import Access
 from contracts.mem_layout import align_up
 from contracts.pim_tensor_spec import PIMTensorSpec
 
@@ -27,26 +25,34 @@ def _check_position(name: str, value: int, upper: int, *, inclusive: bool) -> No
 
 @dataclass
 class KVRegionSpec:
-    """描述单台 DPU 的层、KV head 和 KV 内存区域。"""
+    """描述单台 DPU 的层、KV head 和按固定大小槽组织的 KV 内存区域。"""
 
     dpu_id: int
     layers: list[int]         # 本 DPU 持有 KV 缓存的层号。
     kv_heads: list[int]       # 本 DPU 持有的 KV head 编号。
     q_heads_by_kv: dict[int, list[int]]  # 每个 KV head 对应的 Q head 编号。
-    max_seq: int              # KV 缓存的最大序列长度。
+    max_seq: int              # 单个请求的最大序列长度。
     head_dim: int
     dtype_bytes: int
-    kv_base: int              # KV 区起始地址。
+    kv_base: int              # KV 区起始地址（块表缓冲起点）。
+    slot_tokens: int = 16     # 一个槽容纳的 token 数。
     kv_off: dict[tuple[int, int, str], int] = field(default_factory=dict)
     kv_allocated_bytes: int = 0
+    blocks_per_request: int = 0   # 单请求最大逻辑块数（也是块表缓冲表项数）。
+    pool_slots: int = 0           # 物理槽总数。
+    block_table_base: int = 0     # 块表缓冲起始地址。
+    block_table_bytes: int = 0    # 单份块表缓冲占用字节数。
+    block_table_slots: int = 1    # 并发的块表窗口份数，每份对应一个请求。
+    slots_base: int = 0           # 物理槽池起始地址。
+    slot_bytes: int = 0           # 单个物理槽的字节数。
 
     def validate(self) -> None:
         if self.dpu_id < 0:
             raise ValueError("dpu_id must be non-negative")
         if not self.layers or not self.kv_heads:
             raise ValueError("layers / kv_heads 不能为空")
-        if self.max_seq <= 0 or self.head_dim <= 0:
-            raise ValueError("max_seq / head_dim 必须为正")
+        if self.max_seq <= 0 or self.head_dim <= 0 or self.slot_tokens <= 0:
+            raise ValueError("max_seq / head_dim / slot_tokens 必须为正")
         if self.dtype_bytes not in _NP_DTYPE:
             raise ValueError(f"unsupported dtype_bytes {self.dtype_bytes}")
         if self.kv_base < 0:
@@ -57,24 +63,75 @@ class KVRegionSpec:
 
 
 def kv_bytes(spec: KVRegionSpec) -> int:
-    """返回未包含对齐填充的 KV 缓存字节数。"""
+    """返回一个请求在未对齐前需要的 KV 字节数（逻辑下界）。"""
     return (2 * len(spec.layers) * spec.max_seq
             * len(spec.kv_heads) * spec.head_dim * spec.dtype_bytes)
 
 
-def build_kv_layout(spec: KVRegionSpec, align: int) -> KVRegionSpec:
-    """为每个层、KV head 和 K/V 张量分配对齐后的 MRAM 偏移。"""
+def build_kv_layout(spec: KVRegionSpec, align: int,
+                    pool_slots: int | None = None,
+                    block_table_slots: int = 1) -> KVRegionSpec:
+    """规划全局块表缓冲和全局物理槽池，`kv_off` 存槽 0 内的绝对地址。
+
+    每个物理槽存本 DPU 全部本地 KV 平面的 `slot_tokens` 个 token；槽内按
+    `layer -> kv_head -> k/v` 顺序排列。块表缓冲有 `block_table_slots` 份，
+    并行请求各写一份，每份 `block_table_bytes` 字节。
+    `pool_slots` 为空时取满长单请求的块数。
+    """
     spec.validate()
+    if block_table_slots < 1:
+        raise ValueError(f"block_table_slots={block_table_slots} 必须 >= 1")
+    row = spec.head_dim * spec.dtype_bytes
+    plane_stride = align_up(spec.slot_tokens * row, align)
+    spec.slot_bytes = 2 * len(spec.layers) * len(spec.kv_heads) * plane_stride
+    spec.blocks_per_request = -(-spec.max_seq // spec.slot_tokens)
+    if pool_slots is None:
+        pool_slots = spec.blocks_per_request
+    if pool_slots < spec.blocks_per_request:
+        raise ValueError(
+            f"pool_slots={pool_slots} 装不下一个满长请求"
+            f"（需要 {spec.blocks_per_request} 个块）")
+    spec.pool_slots = pool_slots
+    spec.block_table_slots = block_table_slots
+    spec.block_table_base = spec.kv_base
+    spec.block_table_bytes = align_up(spec.blocks_per_request * 4, align)
+    spec.slots_base = spec.kv_base + block_table_slots * spec.block_table_bytes
+
     spec.kv_off = {}
-    off = spec.kv_base
-    block = spec.max_seq * spec.head_dim * spec.dtype_bytes  # 单个 K 或 V 子块。
+    off = spec.slots_base
     for layer in spec.layers:
         for head in spec.kv_heads:
             for which in ("k", "v"):
                 spec.kv_off[(layer, head, which)] = off
-                off += align_up(block, align)
-    spec.kv_allocated_bytes = off - spec.kv_base
+                off += plane_stride
+    spec.kv_allocated_bytes = (
+        block_table_slots * spec.block_table_bytes + spec.pool_slots * spec.slot_bytes)
     return spec
+
+
+def write_block_table(spec: KVRegionSpec, hal, block_table: list[int],
+                      slot_index: int = 0) -> None:
+    """把逻辑块到物理槽的映射写进第 `slot_index` 份块表缓冲，整段覆盖，不足补 -1。
+
+    必须整段写：短请求不能继承上一个长请求留在表尾的块号。并行请求各占一份，
+    `slot_index` 越界直接抛错，避免两个请求写到同一份表。
+    """
+    if not spec.block_table_bytes:
+        raise ValueError(f"dpu{spec.dpu_id} 的 KVRegionSpec 未过 build_kv_layout")
+    if not 0 <= slot_index < spec.block_table_slots:
+        raise ValueError(
+            f"块表窗口 {slot_index} 越界 [0,{spec.block_table_slots})")
+    if len(block_table) > spec.blocks_per_request:
+        raise ValueError(
+            f"块表长 {len(block_table)} 超过块表项数 {spec.blocks_per_request}")
+    for block in block_table:
+        if not 0 <= block < spec.pool_slots:
+            raise ValueError(
+                f"块号 {block} 越界 [0,{spec.pool_slots})")
+    entries = np.full((spec.blocks_per_request,), -1, dtype=np.int32)
+    entries[:len(block_table)] = block_table
+    offset = spec.block_table_base + slot_index * spec.block_table_bytes
+    hal.write_local(spec.dpu_id, offset, entries)
 
 
 def kv_specs_from_placement(
@@ -87,6 +144,7 @@ def kv_specs_from_placement(
     max_seq: int,
     dtype_bytes: int,
     kv_base: int,
+    slot_tokens: int = 16,
 ) -> dict[int, KVRegionSpec]:
     """从 `k_proj` 分片构造每台 DPU 的 KV 缓存规格。"""
     if k_proj_spec.placement.kind != "Shard" or k_proj_spec.placement.dim != 0:
@@ -110,6 +168,7 @@ def kv_specs_from_placement(
             head_dim=head_dim,
             dtype_bytes=dtype_bytes,
             kv_base=kv_base,
+            slot_tokens=slot_tokens,
         )
     assigned_heads = [head for spec in specs.values() for head in spec.kv_heads]
     expected_heads = set(range(num_kv_heads))
@@ -132,9 +191,26 @@ def kv_specs_from_strategy(
     max_seq: int,
     dtype_bytes: int,
     kv_base: int = 0,
+    slot_tokens: int = 16,
 ) -> dict[int, KVRegionSpec]:
     """按切分策略为每台 DPU 生成层和 KV head 的缓存规格。"""
     specs: dict[int, KVRegionSpec] = {}
+    if getattr(strategy, "ep_width", 1) > 1:
+        # PP×EP（路线 B）：attention/KV 在段内 REPLICATE——每台 DPU 持有本段
+        # 全部层的全部 KV 头（各份内容相同）。k_proj 是 REPLICATE，不走按头切。
+        group = num_q_heads // num_kv_heads
+        for stage in range(strategy.num_stages):
+            layers = strategy.layers_of_stage(stage, num_layers)
+            for dpu_id in strategy.dpus_of_stage(stage):
+                specs[dpu_id] = KVRegionSpec(
+                    dpu_id=dpu_id, layers=list(layers),
+                    kv_heads=list(range(num_kv_heads)),
+                    q_heads_by_kv={h: list(range(h * group, (h + 1) * group))
+                                   for h in range(num_kv_heads)},
+                    max_seq=max_seq, head_dim=head_dim, dtype_bytes=dtype_bytes,
+                    kv_base=kv_base, slot_tokens=slot_tokens,
+                )
+        return specs
     for stage in range(strategy.num_stages):
         layers = strategy.layers_of_stage(stage, num_layers)
         stage_specs = [_k_proj_spec_of_layer(gm, layer) for layer in layers]
@@ -156,6 +232,7 @@ def kv_specs_from_strategy(
                 max_seq=max_seq,
                 dtype_bytes=dtype_bytes,
                 kv_base=kv_base,
+                slot_tokens=slot_tokens,
             )
         )
     missing = [dpu_id for dpu_id in strategy.dpu_ids if dpu_id not in specs]
@@ -178,73 +255,6 @@ def _k_proj_spec_of_layer(gm, layer: int) -> PIMTensorSpec:
     return matches[0].meta[SPEC_META_KEY]
 
 
-def kv_access(
-    spec: KVRegionSpec, layer: int, head: int, which: Literal["k", "v"], pos_start: int, pos_end: int
-) -> Access:
-    """返回指定 K/V 子块中 token 区间的绝对 MRAM 地址。"""
-    if not (0 <= pos_start < pos_end <= spec.max_seq):
-        raise ValueError(f"区间 [{pos_start},{pos_end}) 越界 [0,{spec.max_seq})")
-    row = spec.head_dim * spec.dtype_bytes
-    return Access(
-        loc=("dpu", spec.dpu_id),
-        offset=spec.kv_off[(layer, head, which)] + pos_start * row,
-        length=(pos_end - pos_start) * row,
-    )
-
-
-class PIMStaticKVCache:
-    """管理预分配在 DPU 本地 MRAM 中的定长 KV 缓存。"""
-
-    def __init__(self, backend, specs: dict[int, KVRegionSpec], wram_budget_bytes: int) -> None:
-        # 保存后端、KV 规格和 WRAM 上限。
-        self.backend = backend
-        self.specs = specs
-        self.wram_budget_bytes = wram_budget_bytes
-        for spec in specs.values():
-            spec.validate()
-            if not spec.kv_off:
-                raise ValueError(f"dpu{spec.dpu_id} 的 KVRegionSpec 未过 build_kv_layout")
-
-    def update(self, layer: int, pos: int, k_by_dpu: dict, v_by_dpu: dict) -> None:
-        """将指定位置的 K/V 向量写入持有该层的 DPU。"""
-        for dpu_id, spec in self.specs.items():
-            if layer not in spec.layers:
-                continue
-            if not 0 <= pos < spec.max_seq:
-                raise ValueError(f"pos={pos} 越界 [0,{spec.max_seq})")
-            row = spec.head_dim * spec.dtype_bytes
-            for head in spec.kv_heads:
-                for which, by_dpu in (("k", k_by_dpu), ("v", v_by_dpu)):
-                    vec = np.asarray(by_dpu[dpu_id][head])
-                    expected_dtype = _NP_DTYPE[spec.dtype_bytes]
-                    if vec.shape != (spec.head_dim,) or vec.dtype != expected_dtype:
-                        raise ValueError(
-                            f"dpu{dpu_id} layer{layer} head{head} {which}: 期望 "
-                            f"shape=({spec.head_dim},) dtype={expected_dtype}，got "
-                            f"shape={vec.shape} dtype={vec.dtype}")
-                    off = spec.kv_off[(layer, head, which)] + pos * row
-                    self.backend.write_local(dpu_id, off, vec)  # 写入 DPU 本地 MRAM。
-
-    def read_tile(
-        self, layer: int, dpu_id: int, head: int, tile_start: int, tile_end: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """读取一个 KV head 的 token 区间，返回 K 和 V 瓦片。"""
-        spec = self.specs[dpu_id]
-        if head not in spec.kv_heads:
-            raise KeyError(f"head {head} 不在 dpu{dpu_id} 的 kv_heads {spec.kv_heads}")
-        if not (0 <= tile_start < tile_end <= spec.max_seq):
-            raise ValueError(f"tile [{tile_start},{tile_end}) 越界 [0,{spec.max_seq})")
-        row = spec.head_dim * spec.dtype_bytes
-        if (tile_end - tile_start) * row > self.wram_budget_bytes:
-            raise ValueError("单 tile 超 WRAM 预算，调小 tile（尺寸由问题 5 的桥按 WRAM 容量定）")
-        koff = spec.kv_off[(layer, head, "k")] + tile_start * row
-        voff = spec.kv_off[(layer, head, "v")] + tile_start * row
-        shape = (tile_end - tile_start, spec.head_dim)
-        dtype = _NP_DTYPE[spec.dtype_bytes]
-        return (self.backend.read_local(dpu_id, koff, shape, dtype),
-                self.backend.read_local(dpu_id, voff, shape, dtype))
-
-
 def prefill_mask(prompt_len: int, max_seq: int) -> np.ndarray:
     """返回 prefill 的因果掩码，屏蔽未来位置和预留位置。"""
     _check_position("prompt_len", prompt_len, max_seq, inclusive=True)
@@ -262,14 +272,21 @@ def decode_mask(valid_len: int, max_seq: int) -> np.ndarray:
 
 
 def format_kv_layout(specs: dict[int, KVRegionSpec]) -> str:
-    """把各 DPU 的 KV 布局打印成可读文本，便于核对 offset 与容量（对齐 format_comm_plan 惯例）。"""
+    """把各 DPU 的槽几何打印成可读文本，便于核对槽池与块表占用。"""
     lines = []
     for dpu_id, spec in sorted(specs.items()):
         heads = spec.kv_heads
+        max_full_len_requests = spec.pool_slots // spec.blocks_per_request
         lines.append(
             f"dpu{dpu_id}: layers={len(spec.layers)} kv_heads=[{heads[0]}..{heads[-1]}] "
-            f"max_seq={spec.max_seq} head_dim={spec.head_dim} kv_base={spec.kv_base} "
-            f"kv_allocated_bytes={spec.kv_allocated_bytes} (kv_bytes 下界={kv_bytes(spec)}) "
-            f"blocks={len(spec.kv_off)}"
+            f"max_seq={spec.max_seq} head_dim={spec.head_dim} "
+            f"slot_tokens={spec.slot_tokens} slot_bytes={spec.slot_bytes} "
+            f"blocks_per_request={spec.blocks_per_request} "
+            f"pool_slots={spec.pool_slots} "
+            f"block_table_bytes={spec.block_table_bytes} "
+            f"max_full_len_requests={max_full_len_requests} "
+            f"kv_base={spec.kv_base} slots_base={spec.slots_base} "
+            f"kv_allocated_bytes={spec.kv_allocated_bytes} "
+            f"(kv_bytes 下界={kv_bytes(spec)})"
         )
     return "KV layout:\n" + "\n".join(lines)

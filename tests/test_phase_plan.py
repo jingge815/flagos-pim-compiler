@@ -1,7 +1,8 @@
 """算子编译器给出的相位模板要与 GML 侧静态表一致。
 
-这组测试是「相位由谁决定」的交叉校验。`contracts/gml_hw_table.py` 的
-`DQ_PHASES` / `SOFTMAX_PHASES` / `ROPE_UNITS` 目前仍是 GML 的字段来源，而
+这组测试是「相位由谁决定」的交叉校验。`contracts/gml_hw_constants.py` 的
+`DQ_PHASES` / `SOFTMAX_PHASES` 与 `contracts/gml_hw_table.py` 的 `ROPE_UNITS`
+目前仍是 GML 的字段来源，而
 FlagTree 的 `-pim-expand-phases` 是相位结构的新真源。两边对不上就说明其中
 一处退化了——这正是这里要拦住的。
 
@@ -20,6 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from contracts.gml_hw_constants import DQ_PHASES, SOFTMAX_PHASES
 from contracts.gml_quant import PHASE_COUNTS
 from contracts import gml_hw_table as hw_table
 from opcompiler_bridge.phase_plan import parse_phase_plans
@@ -165,8 +167,8 @@ def test_dq_kinds_match_static_table_semantics() -> None:
     plan = parse_phase_plans(_EXPANDED_DQ)["dq_four_phases"]
     assert plan.kinds() == ["absmax", "identity", "reciprocal", None]
     assert plan.phases[3].op == "pim.quantize"
-    assert hw_table.DQ_PHASES[3]["kantor_mode"] == "fp2int_converter"
-    assert hw_table.DQ_PHASES[2]["activation_special_operators"] == 4
+    assert DQ_PHASES[3]["kantor_mode"] == "fp2int_converter"
+    assert DQ_PHASES[2]["activation_special_operators"] == 4
 
 
 def test_softmax_kinds_match_static_table_semantics() -> None:
@@ -174,7 +176,7 @@ def test_softmax_kinds_match_static_table_semantics() -> None:
     plan = parse_phase_plans(_EXPANDED_SOFTMAX)["softmax_five_phases"]
     assert plan.kinds() == ["max", "exp", "add", "reciprocal", "mul"]
     # 静态表的 p3 同样是倒数那一相。
-    assert hw_table.SOFTMAX_PHASES[3]["activation_special_operators"] == 4
+    assert SOFTMAX_PHASES[3]["activation_special_operators"] == 4
 
 
 def test_reduction_phases_run_on_vector_unit() -> None:

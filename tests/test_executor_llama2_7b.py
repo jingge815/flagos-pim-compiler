@@ -19,11 +19,11 @@ from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement
+from memory.kv_layout import kv_specs_from_placement, write_block_table
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime.compile import sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, execute_plan
+from runtime.executor import execute_plan
 from runtime.kernels import register_all, sdpa_kv_info
 from tests.test_partition import _FixedMaskLlama
 
@@ -79,6 +79,7 @@ def llama2_compiled_plan():
         max_seq=MAX_SEQ,
         dtype_bytes=KV_DTYPE_BYTES,
         kv_base=0,
+        slot_tokens=16,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
@@ -89,14 +90,14 @@ def llama2_compiled_plan():
         dma_align=64,
     )
     nodes = list(gm.graph.nodes)
-    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw) for d in range(NUM_DPUS)}
+    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw)
+             for d in range(NUM_DPUS)}
 
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
     pending = {}
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
 
-    state = DecodeState(valid_len=0)
     sdpa_layer = sdpa_layer_map(gm)
 
     def sdpa_info_of(node):
@@ -108,13 +109,13 @@ def llama2_compiled_plan():
         nodes, gm, entries_by_id, pending, hardware=hardware,
         sdpa_info_of=sdpa_info_of,
     )
-    return model, gm, input_ids, causal_mask, compiled, plans, state
+    return model, gm, input_ids, causal_mask, compiled, plans, kv_specs
 
 
 @pytest.fixture(scope="module")
 def llama2_executed(llama2_compiled_plan):
     """将权重写入 DPU 后执行一次完整 prefill 计划。"""
-    model, gm, input_ids, causal_mask, compiled, plans, state = llama2_compiled_plan
+    model, gm, input_ids, causal_mask, compiled, plans, kv_specs = llama2_compiled_plan
     hw_mram_bytes = 4 * 2**30
 
     backend = NumpyBackend(
@@ -122,12 +123,15 @@ def llama2_executed(llama2_compiled_plan):
     )
     register_all(backend)
     write_weight_shards(gm, plans, backend)
+    for spec in kv_specs.values():
+        write_block_table(spec, backend, list(range(spec.blocks_per_request)))
 
     events = execute_plan(
         compiled.plan,
         backend,
         values={"input_ids": input_ids, "causal_mask": causal_mask},
-        pos=state.valid_len,
+        pos=0,
+        num_tokens=SEQ_LEN,
     )
     result = np.asarray(backend.wait(events[compiled.output_cmd_id]))
     ref = model(input_ids=input_ids, attention_mask=causal_mask, use_cache=False).logits

@@ -166,9 +166,14 @@ def test_the_compiled_set_is_what_the_docs_claim() -> None:
     assert called == {
         "linear", "softmax", "mask", "gather", "eltwise",
         "matmul", "convert", "transpose", "reshape", "concat",
-        "normalize", "rope", "lut", "kv_cache", "split_heads",
-        "reduce",
+        "rope", "lut", "kv_cache", "split_heads",
+        "reduce", "paged_attn",
     }, f"实际调用编译器的算子集合变了：{sorted(called)}"
+
+    # RMSNorm 是唯一的例外：融合命令要在 f16 上取一次整再乘缩放，而
+    # `pim.normalize` 在内核里一次乘完，两边差一个 f16 的计次点，解码 token
+    # 会分叉，所以运行时按图上的链在 numpy 里算，不走编译内核。
+    assert "normalize" not in called
 
 
 def test_neg_and_slice_fallbacks_are_recorded() -> None:
@@ -229,7 +234,6 @@ def test_toolchain_miss_is_recorded(monkeypatch) -> None:
     monkeypatch.setattr("opcompiler_bridge.driver.compile_op", miss)
 
     x = np.ones((2, 4), dtype=np.float16)
-    gamma = np.ones((4,), dtype=np.float16)
     cos = np.ones((1, 1, 2, 4), dtype=np.float16)
     scores = np.ones((2, 4), dtype=np.float16)
     offset = np.zeros((2, 4), dtype=np.float16)
@@ -250,7 +254,6 @@ def test_toolchain_miss_is_recorded(monkeypatch) -> None:
             writes=[Access(("dpu", 0), 256, x.nbytes)], waits=[], num_tasklets=1)
 
     kernels._silu(x)
-    kernels._normalize(x, gamma)
     kernels._rope(x.reshape(1, 1, 2, 4), cos, cos)
     kernels.add_mask(scores, offset)
     kernels.convert(x, np.float32)
@@ -264,7 +267,7 @@ def test_toolchain_miss_is_recorded(monkeypatch) -> None:
         ["tensor", 2, 1], [x.shape, None, None], (2, 2, 2), 1))
     counts = kernels.route_counts()
     expected = {
-        "lut", "normalize", "rope", "mask", "convert",
+        "lut", "rope", "mask", "convert",
         "transpose", "reshape", "concat", "split_heads",
     }
     missing = sorted(
@@ -366,29 +369,6 @@ def test_transpose_int_reaches_the_compiler() -> None:
     x = np.zeros((2, 4, 8), dtype=np.float16)
     _run(kernels.transpose_int_kernel, [x, 1, 2], (2, 8, 4), calls)
     assert "transpose" in calls
-
-
-def test_normalize_reaches_the_compiler() -> None:
-    calls: list[str] = []
-    x = np.zeros((4, 16), dtype=np.float16)
-    gamma = np.ones((16,), dtype=np.float16)
-    _run(kernels.rmsnorm_kernel, [x, gamma], (4, 16), calls)
-    assert "normalize" in calls
-
-
-def test_normalize_matches_numpy() -> None:
-    """运行时入口编出来的 normalize 要与镜像逐元素一致。
-
-    `_compiled_normalize` 传的形状与算子级契约不一致时，这里会直接抛
-    `ValueError`，mock 掉 `compile_op` 的用例看不见。
-    """
-    from runtime.kernels import _normalize
-    from runtime import kernels_pim
-
-    x = np.zeros((4, 16), dtype=np.float16)
-    gamma = np.ones((16,), dtype=np.float16)
-    got = _normalize(x, gamma)
-    assert np.array_equal(got, kernels_pim.normalize(x, gamma))
 
 
 def test_rope_reaches_the_compiler() -> None:
@@ -498,7 +478,9 @@ def test_every_kernel_in_the_plan_has_a_compiled_path() -> None:
 
     # alias 是视图，不改数值，按设计不编。neg 走减法、slice 走转置加拷贝，
     # 都进编译集合，不在这里豁免。
-    numpy_only = {"aten.alias.default"}
+    # 融合的 RMSNorm 是另一回事：它要在 f16 上取一次整再乘缩放，而
+    # `pim.normalize` 的内核一次乘完，所以运行时按图上的链在 numpy 里算。
+    numpy_only = {"aten.alias.default", "pim.normalize"}
     compiled_ops = set(_kernels_reaching_compile())
     kernels = {
         str(cmd.payload["kernel"])

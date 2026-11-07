@@ -1129,3 +1129,80 @@ def test_fused_tail_activation_with_gathered_output(act, second_linear) -> None:
                                          weights["w2"].half().float())
     np.testing.assert_allclose(result.astype(np.float32), ref.numpy(),
                                atol=5e-2, rtol=1e-2)
+def test_repeated_writer_of_same_range_only_leaves_the_last_one_as_dep() -> None:
+    """同一区间被反复写时，读者只等最后一个写者。
+
+    decode 图里每层复用同一块激活缓冲，若把整串历史写者都列进 waits，
+    一个命令的依赖能从十几条涨到几百条。写者生成时已经等过前一个写者，
+    顺序由这条链保证，所以读者只留最后一个。
+    """
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    writes = [Access(("dpu", 0), 64, 16)]
+    w0 = builder.append("launch", 0, {}, [], writes, [])
+    w1 = builder.append("launch", 0, {}, [], writes, [])
+    w2 = builder.append("launch", 0, {}, [], writes, [])
+    assert w1.waits == [w0.id]
+    assert w2.waits == [w1.id]
+
+    raw = exec_plan_gen_module._deps_of([Access(("dpu", 0), 64, 16)], builder.writers)
+    assert raw == [w2.id]
+
+
+def test_same_lane_waits_collapse_to_the_last_command() -> None:
+    """同一 DPU 只等该 DPU 上最后一条前驱；host 命令之间没有串行关系。
+
+    DPU 的命令链保证同 DPU 按提交序执行，等最后一条就够了。host 命令在
+    线程池里无序，必须逐条保留。
+    """
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    a = builder.append("launch", 0, {}, [], [], [])
+    b = builder.append("launch", 0, {}, [], [], [])
+    c = builder.append("launch", 1, {}, [], [], [])
+    host = builder.append("host_slice", None, {}, [], [], [a.id, b.id, c.id])
+    assert host.waits == [b.id, c.id]
+    local = builder.append("launch", 0, {}, [], [], [a.id, b.id, c.id, host.id])
+    assert local.waits == [b.id, c.id, host.id]
+
+
+def test_overlapping_but_not_identical_writes_are_all_kept() -> None:
+    """区间只部分重叠时不能省：它们各自的等待链不保证相互覆盖。"""
+    builder = exec_plan_gen_module._PlanBuilder(None, {})
+    lo = builder.append("launch", 0, {}, [], [Access(("dpu", 0), 0, 16)], [])
+    hi = builder.append("launch", 0, {}, [], [Access(("dpu", 0), 8, 16)], [])
+    raw = exec_plan_gen_module._deps_of([Access(("dpu", 0), 0, 24)], builder.writers)
+    assert set(raw) == {lo.id, hi.id}
+
+
+def test_the_plan_emits_one_command_per_rms_norm() -> None:
+    """RMSNorm 链在执行计划里只留一条 `pim.normalize`。
+
+    链上的 pow/mean/add/rsqrt/mul 与那次 `to` 都被吸收，不再各发一条命令；
+    没折的话这些内核名会原样出现在每台 DPU 上。
+    """
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from graph.strategy import llama_strategies
+    from runtime.compile import compile_llama2
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=4, vocab_size=128,
+    )).eval().half()
+    strategy = llama_strategies(
+        4, num_heads=4, num_kv_heads=4, intermediate_size=128,
+        vocab_size=128, num_layers=2)[0]
+    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hardware = PIMHardwareConfig(
+        num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536, dma_align=64)
+    compiled = compile_llama2(
+        model, strategy, prefill_seq_len=4, max_seq=16, hw=hw,
+        hardware=hardware, num_request_slots=1, kv_slot_tokens=16)
+
+    names = [cmd.payload["kernel"] for cmd in compiled.decode.plan.commands
+             if cmd.dpu_id is not None]
+    # 2 层各 2 个 RMSNorm，加末尾那个 norm，共 5 条链，每条每台 DPU 一条命令。
+    assert names.count("pim.normalize") == 5 * 4
+    for gone in ("aten.pow.Tensor_Scalar", "aten.mean.dim", "aten.rsqrt.default"):
+        assert gone not in names, f"{gone} 还在计划里，链没有折干净"

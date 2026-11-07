@@ -203,6 +203,11 @@ class OpCompileRequest:
     # 0 表示从基址起、没有额外对齐，下发文本与改动前逐字节相同。
     mram_offset: int = 0
     align_bytes: int = 0
+    # `paged_attn` 的槽几何：一个槽容纳的 token 数与元素数。只有这个算子用。
+    slot_tokens: int | None = None
+    slot_elems: int | None = None
+    # `paged_attn` 的缩放，1/sqrt(head_dim)，与主机参考同一个双精度值。
+    scale: float | None = None
 
 
 @dataclass(frozen=True)

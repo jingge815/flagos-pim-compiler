@@ -21,9 +21,9 @@ from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
 from memory.kv_layout import kv_specs_from_placement
 from memory.mem_planner import HwBudget, plan_dpu
-from runtime.compile import sdpa_layer_map, write_weight_shards
+from runtime.compile import CompiledModel, sdpa_layer_map, write_weight_shards
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, run_decode_loop
+from runtime.executor import run_decode_loop
 from runtime.kernels import register_all, sdpa_kv_info
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -32,6 +32,7 @@ PROMPT = "The capital of France is"
 DECODE_STEPS = 16
 MAX_SEQ = 64
 KV_DTYPE_BYTES = 2  # fp16
+SLOT_TOKENS = 16
 # top-2 间距小于这个值的 decode 步算打平：编排器与 HF 的 fp16 logits 只差
 # 1 ulp 量级（实测 max|Δ| ≈ 0.012），而本仓 logits 判据的容差是 0.2
 # （tests/test_executor_llama2_7b.py）。间距 0.047 的实测步（第 9 步）远在
@@ -134,6 +135,7 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     kv_specs = kv_specs_from_placement(
         k_proj.meta[SPEC_META_KEY], layers=list(range(cfg.num_hidden_layers)), num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
+        slot_tokens=SLOT_TOKENS,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
@@ -146,7 +148,8 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     )
     prefill_nodes = list(prefill_gm.graph.nodes)
     decode_nodes = list(decode_gm.graph.nodes)
-    plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw) for d in range(NUM_DPUS)}
+    plans = {d: plan_dpu(d, prefill_nodes, decode_nodes, kv_specs, hw)
+             for d in range(NUM_DPUS)}
 
     prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}
     decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
@@ -154,9 +157,6 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
     for plan in plans.values():
         pending_prefill.update(plan.pending_readers_prefill)
         pending_decode.update(plan.pending_readers_decode)
-
-    state = DecodeState(valid_len=0)
-
 
     def sdpa_info_for(gm):
         layer_map = sdpa_layer_map(gm)
@@ -182,15 +182,32 @@ def test_real_prompt_produces_readable_text_matching_hf_generate() -> None:
 
     write_weight_shards(prefill_gm, plans, backend)
 
+    compiled = CompiledModel(
+        strategy=shard_config,
+        prefill_gm=prefill_gm,
+        decode_gm=decode_gm,
+        prefill_edges=prefill_edges,
+        decode_edges=decode_edges,
+        kv_specs=kv_specs,
+        mem_plans=plans,
+        prefill=prefill_compiled,
+        decode=decode_compiled,
+        hw=hw,
+        hardware=hardware,
+        num_request_slots=1,
+        kv_slot_tokens=SLOT_TOKENS,
+        kv_pool_slots=next(iter(kv_specs.values())).pool_slots,
+        prefill_seq_len=prefill_seq_len,
+    )
+
     def greedy(logits_1d):
         return int(np.argmax(logits_1d))
 
     prompt_ids = torch.tensor(prompt_ids_list, dtype=torch.long)
     generated = run_decode_loop(
-        prefill_compiled.plan, decode_compiled.plan, backend,
-        prompt_ids=prompt_ids, max_new_tokens=DECODE_STEPS, eos_id=tokenizer.eos_token_id, state=state,
-        sample_fn=greedy, prefill_output_cmd_id=prefill_compiled.output_cmd_id,
-        decode_output_cmd_id=decode_compiled.output_cmd_id, causal_mask_of=_causal_mask_of,
+        compiled, backend,
+        prompt_ids=prompt_ids, max_new_tokens=DECODE_STEPS, eos_id=tokenizer.eos_token_id,
+        sample_fn=greedy, causal_mask_of=_causal_mask_of,
     )
 
     our_ids = prompt_ids_list + generated

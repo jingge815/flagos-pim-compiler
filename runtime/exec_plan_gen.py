@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -18,6 +19,53 @@ from contracts.graph_meta import (
     DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, FUSED_TAIL_META_KEY,
     REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 from contracts.op_contract import DpuShard, PIMHardwareConfig
+from contracts.op_semantics import RMS_NORM_KERNEL
+from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY
+
+# MoE 动态分派开关：PIM_MOE_DISPATCH=0 关闭（退回稠密模拟全专家执行），用于 A/B 对比。
+_MOE_DISPATCH = os.environ.get("PIM_MOE_DISPATCH", "1") != "0"
+
+
+def _moe_layer_of(node: Node, marker: str) -> int | None:
+    """沿上游找第一个含 marker 的 get_attr 权重，返回所属层号。"""
+    seen, stack = set(), [node]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur.op == "get_attr" and marker in str(cur.target):
+            part = str(cur.target).split(".")
+            return int(part[part.index("layers") + 1])
+        stack.extend(a for a in cur.args if hasattr(a, "op"))
+    return None
+
+
+def _moe_expert_of(node: Node) -> tuple[int, int] | None:
+    """专家 linear 的 (layer, expert)；权重 get_attr 形如 layers.L.mlp.experts.E.*。"""
+    for arg in node.args:
+        if getattr(arg, "op", None) == "get_attr" and ".mlp.experts." in str(arg.target):
+            part = str(arg.target).split(".")
+            return int(part[part.index("layers") + 1]), int(part[part.index("experts") + 1])
+    return None
+
+
+def _emit_moe_dispatch(builder, layer: int, route_cmd_id: int) -> int:
+    """发一个 dispatch host_op：读路由张量，把本步无 token 命中的专家写进跳过集。
+
+    跳过集键 (lane_key, 本命令号)：并发窗口各写各的，互不覆盖；被跳过的
+    专家 launch 已 waits 本命令，读到的一定是本步的结果。
+    """
+    def fn(hal, cmd):
+        routing = hal.result_of(route_cmd_id)
+        lane = hal.current_lane_key()
+        hit = (routing != 0).any(dim=0)
+        hal.gate_skips[(lane, cmd.id)] = {
+            int(i) for i in (~hit).nonzero().flatten().tolist()}
+
+    return builder.append(
+        "host_op", None, {"node": f"moe_dispatch_{layer}", "fn": fn},
+        [], [], [route_cmd_id]).id
 
 _REDISTRIBUTE_OP = {
     "all_reduce": "host_reduce",
@@ -28,7 +76,6 @@ _REDISTRIBUTE_OP = {
 }
 _REDISTRIBUTE_FN = {"all_reduce": all_reduce, "all_gather": all_gather, "all_to_all": all_to_all}
 
-KvAccessFn = Callable[[Node], "tuple[list[Access], list[Access]] | None"]
 HostHandlerFn = Callable[[Node], "Callable | None"]
 
 
@@ -53,8 +100,20 @@ def overlap(a: Access, b: Access) -> bool:
 
 
 def _deps_of(reads: list[Access], writers: dict[tuple, list[tuple[Access, int]]]) -> list[int]:
-    """返回与读区间相交的历史写命令。"""
-    return [cid for a in reads for (wa, cid) in writers.get(a.loc, []) if overlap(a, wa)]
+    """返回与读区间相交的历史写命令。
+
+    同一地址区间被反复写（各层复用激活缓冲）时，后写者生成时已经等过前写者，
+    所以只留最后一个写者；前面那些沿等待链传递，不必重复列出。
+    """
+    last: dict[tuple, int] = {}
+    for a in reads:
+        for wa, cid in writers.get(a.loc, []):
+            if not overlap(a, wa):
+                continue
+            key = (wa.loc, wa.offset, wa.length)
+            if cid > last.get(key, -1):
+                last[key] = cid
+    return list(last.values())
 
 
 def _war_waits(
@@ -249,6 +308,7 @@ class _PlanBuilder:
         self.reader_cmds: dict[tuple, list[int]] = {}
         self.pending_readers = pending_readers
         self.host_value_of: dict[str, int] = {}  # 节点名称到 host 结果命令的映射。
+        self.lane_of: dict[int, int | None] = {}  # 命令所属执行泳道：DPU 号或 None。
         self._next_id = 0
 
     def append(self, op: str, dpu_id: int | None, payload: dict,
@@ -256,11 +316,20 @@ class _PlanBuilder:
                num_tasklets: int = 1) -> Command:
         # 写后写：等所有写过同一区间的旧命令，否则旧写者晚跑会覆盖新值。
         waits = waits + _deps_of(writes, self.writers)
+        # 同一 DPU 的命令由执行后端按提交序串行，等该 DPU 上最后一条前驱即可；
+        # host 命令之间没有这种串行关系，逐条保留。
+        last: dict[tuple, int] = {}
+        for cid in waits:
+            lane = self.lane_of[cid]
+            key = ("dpu", lane) if lane is not None else ("host", cid)
+            if cid > last.get(key, -1):
+                last[key] = cid
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
-                       reads=reads, writes=writes, waits=sorted(set(waits)),
+                       reads=reads, writes=writes, waits=sorted(last.values()),
                        num_tasklets=num_tasklets)
         self._next_id += 1
         self.commands.append(cmd)
+        self.lane_of[cmd.id] = dpu_id
         for w in writes:
             self.writers.setdefault(w.loc, []).append((w, cmd.id))
         return cmd
@@ -289,6 +358,15 @@ class _PlanBuilder:
         return (lambda hal: _as_torch(hal.result_of(cmd_id))), cmd_id
 
 
+def _dma_engine(hal, cmd) -> DmaEngine:
+    """按命令上的窗口信息构造 DMA 引擎；原计划没有这些字段时零平移。"""
+    return DmaEngine(
+        hal.dpu_set,
+        act_base_by_dpu=cmd.payload.get("act_base_by_dpu"),
+        act_shift=cmd.payload.get("act_shift", 0),
+    )
+
+
 def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_node: Node) -> None:
     """将一条重分布边生成包含全部段访问的命令。"""
     reads, writes = _edge_accesses(entry)
@@ -302,12 +380,12 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
             waits.append(dep_id)
 
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             scatter(entry, engine, get_host_buf(hal))
             return None
     elif edge.type == "local_slice":
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             itemsize = entry.dtype.itemsize
             for seg in entry.segments:
                 n = seg.nbytes // itemsize
@@ -319,7 +397,7 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
         primitive = _REDISTRIBUTE_FN[edge.type]
 
         def fn(hal, cmd):
-            engine = DmaEngine(hal.dpu_set)
+            engine = _dma_engine(hal, cmd)
             return primitive(entry, engine)
 
     op = _REDISTRIBUTE_OP[edge.type]
@@ -330,6 +408,12 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
     builder.register_reader(f"redist:e{edge.edge_id}", None, cmd.id)
     for w in writes:
         builder.register_reader(f"redist:e{edge.edge_id}", w.loc[1], cmd.id)
+    # 读区也要登记：内存规划的 WAR 链把重分布边记作 `redist:eNN` 读者名，
+    # 按（读者名, 读取 DPU）查命令号；原先只登记 (名, None)，键形对不上，
+    # 激活区复用的后写者查不到——dpu→host 收集是 host 命令，不在 DPU 泳道
+    # 链上，没有这条 WAR 就裸奔（K3 竞态，≥8 worker 下必现）。
+    for r in reads:
+        builder.register_reader(f"redist:e{edge.edge_id}", r.loc[1], cmd.id)
 
 
 def _emit_host_op(builder: _PlanBuilder, node: Node, host_handler_of: HostHandlerFn | None) -> Command:
@@ -378,7 +462,6 @@ def build_execution_plan(
     pending_readers: dict[tuple, list[str]],
     *,
     hardware: PIMHardwareConfig,
-    kv_access_of: KvAccessFn | None = None,
     host_handler_of: HostHandlerFn | None = None,
     sdpa_info_of: "Callable[[Node], dict | None] | None" = None,
     num_tasklets: int = 4,
@@ -393,6 +476,8 @@ def build_execution_plan(
     by_name = {n.name: n for n in nodes}
     output_cmd_id = -1
     emitted_edges: set[int] = set()
+    # MoE 动态分派：层号 → 本层 dispatch host_op 的命令号。
+    dispatch_by_layer: dict[int, int] = {}
     for node in nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
@@ -416,6 +501,10 @@ def build_execution_plan(
             output_cmd_id = builder.host_value_of.get(src.name, output_cmd_id)
             continue
 
+        # 已折进锚点的算子不再发命令，只留锚点那一条。
+        if node.meta.get(ABSORBED_META_KEY):
+            continue
+
         if node.meta.get(DEVICE_META_KEY) == DEVICE_DPU:
             spec = node.meta[SPEC_META_KEY]
             # 校验张量分片对应有效的 DPU 地址。
@@ -433,10 +522,13 @@ def build_execution_plan(
                 e.src: e for e in node.meta.get(REDISTRIBUTE_META_KEY, [])
                 if e.dst_loc.get("device") == DEVICE_DPU
             }
+            # 融合锚点的实参是链首输入和缩放权重，不是它自己那两个操作数。
+            fusion = node.meta.get(RMS_NORM_META_KEY)
             for dpu_id in spec.shard_map:
                 # 按节点参数顺序收集输入地址。`cat` 的第一个实参是**张量
                 # 列表**，要摊平——不摊平它整段被跳过，内核一个输入都读不到。
-                flat_args = _flatten_node_args(node.args)
+                flat_args = ([fusion.eaten[0].args[0], fusion.weight_node]
+                             if fusion is not None else _flatten_node_args(node.args))
                 reads: list[Access] = []
                 for arg in flat_args:
                     if not isinstance(arg, Node):
@@ -456,12 +548,6 @@ def build_execution_plan(
                             and dpu_id in arg_spec.shard_map):
                         reads.append(_node_access(arg, dpu_id, _placed_width(
                             arg, placed_elem_bytes)))
-                if kv_access_of is not None:
-                    hook = kv_access_of(node)
-                    kv_reads, kv_writes = hook if hook is not None else ([], [])
-                else:
-                    kv_reads, kv_writes = [], []
-                reads = reads + kv_reads
                 write = _node_access(node, dpu_id, _placed_width(
                     node, placed_elem_bytes))
                 waits = _deps_of(reads, builder.writers)
@@ -521,7 +607,8 @@ def build_execution_plan(
                 _assert_same_shape_args_share_the_decision(
                     node, dpu_id, arg_decisions, spec, out_detail)
                 payload = {
-                    "kernel": str(node.target), "node": node.name,
+                    "kernel": RMS_NORM_KERNEL if fusion is not None else str(node.target),
+                    "node": node.name,
                     # 折进主算子的尾部激活：A 路编译内核按它带 ACTIVATION
                     # 常量，numpy 镜像按它补上激活再写回。
                     "activation": _fused_activation_of(node),
@@ -542,6 +629,8 @@ def build_execution_plan(
                     "mram_offset": out_detail.mram_offset,
                     "align_bytes": out_detail.align_bytes,
                 }
+                if fusion is not None:
+                    payload["epsilon"] = fusion.epsilon
                 # 注意力要读的设备侧 KV 区域，编译期才知道，在这里烘进命令——
                 # 内核自己拿不到 `kv_specs`，而用模块级全局会在多个策略之间
                 # 互相覆盖（实测三种策略连着编译时后面的把前面的盖掉）。
@@ -549,9 +638,16 @@ def build_execution_plan(
                     info = sdpa_info_of(node)
                     if info is not None:
                         payload["sdpa"] = info
+                # MoE 动态分派：专家 linear 打上 (gate=本层 dispatch, expert) 标签，
+                # 并把 dispatch 加进 waits——运行期先看跳过集再决定发不发内核。
+                expert = _moe_expert_of(node) if _MOE_DISPATCH else None
+                if expert is not None and expert[0] in dispatch_by_layer:
+                    payload["gate"] = dispatch_by_layer[expert[0]]
+                    payload["expert"] = expert[1]
+                    waits = waits + [payload["gate"]]
                 cmd = builder.append(
                     "launch", dpu_id, payload,
-                    reads, [write] + kv_writes, waits,
+                    reads, [write], waits,
                     num_tasklets=num_tasklets,
                 )
                 # 登记本节点为输入地址读者。
@@ -561,5 +657,11 @@ def build_execution_plan(
         # 生成主机计算命令。
         cmd = _emit_host_op(builder, node, host_handler_of)
         builder.register_reader(node.name, None, cmd.id)
+        # MoE 门控的 scatter 落地后紧跟一个 dispatch：读 routing 结果，
+        # 把本步无 token 命中的专家写进跳过集（专家 launch 已 waits 本命令）。
+        if _MOE_DISPATCH and node.target == torch.ops.aten.scatter.src:
+            layer = _moe_layer_of(node, "mlp.gate.weight")
+            if layer is not None:
+                dispatch_by_layer[layer] = _emit_moe_dispatch(builder, layer, cmd.id)
 
     return CompiledPlan(plan=ExecutionPlan(commands=builder.commands), output_cmd_id=output_cmd_id)

@@ -23,12 +23,11 @@ from torch.fx import GraphModule
 from contracts import gml_names as names
 from contracts.compile_slots import DEFAULT_SLOTS, CompileSlots
 from contracts.gml_quant import GML_VERSION
-from contracts.graph_meta import FUSED_TAIL_META_KEY
 from contracts.unified_ir import STAGE_FUSED, mark_stage
 from graph.fuse import fuse_graph
 from graph.opt_passes import optimize_graph
 from graph.fuse_pim import fuse_for_pim
-from graph.fuse_rope import ROPE_META_KEY, fuse_rope
+from graph.fuse_rope import fuse_rope
 from graph.kv_dma_pass import insert_kv_dma_and_split
 from graph.quant_pass import DQ_META_KEY, insert_dynamic_scaling
 from graph.split_heads import split_attention_heads
@@ -481,7 +480,6 @@ def write_runtime_files(
         write_dq_phases,
         write_fixed_point_scaling,
         write_fused_silu_lut,
-        write_identity_lut,
         write_scaling,
         write_output_scale,
         write_per_tensor_weight,

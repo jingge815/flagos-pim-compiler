@@ -1,0 +1,66 @@
+{
+  "note": "基准回归基线，由 scripts/check_benchmarks.py --update 生成。墙钟随机器变化，换机器后必须重新生成并在提交信息里写明原因；计数类指标（kernels、max_concurrency）不随机器变化，容差为 0。",
+  "suites": [
+    {
+      "suite": "bench_parallel",
+      "script": "bench_parallel.py",
+      "command": [
+        "--num-dpus",
+        "4",
+        "--layers",
+        "4",
+        "--requests",
+        "4",
+        "--steps",
+        "8",
+        "--parallel-slots",
+        "1",
+        "2",
+        "--repeat",
+        "1"
+      ],
+      "tolerance": {
+        "kernels": 0,
+        "wall_ms": 0.5,
+        "util": 0.3
+      },
+      "metrics": {
+        "1": {
+          "kernels": 21632,
+          "wall_ms": 19913.890328258276,
+          "util": 60.76849953437852
+        },
+        "2": {
+          "kernels": 21632,
+          "wall_ms": 17809.460925869644,
+          "util": 78.83869809104034
+        }
+      }
+    },
+    {
+      "suite": "bench_vllm_scheduling",
+      "script": "bench_vllm_scheduling.py",
+      "command": [
+        "--only",
+        "baseline,prefix"
+      ],
+      "tolerance": {
+        "max_concurrency": 0,
+        "decode_efficiency": 0.2,
+        "wall_ms": 0.5
+      },
+      "metrics": {
+        "baseline": {
+          "max_concurrency": 2,
+          "decode_efficiency": 0.999695610785167,
+          "wall_ms": 2452.9406670480967
+        },
+        "prefix": {
+          "max_concurrency": 2,
+          "decode_efficiency": 1.8872909920196936,
+          "wall_ms": 2038.988840766251
+        }
+      }
+    }
+  ]
+}

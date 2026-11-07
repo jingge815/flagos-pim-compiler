@@ -71,6 +71,8 @@ _OPLEVEL_CANONICAL = {
     # 的成本会静默变成 0——展开后每相各计一遍，少一相就是少 4096 个元素。
     "pim.kantor": "pim.kantor",
     "pim.fpsu_scale": "pim.fpsu_scale",
+    # 分页注意力不展开成相位链，成本按 QK + softmax + PV 三段估。
+    "pim.paged_attn": "pim.paged_attn",
 }
 # 每个**元素**的浮点运算量。整算子（未展开）按相数计：展开成相位链之后每一相
 # 各自计一遍，两边同量级，sidecar 不会因为"还没展开"就少一大截。
@@ -125,7 +127,10 @@ _PIM_OP_NAME_RE = re.compile(r"=\s*pim\.([a-z_][a-z_0-9]*)")
 _PHASES_ATTR_RE = re.compile(r"phases\s*=\s*\[")
 # 展开后每一相的搬运字节数写在 `bytes` 字段里，计算类算子（softmax/lut/...）
 # 没有自己的访存 mnemonic，搬运量全靠这个字段，不解析就整列是 0。
-_PHASE_SPEC_BYTES_RE = re.compile(r"#pim\.phase_spec<[^>]*bytes\s*=\s*(\d+)")
+_PHASE_SPEC_RE = re.compile(r"#pim\.phase_spec<([^>]*)>")
+# 一条相位里的 `键 = 值`。`reads = [0, 1]` 带逗号，先摘出去再切。
+_PHASE_PARAM_RE = re.compile(r"(\w+)\s*=\s*([^,]+)")
+_PHASE_READS_RE = re.compile(r"reads\s*=\s*\[[^\]]*\]")
 
 
 def _mnemonic_re(names) -> re.Pattern:
@@ -152,6 +157,8 @@ _DATPATH_RE = re.compile(r"#pim\.datapath<([^>]*)>")
 _GROUP_ACCUM_RE = re.compile(r"groupDequantAccum\s*=\s*(true|false)")
 _GROUP_SIZE_RE = re.compile(r"groupSize\s*=\s*(\d+)")
 _SCF_FOR_RE = re.compile(r"scf\.for\s+%\S+\s*=\s*(\S+)\s+to\s+(\S+)\s+step\s+(\S+)")
+# `pim.paged_attn` 的槽长写在属性上：一个物理槽容纳多少个历史 token。
+_SLOT_TOKENS_RE = re.compile(r"slotTokens\s*=\s*(\d+)")
 _SSA_RE = re.compile(r"^\s*(%[\w#]+)\s*=\s*(\S+)(.*)$")
 
 
@@ -346,6 +353,18 @@ def _line_operator_flops(line: str) -> float:
         n = shapes[1][1]
         return 2.0 * m * k * n
 
+    if mnemonic == "pim.paged_attn":
+        # q 是 `(tokens, head_dim)`，块表长度 × 槽长就是历史长度的上界
+        # （编译期不知道本步实际读了几个块，按满长计）。
+        shapes = [[int(d) for d in dims.split("x")] for dims, _ in tensors]
+        slot_tokens = _SLOT_TOKENS_RE.search(line)
+        if slot_tokens is None or len(shapes) < 2:
+            return 0.0
+        tokens, head_dim = shapes[0][:2]
+        hist = shapes[1][0] * int(slot_tokens.group(1))
+        # QKᵀ 与 PV 各 `2·tokens·hist·head_dim`，softmax 每元素约五相。
+        return 4.0 * tokens * hist * head_dim + 5.0 * tokens * hist
+
     phases = 1.0 if _PHASES_ATTR_RE.search(line) else _OPLEVEL_FLOPS_PER_ELEMENT[mnemonic]
     return phases * _tensor_numel(tensors[0][0])
 
@@ -473,8 +492,36 @@ def _line_phase_movement_bytes(line: str) -> float:
     计算类算子（softmax/lut/pool/eltwise/normalize/rope/mask/dq）没有自己的
     访存 mnemonic，`_line_movement_bytes` 对它们恒返回 0；真实搬运量全在
     这个字段里，一行里可能有多个 `phase_spec`，逐个累加。
+
+    带 `perBlock` 的相每个历史块跑一遍，按块数乘——块数取同一行块表操作数的
+    首维，与 `_line_operator_flops` 取历史上界的口径一致。`poolBytes` 是这一相
+    从 KV 槽池读的那一块，同样每块一次。
     """
-    return float(sum(int(b) for b in _PHASE_SPEC_BYTES_RE.findall(line)))
+    bodies = _PHASE_SPEC_RE.findall(line)
+    if not bodies:
+        return 0.0
+    parsed = [{key: value.strip() for key, value in _PHASE_PARAM_RE.findall(
+        _PHASE_READS_RE.sub("", body))} for body in bodies]
+    block_loop = any(p.get("perBlock") == "true" for p in parsed)
+    blocks = _phase_block_count(line) if block_loop else 1
+    total = 0
+    for params in parsed:
+        # 槽池那一块（一块 K 或一块 V）每遍历一次都要读，和 bytes 同口径。
+        moved = int(params["bytes"]) + int(params.get("poolBytes", "0"))
+        total += moved * blocks if params.get("perBlock") == "true" else moved
+    return float(total)
+
+
+def _phase_block_count(line: str) -> int:
+    """块循环的块数：同一行块表操作数的首维。
+
+    只有带 `perBlock` 相的整算子（`pim.paged_attn`）会走到这里；块表是第二个
+    张量操作数，`tensor<4xi32>` 就是 4 个块。
+    """
+    tensors = _TENSOR_RE.findall(line)
+    if len(tensors) < 2:
+        raise ValueError(f"相位链没有块表操作数，算不出块数: {line.strip()}")
+    return int(tensors[1][0].split("x")[0])
 
 
 def _line_dma_bytes(line: str) -> float:

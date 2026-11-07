@@ -17,11 +17,13 @@ from contracts.op_semantics import OP_SEMANTICS, oplevel_ops
 # genesim 的助记符不含这些算子，汇总时按归属注明，不算缺失。
 # 值为 None 的没有 genesim 名字（convert 不是助记符，reduce 折进 RMSNorm）；
 # 有值的归到那个算子名下，那个算子在 genesim 侧有名字才算覆盖到。
-_GENESIM_COVERED_BY = {"linear": "matmul", "convert": None, "reduce": None}
+_GENESIM_COVERED_BY = {"linear": "matmul", "convert": None, "reduce": None,
+                       "paged_attn": None}
 
 # 没有独立 GML 名的内核入口：归约只出现在 RMSNorm 链里，GML 侧折进
-# RMSNorm_vpu，不单发节点。
-_NO_GML = {"reduce"}
+# RMSNorm_vpu；分页注意力是运行时按 SDPA 节点调用，GML 侧仍折进
+# MatMul / Softmax 链。两者都不单发节点。
+_NO_GML = {"reduce", "paged_attn"}
 
 
 def _covered() -> dict[str, set[str]]:

@@ -248,6 +248,46 @@ def _consumers_through_slices(node: Node) -> list[Node]:
     return seen
 
 
+def _experts_ancestor_layers(node: Node) -> set[int]:
+    """沿上游收集所有 experts 权重所在的层号。"""
+    layers: set[int] = set()
+    seen, stack = set(), [node]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur.op == "get_attr" and ".mlp.experts." in str(cur.target):
+            part = str(cur.target).split(".")
+            layers.add(int(part[part.index("layers") + 1]))
+        stack.extend(a for a in cur.args if hasattr(a, "op"))
+    return layers
+
+
+def remark_moe_aggregation_for_ep(gm: GraphModule) -> int:
+    """PP×EP：把 MoE 累加链（mul/add）改标 host，返回改标数。
+
+    专家输出落在互不相交的 DPU 上，跨 DPU 加权求和在主机做——REPLICATE
+    词表覆盖不了「子集复制」，硬走 DPU 会拼错。只标记「experts 祖先层 ==
+    节点归属层」的 mul/add：MoE 块下游（下一层 RMSNorm/残差）虽然也带
+    experts 祖先，但归属下一层，留在设备上走 fused 路径（host 的 fp16
+    mean 精度低于内核的 fp32 累加，会把近平局的门控 argmax 翻掉）。
+    """
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in (
+                torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor):
+            continue
+        expert_layers = _experts_ancestor_layers(node)
+        if not expert_layers:
+            continue
+        home = _layer_of_node(node)
+        if home in expert_layers:
+            node.meta[DEVICE_META_KEY] = DEVICE_HOST
+            count += 1
+    return count
+
+
 def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTensorSpec:
     """按策略为权重构造常驻的 host 或 DPU 张量规格。"""
     shape = tuple(node.meta["val"].shape)
@@ -262,6 +302,18 @@ def _weight_spec(node: Node, strategy: ShardStrategy, num_layers: int) -> PIMTen
         u for u in dpu_users if u.target in (torch.ops.aten.linear.default, torch.ops.aten.addmm.default)
     ]
     if linear_users:
+        if getattr(strategy, "ep_width", 1) > 1:
+            # PP×EP（路线 B）：专家权重整块落单 DPU；其余 linear 权重段内 REPLICATE。
+            target = str(node.target)
+            if ".mlp.experts." in target:
+                part = target.split(".")
+                layer = int(part[part.index("layers") + 1])
+                expert = int(part[part.index("experts") + 1])
+                dpu = strategy.ep_dpu_of_expert(layer, expert, num_layers)
+                return _dpu_spec(
+                    REPLICATE, shape, (dpu,), residency="pinned", dtype=dt, quant=qz)
+            return _dpu_spec(
+                REPLICATE, shape, dpus, residency="pinned", dtype=dt, quant=qz)
         mode = strategy.match(node.target)
         if mode is None:
             raise ValueError(f"权重 {node.target} 被 linear 消费，但策略未指定其切法")
@@ -306,6 +358,13 @@ def _rule_linear(
             (x_node, _dpu_req(Placement("Shard", out_dim))),
             (weight_node, _dpu_req(w_spec.placement)),
         ], Placement("Partial", reduce_type="sum")
+    if w_spec.placement.kind == "Replicate":
+        # PP×EP：整块权重（专家/段内复制的 attention）配 replicate 输入，
+        # 输出 replicate 在权重的 DPU 集上。
+        return [
+            (x_node, _dpu_req(REPLICATE)),
+            (weight_node, _dpu_req(REPLICATE)),
+        ], REPLICATE
     raise _unsupported_layouts(node, x_spec, w_spec)
 
 
@@ -611,6 +670,14 @@ def _diff_edge(
     if (actual.device == req.device == DEVICE_DPU
             and actual.placement.kind == req.placement.kind == "Partial"
             and set(actual.shard_map) <= set(dst_spec.shard_map)):
+        return None
+    # REPLICATE 的超集已覆盖子集需求：本 DPU 上数据已在，不需要任何搬运。
+    # PP×EP 下专家 linear 只在权重所在 DPU 发射，x 是段内 replicate 的超集。
+    if (
+        actual.device == req.device == DEVICE_DPU
+        and actual.placement == req.placement == REPLICATE
+        and set(dst_spec.shard_map) <= set(actual.shard_map)
+    ):
         return None
     if actual.residency == "pinned":
         # 常驻张量不支持重分布。
@@ -1002,8 +1069,14 @@ def _propagate_dpu_node(
     if node.target == torch.ops.aten.linear.default:
         x = _tensor_operand(node, 0, "input")
         weight = _tensor_operand(node, 1, "weight")
-        _reject_tensor_scalar_operand(node, 2, "bias")
+        bias = _optional_tensor_operand(node, 2, "bias")
         reqs, out_placement = rule(node, x, weight)
+        if bias is not None:
+            # 偏置只能跟着列切分走：输出的每一列是独立的，本 DPU 加本片的偏置；
+            # 行切分的输出是部分和，加偏置会重复累加。
+            if weight[1].placement != Placement("Shard", 0):
+                raise _unsupported_layouts(node, x[1], weight[1], bias[1])
+            reqs.append((bias[0], _dpu_req(Placement("Shard", 0))))
         if out_placement.kind == "Partial" and _row_slice_linear(
                 node, x, weight, edges, strategy, num_layers):
             return
@@ -1144,11 +1217,26 @@ def _propagate_dpu_node(
                 for src, req in reqs:
                     _append_edge(node, src, req, edges, strategy, num_layers)
                 return
+    # 先算有效发射面：PP×EP 下 replicate 输出的 DPU 集取「节点 DPU ∩ 各 DPU
+    # replicate 输入的 DPU 集」——专家链（整块权重在单 DPU）由此保持在权重
+    # 所在 DPU 上；普通路径输入是全集，交集等于原集合，行为不变。
+    out_dpus = _dpus_of_node(node, strategy, num_layers)
+    if out_placement.kind == "Replicate":
+        for src, req in reqs:
+            if req.device != DEVICE_DPU:
+                continue
+            src_spec = src.meta.get(SPEC_META_KEY)
+            if (src_spec is None or src_spec.device != DEVICE_DPU
+                    or src_spec.placement.kind != "Replicate"):
+                continue
+            out_dpus = tuple(d for d in out_dpus if d in src_spec.shard_map)
+        if not out_dpus:
+            out_dpus = _dpus_of_node(node, strategy, num_layers)
     for src, req in reqs:
-        _append_edge(node, src, req, edges, strategy, num_layers)
+        _append_edge(node, src, req, edges, strategy, num_layers, dst_dpus=out_dpus)
     followed = _linear_output_following_weight(node, out_placement, tuple(val.shape))
     node.meta[SPEC_META_KEY] = followed or _dpu_spec(
-        out_placement, tuple(val.shape), _dpus_of_node(node, strategy, num_layers),
+        out_placement, tuple(val.shape), out_dpus,
         dtype=_dtype_of(node),
     )
 
@@ -1197,6 +1285,19 @@ def _tensor_or_scalar_operand(
     if isinstance(operand, (int, float, bool)):
         return None
     raise TypeError(f"{node.name} 的 {keyword} 必须是 tensor 节点或标量")
+
+
+def _optional_tensor_operand(
+    node: Node, position: int, keyword: str
+) -> tuple[Node, PIMTensorSpec] | None:
+    """可选的 tensor 操作数：缺省或为 None 时返回 None，标量不接受。"""
+    operand = _operand_value(node, position, keyword)
+    if operand is _MISSING or operand is None:
+        return None
+    _reject_nested_tensor_container(node, operand, keyword)
+    if not isinstance(operand, Node):
+        raise TypeError(f"{node.name} 的 {keyword} 必须是 tensor 节点")
+    return operand, operand.meta[SPEC_META_KEY]
 
 
 def _reject_tensor_scalar_operand(node: Node, position: int, keyword: str) -> None:

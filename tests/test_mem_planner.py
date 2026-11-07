@@ -50,7 +50,7 @@ def _kv_specs() -> dict[int, KVRegionSpec]:
     return {
         d: KVRegionSpec(
             dpu_id=d, layers=[0], kv_heads=[d], q_heads_by_kv={d: [d]},
-            max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0,
+            max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0, slot_tokens=4,
         )
         for d in (0, 1)
     }

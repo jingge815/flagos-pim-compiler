@@ -35,9 +35,11 @@ class DPUPlan:
     act_base: int                        # 激活区基址，两图共享
     act_prefill: dict[str, int]         # prefill 图节点名 -> 激活 offset
     act_decode: dict[str, int]          # decode 图节点名 -> 激活 offset
-    total: int                           # 持久区 + max(两图激活峰值)
+    total: int                           # 持久区 + 激活窗口总占用
     pending_readers_prefill: dict[tuple, list[str]]
     pending_readers_decode: dict[tuple, list[str]]
+    act_extent: int = 0                  # 单个请求窗口实际用到的激活字节数
+    act_stride: int = 0                  # 相邻请求窗口的步长（对齐后）
 
 
 @dataclass
@@ -279,6 +281,10 @@ def plan_dpu(
     hw: HwBudget,
     *,
     kernel_mram_bytes: int = 0,
+    kv_pool_slots: int | None = None,
+    act_slots: int = 1,
+    act_stride: int | None = None,
+    block_table_slots: int = 1,
 ) -> DPUPlan:
     """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
 
@@ -286,12 +292,16 @@ def plan_dpu(
     （`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。它与三区占的是同一
     块 MRAM，所以算进容量判据。默认 0 = 没有回传可用，判据退回只看三区，
     与改动前逐字节等价。
+    `kv_pool_slots` 是全局物理槽池大小；为空时取满长单请求的块数。
+    `act_slots` 是激活区复制的窗口数，`act_stride` 为空时按单请求占用对齐后取。
+    `block_table_slots` 是并发的块表窗口份数。
     """
     weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
 
     kv_spec = kv_specs[dpu_id]
     kv_spec.kv_base = off
-    build_kv_layout(kv_spec, hw.align)
+    build_kv_layout(kv_spec, hw.align, pool_slots=kv_pool_slots,
+                    block_table_slots=block_table_slots)
     kv_base = off
     off += kv_spec.kv_allocated_bytes
 
@@ -300,7 +310,10 @@ def plan_dpu(
     decode_tensors = transient_tensors(decode_nodes, dpu_id)
     act_prefill, end_prefill = greedy_reuse(prefill_tensors, act_base, hw.align)
     act_decode, end_decode = greedy_reuse(decode_tensors, act_base, hw.align)
-    total = max(end_prefill, end_decode)
+    act_extent = max(end_prefill, end_decode) - act_base
+    if act_stride is None:
+        act_stride = align_up(act_extent, hw.align)
+    total = act_base + act_slots * act_stride
 
     # 写回激活节点的 MRAM 偏移。
     for nodes, offsets in ((prefill_nodes, act_prefill), (decode_nodes, act_decode)):
@@ -348,7 +361,68 @@ def plan_dpu(
         total=total,
         pending_readers_prefill=pending_readers_of_reused_addresses(prefill_tensors, act_prefill, dpu_id),
         pending_readers_decode=pending_readers_of_reused_addresses(decode_tensors, act_decode, dpu_id),
+        act_extent=act_extent,
+        act_stride=act_stride,
     )
+
+
+def fit_activation_windows(
+    plans: dict[int, DPUPlan],
+    act_slots: int,
+    hw: HwBudget,
+    kernel_mram_bytes: int = 0,
+) -> int:
+    """把各 DPU 的激活区统一成 `act_slots` 个互不相交的窗口。
+
+    步长取全体 DPU 的最大单请求占用再对齐：`comm/plan.py` 的批量 push/broadcast
+    用一个共享基址扇出到多台 DPU，per-DPU 步长会让批处理错位。返回统一步长。
+    """
+    if act_slots < 1:
+        raise ValueError(f"act_slots={act_slots} 必须 >= 1")
+    stride = align_up(max(plan.act_extent for plan in plans.values()), hw.align)
+    budget = hw.mram_bytes - hw.sys_reserve_bytes
+    kernel_bytes = kernel_mram_bytes or 0
+    for dpu_id, plan in plans.items():
+        if stride < plan.act_extent or stride % hw.align != 0:
+            raise ValueError(
+                f"dpu{dpu_id} 激活窗口步长 {stride} 不满足 extent={plan.act_extent} "
+                f"或对齐 {hw.align}")
+        plan.act_stride = stride
+        plan.total = plan.act_base + act_slots * stride
+        peak = plan.total + kernel_bytes
+        if peak > budget:
+            raise ValueError(
+                f"dpu{dpu_id} 激活窗口 ×{act_slots} 后内存超限: "
+                f"peak={peak}（三区 {plan.total} + 内核 tile {kernel_bytes}）"
+                f" > 可用预算={budget}")
+    return stride
+
+
+def fit_pool_slots(
+    plans: dict[int, DPUPlan],
+    kv_specs: dict[int, KVRegionSpec],
+    hw: HwBudget,
+    *,
+    kernel_mram_bytes: int = 0,
+    act_slots: int = 1,
+    block_table_slots: int | None = None,
+) -> int:
+    """按剩余 MRAM 算物理槽池最多能放多少个槽，多台 DPU 取最小。
+
+    权重区、块表窗口、激活窗口先扣掉，剩下的连续空间按单槽字节数整除。
+    槽池大小不改变权重与激活的占用，所以随便拿一份已规划好的蓝图就能反推。
+    `block_table_slots` 为空时用蓝图里的份数。
+    """
+    budget = hw.mram_bytes - hw.sys_reserve_bytes
+    stride = align_up(max(plan.act_extent for plan in plans.values()), hw.align)
+    caps = []
+    for dpu_id, plan in plans.items():
+        spec = kv_specs[dpu_id]
+        bt_slots = spec.block_table_slots if block_table_slots is None else block_table_slots
+        used = plan.kv_base + bt_slots * spec.block_table_bytes
+        room = budget - (kernel_mram_bytes or 0) - used - act_slots * stride
+        caps.append(room // spec.slot_bytes)
+    return min(caps)
 
 
 def format_mem_plan(plans: dict[int, DPUPlan], hw: HwBudget) -> str:

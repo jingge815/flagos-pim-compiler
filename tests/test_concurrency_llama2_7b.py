@@ -21,13 +21,16 @@ from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import llama2_7b_model_dir
 from graph.partition import partition_graph
 from graph.spec_prop import llama_shard_config, propagate_specs
-from memory.kv_layout import kv_specs_from_placement
+from graph.strategy import llama_strategies
+from memory.kv_layout import kv_specs_from_placement, write_block_table
 from memory.mem_planner import HwBudget, plan_dpu
 from runtime import kernels as kernels_mod
-from runtime.kernels import sdpa_kv_info
-from runtime.compile import sdpa_layer_map, write_weight_shards
+from runtime.kernels import register_all, sdpa_kv_info
+from runtime.compile import (
+    causal_mask_of, compile_llama2, load_weights, sdpa_layer_map, write_weight_shards,
+)
 from runtime.exec_plan_gen import build_execution_plan
-from runtime.executor import DecodeState, execute_plan
+from runtime.executor import RequestTable, execute_plan, run_decode_loop, run_one_step
 from tests.test_partition import _FixedMaskLlama
 
 MODEL_DIR = llama2_7b_model_dir(required=False)
@@ -35,6 +38,10 @@ NUM_DPUS = 8
 SEQ_LEN = 16
 MAX_SEQ = 64
 KV_DTYPE_BYTES = 2
+
+PARALLEL_SEQ_LEN = 4
+PARALLEL_MAX_NEW = 2
+PARALLEL_PROMPTS = [[1, 2, 3, 4], [5, 6, 7, 8]]
 
 pytestmark = pytest.mark.skipif(
     MODEL_DIR is None or not MODEL_DIR.is_dir(),
@@ -68,6 +75,7 @@ def llama2_instrumented_run():
     kv_specs = kv_specs_from_placement(
         k_proj.meta[SPEC_META_KEY], layers=list(range(cfg.num_hidden_layers)), num_kv_heads=cfg.num_key_value_heads,
         num_q_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq=MAX_SEQ, dtype_bytes=KV_DTYPE_BYTES, kv_base=0,
+        slot_tokens=16,
     )
     hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
     hardware = PIMHardwareConfig(
@@ -79,14 +87,14 @@ def llama2_instrumented_run():
         dma_align=64,
     )
     nodes = list(gm.graph.nodes)
-    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw) for d in range(NUM_DPUS)}
+    plans = {d: plan_dpu(d, nodes, nodes, kv_specs, hw)
+             for d in range(NUM_DPUS)}
 
     entries_by_id = {e.edge_id: e for e in build_comm_plan(edges)}
     pending = {}
     for plan in plans.values():
         pending.update(plan.pending_readers_prefill)
 
-    state = DecodeState(valid_len=0)
     sdpa_layer = sdpa_layer_map(gm)
 
     def sdpa_info_of(node):
@@ -120,8 +128,12 @@ def llama2_instrumented_run():
         backend.register_kernel(name, wrap(entry.mirror))
 
     write_weight_shards(gm, plans, backend)
+    for spec in kv_specs.values():
+        write_block_table(spec, backend, list(range(spec.blocks_per_request)))
 
-    events = execute_plan(compiled.plan, backend, values={"input_ids": input_ids, "causal_mask": causal_mask}, pos=state.valid_len)
+    events = execute_plan(compiled.plan, backend,
+                          values={"input_ids": input_ids, "causal_mask": causal_mask},
+                          pos=0, num_tokens=SEQ_LEN)
     backend.wait(events[compiled.output_cmd_id])
 
     return compiled, intervals
@@ -168,3 +180,82 @@ def test_dependent_launch_waits_for_true_completion(llama2_instrumented_run) -> 
             )
             checked += 1
     assert checked > 0, "至少要找到一对有真实 RAW 依赖的 launch 命令用于验证"
+
+
+def _greedy(logits) -> int:
+    return int(np.argmax(logits))
+
+
+@pytest.fixture(scope="module")
+def llama2_parallel_setup():
+    """编译真实 7B 的两窗口蓝图，权重写入 DPU。"""
+    torch.set_grad_enabled(False)
+    model = LlamaForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float16).eval()
+    cfg = model.config
+    strategy = llama_strategies(
+        NUM_DPUS, num_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads, intermediate_size=cfg.intermediate_size,
+        vocab_size=cfg.vocab_size, num_layers=cfg.num_hidden_layers)[0]
+    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
+    hardware = PIMHardwareConfig(
+        num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536, dma_align=64,
+    )
+    compiled = compile_llama2(
+        model, strategy, prefill_seq_len=PARALLEL_SEQ_LEN, max_seq=MAX_SEQ,
+        hw=hw, hardware=hardware, num_request_slots=2, num_parallel_slots=2,
+    )
+    backend = NumpyBackend(NumpyBackendConfig(
+        num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes,
+        num_parallel_slots=compiled.num_parallel_slots,
+    ))
+    register_all(backend)
+    load_weights(compiled, backend)
+    return compiled, backend
+
+
+@pytest.mark.slow
+def test_two_requests_decode_in_parallel(llama2_parallel_setup) -> None:
+    """两个 7B 请求同步解码：token 与单跑一致，且同 DPU 命令区间真重叠。"""
+    compiled, backend = llama2_parallel_setup
+    launches: list[tuple[int, int, float, float]] = []
+    lock = threading.Lock()
+
+    def wrap(fn):
+        def wrapped(hal, dpu_id, cmd):
+            lane = int(cmd.payload.get("block_slot", 0))
+            t0 = time.perf_counter()
+            time.sleep(0.01)
+            try:
+                return fn(hal, dpu_id, cmd)
+            finally:
+                with lock:
+                    launches.append((lane, dpu_id, t0, time.perf_counter()))
+        return wrapped
+
+    for name, entry in kernels_mod._KERNELS.items():
+        backend.register_kernel(name, wrap(entry.mirror))
+
+    table = RequestTable(2, compiled.kv_pool_slots)
+    for index, prompt in enumerate(PARALLEL_PROMPTS):
+        table.add_request(f"r{index}", prompt, eos_id=-1)
+    for _ in range(PARALLEL_MAX_NEW):
+        run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+
+    for index, prompt in enumerate(PARALLEL_PROMPTS):
+        got = list(table.get(f"r{index}").generated)
+        reference = run_decode_loop(
+            compiled, backend, prompt_ids=torch.tensor(prompt),
+            max_new_tokens=PARALLEL_MAX_NEW, eos_id=-1,
+            sample_fn=_greedy, causal_mask_of=causal_mask_of,
+        )
+        assert got == reference, f"r{index} 并发生成 {got} 与单跑 {reference} 不一致"
+
+    lane0 = [item for item in launches if item[0] == 0]
+    lane1 = [item for item in launches if item[0] == 1]
+    assert lane0 and lane1, "两个窗口都应执行到 launch 命令"
+    assert any(
+        d0 == d1 and s0 < e1 and s1 < e0
+        for _, d0, s0, e0 in lane0
+        for _, d1, s1, e1 in lane1
+    ), "同一 DPU 上两个窗口的 launch 区间没有重叠"

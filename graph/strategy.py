@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:  # 只为类型标注，避免 contracts 与 graph 之间的运行时循环导入。
     from contracts.partition_plan import PartitionPlan
 
-# Llama 权重的列切和行切规则。
+# Llama/Qwen2 权重的列切和行切规则。Qwen2 的 q/k/v 带偏置，切法跟权重同向；
+# 偏置只在输出维上分片，所以只能是列切。
 LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
     ("q_proj.weight", "col"),
     ("k_proj.weight", "col"),
@@ -18,6 +19,11 @@ LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
     ("up_proj.weight", "col"),
     ("down_proj.weight", "row"),
     ("lm_head.weight", "col"),
+    ("q_proj.bias", "col"),
+    ("k_proj.bias", "col"),
+    ("v_proj.bias", "col"),
+    # MoE router：按专家维列切，各 DPU 出 E/tp 份 logits，host all_gather 后门控。
+    ("mlp.gate.weight", "col"),
 )
 
 
@@ -30,6 +36,8 @@ class ShardStrategy:
     num_stages: int = 1
     weight_rules: tuple[tuple[str, Literal["col", "row"]], ...] = ()
     dpu_ids: tuple[int, ...] | None = None
+    # 专家并行宽：每段内按 EP 分组、专家整块落位。1 = 关闭（行为与引入前一致）。
+    ep_width: int = 1
 
     def __post_init__(self) -> None:
         if self.num_dpus <= 0:
@@ -40,6 +48,18 @@ class ShardStrategy:
             raise ValueError(
                 f"num_stages={self.num_stages} 不能整除 num_dpus={self.num_dpus}"
                 "（每个 stage 必须持有同样多的 DPU）"
+            )
+        if self.ep_width < 1:
+            raise ValueError("ep_width must be positive")
+        if self.num_dpus % (self.num_stages * self.ep_width):
+            raise ValueError(
+                f"num_stages*ep_width={self.num_stages * self.ep_width} 不能整除 "
+                f"num_dpus={self.num_dpus}（每段必须能均分出 ep_width 个 EP 组）"
+            )
+        if self.ep_width > 1 and self.num_dpus != self.num_stages * self.ep_width:
+            raise ValueError(
+                "ep_width>1 时本轮只支持 tp=1（PP×EP）；"
+                "TP×EP 复合放置是后续课题"
             )
         dpu_ids = tuple(range(self.num_dpus)) if self.dpu_ids is None else tuple(self.dpu_ids)
         if (
@@ -53,7 +73,17 @@ class ShardStrategy:
     @property
     def tp_width(self) -> int:
         """每个 stage 内的张量并行宽度（1 = 段内不切，纯流水）。"""
+        return self.num_dpus // (self.num_stages * self.ep_width)
+
+    @property
+    def stage_width(self) -> int:
+        """每个流水段持有的 DPU 数；EP 打开时大于 tp_width。"""
         return self.num_dpus // self.num_stages
+
+    def ep_dpu_of_expert(self, layer: int, expert: int, num_layers: int) -> int:
+        """专家所在 DPU：段内按 expert % ep_width 轮转落位（每 DPU 差 ≤1）。"""
+        stage_dpus = self.dpus_of_stage(self.stage_of_layer(layer, num_layers))
+        return stage_dpus[expert % self.ep_width]
 
     @property
     def kind(self) -> Literal["tensor", "pipeline", "hybrid"]:
@@ -72,7 +102,7 @@ class ShardStrategy:
         """stage 持有的物理 DPU 编号（按 dpu_ids 顺序切段）。"""
         if not 0 <= stage < self.num_stages:
             raise ValueError(f"stage={stage} 越界 [0,{self.num_stages})")
-        width = self.tp_width
+        width = self.stage_width
         return self.dpu_ids[stage * width : (stage + 1) * width]
 
     def stage_of_layer(self, layer: int, num_layers: int) -> int:
@@ -105,7 +135,7 @@ class ShardStrategy:
     def stage_of_dpu(self, dpu_id: int) -> int:
         """返回 DPU 所属的流水段。"""
         index = self.dpu_ids.index(dpu_id)
-        return index // self.tp_width
+        return index // self.stage_width
 
     def layers_of_dpu(self, dpu_id: int, num_layers: int) -> list[int]:
         """返回 DPU 持有的层号。"""

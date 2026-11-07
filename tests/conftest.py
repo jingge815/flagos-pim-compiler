@@ -4,19 +4,25 @@ from pathlib import Path
 import time
 
 import pytest
+import torch
 
 
 _REPORT_STATE = None
+# 会话开始时的梯度开关。有的用例会在 module 级 fixture 里关掉它又不恢复，
+# 之后的 torch.export 会导出另一张图。
+_INITIAL_GRAD = None
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def _restore_grad_mode():
-    """每个测试文件结束后恢复梯度开关。7B 夹具会全局关闭梯度，漏到后续文件会改变 torch.export 的图。"""
-    import torch
-
-    enabled = torch.is_grad_enabled()
+    """每个用例结束后把梯度开关恢复成会话开始时的状态。"""
     yield
-    torch.set_grad_enabled(enabled)
+    torch.set_grad_enabled(_INITIAL_GRAD)
+
+
+def _is_xdist_worker(config) -> bool:
+    """是否是 pytest-xdist 的 worker 进程；报告统一由主控进程写。"""
+    return hasattr(config, "workerinput")
 
 
 @dataclass
@@ -28,7 +34,10 @@ class TestResult:
 
 
 def pytest_sessionstart(session):
-    global _REPORT_STATE
+    global _REPORT_STATE, _INITIAL_GRAD
+    _INITIAL_GRAD = torch.is_grad_enabled()
+    if _is_xdist_worker(session.config):
+        return
     root = Path(session.config.rootpath)
     out_dir = root / "test-results"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -43,6 +52,8 @@ def pytest_sessionstart(session):
 
 
 def pytest_collection_modifyitems(session, config, items):
+    if _REPORT_STATE is None:
+        return
     state = _REPORT_STATE
     for item in sorted(items, key=lambda value: value.nodeid):
         state["ordered"].append(item.nodeid)
@@ -50,10 +61,15 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_runtest_logreport(report):
-    if _REPORT_STATE is None or report.nodeid not in _REPORT_STATE["results"]:
+    if _REPORT_STATE is None:
         return
     state = _REPORT_STATE
-    result = state["results"][report.nodeid]
+    result = state["results"].get(report.nodeid)
+    if result is None:
+        # xdist 主控没有亲自收集该用例时，按报告到达顺序补建条目。
+        result = TestResult(report.nodeid)
+        state["results"][report.nodeid] = result
+        state["ordered"].append(report.nodeid)
     if report.when == "call":
         result.duration = report.duration
         result.status = (
@@ -69,6 +85,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if _REPORT_STATE is None:
+        return
     state = _REPORT_STATE
     ended = datetime.now()
     elapsed = time.perf_counter() - state["perf"]

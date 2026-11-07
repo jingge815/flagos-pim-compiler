@@ -2,7 +2,7 @@
 
 这一步贡献参考产物 200 个节点里的 128 个，所以「数量对不对」是核心断言。
 但最强的一条仍是语义等价：展开是图变换，不能改变数值
-（`fuse_pim` 那次返工的教训，见 docs/gml-parser-output-plan-20260917.md §11.5.1）。
+（`fuse_pim` 那次返工的教训，见 docs/gml-lowering-20260914.md 的逐头展开一节）。
 """
 
 from __future__ import annotations

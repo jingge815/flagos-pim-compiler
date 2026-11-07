@@ -15,3 +15,7 @@ gml-artifacts/
 
 # 终端会话转录，与本仓无关
 *-local-command-*.txt
+
+# profile_execution.py 的输出：每次运行都会覆写，不入库
+/results.txt
+/timeline_7b_p*.html

@@ -22,14 +22,14 @@ def _add_cuda_toolchain(backend: Path) -> None:
         raise RuntimeError(
             f"找不到 cuda.h：{include_dir}\n"
             f"当前生效路径：\n{describe()}\n"
-            "请用 FLAGTREE_PREFIX 环境变量或 paths.json 指向正确的 "
+            "请用 FLAGTREE_PREFIX 环境变量或 paths.local.json 指向正确的 "
             "flagTree 安装。"
         )
     if not ptxas.is_file():
         raise RuntimeError(
             f"找不到 ptxas：{ptxas}\n"
             f"当前生效路径：\n{describe()}\n"
-            "请用 FLAGTREE_PREFIX 环境变量或 paths.json 指向正确的 "
+            "请用 FLAGTREE_PREFIX 环境变量或 paths.local.json 指向正确的 "
             "flagTree 安装。"
         )
 

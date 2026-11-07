@@ -655,6 +655,24 @@ def test_gather_costs_movement_but_no_flops():
     assert cost.mram_traffic_bytes == 80.0
 
 
+def test_paged_attn_costs_qk_softmax_and_pv():
+    """分页注意力按 QK + softmax + PV 三段计，且不被当成未识别算子。
+
+    手推：q 是 `1x128`，块表 2 项、槽长 16，历史上界 32。
+    QK 与 PV 各 `2·1·32·128`，softmax 每元素五相共 `5·1·32`。
+    """
+    text = '''module attributes {pim.target = "pim:v1"} {
+  tt.func @pa(%q: tensor<1x128xf16>, %c: !pim.memdesc<4096xf16, #pim.mram>, %bt: tensor<2xi32>, %ko: i32, %vo: i32, %pos: i32, %nb: i32, %nt: i32) {
+    %y = pim.paged_attn %q, %c, %bt, %ko, %vo, %pos, %nb, %nt {scale = 0.088388347648318433 : f64, slotElems = 2048 : i64, slotTokens = 16 : i64} : tensor<1x128xf16>, !pim.memdesc<4096xf16, #pim.mram>, tensor<2xi32>, i32, i32, i32, i32, i32 -> tensor<1x128xf16>
+    tt.return
+  }
+}
+'''
+    cost = analyze_ir(text, "pa", (1,), {}, ir_level="pimir")
+    assert cost.flops == 2 * (2 * 1 * 32 * 128) + 5 * 1 * 32, cost.flops
+    assert not [n for n in cost.notes if "未识别" in n or "没有计费规则" in n], cost.notes
+
+
 def _matmul_ir(stationarity: str, extra: str = "") -> str:
     return f'''module attributes {{pim.target = "pim:v1"}} {{
   tt.func @mm(%a: tensor<128x512xi8>, %b: tensor<512x256xi8>) {{
@@ -893,8 +911,10 @@ def test_oplevel_sidecar_records_mnemonics(tmp_path):
     assert "cross_validation" not in sidecar
     assert sidecar["coverage"]["bridged"], "B 路一个算子都没桥接上"
 
+    # `pim.paged_attn` 是方言算子，不在表 1.2.4 的 14 个 GML mnemonic 里。
+    allowed = set(MNEMONICS) | {"pim.paged_attn"}
     for op_id, entry in sidecar["operators"].items():
-        assert entry["source_name"] in MNEMONICS, (
+        assert entry["source_name"] in allowed, (
             f"op {op_id} 的 source_name={entry['source_name']} 不是 mnemonic")
         for point in ("prefill", "decode"):
             measured = entry["measurements"][point]
@@ -970,7 +990,8 @@ def test_real_model_bridge_coverage_is_recorded() -> None:
     合成代表形状——14 个 mnemonic 全过。但真实模型上出现几个是另一回事：
     genesim 的 `.ir` 骨架过去把 attention 抽象成 GEMV_SCORE / GEMV_CONTEXT，
     骨架里没有 ROPE / MASK / DQ / KV / 视图这些 op_type，那 9 个在整模型上
-    一次都不会出现；现在骨架补齐了这些节点，14 个全都能在整模型上量到成本。
+    一次都不会出现；现在骨架补齐了这些节点，14 个里 12 个能在整模型上量到成本，
+    剩下的 mask / softmax 被融合注意力吞掉了。
 
     这条把「实际覆盖到哪些」写成断言：哪天上游改了骨架或配方，数字会变，这里
     必须跟着更新——而不是让「14 个都能回归」这句话一直听起来像是整模型的结论。
@@ -988,10 +1009,12 @@ def test_real_model_bridge_coverage_is_recorded() -> None:
         ir_level="oplevel",
     )
     covered = sorted({e["source_name"] for e in sidecar["operators"].values()})
-    # llama2.ir 的 op_type 覆盖表 1.2.4 的全部 14 个 mnemonic：计算类来自
-    # GEMM/GEMV/ SOFTMAX/RMSNORM/SILU/VECTOR_*，视图与缓存类来自
-    # ROPE/MASK/QUANT/MEM_COPY/GATHER 和 RESHAPE/TRANSPOSE/SPLIT/CONCAT。
-    assert covered == sorted(MNEMONICS), (
+    # 计算类来自 GEMM/RMSNORM/SILU/VECTOR_*，视图与缓存类来自
+    # ROPE/QUANT/MEM_COPY/GATHER 和 RESHAPE/TRANSPOSE/SPLIT/CONCAT。
+    # fp16 下注意力折成一个 `PAGED_ATTN`（方言算子，不在表 1.2.4 的 14 个里），
+    # 所以 `pim.mask` 与 `pim.softmax` 在整模型上一次都不出现。
+    expected = sorted(set(MNEMONICS) - {"pim.mask", "pim.softmax"} | {"pim.paged_attn"})
+    assert covered == expected, (
         f"整模型覆盖的 mnemonic 变了：{covered}。是模型 IR 少了 op_type，"
         "还是桥接漏了？"
     )

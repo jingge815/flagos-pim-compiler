@@ -288,3 +288,38 @@ def test_silu_after_integer_cast_is_not_folded() -> None:
 
     gm = _aten_graph(IntGate(), torch.randn(4, 64))
     assert _fuse_activations(gm) == 0
+def test_exec_plan_fusion_tags_the_chain_tail_and_its_inputs(graph) -> None:
+    """执行计划的折叠把锚点落在链尾的乘缩放，实参就是链首输入与缩放张量。
+
+    执行计划按这两点重排实参：`eaten[0].args[0]` 是被归一化的激活，
+    `weight_node` 是缩放。
+    """
+    import copy
+
+    from graph.fuse_pim import fuse_rms_norms
+
+    clone = copy.deepcopy(graph)
+    assert fuse_rms_norms(clone) == 3
+
+    anchors = [n for n in clone.graph.nodes if RMS_NORM_META_KEY in n.meta]
+    for node in anchors:
+        fusion = node.meta[RMS_NORM_META_KEY]
+        assert node is fusion.eaten[-1]
+        assert node.target is torch.ops.aten.mul.Tensor
+        source = fusion.eaten[0].args[0]
+        assert fusion.weight_node in node.all_input_nodes
+        assert source.meta.get(ABSORBED_META_KEY) is None
+
+
+def test_exec_plan_fusion_skips_a_chain_with_a_redistribute_edge(graph) -> None:
+    """链上带重分布边的那条折不了：被吸收的节点不发命令，边就没有落点。"""
+    import copy
+
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY
+    from graph.fuse_pim import fuse_rms_norms
+
+    clone = copy.deepcopy(graph)
+    starts = [n for n in clone.graph.nodes
+              if n.op == "call_function" and n.target is RMS_NORM_CHAIN[0]]
+    starts[0].meta[REDISTRIBUTE_META_KEY] = [object()]
+    assert fuse_rms_norms(clone) == 2

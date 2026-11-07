@@ -45,7 +45,6 @@ module {
         %d = tt.dot %a, %b, %acc : tensor<8x32xf16> * tensor<32x512xf16> -> tensor<8x512xf32>
       }
     }
-    tt.return
   }
 }
 """
@@ -53,3 +52,23 @@ module {
     # 16 趟外层 × 128 趟内层 × 每趟 2*8*32*512。
     assert cost.flops == 16 * 128 * 2 * 8 * 32 * 512, cost.flops
     assert not any("循环次数" in n for n in cost.notes), cost.notes
+
+
+def test_per_block_phases_multiply_by_the_block_count() -> None:
+    """`pim.paged_attn` 的相 0-4 每个 KV 块跑一遍，块数取块表首维。
+
+    以前相位字节只按 `bytes` 求一次和，KV 槽池那 2×4×4096 B 一点没进账，
+    整算子只剩工作区的 840 B。
+    """
+    text = """\
+module {
+  tt.func @kernel(%q: tensor<1x128xf16>, %cache: !pim.memdesc<8192xf16, #pim.mram>, %bt: tensor<4xi32>) {
+    %0 = pim.paged_attn %q, %cache, %bt {phases = [#pim.phase_spec<index = 0, bytes = 32, unit = nmu, perBlock = true, poolBytes = 4096>, #pim.phase_spec<index = 1, bytes = 4, unit = vpu, reads = [0], perBlock = true>, #pim.phase_spec<index = 2, bytes = 32, unit = activation, reads = [0, 1], perBlock = true>, #pim.phase_spec<index = 3, bytes = 4, unit = vpu, reads = [2], perBlock = true>, #pim.phase_spec<index = 4, bytes = 512, unit = nmu, reads = [2], perBlock = true, poolBytes = 4096>, #pim.phase_spec<index = 5, bytes = 256, unit = combiner, reads = [3, 4]>], slotElems = 2048 : i64, slotTokens = 16 : i64} : tensor<1x128xf16>, !pim.memdesc<8192xf16, #pim.mram>, tensor<4xi32> -> tensor<1x128xf16>
+    tt.return
+  }
+}
+"""
+    cost = analyze_ir(text, "kernel", grid=(1,), arg_values={}, ir_level="oplevel")
+    # 工作区相 0-4 = 32+4+32+4+512 每块一次，相 5 = 256 只一次；
+    # KV 流 = (4096 K + 4096 V) × 4 块。
+    assert cost.mram_traffic_bytes == (32 + 4 + 32 + 4 + 512) * 4 + 256 + 2 * 4096 * 4

@@ -48,6 +48,15 @@ HOST_ONLY = frozenset(
         #    但给一个目标模型里根本不出现的算子编内核，编出来也无从验证。
         #    等真有模型要它，再补规则与内核。
         torch.ops.aten.layer_norm.default,
+        # 6. MoE 门控链（Qwen3MoE 静态前向）：topk/scatter 需要完整专家维，
+        #    门控张量只有 T×E，留在主机走通用回退；softmax 用具体重载，
+        #    不能进 HOST_ONLY_PACKETS——那会按名分族误伤已是设备算子的
+        #    `aten._softmax.default`（注意力路径）。
+        torch.ops.aten.topk.default,
+        torch.ops.aten.softmax.int,
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.scatter.src,
+        torch.ops.aten.zeros_like.default,
     }
 )
 
