@@ -173,7 +173,7 @@ def test_vllm_engine_reuses_cached_prefix(tmp_path, monkeypatch) -> None:
     def _run(prefix_caching: bool) -> tuple[list[list[int]], int]:
         llm = LLM(
             model=str(model_dir), skip_tokenizer_init=True, dtype="float16",
-            max_model_len=e2e_seq, max_num_seqs=2,
+            block_size=16, max_model_len=e2e_seq, max_num_seqs=2,
             max_num_batched_tokens=e2e_seq,
             enable_prefix_caching=prefix_caching,
             gpu_memory_utilization=0.2, distributed_executor_backend=PIMExecutor)

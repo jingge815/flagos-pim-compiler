@@ -43,7 +43,7 @@ LlamaForCausalLM
    │     gml_bridge/export.py::fuse_for_gml        六个融合/拆头 pass
    │     gml_bridge/from_fx.py::convert            FX → GML 节点/边/权重参数
    │     gml_bridge/writer.py::write_gml           relay2gml_graph.gml + *.bin + IO_info.txt
-   │     orchestrator/plan.py::orchestrate         prepare_out/net.ini + txt_files/
+   │     gml_bridge/runtime_files.py               相位与运行时文件；net.ini 由厂商 GC 生成
    │
    └── C. GeneSim 桥接 ────────────────────────────────────────────
          genesim_bridge/flagtree_driver.py         TTIR / 算子级 mlir → pim mlir
@@ -52,7 +52,7 @@ LlamaForCausalLM
          genesim_bridge/placement_export.py        导出 placement 文件
 ```
 
-三条支线共享同一张图，但**用途不同**：A 跑在 NumpyBackend 上做数值对齐，B 交给 GML 工具链，C 给 GeneSim 做性能评估。A 走的是**未融合**的 aten 图（SDPA 仍是一个节点，RMSNorm 仍是一条 aten 链），融合只在 B 支线做——GML 没有独立激活节点的表达能力，融合是目标格式的硬要求。
+三条支线共享同一张图，但**用途不同**：A 跑在 NumpyBackend 上做数值对齐，B 交给 GML 工具链，C 给 GeneSim 做性能评估。A 保留 aten 目标，并可把 RMSNorm 链折成单条执行命令；B 按 GML 的目标格式做主算子与激活融合。
 
 ### 编译期主线：带标注的统一 IR
 
@@ -98,9 +98,9 @@ LlamaForCausalLM
 | **ModelIR** | `.ir` JSON（算子/边/形状/成本系数） | GeneSim 的 `--parse-model`；本仓 `genesim_bridge` 回填 `flops_coeffs` / `data_bytes_coeffs` | GeneSim 调度器 | 性能仿真的模型输入 |
 | **pimir** | pim mlir 文本 | FlagTree（本仓 `genesim_bridge/flagtree_driver.py` 驱动） | GeneSim 的 PIM 指令编译与成本估算 | 设备侧算子的中间表达 |
 | **蓝图** | `ExecutionPlan`（`Command` 列表） | `runtime/exec_plan_gen.py::build_execution_plan` | `runtime/executor.py` + `backend/hal_numpy.py` | 运行时命令流；内存对象，host 命令带 Python 闭包，不能跨进程序列化 |
-| **GML** | `relay2gml_graph.gml` + `*.bin` + `IO_info.txt`（另加 `prepare_out/net.ini`、`txt_files/`） | `gml_bridge/export.py` + `orchestrator/` | GML 工具链、参考产物对拍 | 交付给硬件侧的目标格式 |
+| **GML** | `relay2gml_graph.gml` + `*.bin` + `IO_info.txt` + 相位运行时文件 | `gml_bridge/export.py` + `gml_bridge/runtime_files.py` | GML 工具链、参考产物对拍、厂商 GC | 交付给硬件侧的目标格式 |
 
-GML 导出（单层 decode block，`--layers 1 --seq-len 16`）的参考规模：200 节点 / 331 边 / 3122 个运行时文件（`docs/pim-compiler-v0.0.9.md:579`），编排后展开成 422 层（`orchestrator/layer_expand.py::expand_layers`）。
+GML 导出（单层 decode block，`--layers 1 --seq-len 16`）的参考规模：200 节点 / 331 边 / 3122 个运行时文件（`docs/pim-compiler-v0.0.9.md:579`）；后续 `net.ini` 与设备布局由厂商 GC/L2A 生成。
 
 文档里常见的 `DPU_k.plan` **不是文件**：它指 `memory/mem_planner.py::plan_dpu` 返回的 `DPUPlan`（问题 8 的内存蓝图，可用 `format_mem_plan` 打印）。同理 `format_comm_plan`、`format_kv_layout` 分别打印通信计划与 KV 布局。
 
@@ -158,7 +158,6 @@ HAL 的四条语义决定了蓝图长什么样：
 | `backend/` | `dpu_sdk` SDK 镜像 / `hal_numpy` 异步 HAL / `hal_vendor` 真硬件桩；`vllm_worker`、`vllm_executor` 接 vLLM V1 | 运行时底座 |
 | `opcompiler_bridge/` | 算子编译器桥：TTIR（A 路）/ 算子级 mlir（B 路）→ `triton-opt` → EmitC → gcc → `.so`，带 `.opcompiler_cache` | 问题 5 的下游 |
 | `gml_bridge/` | FX → GML：融合、转换、序列化、`.bin` 与运行时文件、相位数据 | GML 交付 |
-| `orchestrator/` | GML 产物编排：层展开、L2 分配、`net.ini` 与 `txt_files/` | GML 交付 |
 | `quant/` | GML 要的 int4 权重 / int8 激活量化 | GML 交付 |
 | `genesim_bridge/` | GeneSim 成本桥接与 pimir / placement 导出 | 问题 4 |
 | `scripts/` | 导出与验证脚本：`export_gml.py`、`run_full_pipeline.py`、`serve_pim.py` 等 | — |
@@ -204,7 +203,7 @@ HAL 的四条语义决定了蓝图长什么样：
 | 算子编译器调用与缓存 | `opcompiler_bridge/driver.py::compile_op` |
 | GML 导出总入口 | `gml_bridge/export.py::export_graph` / `export_llama2` |
 | GML 六个 pass 的顺序与理由 | `gml_bridge/export.py::fuse_for_gml` |
-| `prepare_out/` 编排 | `orchestrator/plan.py::orchestrate` |
+| GML 相位与运行时文件 | `gml_bridge/runtime_files.py` |
 | GeneSim 成本抽取 | `genesim_bridge/ir_cost.py::analyze_ir` |
 | vLLM 接入 | `backend/vllm_worker.py`、`scripts/serve_pim.py` |
 
@@ -265,7 +264,7 @@ parser 输出），它不在四个安装脚本的产物里，需要单独放置�
 | 未配置时的现象 | 影响的检查 |
 | --- | --- |
 | `RuntimeError: 未配置站点路径 gml_llama2_reference_dir` | `tests/test_gml_hw_table.py`、`tests/test_runtime_files_phases.py` 等一组结构校验 |
-| 打印「无参考产物，跳过」或「无参考目录，跳过」，校验静默通过 | `scripts/export_gml.py` 的 dtype 覆盖检查、`--orchestrate` 的文件族检查 |
+| 打印「无参考产物，跳过」或「无参考目录，跳过」，校验静默通过 | `scripts/export_gml.py` 的 dtype 与运行时文件参考结构检查 |
 
 也就是说，**不配这两个键，测试会报错，而导出脚本会悄悄少做两项校验**——后者更隐蔽，
 建议一并配好。

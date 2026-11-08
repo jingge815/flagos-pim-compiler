@@ -1011,9 +1011,14 @@ def test_real_model_bridge_coverage_is_recorded() -> None:
     covered = sorted({e["source_name"] for e in sidecar["operators"].values()})
     # 计算类来自 GEMM/RMSNORM/SILU/VECTOR_*，视图与缓存类来自
     # ROPE/QUANT/MEM_COPY/GATHER 和 RESHAPE/TRANSPOSE/SPLIT/CONCAT。
-    # fp16 下注意力折成一个 `PAGED_ATTN`（方言算子，不在表 1.2.4 的 14 个里），
-    # 所以 `pim.mask` 与 `pim.softmax` 在整模型上一次都不出现。
-    expected = sorted(set(MNEMONICS) - {"pim.mask", "pim.softmax"} | {"pim.paged_attn"})
+    # 已生成的旧 IR 保留四节点注意力，新 IR 则折成一个 `PAGED_ATTN`；两种输入
+    # 都要能量到成本，融合输入不再单独出现 mask 与 softmax。
+    op_types = {op["op_type"] for op in json.loads(model_ir.read_text())["operators"]}
+    fused = "PAGED_ATTN" in op_types
+    expected = set(MNEMONICS)
+    if fused:
+        expected = expected - {"pim.mask", "pim.softmax"} | {"pim.paged_attn"}
+    expected = sorted(expected)
     assert covered == expected, (
         f"整模型覆盖的 mnemonic 变了：{covered}。是模型 IR 少了 op_type，"
         "还是桥接漏了？"

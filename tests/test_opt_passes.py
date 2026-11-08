@@ -1800,8 +1800,8 @@ def test_compile_optimizes_before_propagating_specs() -> None:
     import runtime.compile as compile_mod
 
     src = inspect.getsource(compile_mod.compile_llama2)
-    opt = src.index("optimize_graph(prefill_gm")
-    prop = src.index("propagate_specs(prefill_gm")
+    opt = src.index("optimize_graph(gm")
+    prop = src.index("propagate_specs(gm")
     assert opt < prop, "优化排在了切分传播之后"
 
 

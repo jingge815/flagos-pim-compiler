@@ -93,8 +93,7 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         FUSED_TAIL_META_KEY, (DIM_OP_SEMANTICS,), "FusedTail",
         producer="graph.fuse:fuse_graph | graph.fuse_pim:fuse_for_pim "
                  "| graph.opt_passes:fuse_linear_activation",
-        consumers=("gml_bridge.from_fx", "gml_bridge.export",
-                   "opcompiler_bridge.oplevel_emitter",
+        consumers=("gml_bridge.from_fx", "opcompiler_bridge.oplevel_emitter",
                    "runtime.exec_plan_gen"),
         note="融合后 node.target 不变而语义已变，靠此键表达。"
              "执行路径只读 activation 字段，下发进编译请求"),

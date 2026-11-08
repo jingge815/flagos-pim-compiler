@@ -194,26 +194,8 @@ def _measure_kernel_tile_n(
             "GeneSim 侧要照这份 IR 生成 trace，缺了路径就只能退回手写模板。"
         )
     pimir_path = str(result.pimir_path)
-    if activation:
-        # 激活标在 A 路的 tt.dot 上，不换建模口径：B 路相位链会把乘加循环
-        # 收成一条指令，计算项归零。
-        pimir_path = _annotate_linear_activation(
-            result.pimir, pimir_path, activation)
     cache[key] = (tile_n, pimir_path, cost.mram_bytes_per_dpu)
     return cache[key]
-
-
-def _annotate_linear_activation(
-    pimir: str, src_path: str, activation: str,
-) -> str:
-    """把激活属性写进 A 路分块 GEMM，返回新文件路径。"""
-    from genesim_bridge.ir_cost import mark_fused_activation
-
-    marked = mark_fused_activation(pimir, activation)
-    out = Path(src_path).with_name(
-        f"{Path(src_path).stem}.{activation}.pimir.mlir")
-    out.write_text(marked)
-    return str(out)
 
 
 # 一块历史多少 token：读 KV 的算子按这个占位形状编一份，运行期按真实历史长度
