@@ -63,6 +63,10 @@ from genesim_bridge.paths import (ceva_reference_dir, ceva_workspace, genesim_mo
                                   genesim_root, llama2_7b_model_dir)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+# 默认走 GeneSim 的 CEVA 64 核 4e 画像：编译预算必须与画像一致，否则严格门禁会拒绝产物。
+CEVA_MRAM_BYTES = 8_000_000_000
+CEVA_SYS_RESERVE_BYTES = 0
+CEVA_SIM_CONFIG = "ceva_64core_4e.yaml"
 # 七个投影，缺一个都说明 IR 或匹配退化了。
 _EXPECTED_ROLES = {
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -210,6 +214,7 @@ def step_zero_pu_mapping(
     _run(
         ["python", "scripts/export_fixed_pu_mapping.py",
          "--num-stages", str(num_stages), "--num-dpus", str(num_dpus),
+         "--config", f"conf/{CEVA_SIM_CONFIG}",
          "--ir", str(ir_path), "--out", str(plan_path)],
         cwd=genesim, log_path=log_dir / "0_pu_mapping.log",
     )
@@ -327,7 +332,9 @@ def step_bcd_export(
     )
     _run(
         ["python", "scripts/export_pp_placement.py",
-         *strategy_args, "--measure-kernel-tiles"],
+         *strategy_args, "--measure-kernel-tiles",
+         "--mram-bytes", str(CEVA_MRAM_BYTES),
+         "--sys-reserve-bytes", str(CEVA_SYS_RESERVE_BYTES)],
         cwd=_REPO_ROOT, log_path=log_dir / "bcd_export.log",
     )
 
@@ -454,6 +461,18 @@ def limited_config(source: Path, conf_dir: Path, max_requests: int) -> Path:
     return out
 
 
+def ceva_sim_config(source: Path, conf_dir: Path, placement: Path) -> Path:
+    """复制 CEVA 场景，把放置 sidecar 指向本流程刚生成的产物，原文件不动。"""
+    import yaml
+
+    loaded = yaml.safe_load(source.read_text())
+    loaded.setdefault("scheduler", {})["compiler_placement_file"] = str(placement)
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    out = conf_dir / source.name
+    out.write_text(yaml.safe_dump(loaded, sort_keys=False))
+    return out
+
+
 def _genesim_sim_command(genesim: Path, config_path: Path) -> list[str]:
     """返回跑 GeneSim 仿真的命令。
 
@@ -479,12 +498,14 @@ def _genesim_sim_command(genesim: Path, config_path: Path) -> list[str]:
 
 
 def step_e_simulate(
-    genesim: Path, config_name: str, log_dir: Path, *, label: str,
+    genesim: Path, config: str | Path, log_dir: Path, *, label: str,
     results_dir: Optional[Path] = None, max_requests: Optional[int] = None,
 ) -> Dict[str, Any]:
     """(E) 跑仿真，核对 GEMM 的 trace 真的来自 pim mlir。"""
     print(f"\n[E] GeneSim 仿真（{label}）")
-    config_path = genesim / "conf" / config_name
+    config_path = Path(config)
+    if not config_path.is_absolute():
+        config_path = genesim / "conf" / config_path
     if max_requests is not None:
         # 临时配置放日志目录，不写进 genesim 仓，免得留下一份请求数被改过的副本。
         config_path = limited_config(config_path, log_dir, max_requests)
@@ -808,14 +829,14 @@ def main() -> int:
             print("\n全流程验证通过（未含仿真）。")
             return 0
 
-        config = f"sim_llama2_7b_pp_tp{tp_width}pp{args.num_stages}_globalcost.yaml"
-        if not (genesim / "conf" / config).is_file():
-            raise StepFailed(
-                f"没有对应的 GeneSim 配置 conf/{config}。"
-                f"当前只为部分策略准备了配置，可参照已有文件新建一份。"
-            )
+        config = CEVA_SIM_CONFIG
+        config_path = genesim / "conf" / config
+        if not config_path.is_file():
+            raise StepFailed(f"没有 CEVA 场景配置 conf/{config}")
+        # CEVA 场景固定按 64 核画像跑；放置 sidecar 指向本流程刚生成的产物。
+        config_path = ceva_sim_config(config_path, log_dir / "ceva-config", placement)
         main_summary = step_e_simulate(
-            genesim, config, log_dir, label="pimir",
+            genesim, config_path, log_dir, label="ceva",
             results_dir=Path("/tmp/full_pipeline_pimir"),
             max_requests=args.max_requests,
         )

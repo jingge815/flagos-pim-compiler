@@ -95,30 +95,44 @@ def test_fusion_saves_the_silu_traversal():
 
 @pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")
 def test_fused_activation_costs_one_lookup():
-    """折进主算子的激活只发一条查表指令，与单独的 silu 同口径。
+    """折进主算子的激活与单独的 silu 做同样多的查表工作量。
 
-    按搬运上限把查表指令切块会让融合侧的计算周期随规模上涨，而未融合侧
-    始终一条，两边就不再可比。
+    查表指令现在按元素数套固定次数循环，指令条数不再等于工作量；比较的是
+    算上循环次数的有效查表次数，融合与未融合必须一致。
     """
     from opcompiler_bridge.oplevel_kernel import lut_kernel, matmul_kernel
 
     _use_genesim()
     from genesim_bridge.flagtree_driver import lower_oplevel_to_pimir
-    from pim.pim_isa import OPCODE_LUT, decode_instruction
+    from pim.pim_isa import (
+        OPCODE_LOOP_BEGIN, OPCODE_LOOP_BEGIN_INDIRECT, OPCODE_LOOP_END,
+        OPCODE_LUT, decode_instruction,
+    )
     from pim.pimir_trace import compile_phase_chain, parse_phase_chain
 
     def lookups(body: str) -> int:
         text = lower_oplevel_to_pimir(_module_text(body))
         instrs = compile_phase_chain(parse_phase_chain(text))
-        return sum(
-            1 for raw in instrs
-            if decode_instruction(raw)["opcode"] == OPCODE_LUT
-        )
+        total = 0
+        stack = [1]
+        for raw in instrs:
+            decoded = decode_instruction(raw)
+            opcode = decoded["opcode"]
+            if opcode == OPCODE_LOOP_BEGIN:
+                stack.append(stack[-1] * (decoded["imm"] or 1))
+            elif opcode == OPCODE_LOOP_BEGIN_INDIRECT:
+                # 运行时才绑定次数；这份对比里两边都没有间接循环。
+                stack.append(stack[-1])
+            elif opcode == OPCODE_LOOP_END:
+                stack.pop()
+            elif opcode == OPCODE_LUT:
+                total += stack[-1]
+        return total
 
     point = ShapePoint(tq=64, tp=0)
     fused = lookups(matmul_kernel("linear", point.tq, 512, 512, activation="silu"))
     separate = lookups(lut_kernel("lut", (point.tq, 512), "silu"))
-    assert fused == separate == 1
+    assert fused == separate == point.tq * 512
 
 
 @pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")

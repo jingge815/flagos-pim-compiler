@@ -378,6 +378,114 @@ def test_kv_writeback_never_enters_the_communication_account(
     assert "local_slice" not in account
 
 
+def _export_with_one_collective(
+    annotated_tiny_llama, tmp_path, **overrides
+):
+    """在清空原重分布边后注入一条集合通信边，验证导出侧数值契约。"""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY
+
+    gm = deepcopy(annotated_tiny_llama)
+    for node in gm.graph.nodes:
+        if REDISTRIBUTE_META_KEY in node.meta:
+            node.meta[REDISTRIBUTE_META_KEY] = []
+    carrier = next(
+        node for node in gm.graph.nodes if node.op == "call_function")
+    edge = SimpleNamespace(
+        edge_id=9001,
+        type="all_gather",
+        nbytes=4096,
+        src_loc={"device": "DPU", "dpus": [0, 1]},
+        dst_loc={"device": "DPU", "dpus": [0, 1]},
+        dtype="float16",
+        shape=(16, 64),
+    )
+    for name, value in overrides.items():
+        setattr(edge, name, value)
+    carrier.meta[REDISTRIBUTE_META_KEY] = [edge]
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    return export_placement_to_genesim(
+        gm, ir_path, tmp_path / "placed.ir", tmp_path / "sidecar.json",
+    )
+
+
+@pytest.mark.parametrize("overrides", [
+    {"nbytes": True},
+    {"nbytes": 4096.9},
+    {"nbytes": -4096},
+    {"nbytes": 0},
+    {"nbytes": 10 ** 1000},
+    {"src_loc": {"device": "DPU", "dpus": [0.0]}},
+    {"src_loc": {"device": "DPU", "dpus": [True]}},
+    {"src_loc": {"device": "DPU", "dpus": [-1]}},
+    {"src_loc": {"device": "DPU", "dpus": []},
+     "dst_loc": {"device": "DPU", "dpus": []}},
+])
+def test_export_rejects_malformed_collective_fields(
+    annotated_tiny_llama, tmp_path, overrides
+) -> None:
+    """畸形 nbytes/dpu_ids 必须在写 sidecar 之前被拒绝。"""
+    with pytest.raises(ValueError):
+        _export_with_one_collective(
+            annotated_tiny_llama, tmp_path, **overrides)
+    assert not (tmp_path / "sidecar.json").exists()
+
+
+def test_collective_number_contract_matches_the_cost_model() -> None:
+    """字节量与派生系数必须能被 GeneSim 的浮点成本模型表示。
+
+    任意精度整数能通过正整数检查，但常量分支的 float() 会溢出，
+    序列分支的除法也会溢出或下溢成 0；导出侧必须与消费端拒绝同一批值。
+    """
+    from genesim_bridge.placement_export import _collective_number_errors
+
+    for nbytes, seq_len in (
+        (10 ** 1000, None),
+        (10 ** 1000, 16),
+        (4096, 10 ** 1000),
+    ):
+        assert _collective_number_errors(nbytes, seq_len), (nbytes, seq_len)
+    for nbytes, seq_len in (
+        (4096, None),
+        (4096, 16),
+        (2 ** 100, None),
+        (2 ** 100, 2 ** 20),
+    ):
+        assert _collective_number_errors(nbytes, seq_len) == []
+
+
+def test_export_accepts_large_representable_collective_numbers(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """可表示的大整数原样导出，不能被新契约误拒。"""
+    big = 2 ** 100
+    sidecar = _export_with_one_collective(
+        annotated_tiny_llama, tmp_path, nbytes=big)
+    assert sidecar["collectives"] == [{
+        "type": "all_gather",
+        "nbytes": big,
+        "dpu_ids": [0, 1],
+        "seq_len": 16,
+    }]
+
+
+def test_export_writes_legal_collective_fields_exactly(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """合法整数原样写出，不做 int() 之外的静默改写。"""
+    sidecar = _export_with_one_collective(annotated_tiny_llama, tmp_path)
+    assert sidecar["collectives"] == [{
+        "type": "all_gather",
+        "nbytes": 4096,
+        "dpu_ids": [0, 1],
+        "seq_len": 16,
+    }]
+
+
 def _two_layer_graph() -> GraphModule:
     """两层的小模型图，用来验证层到流水段的钉死。"""
     sequence_length = 16
@@ -493,6 +601,33 @@ def test_bpath_entries_keep_the_sidecar_shape() -> None:
     assert sidecar["operators"]["0"]["shards"] == [{"dpu_id": 0}]
 
 
+def test_bpath_entry_records_symbolic_dim_placeholders() -> None:
+    """B 路条目要登记符号维的占位值。
+
+    仿真侧靠它把整算子相位轨迹的静态形状缩放到实际请求；缺了它，运行时
+    要么按请求行数重复整条轨迹（128 倍失真），要么拒绝执行。
+    """
+    from genesim_bridge.placement_export import (
+        _SYMBOLIC_DIM, _attach_bpath_pimir,
+    )
+
+    operators = {
+        0: {"op_id": 0, "op_type": "GEMV_SCORE",
+            "input_shapes": [["Tq", 128], ["Tp+Tq", 128]],
+            "output_shapes": [["Tq", "Tp+Tq"]]},
+        1: {"op_id": 1, "op_type": "SILU",
+            "input_shapes": [[8, 64]], "output_shapes": [[8, 64]]},
+    }
+    sidecar = {"operators": {}}
+    _attach_bpath_pimir(operators, sidecar)
+
+    assert sidecar["operators"]["0"]["symbolic_dim_placeholder"] == {
+        "Tq": _SYMBOLIC_DIM,
+        "Tp+Tq": _SYMBOLIC_DIM,
+    }
+    assert sidecar["operators"]["1"]["symbolic_dim_placeholder"] == {}
+
+
 def test_bpath_matmul_ignores_fused_activation() -> None:
     """放置导出看不到 fused_activation，B 路不得按它分叉。
 
@@ -584,8 +719,70 @@ def test_local_shard_widths_follow_each_projection(
             assert shard["local_in_features"] == want_in, (op_id, entry)
             assert shard["local_out_features"] == want_out, (op_id, entry)
 
-    assert sidecar["version"] == 3
+    assert sidecar["version"] == 4
     assert sidecar["ir_num_operators"] == 11
+
+
+def test_sidecar_exports_the_same_byte_budget(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """放置 sidecar 必须带物理 MRAM、系统预留和可用量。
+
+    GeneSim 的 CEVA 严格模式据此核对 `ceva.local_memory_bytes` 与
+    `ceva.sys_reserve_bytes`；缺了这三项，按另一套预算搜索的分块、放置和
+    计时输入就会被当成当前硬件的产物。
+    """
+    from contracts.op_contract import PIMHardwareConfig
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    reserve = 64 * 2**20
+    hardware = PIMHardwareConfig(
+        num_dpus=NUM_DPUS,
+        num_tasklets=16,
+        mram_bytes_per_dpu=8000000000,
+        wram_bytes_per_dpu=65536,
+        dma_align=64,
+    )
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+        hardware=hardware,
+        sys_reserve_bytes=reserve,
+    )
+
+    assert sidecar["version"] == 4
+    assert sidecar["hardware"] == {
+        "mram_bytes_per_dpu": 8000000000,
+        "sys_reserve_bytes": reserve,
+        "usable_mram_bytes": 8000000000 - reserve,
+    }
+
+
+def test_sidecar_rejects_a_reserve_larger_than_capacity(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """预留不能吃掉整份预算，否则导出的可用量没有意义。"""
+    from contracts.op_contract import PIMHardwareConfig
+
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    hardware = PIMHardwareConfig(
+        num_dpus=NUM_DPUS,
+        num_tasklets=16,
+        mram_bytes_per_dpu=1 << 20,
+        wram_bytes_per_dpu=65536,
+        dma_align=64,
+    )
+
+    with pytest.raises(ValueError):
+        export_placement_to_genesim(
+            annotated_tiny_llama, ir_path,
+            tmp_path / "placed.ir", tmp_path / "sc.json",
+            hardware=hardware,
+            sys_reserve_bytes=1 << 20,
+        )
 
 
 def test_shard_widths_sum_to_the_global_width(

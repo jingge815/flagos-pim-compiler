@@ -50,6 +50,22 @@ NUM_DPUS = 8
 NUM_TASKLETS = 4
 PREFILL_SEQ_LEN = 16
 MAX_SEQ = 64
+# 默认按 GeneSim 的 CEVA 64 核 4e 画像：每核 8,000,000,000 B，无系统预留。
+DEFAULT_MRAM_BYTES = 8_000_000_000
+DEFAULT_SYS_RESERVE_BYTES = 0
+
+
+def build_hw_budget(mram_bytes: int, sys_reserve_bytes: int) -> HwBudget:
+    """按显式字节预算构造单台 DPU 的 MRAM 约束。"""
+    if mram_bytes <= 0:
+        raise SystemExit("--mram-bytes 必须为正")
+    if sys_reserve_bytes < 0 or sys_reserve_bytes >= mram_bytes:
+        raise SystemExit("--sys-reserve-bytes 必须非负且小于 --mram-bytes")
+    return HwBudget(
+        mram_bytes=mram_bytes,
+        align=64,
+        sys_reserve_bytes=sys_reserve_bytes,
+    )
 
 
 def _fuse_for_placement(gm):
@@ -81,6 +97,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out-dir", default=None,
         help="产物目录，默认取 <genesim>/models",
+    )
+    parser.add_argument(
+        "--mram-bytes", type=int, default=DEFAULT_MRAM_BYTES,
+        help=(
+            "单台 DPU 的 MRAM 字节预算；缺省 8,000,000,000 B（CEVA 64 核 4e 画像），"
+            "其他场景按 GeneSim 配置显式覆盖。"
+        ),
+    )
+    parser.add_argument(
+        "--sys-reserve-bytes", type=int, default=DEFAULT_SYS_RESERVE_BYTES,
+        help="系统预留字节数（内核、栈、workspace）；缺省 0。",
     )
     parser.add_argument(
         "--measure-kernel-tiles", action="store_true",
@@ -140,10 +167,15 @@ def main() -> None:
         num_dpus = args.num_dpus
     print(format_strategy(strategy, cfg.num_hidden_layers))
 
-    hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
+    hw = build_hw_budget(args.mram_bytes, args.sys_reserve_bytes)
     hardware = PIMHardwareConfig(
         num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
         mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536, dma_align=64,
+    )
+    print(
+        f"MRAM 预算: 物理 {hw.mram_bytes} B，"
+        f"预留 {hw.sys_reserve_bytes} B，"
+        f"可用 {hw.mram_bytes - hw.sys_reserve_bytes} B"
     )
     compiled = compile_llama2(
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
@@ -158,6 +190,8 @@ def main() -> None:
         compiled.prefill_gm, ir_path, out_ir, sidecar_path,
         dtype="float16",
         hardware=hardware,
+        # 与 HwBudget 同一份预留：sidecar 里要能对账物理量、预留和可用量。
+        sys_reserve_bytes=hw.sys_reserve_bytes,
         measure_kernel_tiles=args.measure_kernel_tiles,
         # GeneSim 给了方案就把它的 Cluster 映射原样带进 sidecar，往返用同一份声明。
         dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,

@@ -93,6 +93,86 @@ def _export_seq_len(edge, export_seq_len: int) -> int | None:
     return export_seq_len
 
 
+def _collective_number_errors(nbytes: int, seq_len: int | None) -> list[str]:
+    """字节量与派生系数必须能被 GeneSim 的浮点成本模型表示。
+
+    任意精度整数能通过正整数检查，但常量分支的 float() 会溢出；
+    序列分支的 nbytes/seq_len 也可能溢出或下溢成 0。导出侧与
+    GeneSim 的 `collective_edge_errors` 必须拒绝同一批数值。
+    """
+    try:
+        nbytes_number = float(nbytes)
+    except (OverflowError, ValueError):
+        nbytes_number = None
+    if nbytes_number is None or not math.isfinite(nbytes_number):
+        return [f"nbytes 超出浮点可表示范围：{nbytes!r}"]
+    if seq_len is None:
+        return []
+    try:
+        seq_len_number = float(seq_len)
+    except (OverflowError, ValueError):
+        seq_len_number = None
+    if seq_len_number is None or not math.isfinite(seq_len_number):
+        return [f"seq_len 超出浮点可表示范围：{seq_len!r}"]
+    coefficient = nbytes / seq_len
+    if not math.isfinite(coefficient) or coefficient <= 0:
+        return [f"nbytes/seq_len 必须是有限正数：{nbytes!r}/{seq_len!r}"]
+    return []
+
+
+def _collective_entry(edge, export_seq_len: int) -> dict:
+    """把一条重分布边写成 GeneSim 可消费的集合通信记录。
+
+    字段契约与 GeneSim 的 `collective_edge_errors` 保持一致：nbytes 与
+    dpu_ids 必须是正整数，字节量与派生系数还必须能被浮点成本模型表示，
+    非法值不能靠 int() 静默截断或改写。
+    """
+    nbytes = edge.nbytes
+    if isinstance(nbytes, bool) or not isinstance(nbytes, int) or nbytes <= 0:
+        raise ValueError(
+            f"重分布边 {edge.edge_id} 的 nbytes 必须是正整数，"
+            f"收到 {nbytes!r}。")
+    dpus = set()
+    for loc in (edge.src_loc, edge.dst_loc):
+        dpus.update(loc.get("dpus", ()))
+    # 先做类型校验再排序：混入字符串时 sorted() 会先抛 TypeError，
+    # 报错就不再指向具体字段。
+    for dpu_id in dpus:
+        if (
+            isinstance(dpu_id, bool)
+            or not isinstance(dpu_id, int)
+            or dpu_id < 0
+        ):
+            raise ValueError(
+                f"重分布边 {edge.edge_id} 的 dpu_ids 必须是非负的非布尔"
+                f"整数，收到 {dpu_id!r}。")
+    dpu_ids = sorted(dpus)
+    if not dpu_ids:
+        raise ValueError(
+            f"重分布边 {edge.edge_id} 没有参与 DPU，"
+            "无法生成集合通信记录。")
+    seq_len = _export_seq_len(edge, export_seq_len)
+    if seq_len is not None and (
+        isinstance(seq_len, bool)
+        or not isinstance(seq_len, int)
+        or seq_len <= 0
+    ):
+        raise ValueError(
+            f"重分布边 {edge.edge_id} 的 seq_len 必须是正整数或 None，"
+            f"收到 {seq_len!r}。")
+    number_errors = _collective_number_errors(nbytes, seq_len)
+    if number_errors:
+        raise ValueError(
+            f"重分布边 {edge.edge_id} 的集合通信数值不合法："
+            + "；".join(number_errors))
+    return {
+        "type": edge.type,
+        "nbytes": nbytes,
+        "dpu_ids": dpu_ids,
+        "seq_len": seq_len,
+    }
+
+
 def _fused_activations(gm: GraphModule) -> list[dict]:
     """图上被折进主算子的激活，按层与投影身份列出。
 
@@ -197,6 +277,12 @@ def _measure_kernel_tile_n(
     return cache[key]
 
 
+# B 路符号维的代表值：只要不是 1 这种极端退化值即可，128 和
+# `op_classify.mnemonic_of` 探测配方时用的占位维度同一量级。
+# 仿真侧按 `symbolic_dim_placeholder` 把静态形状缩放到实际请求形状。
+_SYMBOLIC_DIM = 128
+
+
 def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
     """给一个算子级 mnemonic 编一份 B 路 pimir，返回落盘路径。
 
@@ -219,10 +305,6 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
     )
     from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
     from genesim_bridge.op_classify import _attention_matmul_body, _module
-
-    # 符号维的代表值：只要不是 1 这种极端退化值即可，128 和
-    # `op_classify.mnemonic_of` 探测配方时用的占位维度同一量级。
-    _SYMBOLIC_DIM = 128
 
     def n(dim):
         return _SYMBOLIC_DIM if isinstance(dim, str) else int(dim)
@@ -342,6 +424,14 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         })
         entry["pimir_path"] = cache[key]
         entry["pimir_sha256"] = _file_sha256(cache[key])
+        # 符号维在 PIM MLIR 里按固定占位值编译；仿真侧据此把整算子轨迹的
+        # 静态工作量缩放到本次请求形状，避免运行时再按 Tq 重复一次。
+        entry["symbolic_dim_placeholder"] = {
+            str(dimension): _SYMBOLIC_DIM
+            for shape in (*op["input_shapes"], *op["output_shapes"])
+            for dimension in shape
+            if isinstance(dimension, str)
+        }
 
 
 # 读 KV 缓存的算子：attention 的两次矩阵乘，一次读 K、一次读 V。
@@ -452,6 +542,7 @@ def export_placement_to_genesim(
     *,
     dtype: str = "float16",
     hardware: "PIMHardwareConfig | None" = None,
+    sys_reserve_bytes: int = 0,
     measure_kernel_tiles: bool = False,
     dpu_to_cluster: tuple[tuple[int, int], ...] | None = None,
     strategy: "ShardStrategy | None" = None,
@@ -469,7 +560,23 @@ def export_placement_to_genesim(
     `dpu_to_cluster` 来自 GeneSim 给定的切分方案（`contracts/partition_plan.py`），
     原样写进 sidecar 顶层，让 GeneSim 按它把逻辑 DPU 落到指定的 ClusterPU 上，
     而不是走 `dpu_id % len(cluster_keys)` 的取模换算。往返用同一份声明，编号就不会错位。
+
+    `sys_reserve_bytes` 与 `hardware.mram_bytes_per_dpu` 一起写进顶层的
+    `hardware` 字段：GeneSim 的 CEVA 严格模式要求这份预算与
+    `ceva.local_memory_bytes` / `ceva.sys_reserve_bytes` 逐项一致。
     """
+    if hardware is None:
+        from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
+        hardware = DEFAULT_HARDWARE_CONFIG
+    if (
+        isinstance(sys_reserve_bytes, bool)
+        or not isinstance(sys_reserve_bytes, int)
+        or sys_reserve_bytes < 0
+        or sys_reserve_bytes >= hardware.mram_bytes_per_dpu
+    ):
+        raise ValueError(
+            "sys_reserve_bytes 必须是非负整数且小于硬件 MRAM 预算："
+            f"{sys_reserve_bytes!r} vs {hardware.mram_bytes_per_dpu}。")
     ir = json.loads(Path(ir_path).read_text())
     num_layers = ir["num_layers"]
     if len(ir["subgraphs"]) != num_layers:
@@ -481,9 +588,19 @@ def export_placement_to_genesim(
     # 真正可校验的是内容——算子总数和每个被放置算子的 op_type，见
     # GeneSim 侧 _load_compiler_placement 的比对。
     sidecar: Dict[str, Any] = {
-        "version": 3,
+        "version": 4,
         "source_ir": str(ir_path),
         "ir_num_operators": len(ir["operators"]),
+        # 与编译本地形状时下发的 PIMHardwareConfig 同源：物理总量、系统预留
+        # 和可用量必须能逐项对账，否则产物可能来自另一套字节预算。
+        "hardware": {
+            "mram_bytes_per_dpu": int(hardware.mram_bytes_per_dpu),
+            "sys_reserve_bytes": int(sys_reserve_bytes),
+            "usable_mram_bytes": (
+                int(hardware.mram_bytes_per_dpu)
+                - int(sys_reserve_bytes)
+            ),
+        },
         # 这份 sidecar 是否带算子编译产物（pimir_path / kernel_tile_n）。
         # GeneSim 据此自动进入严格模式：写了产物却读不到就报错，而不是静默退回
         # 手写模板。让产物自己声明，配置文件漏写 require_compiler_pimir 也不会
@@ -509,18 +626,9 @@ def export_placement_to_genesim(
             ):
                 continue
             seen_edges.add(edge.edge_id)
-            dpus = set()
-            for loc in (edge.src_loc, edge.dst_loc):
-                dpus.update(loc.get("dpus", ()))
-            entry = {
-                "type": edge.type,
-                "nbytes": int(edge.nbytes),
-                "dpu_ids": sorted(dpus),
-            }
             # 键必须在：调度器把缺 seq_len 当成旧 sidecar 直接报错。不带序列
             # 维的边显式写 null，仿真侧按常量计，不会被错除。
-            entry["seq_len"] = _export_seq_len(edge, export_seq_len)
-            collectives.append(entry)
+            collectives.append(_collective_entry(edge, export_seq_len))
     sidecar["collectives"] = collectives
     # 融合清单只读图上的标记：没跑融合 pass 就是空，不能从 IR 形状猜。
     sidecar["fused_activations"] = _fused_activations(gm)
