@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,9 +111,10 @@ def gqa_model():
         max_position_embeddings=MAX_SEQ, **MODEL_KWARGS)).eval().to(torch.float16)
 
 
-def _compile_and_load(model, strategy, num_request_slots=2, num_parallel_slots=2):
+def _compile_and_load(model, strategy, num_request_slots=2, num_parallel_slots=2,
+                      *, moe_dispatch=None):
     """编译 + 建后端 + 装权重，供各架构的数值测试共用。"""
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64)
@@ -122,7 +124,8 @@ def _compile_and_load(model, strategy, num_request_slots=2, num_parallel_slots=2
         kv_slot_tokens=4, num_parallel_slots=num_parallel_slots)
     backend = NumpyBackend(NumpyBackendConfig(
         num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes,
-        num_parallel_slots=compiled.num_parallel_slots))
+        num_parallel_slots=compiled.num_parallel_slots,
+        moe_dispatch=moe_dispatch))
     register_all(backend)
     load_weights(compiled, backend)
     return compiled, backend
@@ -283,6 +286,211 @@ def test_static_moe_forward_matches_hf() -> None:
         assert diff < 1e-3, f"norm_topk_prob={norm_topk_prob}: max|Δ|={diff}"
 
 
+class _ConstantLogitsGate(torch.nn.Module):
+    """按行返回固定 logits 的门控，用来制造「选中但权重下溢为 0」的场景。"""
+
+    def __init__(self, logits: list[float]) -> None:
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.tensor(logits))
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        return self.logits.to(xs.dtype).expand(xs.shape[0], -1)
+
+
+class _ConstantExpert(torch.nn.Module):
+    """输出固定值的专家，用于构造非有限输出。"""
+
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(xs, self.value)
+
+
+def _zero_weight_selected_block(norm_topk_prob: bool):
+    """3 专家 top-2，选中 [0, 1] 且 1 号权重下溢为 0；1 号输出 inf。"""
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeSparseMoeBlock)
+
+    cfg = Qwen3MoeConfig(
+        hidden_size=4, intermediate_size=8, moe_intermediate_size=8,
+        num_hidden_layers=1, num_attention_heads=1, num_key_value_heads=1,
+        head_dim=4, vocab_size=16, num_experts=3, num_experts_per_tok=2,
+        norm_topk_prob=norm_topk_prob, max_position_embeddings=16)
+    block = Qwen3MoeSparseMoeBlock(cfg).eval().to(torch.float16)
+    block.gate = _ConstantLogitsGate([0.0, -200.0, -300.0])
+    block.experts = torch.nn.ModuleList([
+        _ConstantExpert(0.0), _ConstantExpert(float("inf")),
+        _ConstantExpert(1.0)])
+    return block
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+def test_static_moe_forward_masks_unselected_overflow_both_norms(
+        norm_topk_prob) -> None:
+    """未选中专家的 inf 在两态归一化下都必须掩零，不能以 inf×0=nan 污染。"""
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeSparseMoeBlock)
+
+    from backend.architectures import make_static_moe_forward
+
+    cfg = Qwen3MoeConfig(
+        hidden_size=4, intermediate_size=8, moe_intermediate_size=8,
+        num_hidden_layers=1, num_attention_heads=1, num_key_value_heads=1,
+        head_dim=4, vocab_size=16, num_experts=2, num_experts_per_tok=1,
+        norm_topk_prob=norm_topk_prob, max_position_embeddings=16)
+    block = Qwen3MoeSparseMoeBlock(cfg).eval().to(torch.float16)
+    block.gate = _ConstantLogitsGate([0.0, -300.0])
+    block.experts = torch.nn.ModuleList([
+        _ConstantExpert(1.0), _ConstantExpert(float("inf"))])
+    xs = torch.ones(1, 2, 4, dtype=torch.float16)
+    with torch.no_grad():
+        ref, _ = block(xs)
+        got, _ = make_static_moe_forward(block)(xs)
+    assert torch.equal(got, ref)
+    assert torch.isfinite(got).all()
+
+
+@pytest.mark.parametrize("norm_topk_prob", [False, True])
+def test_static_moe_forward_zero_weight_selected_expert_matches_hf(
+        norm_topk_prob) -> None:
+    """top-k 选中但权重下溢为 0：HF 仍执行该专家，0×inf=nan 必须同样出现。"""
+    from backend.architectures import make_static_moe_forward
+
+    block = _zero_weight_selected_block(norm_topk_prob)
+    xs = torch.ones(1, 2, 4, dtype=torch.float16)
+    with torch.no_grad():
+        ref, _ = block(xs)
+        got, _ = make_static_moe_forward(block)(xs)
+    assert int(torch.isnan(ref).sum()) == 8, "探针前提：HF 对选中专家做 0×inf"
+    assert int(torch.isnan(got).sum()) == int(torch.isnan(ref).sum()), (
+        "静态前向漏算了 top-k 选中但权重为 0 的专家")
+    finite = torch.isfinite(ref)
+    assert torch.equal(got[finite], ref[finite])
+
+
+def test_bool_dtype_comment_describes_the_selected_mask() -> None:
+    """bool 张量的注释必须描述真实命中口径，不能退回路由权重非零判定。
+
+    命中只由 top-k 选中索引 scatter 出的 `selected_mask` 决定，路由权重只参与
+    加权；注释若写 `routing != 0` 会把读者带回「零权重选中专家被跳过」的旧语义。
+    """
+    import inspect
+
+    from contracts import dtypes
+
+    source = inspect.getsource(dtypes)
+    assert "selected_mask" in source
+    assert "routing != 0" not in source
+
+
+def _single_expert_config() -> Qwen3MoeConfig:
+    return Qwen3MoeConfig(
+        max_position_embeddings=MAX_SEQ, hidden_size=64,
+        moe_intermediate_size=32, num_hidden_layers=NUM_LAYERS,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+        vocab_size=128, num_experts=1, num_experts_per_tok=1,
+        norm_topk_prob=True)
+
+
+def test_single_expert_moe_keeps_moe_execution_semantics() -> None:
+    """单专家也是合法 MoE：执行语义与默认分块策略不能按「非 MoE」处理。"""
+    from runtime.compile import graph_tiling_enabled
+    from runtime.exec_plan_gen import resolve_moe_execution
+
+    cfg = _single_expert_config()
+    assert resolve_moe_execution(cfg) == "dynamic_dispatch"
+    assert resolve_moe_execution(cfg, "dense_sim") == "dense_sim"
+    assert graph_tiling_enabled(cfg, None) is False
+    # 真正的 dense 配置不携带 MoE 字段，行为必须不变。
+    dense = Qwen3Config(hidden_size=64, intermediate_size=128,
+                        num_hidden_layers=1, num_attention_heads=4,
+                        num_key_value_heads=2, vocab_size=128)
+    assert resolve_moe_execution(dense) == ""
+    assert graph_tiling_enabled(dense, None) is True
+
+
+def test_single_expert_moe_generate_matches_hf(tmp_path_factory) -> None:
+    """1 专家/top-1 的静态改写、编译与贪心生成都与 HF 稀疏前向一致。"""
+    torch.manual_seed(11)
+    model = Qwen3MoeForCausalLM(_single_expert_config()).eval().to(torch.float16)
+    path = tmp_path_factory.mktemp("qwen3_moe_single")
+    model.save_pretrained(path)
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ARCHITECTURES["qwen3_moe"].strategy(NUM_DPUS, loaded.config)
+    compiled, backend = _compile_and_load(loaded, strategy)
+    assert compiled.moe_execution == "dynamic_dispatch"
+    prompt = torch.tensor(PROMPTS[0])
+    got = run_decode_loop(
+        compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,
+        eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of)
+    ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
+                         do_sample=False)
+    assert got == ref[0][len(PROMPTS[0]):].tolist()
+
+
+@pytest.fixture(scope="module")
+def qwen3_moe_overflow_model(tmp_path_factory):
+    """路由只选 0 号专家；1 号专家权重放大到未选中时必然溢出 fp16。"""
+    torch.manual_seed(7)
+    model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+        max_position_embeddings=MAX_SEQ, hidden_size=64, moe_intermediate_size=32,
+        num_hidden_layers=NUM_LAYERS, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=32, vocab_size=128, num_experts=2, num_experts_per_tok=1,
+        norm_topk_prob=True)).eval().to(torch.float16)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            # logits 全相等时 top1 取首个下标，0 号专家恒命中、1 号恒不命中。
+            layer.mlp.gate.weight.zero_()
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                getattr(layer.mlp.experts[1], name).weight.fill_(60000.0)
+    path = tmp_path_factory.mktemp("qwen3_moe_overflow")
+    model.save_pretrained(path)
+    return model, path
+
+
+def test_static_moe_forward_masks_unselected_expert_overflow(
+        qwen3_moe_overflow_model) -> None:
+    """未选中专家内部溢出不得以 inf×0=nan 毒化结果（评审问题 3）。"""
+    from backend.architectures import make_static_moe_forward
+
+    model, _ = qwen3_moe_overflow_model
+    blk = model.model.layers[0].mlp
+    x = torch.randn(1, 5, 64, dtype=torch.float16)
+    with torch.no_grad():
+        ref, _ = blk(x)                       # HF 稀疏前向：1 号专家根本不执行
+        got, _ = make_static_moe_forward(blk)(x)
+    assert torch.isfinite(ref).all(), "探针前提：HF 参考必须全有限"
+    assert torch.isfinite(got).all(), "静态前向把未选中专家的 inf/nan 带进了结果"
+    assert torch.equal(got, ref)
+
+
+def test_qwen3_moe_unselected_overflow_matches_hf(
+        qwen3_moe_overflow_model) -> None:
+    """导出/执行全链：稠密模拟与动态分派两态都与 HF 原始稀疏前向一致。"""
+    model, path = qwen3_moe_overflow_model
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ARCHITECTURES["qwen3_moe"].strategy(NUM_DPUS, loaded.config)
+    prompt = torch.tensor(PROMPTS[0])
+
+    def generate(*, moe_dispatch=None) -> list:
+        compiled, backend = _compile_and_load(
+            loaded, strategy, num_request_slots=1, num_parallel_slots=1,
+            moe_dispatch=moe_dispatch)
+        return run_decode_loop(
+            compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of)
+
+    dispatch = generate()
+    dense = generate(moe_dispatch=False)
+    ref = model.generate(prompt.unsqueeze(0), max_new_tokens=MAX_NEW_TOKENS,
+                         do_sample=False)
+    expected = ref[0][len(PROMPTS[0]):].tolist()
+    assert dispatch == expected, "动态分派路径被未选中专家的溢出污染"
+    assert dense == expected, "稠密模拟路径被未选中专家的溢出污染"
+
+
 def test_moe_gate_ops_stay_on_host() -> None:
     """MoE 门控链算子（topk/softmax/sum/scatter/zeros_like）分区后留在主机。"""
     from backend.architectures import make_static_moe_forward
@@ -314,6 +522,43 @@ def test_moe_gate_ops_stay_on_host() -> None:
             seen.add(name)
             assert node.meta[DEVICE_META_KEY] == DEVICE_HOST, f"{name} 应留主机"
     assert seen == gate_ops, f"图里应出现全部门控算子，缺 {gate_ops - seen}"
+
+
+def test_moe_graph_tiling_policy(monkeypatch) -> None:
+    """图级分块开关：MoE 默认关闭、显式参数与 PIM_DISABLE_TILE 都能覆盖。"""
+    from runtime.compile import graph_tiling_enabled
+
+    moe = SimpleNamespace(num_experts=128)
+    dense = SimpleNamespace(intermediate_size=128)
+    monkeypatch.delenv("PIM_DISABLE_TILE", raising=False)
+    assert graph_tiling_enabled(moe, None) is False
+    assert graph_tiling_enabled(dense, None) is True
+    assert graph_tiling_enabled(moe, True) is True
+    monkeypatch.setenv("PIM_DISABLE_TILE", "1")
+    assert graph_tiling_enabled(dense, None) is False
+    assert graph_tiling_enabled(dense, True) is True
+
+
+def test_moe_compile_does_not_tile_experts(qwen3_moe_model) -> None:
+    """正式编译入口下 MoE 图不被图级分块拆散，prefill/decode 都受控。"""
+    model, path = qwen3_moe_model
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ARCHITECTURES["qwen3_moe"].strategy(NUM_DPUS, loaded.config)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
+    hardware = PIMHardwareConfig(
+        num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536, dma_align=64)
+    compiled = compile_llama2(
+        loaded, strategy, prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
+        hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1)
+    # 4 层 × 8 专家 × (3 linear + silu + mul) + 门控/注意力 ≈ 数百节点；
+    # 图级分块会把每个线性的工作集拆成上百块，节点数放大两个数量级。
+    for name, gm in (("prefill", compiled.prefill_gm), ("decode", compiled.decode_gm)):
+        count = len(list(gm.graph.nodes))
+        assert count < 3000, f"{name} 图有 {count} 个节点，MoE 默认分块没有关闭"
+        tiled = sum(1 for node in gm.graph.nodes
+                    if str(node.target) == "aten.cat.default")
+        assert tiled < 100, f"{name} 图出现 {tiled} 个拼接节点，像是分块留下的子块"
 
 
 def test_moe_weight_rules() -> None:
@@ -361,10 +606,280 @@ def test_qwen3_moe_generate_matches_hf(qwen3_moe_model) -> None:
     assert got == ref[0][len(PROMPTS[0]):].tolist()
 
 
-def test_qwen3_30b_model_dir_configured() -> None:
-    """站点路径键 qwen3_30b_model_dir 可解析（30B 用例的前置条件）。"""
-    from genesim_bridge.paths import qwen3_30b_model_dir
+def test_qwen3_30b_model_dir_resolution(tmp_path, monkeypatch) -> None:
+    """站点键解析不依赖真实权重：环境变量优先、缺省可跳过、必填给配置指引。
 
-    path = qwen3_30b_model_dir(required=False)
-    assert path is not None, "paths.local.json 缺 qwen3_30b_model_dir"
-    assert path.is_dir()
+    真实目录存在性由 `tests/test_qwen3_30b_real.py` 的 skipif 守护——那才是
+    需要权重的验收面，架构单测不应因为本机没配站点路径而变红。
+    """
+    from genesim_bridge import paths
+
+    monkeypatch.setenv("QWEN3_30B_MODEL_DIR", str(tmp_path))
+    assert paths.qwen3_30b_model_dir(required=False) == tmp_path
+
+    monkeypatch.delenv("QWEN3_30B_MODEL_DIR")
+    monkeypatch.setattr(
+        paths, "_load_file_config", lambda: {"qwen3_30b_model_dir": None})
+    assert paths.qwen3_30b_model_dir(required=False) is None
+    with pytest.raises(RuntimeError, match="qwen3_30b_model_dir"):
+        paths.qwen3_30b_model_dir()
+
+
+def test_architecture_registry_drives_moe_pipeline(tmp_path) -> None:
+    """主链描述从注册表派生：产物名、角色契约、切分宽度、仿真配置。"""
+    from backend.architectures import architecture_of
+
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen3_moe"}', encoding="utf-8")
+    model_type, arch = architecture_of(tmp_path)
+    assert model_type == "qwen3_moe"
+    assert arch.artifact == "qwen3_moe"
+    assert arch.required_roles == {
+        "router", "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj", "lm_head"}
+    assert arch.sim_config == "sim_qwen3_moe_pimir.yaml"
+    cfg = SimpleNamespace(
+        num_attention_heads=32, num_key_value_heads=4,
+        intermediate_size=6144, moe_intermediate_size=768,
+        vocab_size=151936, num_hidden_layers=48)
+    widths = arch.widths(cfg)
+    # 切专家 FFN 宽，不是 dense 残留的 6144。
+    assert widths["intermediate_size"] == 768
+    assert arch.strategy(8, cfg).name == "tp4_pp2"
+
+
+def test_architecture_registry_rejects_unknown_model(tmp_path) -> None:
+    from backend.architectures import architecture_of
+
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "gpt2"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="qwen3_moe"):
+        architecture_of(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# 编译器导出图 ↔ GeneSim 图骨架的完整算子/权重对齐
+# ---------------------------------------------------------------------------
+
+_TINY_PARITY_CONFIGS = {
+    "llama": dict(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=100,
+        max_position_embeddings=16),
+    "qwen3": dict(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        vocab_size=100, max_position_embeddings=16),
+    "qwen3_moe": dict(
+        hidden_size=32, moe_intermediate_size=16, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=8, vocab_size=100, num_experts=4, num_experts_per_tok=2,
+        norm_topk_prob=True, max_position_embeddings=16),
+}
+_TINY_PARITY_CLASSES = {
+    "llama": LlamaForCausalLM,
+    "qwen3": Qwen3ForCausalLM,
+    "qwen3_moe": Qwen3MoeForCausalLM,
+}
+
+
+def _role_key(target: str):
+    """编译器权重名 → 与 GeneSim IR 共用的 (角色, 层号, 专家号) 归一身份。"""
+    # PositionalLlama 包装后会多一层 `model.` 前缀，按后缀认身份。
+    if target.endswith("embed_tokens.weight"):
+        return ("embed", -1, -1)
+    if target.endswith("lm_head.weight"):
+        return ("lm_head", -1, -1)
+    if target.endswith("model.norm.weight"):
+        return ("final_norm", -1, -1)
+    match = re.search(r"\.layers\.(\d+)\.", target)
+    if match is None:
+        return None
+    layer = int(match.group(1))
+    if "input_layernorm.weight" in target or "post_attention_layernorm.weight" in target:
+        return ("layer_norm", layer, -1)
+    if ".self_attn." in target and target.endswith("_norm.weight"):
+        return ("q_norm" if ".q_norm." in target else "k_norm", layer, -1)
+    if ".self_attn." in target:
+        role = target.rsplit(".", 2)[-2]
+        return (role, layer, -1)
+    if target.endswith(".mlp.gate.weight"):
+        return ("router", layer, -1)
+    expert = re.search(r"\.experts\.(\d+)\.", target)
+    if expert is not None:
+        return (target.rsplit(".", 2)[-2], layer, int(expert.group(1)))
+    if ".mlp." in target:
+        return (target.rsplit(".", 2)[-2], layer, -1)
+    return None
+
+
+def _ir_role_key(tensor_id: str):
+    """GeneSim IR 权重 tensor_id → 同一个归一身份。"""
+    if tensor_id == "model.embed_tokens.weight":
+        return ("embed", -1, -1)
+    if tensor_id == "model.lm_head.weight":
+        return ("lm_head", -1, -1)
+    if tensor_id == "model.final_norm.weight":
+        return ("final_norm", -1, -1)
+    match = re.search(r"layer\.(\d+)\.", tensor_id)
+    if match is None:
+        return None
+    layer = int(match.group(1))
+    name = tensor_id.rsplit(".", 2)[-2]
+    if name in ("attention_norm", "ffn_norm"):
+        return ("layer_norm", layer, -1)
+    if name in ("q_norm", "k_norm", "q_proj", "k_proj", "v_proj", "o_proj"):
+        return (name, layer, -1)
+    if name == "gate" or tensor_id.endswith(".mlp.gate.weight"):
+        return ("router", layer, -1)
+    expert = re.search(r"\.experts\.(\d+)\.", tensor_id)
+    if expert is not None:
+        return (name, layer, int(expert.group(1)))
+    return (name, layer, -1)
+
+
+def _compiler_weight_roles(gm) -> dict:
+    """编译导出图里每张权重 → (归一身份, 元素数)，按身份聚合。"""
+    roles = {}
+    for node in gm.graph.nodes:
+        if node.op != "get_attr":
+            continue
+        target = str(node.target)
+        if not target.endswith(".weight"):
+            continue
+        key = _role_key(target)
+        if key is None:
+            continue
+        shape = tuple(int(d) for d in node.meta["val"].shape)
+        count = 1
+        for dim in shape:
+            count *= dim
+        roles[key] = roles.get(key, 0) + count
+    return roles
+
+
+def _genesim_weight_roles(config_path) -> dict:
+    """GeneSim 图骨架里每张常驻权重 → (归一身份, 元素数)，按身份聚合。"""
+    from genesim_bridge.paths import genesim_root
+
+    root = genesim_root(required=False)
+    if root is None:
+        pytest.skip("需要在 paths.json 配置 genesim_root")
+    src = str(root / "src")
+    # 追加而不是插到最前：两仓都有 `backend` 包，GeneSim 的会遮住本仓的
+    # `backend.vllm_executor`，vLLM 子进程按 sys.path 重新导入时直接失败。
+    if src not in sys.path:
+        sys.path.append(src)
+    from ir.model_ir import HOST_OP_ID, build_from_hf_config
+
+    ir = build_from_hf_config(str(config_path), execution_dtype="float16")
+    roles = {}
+    for dependency in ir.dependencies:
+        if (dependency.src_op_id != HOST_OP_ID
+                or dependency.first_use_scope != "model"):
+            continue
+        key = _ir_role_key(dependency.tensor_id)
+        if key is None:
+            continue
+        count = int(
+            dependency.first_use_bytes_coeffs["constant"]) // 2
+        roles[key] = roles.get(key, 0) + count
+    return roles
+
+
+@pytest.mark.parametrize("model_type", sorted(_TINY_PARITY_CONFIGS))
+def test_compiler_graph_and_genesim_ir_cover_the_same_weights(
+        model_type, tmp_path_factory) -> None:
+    """逐架构对拍：角色、形状、权重名与数量必须一一对应。
+
+    主链只查八种投影角色，漏掉的 lm_head 与 q/k norm 照样退出码 0。
+    这里从两侧的真实产物出发做集合对拍，缺一个权重就失败。
+    """
+    from runtime.compile import export_annotated_graph
+
+    kwargs = _TINY_PARITY_CONFIGS[model_type]
+    config = _TINY_PARITY_CLASSES[model_type].config_class(**kwargs)
+    model = _TINY_PARITY_CLASSES[model_type](config).eval().to(torch.float16)
+    path = tmp_path_factory.mktemp(f"parity-{model_type}")
+    model.save_pretrained(path)
+
+    loaded = ARCHITECTURES[model_type].load(str(path))
+    gm = export_annotated_graph(
+        loaded, 2, torch.arange(2, dtype=torch.long).unsqueeze(0),
+        dtype=torch.float16)
+    compiler_roles = _compiler_weight_roles(gm)
+    genesim_roles = _genesim_weight_roles(path / "config.json")
+
+    assert genesim_roles == compiler_roles, (
+        f"{model_type}: 编译器导出图与 GeneSim 骨架的权重不一致；"
+        f"仅编译器有 {sorted(set(compiler_roles) - set(genesim_roles))}，"
+        f"仅 GeneSim 有 {sorted(set(genesim_roles) - set(compiler_roles))}")
+
+
+def test_arch_strategy_constraints_cover_all_entry_points(tmp_path: Path) -> None:
+    """单专家 MoE：自动选择、直接段数与 PartitionPlan 共用同一组专家约束。"""
+    import json
+
+    from contracts.partition_plan import PartitionPlan
+    from scripts.export_pp_placement import resolve_strategy
+
+    cfg = _single_expert_config()
+    arch = ARCHITECTURES["qwen3_moe"]
+    assert arch.strategy(4, cfg).name == "tp1_pp4"
+
+    ir = tmp_path / "m.ir"
+    ir.write_text(json.dumps({"model_id": ""}))
+
+    def args(**overrides):
+        values = {"partition_plan": None, "num_stages": None, "num_dpus": 4}
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    # 自动选择之外的两条入口：合法 TP=1 放行，非法 TP=2 在加载后报错。
+    strategy, num_dpus, plan = resolve_strategy(
+        args(num_stages=4), arch, cfg, ir, tmp_path)
+    assert (strategy.name, num_dpus, plan) == ("tp1_pp4", 4, None)
+    with pytest.raises(ValueError, match="num_experts"):
+        resolve_strategy(args(num_stages=2), arch, cfg, ir, tmp_path)
+
+    legal = tmp_path / "legal.json"
+    PartitionPlan(num_dpus=4, num_stages=4).write(legal)
+    strategy, _, _ = resolve_strategy(
+        args(partition_plan=legal), arch, cfg, ir, tmp_path)
+    assert strategy.name == "tp1_pp4"
+
+    illegal = tmp_path / "illegal.json"
+    PartitionPlan(num_dpus=4, num_stages=2).write(illegal)
+    with pytest.raises(ValueError, match="num_experts"):
+        resolve_strategy(args(partition_plan=illegal), arch, cfg, ir, tmp_path)
+
+    # 稠密模型没有专家约束，行为不变。
+    dense = Qwen3Config(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
+    strategy, _, _ = resolve_strategy(
+        args(num_stages=2), ARCHITECTURES["qwen3"], dense, ir, tmp_path)
+    assert strategy.name == "tp2_pp2"
+
+
+_REAL_TEST_CONTRACT_LITERALS = (
+    (r"8\s*\*\s*2\s*\*\*\s*30", "8 GiB 容量字面量"),
+    (r"64\s*\*\s*2\s*\*\*\s*20", "64 MiB 预留字面量"),
+    (r"dma_align\s*=\s*64", "对齐字面量"),
+    (r"wram_bytes_per_dpu\s*=\s*65536", "WRAM 字面量"),
+    (r"HwBudget\s*\(", "手写 HwBudget"),
+    (r"PIMHardwareConfig\s*\(", "手写 PIMHardwareConfig"),
+)
+
+
+@pytest.mark.parametrize(
+    "name", ["test_qwen3_8b_real.py", "test_qwen3_30b_real.py"])
+def test_real_weight_tests_derive_capacity_from_the_single_factory(
+        name: str) -> None:
+    """真实测试不得手写容量三件套；契约变化必须经同一工厂传播。"""
+    text = (Path(__file__).parent / name).read_text()
+    assert "default_site_capacity(" in text, (
+        f"{name} 没有使用 default_site_capacity()：容量与对齐会出现第二套真源")
+    for pattern, label in _REAL_TEST_CONTRACT_LITERALS:
+        assert re.search(pattern, text) is None, (
+            f"{name} 出现{label}：容量三件套必须从 default_site_capacity() 派生")

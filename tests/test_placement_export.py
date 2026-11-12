@@ -131,7 +131,10 @@ _FIXTURE_GEMM_ROLES = (
 )
 
 
-def _write_fixture_ir(path: Path, *, roles: dict[int, str] | None = None) -> None:
+def _write_fixture_ir(
+    path: Path, *, roles: dict[int, str] | None = None,
+    lm_head: bool = False,
+) -> None:
     """写入每层七个 GEMM 加注意力算子的最小 GeneSim IR。
 
     GEMM 的身份由 `semantic_role` 给出，导出侧按它匹配，不依赖 subgraph 里的出现
@@ -185,6 +188,14 @@ def _write_fixture_ir(path: Path, *, roles: dict[int, str] | None = None) -> Non
             "input_shapes": in_shapes, "output_shapes": out_shapes,
             "semantic_role": role,
         })
+    if lm_head:
+        # 模型级输出头：不属于任何一层，逐层循环看不到它。
+        operators.append({
+            "op_id": len(operators), "op_type": "GEMM", "device_hint": "gpu",
+            "input_shapes": [["Tq", HIDDEN_SIZE]],
+            "output_shapes": [["Tq", 32000]],
+            "semantic_role": "lm_head",
+        })
 
     # 权重 tensor_id 故意与 semantic_role **不一致**（循环错位一位）。
     #
@@ -212,7 +223,11 @@ def _write_fixture_ir(path: Path, *, roles: dict[int, str] | None = None) -> Non
         "hidden_size": HIDDEN_SIZE,
         "operators": operators,
         "dependencies": dependencies,
-        "subgraphs": [[op["op_id"] for op in operators]],
+        # 输出头是模型级算子，不能混进层子图。
+        "subgraphs": [[
+            op["op_id"] for op in operators
+            if not (lm_head and op["semantic_role"] == "lm_head")
+        ]],
     }
     path.write_text(json.dumps(ir))
 
@@ -476,7 +491,7 @@ def test_bpath_entries_keep_the_sidecar_shape() -> None:
         "0": {"op_type": "GEMM", "shards": [{"dpu_id": 0}]},
     }}
 
-    _attach_bpath_pimir(operators, sidecar)
+    _attach_bpath_pimir(operators, sidecar, {"dependencies": []})
 
     # 非 GEMM 的算子级节点也要进 sidecar，且带上 B 路产物。
     for op_id, op_type in (("1", "SOFTMAX"), ("2", "ROPE")):
@@ -514,22 +529,56 @@ def test_bpath_matmul_ignores_fused_activation() -> None:
             "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
     }
     sidecar = {"operators": {}}
-    _attach_bpath_pimir(operators, sidecar)
+    _attach_bpath_pimir(operators, sidecar, {"dependencies": []})
     fused = Path(sidecar["operators"]["0"]["pimir_path"]).read_text()
     plain = Path(sidecar["operators"]["1"]["pimir_path"]).read_text()
     assert fused == plain
     assert "act_spec" not in fused
 
 
+def test_bpath_eltwise_keeps_operator_kind() -> None:
+    """VECTOR_MUL 的 B 路产物必须是乘法，不能一律降成加法。
+
+    B 路构造器原先只拿到 mnemonic（`eltwise`）和形状，VECTOR_ADD 与
+    VECTOR_MUL 共用同一条 `eltwise_kernel(..., "add")`，专家 SwiGLU 的中间
+    乘法被记成了加法，GeneSim 消费的也是这份错误原语。
+    """
+    from genesim_bridge.placement_export import _attach_bpath_pimir
+
+    operators = {
+        0: {"op_id": 0, "op_type": "VECTOR_ADD",
+            "input_shapes": [["Tq", 768]], "output_shapes": [["Tq", 768]]},
+        1: {"op_id": 1, "op_type": "VECTOR_MUL",
+            "input_shapes": [["Tq", 768]], "output_shapes": [["Tq", 768]]},
+    }
+    sidecar = {"operators": {}}
+    _attach_bpath_pimir(operators, sidecar, {"dependencies": []})
+
+    add_text = Path(sidecar["operators"]["0"]["pimir_path"]).read_text()
+    mul_text = Path(sidecar["operators"]["1"]["pimir_path"]).read_text()
+    assert "#pim.eltwise<add>" in add_text
+    assert "#pim.eltwise<mul>" in mul_text, (
+        f"VECTOR_MUL 的 pimir 不是乘法：\n{mul_text[:400]}")
+    assert "#pim.eltwise<add>" not in mul_text
+
+
+def test_bpath_rejects_unknown_eltwise_operator() -> None:
+    """未知逐元素算子直接拒绝，不能按加法编出一份看似合法的产物。"""
+    from genesim_bridge.placement_export import _bpath_pimir
+
+    with pytest.raises((ValueError, KeyError)) as ctx:
+        _bpath_pimir("eltwise", [("Tq", 768)], [("Tq", 768)],
+                     op_type="VECTOR_EXP")
+    assert "VECTOR_EXP" in str(ctx.value)
+
+
 def test_bpath_kv_cache_declares_a_cache_big_enough_for_one_write() -> None:
     """KV 缓存的容量要盖得住一次写入，否则整条 B 路导出被 verifier 拦下。
 
-    `pim.kv_cache` 的 memdesc 必须装得下一次写的元素数。写成末维（`[Tq, 4096]`
-    取 4096）看着像「一行」，但一次搬的是整块 128x4096，verifier 直接报
-    `cache holds 4096 elements, fewer than the 524288 being moved`，而这条路径
-    是直接发 IR 文本给 `triton-opt`，绕开了 `driver` 里同名的守卫。
-
-    形状取自真实 decode 块的 MEM_COPY 节点（`[Tq, 4096]`，Tq 代入 128）。
+    `pim.kv_cache` 的 memdesc 必须装得下一次写的元素数。B 路 pimir 以
+    1 个 token 为单位，`[Tq, 4096]` 的单位形状是 `[1, 4096]`；写死 128 个
+    token 会让 trace 的内部形状与运行期重复次数各算一遍 token。这条路径是
+    直接发 IR 文本给 `triton-opt`，绕开了 `driver` 里同名的守卫。
     """
     import re
 
@@ -537,10 +586,11 @@ def test_bpath_kv_cache_declares_a_cache_big_enough_for_one_write() -> None:
 
     text = Path(_bpath_pimir("kv_cache", [("Tq", 4096)], [("Tq", 4096)])).read_text()
     assert "pim.kv_cache" in text, "B 路产物里没有 kv_cache"
+    assert "tensor<1x4096xi8>" in text, text
     match = re.search(r"!pim\.memdesc<(\d+)xi8", text)
     assert match, f"没找到缓存 memdesc：\n{text}"
-    assert int(match.group(1)) >= 128 * 4096, (
-        f"缓存只声明了 {match.group(1)} 个元素，装不下一次写的 {128 * 4096} 个"
+    assert int(match.group(1)) >= 4096, (
+        f"缓存只声明了 {match.group(1)} 个元素，装不下一次写的 4096 个"
     )
 
 
@@ -962,8 +1012,13 @@ def test_sidecar_checks_split_by_entry_class() -> None:
             "pimir_path": "/tmp/b.mlir",
         },
     }
+    ir_ops = {0: {"op_id": 0, "op_type": "GEMM",
+                   "semantic_role": "q_proj"},
+              1: {"op_id": 1, "op_type": "SOFTMAX"}}
     # 不抛错即通过，并报出两类各有几条。
-    gemm_count, bpath_count = check_sidecar_entries(ops)
+    gemm_count, bpath_count = check_sidecar_entries(
+        ir_ops, ops, {"q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"})
     assert (gemm_count, bpath_count) == (1, 1)
 
 
@@ -980,7 +1035,11 @@ def test_gemm_entry_still_needs_all_of_its_fields() -> None:
         },
     }
     with pytest.raises(StepFailed, match="kernel_tile_n"):
-        check_sidecar_entries(ops)
+        check_sidecar_entries(
+            {0: {"op_id": 0, "op_type": "GEMM",
+                 "semantic_role": "q_proj"}}, ops,
+            {"q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"})
 
 
 def test_bpath_entry_without_pimir_path_fails() -> None:
@@ -993,7 +1052,10 @@ def test_bpath_entry_without_pimir_path_fails() -> None:
 
     ops = {"1": {"op_type": "SOFTMAX", "device_hint": "pim", "shards": []}}
     with pytest.raises(StepFailed, match="pimir_path"):
-        check_sidecar_entries(ops)
+        check_sidecar_entries(
+            {1: {"op_id": 1, "op_type": "SOFTMAX"}}, ops,
+            {"q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"})
 
 
 def test_bpath_entry_with_unknown_op_type_fails() -> None:
@@ -1009,7 +1071,40 @@ def test_bpath_entry_with_unknown_op_type_fails() -> None:
               "pimir_path": "/tmp/b.mlir"},
     }
     with pytest.raises(StepFailed, match="op_type"):
-        check_sidecar_entries(ops)
+        check_sidecar_entries(
+            {1: {"op_id": 1, "op_type": "BRAND_NEW_OP"}}, ops,
+            {"q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"})
+
+
+def test_bpath_entry_with_a_fake_shard_fails_classification() -> None:
+    """B 路条目塞假分片不能把类别改成 GEMM、跳过编译单位核对。"""
+    from scripts.run_full_pipeline import StepFailed, check_sidecar_entries
+
+    ops = {"1": {"op_type": "RMSNORM", "device_hint": "pim",
+                 "shards": [{"dpu_id": 0, "local_in_features": 1,
+                             "local_out_features": 1}],
+                 "pimir_path": "/tmp/b.mlir"}}
+    with pytest.raises(StepFailed, match="非 GEMM 却带分片"):
+        check_sidecar_entries(
+            {1: {"op_id": 1, "op_type": "RMSNORM"}}, ops,
+            {"q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"})
+
+
+def test_device_gemm_without_shards_fails_classification() -> None:
+    """设备 GEMM 没有分片时不能被当成算子级条目放过。"""
+    from scripts.run_full_pipeline import StepFailed, check_sidecar_entries
+
+    ops = {"0": {"op_type": "GEMM", "device_hint": "pim",
+                 "semantic_role": "q_proj", "kernel_tile_n": 512,
+                 "pimir_path": "/tmp/a.mlir"}}
+    with pytest.raises(StepFailed, match="设备 GEMM 却没有分片"):
+        check_sidecar_entries(
+            {0: {"op_id": 0, "op_type": "GEMM",
+                 "semantic_role": "q_proj"}}, ops,
+            {"q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"})
 
 
 def test_sidecar_counts_report_the_two_classes_apart() -> None:
@@ -1057,21 +1152,21 @@ def test_bpath_compile_failure_is_reported_not_swallowed() -> None:
     pe._bpath_pimir = boom
     try:
         with pytest.raises(RuntimeError, match="op7"):
-            pe._attach_bpath_pimir(operators, sidecar)
+            pe._attach_bpath_pimir(operators, sidecar, {"dependencies": []})
     finally:
         pe._bpath_pimir = original
 
 
-def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) -> None:
+def test_bpath_matmul_carries_stationarity_and_a_one_token_unit(tmp_path) -> None:
     """GEMV_SCORE/GEMV_CONTEXT 走 B 路 matmul 时，IR 必须带 stationarity 标记，
-    符号维也不能退化成字面 1。
+    且查询 token 维是 1、历史维保留一块 KV 的占位长度。
 
     这两类 op_type 映射到 matmul mnemonic，但不属于 `_BPATH_MNEMONIC` 排除的
     GEMM，所以真实会走到 `_bpath_pimir` 的 matmul builder。那条 builder 若直接
     调 `matmul_kernel` 而不走 `_attention_matmul_body`，产出的 IR 就缺
     `stationarity = #pim.stationarity<kv>`——搬运量算得一样，但 KV 缓存被说成
-    模型权值，校验器要求三者一致时对不上。符号维折成 1 同理：trace 外层循环
-    次数按真实序列长度绑定，IR 里写死 1 会让搬运量比真实 prefill 小几个数量级。
+    模型权值，校验器要求三者一致时对不上。查询维写成 128 同理：运行期还会按
+    实际 Tq 重复整份 trace，token 被算两遍，代价放大两个数量级。
     """
     from genesim_bridge.placement_export import _bpath_pimir
 
@@ -1082,8 +1177,9 @@ def test_bpath_matmul_carries_stationarity_and_non_degenerate_shape(tmp_path) ->
     )
     text = Path(path).read_text()
     assert "stationarity = #pim.stationarity<kv>" in text, text
-    # 符号维不能退化成字面 1（`<1x` 是 tensor 形状里"第一维是 1"的写法）。
-    assert "<1x" not in text, text
+    assert "tensor<1x64x" in text, text
+    assert "tensor<64x128x" in text, text
+    assert "tensor<128x64x" not in text, text
 
 
 def test_attention_matmul_declares_what_does_not_repeat_over_the_history():
@@ -1160,9 +1256,11 @@ def test_template_trace_is_rejected_without_an_opt_out(tmp_path) -> None:
     header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
         + struct.pack("<I", len(body))
     (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+    config = tmp_path / "sim.yaml"
+    config.write_text("{}\n")
 
     with pytest.raises(StepFailed, match="ROPE"):
-        verify_trace_provenance(tmp_path)
+        verify_trace_provenance(tmp_path, config)
 
 
 def test_template_trace_of_a_non_gemm_is_rejected(tmp_path) -> None:
@@ -1186,9 +1284,11 @@ def test_template_trace_of_a_non_gemm_is_rejected(tmp_path) -> None:
     header = b"PIMT" + struct.pack("<I", 1) + struct.pack("<Q", 0) \
         + struct.pack("<I", len(body))
     (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+    config = tmp_path / "sim.yaml"
+    config.write_text("{}\n")
 
     with pytest.raises(StepFailed, match="ROPE"):
-        verify_trace_provenance(tmp_path)
+        verify_trace_provenance(tmp_path, config)
 
 
 def test_trace_metadata_rejects_a_truncated_file(tmp_path) -> None:
@@ -1239,7 +1339,7 @@ def test_trace_metadata_survives_a_header_byte_of_0x7b(tmp_path) -> None:
     import json
     import struct
 
-    from scripts.run_full_pipeline import verify_trace_provenance
+    from scripts.run_full_pipeline import _trace_metadata
 
     traces = tmp_path / "pim_traces"
     traces.mkdir()
@@ -1251,7 +1351,9 @@ def test_trace_metadata_survives_a_header_byte_of_0x7b(tmp_path) -> None:
         + struct.pack("<I", len(body))
     (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
 
-    verify_trace_provenance(tmp_path)
+    parsed = _trace_metadata(traces / "op_7_ROPE.pim_trace")
+    assert parsed["op_id"] == 7
+    assert parsed["compile_signature"]["trace_source"] == "pimir"
 
 
 def test_simulation_step_rejects_a_stale_sidecar(tmp_path, monkeypatch) -> None:
@@ -1306,7 +1408,7 @@ def test_simulation_step_rejects_a_template_trace(tmp_path, monkeypatch) -> None
     import scripts.run_full_pipeline as pipeline
     from scripts.run_full_pipeline import StepFailed
 
-    traces = tmp_path / "pim_traces"
+    traces = tmp_path / "logs" / "pim_traces_pytest"
     meta = {"op_id": 7, "op_type": "ROPE",
             "compile_signature": {"trace_source": "template"}}
     body = json.dumps(meta).encode()
@@ -1314,15 +1416,16 @@ def test_simulation_step_rejects_a_template_trace(tmp_path, monkeypatch) -> None
         + struct.pack("<I", len(body))
 
     def fake_run(cmd, *, cwd, log_path) -> None:
-        # 仿真步骤开头会清掉 pim_traces，模板产物得在仿真运行期间才出现。
-        traces.mkdir()
+        # E 阶段使用本次运行号下的独立空 trace 目录，模板产物在运行期间写入。
+        traces.mkdir(exist_ok=True)
         (traces / "op_7_ROPE.pim_trace").write_bytes(header + body)
+
+    config = tmp_path / "conf" / "conf.yaml"
+    config.parent.mkdir()
+    config.write_text("{}\n")
 
     monkeypatch.setattr(pipeline, "_genesim_sim_command", lambda *a, **k: ["true"])
     monkeypatch.setattr(pipeline, "_run", fake_run)
-    summary = tmp_path / "results" / "summary.json"
-    summary.parent.mkdir()
-    summary.write_text(json.dumps({"total_time_s": 1.0, "throughput_tokens_per_s": 1.0}))
 
     with pytest.raises(StepFailed, match="ROPE"):
         pipeline.step_e_simulate(
@@ -1396,9 +1499,16 @@ def test_fused_gate_kernel_carries_the_activation(annotated_tiny_llama, tmp_path
     _write_fixture_ir(ir_path)
     fuse_for_pim(annotated_tiny_llama)
 
+    # 这个夹具的 K 只有 16（fp16 一行 32 字节），装不下 64 字节对齐的分块；
+    # 本用例只核对激活属性，用小对齐的显式硬件配置，真实产物的 64 字节
+    # 对齐由主链导出用例覆盖。
+    from contracts.op_contract import PIMHardwareConfig
+    hardware = PIMHardwareConfig(
+        num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=1 << 28,
+        wram_bytes_per_dpu=65536, dma_align=8)
     sidecar = export_placement_to_genesim(
         annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
-        tmp_path / "sc.json", measure_kernel_tiles=True,
+        tmp_path / "sc.json", measure_kernel_tiles=True, hardware=hardware,
     )
 
     gate = next(
@@ -1560,3 +1670,536 @@ def test_fused_activations_follow_tiled_gate_blocks() -> None:
         {"layer": 0, "role": "gate_proj", "activation": "silu"}]
     (weight,) = [n for n in gm.graph.nodes if n.op == "get_attr"]
     assert _activation_of(weight) == "silu"
+
+
+def test_moe_weight_patterns_cover_router_and_every_expert() -> None:
+    """MoE 的权重匹配：router 独立，专家投影按 expert_id 精确定位。"""
+    from genesim_bridge.placement_export import _role_of_weight, _weight_pattern
+
+    assert _weight_pattern(7, "router") == "layers.7.mlp.gate.weight"
+    assert _weight_pattern(7, "gate_proj", 3) == (
+        "layers.7.mlp.experts.3.gate_proj.weight")
+    assert _weight_pattern(7, "down_proj", 127) == (
+        "layers.7.mlp.experts.127.down_proj.weight")
+    assert _role_of_weight(
+        "model.model.layers.7.mlp.experts.3.gate_proj.weight") == ("gate_proj", 3)
+    assert _role_of_weight(
+        "model.model.layers.7.mlp.gate.weight") == ("router", -1)
+    assert _role_of_weight(
+        "model.model.layers.7.self_attn.q_proj.weight") == ("q_proj", -1)
+    assert _role_of_weight("model.model.embed_tokens.weight") is None
+
+
+def test_moe_gemm_must_carry_expert_id() -> None:
+    """MoE IR 里同层同角色的 128 个专家 GEMM 必须靠 expert_id 区分。"""
+    from genesim_bridge.placement_export import _assert_every_gemm_has_known_role
+
+    ir = {
+        "moe_num_experts": 4,
+        "operators": [
+            {"op_id": 0, "op_type": "GEMM", "semantic_role": "gate_proj"},
+            {"op_id": 1, "op_type": "GEMM", "semantic_role": "gate_proj",
+             "expert_id": 1},
+            {"op_id": 2, "op_type": "GEMM", "semantic_role": "router",
+             "expert_id": 0},
+        ],
+    }
+    with pytest.raises(ValueError, match="expert_id"):
+        _assert_every_gemm_has_known_role(ir)
+
+
+def test_dense_llama_gemm_rejects_expert_id() -> None:
+    """稠密 IR 的 gate/up/down 是层内唯一的 FFN，不该带专家号。"""
+    from genesim_bridge.placement_export import _assert_every_gemm_has_known_role
+
+    ir = {
+        "operators": [
+            {"op_id": 0, "op_type": "GEMM", "semantic_role": "q_proj"},
+            {"op_id": 1, "op_type": "GEMM", "semantic_role": "gate_proj",
+             "expert_id": 3},
+        ],
+    }
+    with pytest.raises(ValueError, match="稠密模型"):
+        _assert_every_gemm_has_known_role(ir)
+
+
+def test_unknown_device_op_is_not_silently_exempted() -> None:
+    """未知设备算子不能自动进豁免清单。
+
+    原实现对任何非 GEMM 的缺产物算子都写一条「该算子类型没有 pim mlir 原语」，
+    `BRAND_NEW_OP` 也能被豁免、随后按 dpu_id 钉到设备上，严格模式的缺项预检
+    只查 PIM 算子，于是整条绕过。
+    """
+    from genesim_bridge.placement_export import _build_pimir_exempt_ops
+
+    ir = {"operators": [
+        {"op_id": 0, "op_type": "MODEL_INPUT", "device_hint": "auto"},
+        {"op_id": 1, "op_type": "BRAND_NEW_OP", "device_hint": "pim"},
+    ]}
+    with pytest.raises(ValueError, match="BRAND_NEW_OP"):
+        _build_pimir_exempt_ops(ir, {"operators": {}})
+
+
+def test_legitimate_exemptions_are_registered() -> None:
+    """host 与模型边界是合法豁免，host GEMM 必须带导出时的落点证据。"""
+    from genesim_bridge.placement_export import _build_pimir_exempt_ops
+
+    ir = {"operators": [
+        {"op_id": 0, "op_type": "MODEL_INPUT", "device_hint": "auto"},
+        {"op_id": 1, "op_type": "MODEL_OUTPUT", "device_hint": "auto"},
+        {"op_id": 2, "op_type": "MOE_ROUTE", "device_hint": "cpu"},
+        {"op_id": 3, "op_type": "GEMM", "semantic_role": "gate_proj",
+         "expert_id": -1, "device_hint": "cpu"},
+        {"op_id": 4, "op_type": "SOFTMAX", "device_hint": "pim"},
+    ]}
+    sidecar = {
+        "operators": {
+            "4": {"op_type": "SOFTMAX", "pimir_path": "/tmp/x.pimir.mlir"},
+        },
+        "host_gemms": {"3": {
+            "op_type": "GEMM", "device_hint": "cpu",
+            "semantic_role": "gate_proj",
+            "weight": "model.layers.0.mlp.gate_proj.weight",
+        }},
+    }
+    exempt = _build_pimir_exempt_ops(ir, sidecar)
+    assert set(exempt) == {"0", "1", "2", "3"}
+    assert exempt["0"]["reason"].startswith("模型入口")
+    assert exempt["2"]["reason"].startswith("host")
+    assert exempt["2"]["device_hint"] == "cpu"
+    assert exempt["3"]["weight"].endswith("gate_proj.weight")
+
+
+def test_device_gemm_without_pimir_cannot_be_exempted() -> None:
+    """router/注意力投影/输出头落在 DPU 上，缺 pimir 必须导出失败。"""
+    from genesim_bridge.placement_export import _build_pimir_exempt_ops
+
+    ir = {"operators": [
+        {"op_id": 0, "op_type": "GEMM", "semantic_role": "router",
+         "expert_id": -1, "device_hint": "pim"},
+    ]}
+    with pytest.raises(ValueError, match="op0"):
+        _build_pimir_exempt_ops(ir, {"operators": {}})
+
+
+def test_host_gemm_exemption_without_export_evidence_is_rejected() -> None:
+    """IR 标了 host，但导出条目没有落点证据（手写豁免）时拒绝。"""
+    from genesim_bridge.placement_export import _build_pimir_exempt_ops
+
+    ir = {"operators": [
+        {"op_id": 0, "op_type": "GEMM", "semantic_role": "gate_proj",
+         "expert_id": -1, "device_hint": "cpu"},
+    ]}
+    with pytest.raises(ValueError, match="落点证据"):
+        _build_pimir_exempt_ops(ir, {"operators": {}})
+
+
+def test_export_step_rejects_a_fresh_sidecar_without_hashes(
+    tmp_path, monkeypatch,
+) -> None:
+    """导出步骤自己产出的 sidecar 缺 pimir_sha256 必须失败。
+
+    `--skip-simulation` 只跑到导出，旧实现遇到缺哈希就打印一句"旧产物"并
+    跳过核对，严格模式在只编译到 sidecar 的路径上完全失效。
+    """
+    import scripts.run_full_pipeline as pipeline
+    from backend.architectures import ARCHITECTURES
+    from scripts.run_full_pipeline import StepFailed
+
+    models = tmp_path / "models"
+    models.mkdir()
+    pimir = tmp_path / "cache.pimir.mlir"
+    pimir.write_text("module {}\n")
+    # 覆盖校验对着源 IR 做：sidecar 的 op_id/角色必须能在图骨架里找到。
+    (models / "llama2_7b.ir").write_text(json.dumps({
+        "operators": [
+            {"op_id": 4, "op_type": "GEMM", "semantic_role": "q_proj",
+             "expert_id": -1, "input_shapes": [["Tq", 64]],
+             "output_shapes": [["Tq", 64]]},
+        ],
+        "dependencies": [], "subgraphs": [[4]],
+    }))
+    sidecar = models / "llama2_7b_tp2_pp2_placement.json"
+    sidecar.write_text(json.dumps({
+        "version": 3,
+        "requires_pimir": True,
+        "operators": {"4": {
+            "op_type": "GEMM",
+            "shards": [{"dpu_id": 0, "local_in_features": 64,
+                        "local_out_features": 64}],
+            "semantic_role": "q_proj",
+            "kernel_tile_n": 32,
+            "pimir_path": str(pimir),
+        }},
+        "collectives": [],
+        "fused_activations": [],
+        "hw_budget": {"mram_bytes_per_dpu": 8 * 2**30,
+                      "sys_reserve_bytes": 64 * 2**20, "align": 64},
+    }))
+
+    monkeypatch.setattr(pipeline, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "genesim_models_dir", lambda: models)
+
+    with pytest.raises(StepFailed, match="pimir_sha256"):
+        pipeline.step_bcd_export(
+            2, 4, tmp_path / "logs", tmp_path / "model", ARCHITECTURES["llama"])
+
+
+def test_pipeline_resolves_one_moe_execution_for_all_stages(tmp_path) -> None:
+    """主链只解析一次执行语义：MoE 缺省动态分派，非 MoE 必须为空。"""
+    import scripts.run_full_pipeline as pipeline
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "model_type": "qwen3_moe", "num_experts": 128,
+        "num_experts_per_tok": 8}))
+    assert pipeline._resolve_moe_execution(tmp_path, None) == "dynamic_dispatch"
+    assert pipeline._resolve_moe_execution(tmp_path, "dense_sim") == "dense_sim"
+
+    config.write_text(json.dumps({"model_type": "llama"}))
+    assert pipeline._resolve_moe_execution(tmp_path, None) == ""
+    with pytest.raises(ValueError, match="非 MoE"):
+        pipeline._resolve_moe_execution(tmp_path, "dense_sim")
+
+
+def test_model_level_lm_head_is_exported_with_its_own_weight(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """输出头不属于任何一层，但必须拿到自己的放置、分片与权重。
+
+    逐层循环只看 subgraph，模型级 GEMM 会整条漏掉：sidecar 里没有条目、
+    GeneSim 没有 pimir、trace 与词表 FLOPs 都缺。这里锚定它真的被导出。
+    """
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path, lm_head=True)
+
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+    )
+
+    lm_id = str(len(_FIXTURE_GEMM_ROLES) + 4)
+    entry = sidecar["operators"][lm_id]
+    assert entry["op_type"] == "GEMM"
+    assert entry["semantic_role"] == "lm_head"
+    assert entry["weight"].endswith("lm_head.weight")
+    assert len(entry["shards"]) == NUM_DPUS
+    assert entry["shard_axis"] == "output_channel"
+    # 输出头的本地分片必须按词表维切，不能落到别的投影形状上。
+    assert sum(
+        shard["local_out_features"] for shard in entry["shards"]
+    ) == 32000
+    placed = json.loads((tmp_path / "placed.ir").read_text())
+    lm_op = next(op for op in placed["operators"]
+                 if op["semantic_role"] == "lm_head")
+    assert lm_op["device_hint"] == "pim"
+    assert lm_op["local_output_shapes"] == [["Tq", 32000 // NUM_DPUS]]
+    # 融合清单只描述层内投影，模型级输出头不能被当成层权重去解析层号。
+    assert all(
+        entry["role"] != "lm_head"
+        for entry in sidecar["fused_activations"])
+
+
+def test_lm_head_with_expert_id_is_rejected() -> None:
+    """输出头是整图一份的权重，带专家号说明身份已经错位。"""
+    from genesim_bridge.placement_export import (
+        _assert_every_gemm_has_known_role)
+
+    ir = {
+        "moe_num_experts": 4,
+        "operators": [{
+            "op_id": 0, "op_type": "GEMM",
+            "semantic_role": "lm_head", "expert_id": 1,
+        }],
+    }
+    with pytest.raises(ValueError, match="lm_head"):
+        _assert_every_gemm_has_known_role(ir)
+
+
+def test_sidecar_carries_the_single_capacity_contract(
+    annotated_tiny_llama, tmp_path
+) -> None:
+    """sidecar 回传容量契约，GeneSim 用它核对两侧不是 4/8/16 GiB 三套预算。"""
+    from memory.mem_planner import default_hw_budget
+
+    hw = default_hw_budget()
+    assert hw.mram_bytes == 8 * 2**30
+    assert hw.sys_reserve_bytes == 64 * 2**20
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path,
+        tmp_path / "placed.ir", tmp_path / "sc.json",
+        hw_budget=hw,
+    )
+    assert sidecar["hw_budget"] == {
+        "mram_bytes_per_dpu": 8 * 2**30,
+        "sys_reserve_bytes": 64 * 2**20,
+        "align": 64,
+    }
+    # 两仓各自持有同一份容量契约，跨仓测试钉住逐值相等：只改一侧会在这里
+    # 失败，而不是等仿真启动时才发现两侧预算不一致。
+    from genesim_bridge.paths import genesim_root
+    genesim_src = genesim_root() / "src"
+    if str(genesim_src) not in sys.path:
+        sys.path.insert(0, str(genesim_src))
+    from pim.capacity import (
+        DPU_DMA_ALIGN, DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES,
+    )
+    assert (DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES, DPU_DMA_ALIGN) == (
+        hw.mram_bytes, hw.sys_reserve_bytes, hw.align)
+
+
+def test_default_hardware_and_budget_share_one_alignment() -> None:
+    """默认硬件、容量预算与 pim_options 的对齐取自同一契约。"""
+    from contracts.op_contract import (
+        DEFAULT_HARDWARE_CONFIG, DPU_DMA_ALIGN, default_hardware_config)
+    from genesim_bridge.paths import pim_options
+    from memory.mem_planner import default_hw_budget, default_site_capacity
+
+    assert DPU_DMA_ALIGN == 64
+    assert DEFAULT_HARDWARE_CONFIG.dma_align == DPU_DMA_ALIGN
+    assert default_hardware_config().dma_align == DPU_DMA_ALIGN
+    assert default_hw_budget().align == DPU_DMA_ALIGN
+    assert pim_options()["pim_dma_align"] == DPU_DMA_ALIGN
+    hw, hardware = default_site_capacity(num_dpus=8, num_tasklets=4)
+    assert hw.align == hardware.dma_align == DPU_DMA_ALIGN
+    assert hw.mram_bytes == hardware.mram_bytes_per_dpu
+
+
+def test_vllm_compile_capacity_uses_the_site_factory() -> None:
+    """vLLM 入口的容量/硬件也从同一工厂派生，对齐不能另写 256。"""
+    from backend.vllm_worker import vllm_compile_capacity
+    from contracts.op_contract import DPU_DMA_ALIGN
+
+    hw, hardware = vllm_compile_capacity(4, 1 << 30, 1 << 20)
+    assert hw.align == hardware.dma_align == DPU_DMA_ALIGN == 64
+    assert hw.mram_bytes == hardware.mram_bytes_per_dpu == 1 << 30
+    assert hardware.num_dpus == 4
+
+
+def test_compile_rejects_misaligned_budget() -> None:
+    """编译入口拒绝 HwBudget.align 与硬件 dma_align 各写一套。"""
+    from types import SimpleNamespace
+
+    from contracts.op_contract import PIMHardwareConfig
+    from memory.mem_planner import HwBudget
+    from runtime.compile import compile_llama2
+
+    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hardware = PIMHardwareConfig(
+        num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=65536, dma_align=64)
+    model = SimpleNamespace(config=SimpleNamespace(model_type="llama"))
+    with pytest.raises(ValueError, match="align"):
+        compile_llama2(
+            model, None, prefill_seq_len=1, max_seq=1, hw=hw,
+            hardware=hardware)
+
+
+def test_with_budget_rejects_conflicting_module_attributes() -> None:
+    """B 路文本已带 8 字节对齐时不能被本次硬件配置静默保留。"""
+    from types import SimpleNamespace
+
+    from opcompiler_bridge.pipeline import with_budget
+
+    text = ('module attributes {"pim.dma-align" = 8 : i64, '
+            '"pim.mram-bytes" = 8589934592 : i64} {\n}\n')
+    hardware = SimpleNamespace(
+        wram_bytes_per_dpu=65536, mram_bytes_per_dpu=8589934592,
+        dma_align=64)
+    with pytest.raises(ValueError, match="dma-align"):
+        with_budget(text, hardware)
+
+
+def test_pimir_hardware_contract_reads_the_real_module_attributes(
+    tmp_path: Path) -> None:
+    """导出侧核对每份 pim mlir 的对齐/容量，而不是只看 sidecar 自报。"""
+    from genesim_bridge.placement_export import _assert_pimir_hardware_contract
+    from memory.mem_planner import default_site_capacity
+
+    _, hardware = default_site_capacity()
+    good = tmp_path / "good.pimir.mlir"
+    good.write_text(
+        'module attributes {"pim.dma-align" = 64 : i64, '
+        '"pim.mram-bytes" = 8589934592 : i64} {\n}\n')
+    bad = tmp_path / "bad.pimir.mlir"
+    bad.write_text(
+        'module attributes {"pim.dma-align" = 8 : i64, '
+        '"pim.mram-bytes" = 8589934592 : i64} {\n}\n')
+    _assert_pimir_hardware_contract(
+        {"operators": {"0": {"pimir_path": str(good)}}}, hardware)
+    with pytest.raises(ValueError, match="dma-align"):
+        _assert_pimir_hardware_contract(
+            {"operators": {"0": {"pimir_path": str(bad)}}}, hardware)
+
+
+def test_hw_budget_payload_rejects_weakened_contract() -> None:
+    """容量契约在写出时就校验：0 预留、1 字节对齐都不能进 sidecar。"""
+    from genesim_bridge.placement_export import _hw_budget_payload
+    from memory.mem_planner import HwBudget, default_hw_budget
+
+    assert _hw_budget_payload(default_hw_budget()) == {
+        "mram_bytes_per_dpu": default_hw_budget().mram_bytes,
+        "sys_reserve_bytes": default_hw_budget().sys_reserve_bytes,
+        "align": default_hw_budget().align,
+    }
+    for bad in (
+            HwBudget(mram_bytes=1 << 30, align=64, sys_reserve_bytes=0),
+            HwBudget(mram_bytes=1 << 30, align=1, sys_reserve_bytes=1 << 20),
+            HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=1 << 20)):
+        with pytest.raises(ValueError):
+            _hw_budget_payload(bad)
+
+
+def _mlp_chain_operators() -> dict:
+    """一个 TP=2 的 MLP 三件套：gate/up 列切、down 行切，act/mul 夹在中间。"""
+    return {
+        0: {"op_id": 0, "op_type": "GEMM", "semantic_role": "gate_proj",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+        1: {"op_id": 1, "op_type": "SILU",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+        2: {"op_id": 2, "op_type": "GEMM", "semantic_role": "up_proj",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+        3: {"op_id": 3, "op_type": "VECTOR_MUL",
+            "input_shapes": [["Tq", 64], ["Tq", 64]],
+            "output_shapes": [["Tq", 64]]},
+        4: {"op_id": 4, "op_type": "GEMM", "semantic_role": "down_proj",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+        5: {"op_id": 5, "op_type": "RMSNORM",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+    }
+
+
+def _mlp_chain_sidecar() -> dict:
+    shards_out = [
+        {"dpu_id": 0, "local_in_features": 64, "local_out_features": 32},
+        {"dpu_id": 1, "local_in_features": 64, "local_out_features": 32},
+    ]
+    shards_in = [
+        {"dpu_id": 0, "local_in_features": 32, "local_out_features": 64},
+        {"dpu_id": 1, "local_in_features": 32, "local_out_features": 64},
+    ]
+    return {"operators": {
+        "0": {"op_type": "GEMM", "shards": shards_out},
+        "2": {"op_type": "GEMM", "shards": shards_out},
+        "4": {"op_type": "GEMM", "shards": shards_in},
+    }}
+
+
+def _mlp_chain_ir() -> dict:
+    return {"dependencies": [
+        {"src_op_id": 0, "dst_op_id": 1},
+        {"src_op_id": 1, "dst_op_id": 3},
+        {"src_op_id": 2, "dst_op_id": 3},
+        {"src_op_id": 3, "dst_op_id": 4},
+    ]}
+
+
+def test_bpath_uses_one_token_and_the_mlp_local_width() -> None:
+    """B 路 pimir 是一个运行期单位：1 个 token × 该 DPU 的本地宽度。
+
+    trace 运行期按实际 Tq 重复整份单位；若 pimir 自己就按 128 token 和全局
+    768 宽编，运行期再乘一遍 Tq，代价会放大两个数量级。只有被 GeneSim TP
+    展开按 elementwise 切分的 MLP act/mul 才用本地宽，其余算子保持全局宽。
+    """
+    from genesim_bridge.placement_export import _attach_bpath_pimir
+
+    operators = _mlp_chain_operators()
+    sidecar = _mlp_chain_sidecar()
+    _attach_bpath_pimir(operators, sidecar, _mlp_chain_ir())
+
+    for op_id in ("1", "3"):
+        entry = sidecar["operators"][op_id]
+        assert entry["trace_tokens"] == 1, entry
+        # 编译单位保留 IR 的符号维：Tq 表示 token 维、本地宽是特征维。
+        expected_inputs = ([["Tq", 32]] if op_id == "1"
+                           else [["Tq", 32], ["Tq", 32]])
+        assert entry["local_input_shapes"] == expected_inputs, entry
+    assert sidecar["operators"]["3"]["local_output_shapes"] == [["Tq", 32]]
+
+    mul_text = Path(sidecar["operators"]["3"]["pimir_path"]).read_text()
+    assert "tensor<1x32xf16>" in mul_text, mul_text
+    assert "tensor<1x64xf16>" not in mul_text, mul_text
+    assert "tensor<128x" not in mul_text, mul_text
+    # token 数写进函数属性：形状维序被 TRANSPOSE 挪动后仍能读到正确单位。
+    assert "pim.traceTokens = 1 : i64" in mul_text, mul_text
+
+    # 不挨着 MLP 三件套的算子（RMSNORM）保持全局宽，token 维同样是 1。
+    rms = sidecar["operators"]["5"]
+    assert rms["trace_tokens"] == 1
+    assert rms["local_input_shapes"] == [["Tq", 64]]
+    rms_text = Path(rms["pimir_path"]).read_text()
+    assert "tensor<1x64xf16>" in rms_text, rms_text
+    assert "tensor<128x" not in rms_text, rms_text
+
+
+def test_bpath_view_ops_keep_the_global_width_next_to_tp_gemms() -> None:
+    """attention 视图族挨着多分片投影，但 GeneSim 不切它们，宽度必须保持全局。
+
+    只按「相邻 GEMM 的本地宽×片数 == 本算子宽度」匹配会把 RESHAPE 也编成
+    1/4 宽，而运行时它仍按整层全局形状执行，trace 与执行形状再次脱节。
+    """
+    from genesim_bridge.placement_export import _attach_bpath_pimir
+
+    operators = {
+        0: {"op_id": 0, "op_type": "GEMM", "semantic_role": "q_proj",
+            "input_shapes": [["Tq", 64]], "output_shapes": [["Tq", 64]]},
+        1: {"op_id": 1, "op_type": "RESHAPE",
+            "input_shapes": [["Tq", 64]],
+            "output_shapes": [["Tq", 2, 32]]},
+    }
+    sidecar = {"operators": {
+        "0": {"op_type": "GEMM", "shards": [
+            {"dpu_id": 0, "local_in_features": 64, "local_out_features": 32},
+            {"dpu_id": 1, "local_in_features": 64, "local_out_features": 32},
+        ]},
+    }}
+    _attach_bpath_pimir(
+        operators, sidecar,
+        {"dependencies": [{"src_op_id": 0, "dst_op_id": 1}]})
+
+    entry = sidecar["operators"]["1"]
+    assert entry["local_input_shapes"] == [["Tq", 64]], entry
+    assert entry["local_output_shapes"] == [["Tq", 2, 32]], entry
+    text = Path(entry["pimir_path"]).read_text()
+    assert "tensor<1x64xf16>" in text, text
+
+
+def test_bpath_kv_ops_keep_symbolic_history_dims() -> None:
+    """四节点注意力的历史维是符号维，不能在 sidecar 单位里固化成占位 128。
+
+    MASK/SOFTMAX 的末维、GEMV_SCORE 的输出末维都是 Tp+Tq；运行期按真实
+    历史长度绑定块循环。侧车若只写 128，任何按绑定形状复核的消费方都会把
+    合法 trace 当成宽度错配。
+    """
+    from genesim_bridge.placement_export import _attach_bpath_pimir
+
+    operators = {
+        0: {"op_id": 0, "op_type": "GEMV_SCORE",
+            "input_shapes": [["Tq", 128], ["Tp+Tq", 128]],
+            "output_shapes": [["Tq", "Tp+Tq"]]},
+        1: {"op_id": 1, "op_type": "MASK",
+            "input_shapes": [["Tq", "Tp+Tq"]],
+            "output_shapes": [["Tq", "Tp+Tq"]]},
+        2: {"op_id": 2, "op_type": "SOFTMAX",
+            "input_shapes": [["Tq", "Tp+Tq"]],
+            "output_shapes": [["Tq", "Tp+Tq"]]},
+        3: {"op_id": 3, "op_type": "GEMV_CONTEXT",
+            "input_shapes": [["Tq", "Tp+Tq"], ["Tp+Tq", 128]],
+            "output_shapes": [["Tq", 128]]},
+    }
+    sidecar = {"operators": {}}
+    _attach_bpath_pimir(operators, sidecar, {"dependencies": []})
+
+    score = sidecar["operators"]["0"]
+    assert score["local_input_shapes"] == [["Tq", 128], ["Tp+Tq", 128]], score
+    assert score["local_output_shapes"] == [["Tq", "Tp+Tq"]], score
+    assert sidecar["operators"]["1"]["local_input_shapes"] == [
+        ["Tq", "Tp+Tq"]]
+    assert sidecar["operators"]["3"]["local_input_shapes"] == [
+        ["Tq", "Tp+Tq"], ["Tp+Tq", 128]]
+    # 编译时历史维仍取一块 KV 的占位长度，符号只用于声明角色。
+    text = Path(score["pimir_path"]).read_text()
+    assert "tensor<1x128xi8>" in text, text
+    assert "tensor<128x128xi8>" in text, text

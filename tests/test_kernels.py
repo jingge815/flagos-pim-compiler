@@ -281,6 +281,7 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
                         "dpus": {0: {"bt_base": block_table_base,
                                      "slots_base": slots_base,
                                      "slot_bytes": 256, "cache_elems": 64,
+                                     "pool_slots": 1,
                                      "max_blocks": 1}}}})
 
     causal_out = run(causal)
@@ -333,6 +334,7 @@ def test_sdpa_streams_blocks_without_concatenating_kv(monkeypatch) -> None:
                              "slot_bytes": slot_bytes,
                              # 3 个物理槽，f32 下每槽 128/4 = 32 个元素。
                              "cache_elems": 3 * slot_bytes // 4,
+                             "pool_slots": 3,
                              "max_blocks": n_tokens // slot_tokens}}}})
 
     concatenations = []
@@ -451,8 +453,9 @@ def test_sdpa_fused_paged_attn_tracks_the_host_path(monkeypatch) -> None:
     host, _ = run(force_host=True)
     assert routes.get(("paged_attn", "hit"), 0) > 0, (
         "融合内核没有被调用：工具链不在位或编译失败")
-    # 单遍在线与相位链两遍的数学结果相同，差在各自的取整位置：实测最大
-    # 绝对误差 < 3e-4，取 atol/rtol = 1e-3 留一个数量级的余量。
+    # 两条路径的相位存储边界相同（每块 PV 乘积先落 f16），这里剩下的差只来自
+    # exp 实现与累加顺序；PV 边界的逐元素判据在
+    # `test_opcompiler_ops.py::test_paged_attn_matches_the_online_reference`。
     assert np.allclose(fused, host, rtol=1e-3, atol=1e-3), (
         "融合路径与主机路径的误差超过了 f16 末位差")
 
@@ -464,6 +467,85 @@ def test_sdpa_fused_paged_attn_tracks_the_host_path(monkeypatch) -> None:
     weights /= weights.sum(-1, keepdims=True)
     assert np.allclose(fused[0, 0], weights @ v[0, 0].astype(np.float32),
                        atol=0.05)
+
+
+def test_sdpa_host_fallback_rounds_at_the_phase_boundaries(monkeypatch) -> None:
+    """工具链整条缺席（matmul 也回退）时，主机路径仍按相位表落 f16。
+
+    只关 `_compiled_paged_attn` 时取整由编译 matmul 的返回 dtype 兜住；工具链
+    不在位时 numpy 乘法返回 f32，QK×scale 与每块 PV 乘积的存储边界都会消失。
+    这里同时关掉两个编译内核，与按相位表实现的参考逐元素对拍。
+    """
+    from types import SimpleNamespace
+
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout, write_block_table
+
+    head_dim, slot_tokens, max_seq = 8, 4, 8
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=max_seq, head_dim=head_dim, dtype_bytes=2,
+        kv_base=8192, slot_tokens=slot_tokens), align=8, pool_slots=3)
+
+    rng = np.random.default_rng(19)
+    q = rng.standard_normal((1, 1, head_dim, head_dim)).astype(np.float16)
+    k = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    v = rng.standard_normal((1, 1, max_seq, head_dim)).astype(np.float16)
+    info = km.sdpa_kv_info(SimpleNamespace(name="n"), {0: spec}, {"n": 0},
+                           np.dtype(np.float16))
+
+    def run(force_all_host: bool):
+        backend = NumpyBackend(
+            NumpyBackendConfig(num_dpus=1, mram_bytes_per_dpu=1 << 20))
+        register_all(backend)
+        write_block_table(spec, backend, [2, 0])
+        if force_all_host:
+            monkeypatch.setattr(km, "_compiled_paged_attn", lambda *a, **kw: None)
+            monkeypatch.setattr(km, "_compiled_matmul", lambda *a, **kw: None)
+        km.reset_route_counts()
+        out = _run(backend,
+                   str(torch.ops.aten.scaled_dot_product_attention.default),
+                   ["tensor"] * 3, [q.shape, k.shape, v.shape], [q, k, v],
+                   q.shape, dtype="float16", extra_payload={"sdpa": info})
+        return out, km.route_counts()
+
+    host, routes = run(force_all_host=True)
+    assert routes.get(("paged_attn", "fallback"), 0) > 0
+    assert routes.get(("matmul", "fallback"), 0) > 0, "matmul 没有回退，用例没覆盖工具链缺席"
+
+    # 相位表参考：QK 点积落 f16 → 乘 scale 落 f16；每块 PV 乘积落 f16 后
+    # 在 f32 里累加。块顺序与块表一致（逻辑块 0 在前）。
+    tq = q.shape[2]
+    scale = 1.0 / np.sqrt(head_dim)
+    scores = np.empty((tq, max_seq), dtype=np.float16)
+    for start in (0, slot_tokens):
+        qk = (q[0, 0].astype(np.float32)
+              @ k[0, 0, start:start + slot_tokens].astype(np.float32).T)
+        scores[:, start:start + slot_tokens] = (
+            qk.astype(np.float16).astype(np.float32) * scale).astype(np.float16)
+    weights = np.empty_like(scores)
+    for t in range(tq):
+        mask = km.prefill_mask(max_seq, max_seq)
+        weights[t] = km.softmax(km.add_mask(
+            scores[t], mask[t]).astype(np.float32))
+    acc = np.zeros((tq, head_dim), dtype=np.float32)
+    for start in (0, slot_tokens):
+        block = (weights[:, start:start + slot_tokens].astype(np.float32)
+                 @ v[0, 0, start:start + slot_tokens].astype(np.float32))
+        acc += block.astype(np.float16).astype(np.float32)
+    # 输出按 np_dtype 落盘，参考也走同一次 f16 写出。
+    stored = acc.astype(np.float16)
+    assert np.array_equal(host[0, 0], stored), (
+        f"主机路径与相位表参考不一致：最大差 "
+        f"{np.max(np.abs(host[0, 0].astype(np.float32) - stored.astype(np.float32)))}")
+
+    # 不落 PV 边界时最后一列必须能区分：证明这条用例不是恒真。
+    unrounded = np.zeros((tq, head_dim), dtype=np.float32)
+    for start in (0, slot_tokens):
+        unrounded += (weights[:, start:start + slot_tokens].astype(np.float32)
+                      @ v[0, 0, start:start + slot_tokens].astype(np.float32))
+    assert not np.array_equal(stored, unrounded.astype(np.float16)), (
+        "样本数据区分不出是否在 PV 乘积后落 f16，用例没有约束力")
 
 
 def test_sdpa_standard_causal_mask_routes_to_fused_kernel(monkeypatch) -> None:
@@ -529,6 +611,7 @@ def test_paged_attention_rejects_history_longer_than_the_block_table() -> None:
         kv_base=8192, slot_tokens=4), align=8, pool_slots=3)
     geo = {"slots_base": spec.slots_base, "bt_base": spec.block_table_base,
            "slot_bytes": spec.slot_bytes, "max_blocks": spec.blocks_per_request,
+           "pool_slots": spec.pool_slots,
            "cache_elems": spec.pool_slots * spec.slot_bytes // spec.dtype_bytes}
     entry = {"head": 0, "dpu": 0, "row": 0, "k_off": spec.slots_base,
              "v_off": spec.slots_base + 2 * spec.slot_bytes}
@@ -596,3 +679,81 @@ def test_view_ops_reach_the_compiler(monkeypatch) -> None:
 
     assert {"transpose", "reshape", "concat"} <= set(seen), (
         f"视图类没走到编译器，实际调用 {sorted(set(seen))}")
+
+
+def test_physical_slot_accepts_both_legal_bounds() -> None:
+    """槽 0 与 pool_slots-1 都是合法边界，不能一刀切拒绝。"""
+    from runtime.kernels import _physical_slot
+
+    table = np.array([0, 3], dtype=np.int32)
+    assert _physical_slot(table, 0, 4, 0) == 0
+    assert _physical_slot(table, 1, 4, 0) == 3
+
+
+@pytest.mark.parametrize("slot", [-1, 4])
+def test_physical_slot_rejects_negative_and_upper_invalid(slot: int) -> None:
+    """负值与 >= pool_slots 都必须失败，不能夹成槽 0 或另一个物理槽。"""
+    from runtime.kernels import _physical_slot
+
+    table = np.array([slot], dtype=np.int32)
+    with pytest.raises(RuntimeError, match=r"越界 \[0,4\)"):
+        _physical_slot(table, 0, 4, 0)
+
+
+def test_block_table_tail_sentinel_is_not_read() -> None:
+    """表尾未参与本次历史的 -1 哨兵不读，也不该被预检拒绝。"""
+    from runtime.kernels import _validate_block_table
+
+    table = np.array([2, -1, -1], dtype=np.int32)
+    _validate_block_table(table, 1, 4, 0)
+
+
+def test_where_kernel_matches_torch_with_a_broadcast_operand() -> None:
+    """设备 `where.self` 的被选支可广播，结果与 torch 逐元素一致。"""
+    backend = _backend()
+    register_all(backend)
+    cond = np.array([[1.0, 1.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]],
+                    dtype=np.float32)
+    a = np.array([[2.0, 4.0, 6.0, 8.0], [1.0, 3.0, 5.0, 7.0]],
+                 dtype=np.float32)
+    b = np.array([[10.0, 20.0, 30.0, 40.0]], dtype=np.float32)
+    result = _run(
+        backend, str(torch.ops.aten.where.self),
+        ["tensor", "tensor", "tensor"],
+        [cond.shape, a.shape, b.shape], [cond, a, b], (2, 4))
+    ref = np.where(cond.astype(bool), a, b)
+    assert np.allclose(result, ref, atol=1e-6)
+
+
+def test_scalar_where_is_host_only_and_not_a_device_kernel() -> None:
+    """MoE 门控选择 `where.ScalarOther`/`ne.Scalar` 留主机，不注册设备内核。"""
+    from graph.partition import _is_host_only
+    from runtime.kernels import _KERNELS
+
+    assert str(torch.ops.aten.where.self) in _KERNELS
+    assert str(torch.ops.aten.where.ScalarOther) not in _KERNELS
+    assert _is_host_only(torch.ops.aten.where.ScalarOther)
+    assert _is_host_only(torch.ops.aten.ne.Scalar)
+
+
+def test_paged_attention_rejects_invalid_slots_before_addressing() -> None:
+    """主机预检必须在读缓存/调用融合内核之前拦下非法块表项。"""
+    import runtime.kernels as km
+    from memory.kv_layout import KVRegionSpec, build_kv_layout
+
+    spec = build_kv_layout(KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=8, head_dim=8, dtype_bytes=2,
+        kv_base=8192, slot_tokens=4), align=8, pool_slots=4)
+    geo = {"slots_base": spec.slots_base, "bt_base": spec.block_table_base,
+           "slot_bytes": spec.slot_bytes, "max_blocks": spec.blocks_per_request,
+           "pool_slots": spec.pool_slots,
+           "cache_elems": spec.pool_slots * spec.slot_bytes // spec.dtype_bytes}
+    entry = {"head": 0, "dpu": 0, "row": 0, "k_off": spec.slots_base,
+             "v_off": spec.slots_base + 2 * spec.slot_bytes}
+    for slot in (-1, spec.pool_slots):
+        table = np.array([slot], dtype=np.int32)
+        with pytest.raises(RuntimeError, match="越界"):
+            km._paged_attention(
+                None, 0, entry, geo, table, np.zeros((1, 8), np.float16),
+                0, 1, 8, 4, np.dtype(np.float16), None, 0.35)

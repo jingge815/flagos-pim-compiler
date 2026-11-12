@@ -155,6 +155,17 @@ class RequestTable:
         return len(self._free)
 
 
+def _apply_moe_execution(compiled, hal) -> None:
+    """后端未显式配置分派开关时，按编译时的执行语义决定是否跳过未命中专家。
+
+    显式配置（NumpyBackendConfig.moe_dispatch）优先，供 A/B 基准在同一份
+    计划上切换两种语义。
+    """
+    if getattr(hal.config, "moe_dispatch", None) is not None:
+        return
+    hal.moe_dispatch = getattr(compiled, "moe_execution", "") != "dense_sim"
+
+
 def step_request(
     compiled,
     hal,
@@ -176,6 +187,7 @@ def step_request(
     """
     if sample_fn is None:
         sample_fn = lambda logits: int(np.argmax(logits))
+    _apply_moe_execution(compiled, hal)
 
     if not slot.is_prefill_done:
         logits = prefill_chunk(
@@ -225,6 +237,7 @@ def prefill_chunk(
     据此走融合内核。分块 prefill 的中间段不采样，由调用方决定。
     """
     length = len(token_ids)
+    _apply_moe_execution(compiled, hal)
     seq_len = prefill_bucket(compiled, length)
     ids = list(token_ids) + [pad_id] * (seq_len - length)
     slot.blocks.ensure(_blocks_for(pos + length, compiled.kv_slot_tokens))

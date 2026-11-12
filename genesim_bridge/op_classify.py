@@ -94,6 +94,12 @@ UNCOVERED_OP_TYPES = frozenset({
     "SPLIT",
     "CONCAT",
     "PAGED_ATTN",
+    # MoE 门控链（softmax/top-k/scatter）与路由选择+加权累加：PIM 原语集没有
+    # 逐元素 select，图编译器把 `where` 与加权乘、累加整段留在 host（`ne` /
+    # `where.ScalarOther` 在 HOST_ONLY 里），没有算子编译器原语，成本沿用
+    # model_parser 写进 IR 的模板系数。
+    "MOE_ROUTE",
+    "MOE_ACCUM",
 })
 
 
@@ -126,6 +132,10 @@ class OpRecipe:
     pimir: Optional[Callable[[], str]] = None
     # B 路写进 sidecar 的 `source_name`，即方言里的 mnemonic。
     mnemonic: str = ""
+    # 成本随哪个编译代表点变量增长。当前 token 的逐元素、归一化、激活与
+    # 视图类取 "Tq"；注意力等随 KV 历史变化的算子取 "Tq(Tp+Tq)"。
+    # 测量 IR、拟合与运行期求值必须用同一个依赖项，不能再按算子大类一刀切。
+    cost_term: str = "Tq"
 
 
 def _module(body: str) -> str:
@@ -133,9 +143,14 @@ def _module(body: str) -> str:
     return f'module attributes {{pim.target = "{_PIM_TARGET}"}} {{\n{body}\n}}\n'
 
 
-def _normalize_ir(dims: Dict[str, int], point: ShapePoint) -> str:
-    """RMSNorm 锚点：[Tq, hidden] 的激活配 [hidden] 的缩放。"""
-    cols = dims["hidden_size"]
+def _normalize_ir(dims: Dict[str, int], point: ShapePoint,
+                  width: int | None = None) -> str:
+    """RMSNorm 锚点：[Tq, width] 的激活配 [width] 的缩放。
+
+    宽度取当前算子自己的形状：Qwen3 的 q_norm/k_norm 作用在 head_dim 上，
+    沿用模型级 hidden 会把每个头的归一化放大 num_heads 倍。
+    """
+    cols = dims["hidden_size"] if width is None else int(width)
     return _module(normalize_kernel("rmsnorm", point.tq, cols, cols))
 
 
@@ -169,25 +184,29 @@ def _softmax_ir(dims: Dict[str, int], point: ShapePoint) -> str:
 
 
 def _mask_ir(dims: Dict[str, int], point: ShapePoint) -> str:
-    """加性因果掩码：分数 `[heads, Tq, Tp+Tq]` 配按末轴广播的掩码。
+    """加性因果掩码，形状按真实图里的逐头节点 `[1, Tq, Tp+Tq]`。
 
-    两种几何由 `layout` 分开：decode 是"一行对整段缓存"（`vector`，除末轴外
-    全是 1），prefill 是"每个位置只看见它前面"的三角（`causal_tril`，末两轴
-    相等）。形状相近时单看形状分不出来，所以必须把 layout 显式传给
-    `mask_kernel`。
+    IR 每层每个头各有一个 MASK 节点，代表形状再乘 `num_heads` 会把单节点
+    成本放大整头数倍。两种几何由 `layout` 分开：decode 是"一行对整段缓存"
+    （`vector`，除末轴外全是 1），prefill 是"每个位置只看见它前面"的三角
+    （`causal_tril`，末两轴相等）。形状相近时单看形状分不出来，所以必须把
+    layout 显式传给 `mask_kernel`。
     """
-    heads, tq, lkv = dims["num_heads"], point.tq, point.lkv
+    tq, lkv = point.tq, point.lkv
     if tq == 1:
-        return _module(mask_kernel("mask", (heads, tq, lkv), (1, 1, lkv),
+        return _module(mask_kernel("mask", (1, tq, lkv), (1, 1, lkv),
                                    layout="vector"))
-    return _module(mask_kernel("mask", (heads, tq, lkv), (tq, tq),
+    return _module(mask_kernel("mask", (1, tq, lkv), (tq, tq),
                                layout="causal_tril"))
 
 
 def _rope_ir(dims: Dict[str, int], point: ShapePoint) -> str:
-    """RoPE 保留 rank-4：cos/sin 沿 head 轴广播，压平会把那个轴抹掉。"""
-    return _module(rope_kernel("rope", dims["num_heads"], point.tq,
-                               dims["head_dim"]))
+    """RoPE 保留 rank-4，但代表形状是逐头节点 `[1, Tq, head_dim]`。
+
+    IR 每层每个头各有一个 ROPE 节点，代表形状再乘 `num_heads` 会把单节点
+    成本放大整头数倍；cos/sin 仍沿 head 轴广播，所以保留那一维。
+    """
+    return _module(rope_kernel("rope", 1, point.tq, dims["head_dim"]))
 
 
 def _lut_ir(dims: Dict[str, int], point: ShapePoint) -> str:
@@ -355,6 +374,7 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
             build=_bmm(dims, point.tq, head_dim, point.lkv),
             mnemonic="pim.matmul",
             pimir=lambda: _matmul_ir(dims, point),
+            cost_term="Tq(Tp+Tq)",
         )
 
     def softmax(point: ShapePoint) -> OpRecipe:
@@ -364,6 +384,7 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
             build=_softmax(dims, point.tq, point.lkv),
             mnemonic="pim.softmax",
             pimir=lambda: _softmax_ir(dims, point),
+            cost_term="Tq(Tp+Tq)",
         )
 
     def gemv_context(point: ShapePoint) -> OpRecipe:
@@ -374,9 +395,11 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
             mnemonic="pim.matmul",
             pimir=lambda: _module(_attention_matmul_body(
                 "context", point.tq, point.lkv, head_dim)),
+            cost_term="Tq(Tp+Tq)",
         )
 
-    def bpath(mnemonic: str, builder) -> Callable[[ShapePoint], OpRecipe]:
+    def bpath(mnemonic: str, builder,
+              cost_term: str = "Tq") -> Callable[[ShapePoint], OpRecipe]:
         """只有 B 路的配方：A 路保留模板成本，理由见 UNCOVERED_OP_TYPES。
 
         成本公式不在这里重写一份：B 路直接发 `opcompiler_bridge/oplevel_kernel`
@@ -384,16 +407,29 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
         """
         def make(point: ShapePoint) -> OpRecipe:
             return OpRecipe(source_name=mnemonic, mnemonic=mnemonic,
-                            pimir=lambda: builder(dims, point))
+                            pimir=lambda: builder(dims, point),
+                            cost_term=cost_term)
         return make
 
     def _binary(source_name: str, kind: str):
-        def make(point: ShapePoint) -> OpRecipe:
+        def make(point: ShapePoint, width: int | None = None) -> OpRecipe:
+            # 宽度必须来自当前算子自己的形状：专家中间宽是 768，不是 hidden。
+            col = dims["hidden_size"] if width is None else int(width)
             return OpRecipe(
                 source_name=source_name,
                 mnemonic="pim.eltwise",
                 pimir=lambda: _module(eltwise_kernel(
-                    "eltwise", (point.tq, dims["hidden_size"]), kind)),
+                    "eltwise", (point.tq, col), kind)),
+            )
+        return make
+
+    def _activation(kind: str):
+        def make(point: ShapePoint, width: int | None = None) -> OpRecipe:
+            col = dims["ffn_dim"] if width is None else int(width)
+            return OpRecipe(
+                source_name="pim.lut", mnemonic="pim.lut",
+                pimir=lambda: _module(lut_kernel(
+                    "lut", (point.tq, col), kind)),
             )
         return make
 
@@ -411,16 +447,23 @@ def build_recipes(dims: Dict[str, int]) -> Dict[str, Callable[[ShapePoint], OpRe
             lambda dims, point: _module(paged_attn_kernel(
                 "op", (point.tq, dims["head_dim"]),
                 *paged_attn_geometry(dims["head_dim"], point.lkv))),
+            cost_term="Tq(Tp+Tq)",
         ),
-        "RMSNORM": bpath("pim.normalize", _normalize_ir),
-        "SILU": bpath("pim.lut", _lut_ir),
+        "RMSNORM": lambda point, width=None: OpRecipe(
+            source_name="pim.normalize", mnemonic="pim.normalize",
+            pimir=lambda: _module(normalize_kernel(
+                "rmsnorm", point.tq,
+                dims["hidden_size"] if width is None else int(width),
+                dims["hidden_size"] if width is None else int(width))),
+        ),
+        "SILU": _activation("silu"),
         "VECTOR_ADD": _binary("pim.eltwise add", "add"),
         "VECTOR_MUL": _binary("pim.eltwise mul", "mul"),
         # 注意力与视图类：模型骨架里真有这些节点，A 路留模板、B 路逐个桥接。
         "GATHER": bpath("pim.gather", _gather_ir),
         "QUANT": bpath("pim.dynamic_quant", _dynamic_quant_ir),
         "ROPE": bpath("pim.rope", _rope_ir),
-        "MASK": bpath("pim.mask", _mask_ir),
+        "MASK": bpath("pim.mask", _mask_ir, cost_term="Tq(Tp+Tq)"),
         "MEM_COPY": bpath("pim.kv_cache", _kv_cache_ir),
         "TRANSPOSE": bpath("pim.transpose", _transpose_ir),
         "RESHAPE": bpath("pim.reshape", _reshape_ir),

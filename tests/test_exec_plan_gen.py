@@ -1192,7 +1192,7 @@ def test_the_plan_emits_one_command_per_rms_norm() -> None:
     strategy = llama_strategies(
         4, num_heads=4, num_kv_heads=4, intermediate_size=128,
         vocab_size=128, num_layers=2)[0]
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     hardware = PIMHardwareConfig(
         num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64)

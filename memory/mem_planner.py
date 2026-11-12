@@ -9,6 +9,9 @@ from torch.fx import Node
 
 from contracts.dtypes import dtype_bytes
 from contracts.graph_meta import DEVICE_DPU, REDISTRIBUTE_META_KEY, SPEC_META_KEY
+from contracts.op_contract import (
+    DPU_DMA_ALIGN, DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES,
+    PIMHardwareConfig, default_hardware_config)
 from contracts.pim_tensor_spec import RedistributeEdge
 from memory.kv_layout import KVRegionSpec, align_up, build_kv_layout
 
@@ -24,6 +27,47 @@ class HwBudget:
     # decode 的 M=1/K=32 分片一行只有 64 字节，分块搜索会直接失败。
     align: int
     sys_reserve_bytes: int    # 系统预留：kernel 二进制 + runtime 栈 + workspace 等非三区占用
+
+
+def default_hw_budget() -> HwBudget:
+    """站点容量契约对应的 HwBudget：每 DPU 8 GiB、扣 64 MiB 系统预留。
+
+    主链导出、真实测试与执行期基准都从这里取，不再各自硬编预算。
+    """
+    return HwBudget(
+        mram_bytes=DPU_MRAM_BYTES,
+        align=DPU_DMA_ALIGN,
+        sys_reserve_bytes=DPU_SYS_RESERVE_BYTES,
+    )
+
+
+def default_site_capacity(
+    *,
+    num_dpus: int = 8,
+    num_tasklets: int = 16,
+    mram_bytes: int | None = None,
+    sys_reserve_bytes: int | None = None,
+    wram_bytes_per_dpu: int = 65536,
+) -> tuple[HwBudget, PIMHardwareConfig]:
+    """从同一容量三件套派生 (HwBudget, PIMHardwareConfig)。
+
+    `mram_bytes` / `sys_reserve_bytes` 只允许显式覆盖容量，对齐始终取
+    `DPU_DMA_ALIGN`；生产入口（主链导出、vLLM、执行期基准）都走这里，
+    避免 HwBudget 与 PIMHardwareConfig 各拿一套对齐。
+    """
+    budget = HwBudget(
+        mram_bytes=DPU_MRAM_BYTES if mram_bytes is None else mram_bytes,
+        align=DPU_DMA_ALIGN,
+        sys_reserve_bytes=(DPU_SYS_RESERVE_BYTES
+                           if sys_reserve_bytes is None else sys_reserve_bytes),
+    )
+    hardware = default_hardware_config(
+        num_dpus=num_dpus,
+        num_tasklets=num_tasklets,
+        mram_bytes_per_dpu=budget.mram_bytes,
+        wram_bytes_per_dpu=wram_bytes_per_dpu,
+    )
+    return budget, hardware
 
 
 @dataclass

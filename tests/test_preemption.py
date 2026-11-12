@@ -95,7 +95,7 @@ def compiled_and_backend():
         num_attention_heads=4, num_key_value_heads=4, vocab_size=128,
         max_position_embeddings=MAX_SEQ,
     )).eval().half()
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     hardware = PIMHardwareConfig(
         num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64)

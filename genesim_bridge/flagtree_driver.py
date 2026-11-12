@@ -235,7 +235,7 @@ def lower_oplevel_to_pimir(mlir_text: str) -> str:
     from opcompiler_bridge.pipeline import b_path_passes, with_budget
 
     return _run_passes(
-        _triton_opt(), with_budget(mlir_text, _options_hardware()),
+        _triton_opt(), with_budget(mlir_text, _options_hardware(mlir_text)),
         b_path_passes(), "整算子级 pim mlir",
     )
 

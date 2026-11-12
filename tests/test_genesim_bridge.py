@@ -257,17 +257,6 @@ def _gemm_op():
     }
 
 
-def _score_op():
-    return {
-        "op_id": 1,
-        "op_type": "GEMV_SCORE",
-        "input_shapes": [["Tq", 64], ["Tp+Tq", 64]],
-        "output_shapes": [["Tq", "Tp+Tq"]],
-        "flops_coeffs": {"Tq(Tp+Tq)": 127},
-        "data_bytes_coeffs": {"Tq": 128, "Tp+Tq": 128, "Tq(Tp+Tq)": 2},
-    }
-
-
 def test_gemm_net_bytes_includes_weight():
     """验证 GEMM 成本包含输入、权重和输出的字节数。"""
     op = _gemm_op()
@@ -389,19 +378,17 @@ def test_export_costs_validates_local_shapes_before_measuring(tmp_path):
     assert not (tmp_path / "out.ir").exists()
 
 
-def _m(point, flops, data_bytes=1.0):
+def _m(point, flops, data_bytes=1.0, cost_term="Tq"):
     return Measurement(point=point, flops=flops, data_bytes=data_bytes,
-                       dtype="f16", element_bytes=2)
+                       dtype="f16", element_bytes=2, cost_term=cost_term)
 
 
 def test_fit_two_point_linear():
     """成本单调随 term 增长时走标准两点解。"""
     prefill, decode = ShapePoint(128, 0), ShapePoint(1, 128)
     f, b, mode = _fit_coeffs(
-        _gemm_op(),
         _m(prefill, 201_523_200.0, 100.0),
         _m(decode, 50_380_800.0, 10.0),
-        seq_len=128,
     )
     assert mode["flops"] == "two_point_linear"
     assert f["Tq"] > 0
@@ -413,10 +400,8 @@ def test_fit_rejects_negative_slope_from_padding():
     """验证负斜率拟合改用过原点解。"""
     prefill, decode = ShapePoint(128, 0), ShapePoint(1, 128)
     f, b, mode = _fit_coeffs(
-        _score_op(),
-        _m(prefill, 2_097_152.0, 100.0),
-        _m(decode, 2_621_440.0, 10.0),
-        seq_len=128,
+        _m(prefill, 2_097_152.0, 100.0, cost_term="Tq(Tp+Tq)"),
+        _m(decode, 2_621_440.0, 10.0, cost_term="Tq(Tp+Tq)"),
     )
     assert mode["flops"] == "origin_through_large_term"
     assert f["Tq(Tp+Tq)"] > 0
@@ -518,6 +503,17 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
 
     ttir = json.loads(ttir_path.read_text())
     pimir = json.loads(pimir_path.read_text())
+    # 两份 sidecar 必须是从当前骨架同一版精化出来的；旧产物（无指纹或指纹
+    # 不符）的 op_id 已经与骨架错位，比较覆盖集合只会得到假失败。
+    from genesim_bridge.ir_fingerprint import fingerprint_ir
+
+    skeleton_fp = fingerprint_ir(
+        json.loads((ir_dir / "llama2_7b.ir").read_text()))
+    for label, sidecar in (("ttir", ttir), ("pimir", pimir)):
+        if sidecar.get("ir_fingerprint") != skeleton_fp:
+            pytest.skip(
+                f"{label} sidecar 与当前 llama2_7b.ir 不同源（旧产物），"
+                "请重新跑 refine_ir_with_flagtree.py 后再比较")
     assert ttir["ir_level"] == "ttir" and pimir["ir_level"] == "pimir"
     assert pimir["coverage"] == ttir["coverage"]
     assert pimir["pim_options"]["pim_target"]

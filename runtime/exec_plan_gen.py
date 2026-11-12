@@ -21,9 +21,59 @@ from contracts.graph_meta import (
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.op_semantics import RMS_NORM_KERNEL
 from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY
+from graph.spec_prop import _layer_of_node
 
-# MoE 动态分派开关：PIM_MOE_DISPATCH=0 关闭（退回稠密模拟全专家执行），用于 A/B 对比。
-_MOE_DISPATCH = os.environ.get("PIM_MOE_DISPATCH", "1") != "0"
+# MoE 执行语义。图编译器与 GeneSim 共用这两个取值；默认跟随 PIM_MOE_DISPATCH。
+MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch")
+
+
+def moe_execution_default() -> str:
+    """编译配置的默认执行语义：PIM_MOE_DISPATCH=0 退回稠密模拟。"""
+    return "dense_sim" if os.environ.get("PIM_MOE_DISPATCH", "1") == "0" \
+        else "dynamic_dispatch"
+
+
+def is_moe_config(cfg) -> bool:
+    """模型是否为 MoE：由 model_type 与有效 MoE 字段共同判定。
+
+    不能用「专家数 > 1」当代替：1 专家/top-1 是合法的 MoE 配置，按阈值
+    判定会让它丢失执行语义、MoE 元数据与默认分块策略。
+    """
+    if str(getattr(cfg, "model_type", "") or "") == "qwen3_moe":
+        return True
+    return (
+        int(getattr(cfg, "num_experts", 0) or 0) > 0
+        or int(getattr(cfg, "moe_intermediate_size", 0) or 0) > 0)
+
+
+def resolve_moe_execution(cfg, requested: str | None = None) -> str:
+    """按模型配置确定执行语义；非 MoE 模型不得带语义，未知取值直接报错。
+
+    这一份值由 `compile_llama2` 同时写入执行计划、放置 sidecar 与仿真 IR，
+    各入口不再各自读环境变量或硬编。
+    """
+    if not is_moe_config(cfg):
+        if requested not in (None, ""):
+            raise ValueError(
+                f"非 MoE 模型不应指定 moe_execution={requested!r}")
+        return ""
+    model_type = str(getattr(cfg, "model_type", "") or "")
+    if model_type != "qwen3_moe":
+        raise ValueError(
+            f"model_type={model_type!r} 带 MoE 配置，但只支持 qwen3_moe 的"
+            "执行语义；不支持的模型类型不能静默按 dense 处理。")
+    num_experts = int(getattr(cfg, "num_experts", 0) or 0)
+    top_k = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
+    if num_experts < 1:
+        raise ValueError(f"qwen3_moe 的 num_experts={num_experts} 必须为正整数")
+    if not 1 <= top_k <= num_experts:
+        raise ValueError(
+            f"num_experts_per_tok={top_k} 越界 [1, {num_experts}]")
+    mode = moe_execution_default() if requested is None else requested
+    if mode not in MOE_EXECUTION_MODES:
+        raise ValueError(
+            f"未知 MoE 执行语义 {mode!r}：只认 {MOE_EXECUTION_MODES}")
+    return mode
 
 
 def _moe_layer_of(node: Node, marker: str) -> int | None:
@@ -37,35 +87,123 @@ def _moe_layer_of(node: Node, marker: str) -> int | None:
         if cur.op == "get_attr" and marker in str(cur.target):
             part = str(cur.target).split(".")
             return int(part[part.index("layers") + 1])
-        stack.extend(a for a in cur.args if hasattr(a, "op"))
+        # 用 all_input_nodes 而不是只扫 args：分块后的 `cat([a, b], dim)` 把
+        # 上游包在列表里，扫位置实参会整段跳过，层号就找不到了。
+        stack.extend(cur.all_input_nodes)
     return None
 
 
-def _moe_expert_of(node: Node) -> tuple[int, int] | None:
-    """专家 linear 的 (layer, expert)；权重 get_attr 形如 layers.L.mlp.experts.E.*。"""
-    for arg in node.args:
-        if getattr(arg, "op", None) == "get_attr" and ".mlp.experts." in str(arg.target):
-            part = str(arg.target).split(".")
-            return int(part[part.index("layers") + 1]), int(part[part.index("experts") + 1])
-    return None
+def _expert_of_weight(node: Node) -> tuple[int, int] | None:
+    """专家权重 get_attr 的 (layer, expert)；形如 layers.L.mlp.experts.E.*。"""
+    if node.op != "get_attr" or ".mlp.experts." not in str(node.target):
+        return None
+    part = str(node.target).split(".")
+    return int(part[part.index("layers") + 1]), int(part[part.index("experts") + 1])
+
+
+def _node_layer_of(node: Node, provenance: dict[str, tuple | None]) -> int | None:
+    """节点的层号：优先取权重名/模块路径，其次取输入标签的唯一层号。
+
+    分块会在专家子图里插入切片与类型转换，它们没有模块路径；这些节点只能
+    从输入继承层号。输入来自不同层时说明是层边界（残差、MoE 出口），返回
+    None，跨层激活按中性输入处理。
+    """
+    layer = _layer_of_node(node)
+    if layer is not None:
+        return layer
+    layers = {
+        value[0]
+        for arg in node.all_input_nodes
+        if isinstance(value := provenance.get(arg.name), tuple)
+    }
+    return layers.pop() if len(layers) == 1 else None
+
+
+def _expert_provenance(nodes: list[Node]) -> dict[str, tuple | None]:
+    """每个节点在本层内的专家归属：(layer, expert) 或 (layer, None)。
+
+    (layer, None) 表示「本层多个专家的汇合点」（累加链一类），它没有单一
+    专家身份，执行计划不给它 gate。分块会在权重与 linear 之间插入切片/类型
+    转换，激活链上还有 silu/mul/cat 等无权重节点，所以按拓扑序把输入的专家
+    归属并上来，整条只由一个专家喂出来的子图都能识别。
+
+    传播域限定在「本层」：上一层的输出、甚至上一层的多专家累加状态，都是
+    下一层的中性激活输入，不得与下一层专家权重相遇后污染候选。层号取模块
+    路径（torch.export 的 `nn_module_stack`）或权重名，两者都没有时从输入
+    继承；输入跨层即层边界，归属到此终止。
+    """
+    provenance: dict[str, tuple | None] = {}
+    for node in nodes:
+        own = _expert_of_weight(node)
+        if own is not None:
+            provenance[node.name] = own
+            continue
+        layer = _node_layer_of(node, provenance)
+        values = [
+            value
+            for arg in node.all_input_nodes
+            if isinstance(value := provenance.get(arg.name), tuple)
+            and (layer is None or value[0] == layer)
+        ]
+        if not values:
+            provenance[node.name] = None
+            continue
+        first = values[0]
+        if all(value == first for value in values):
+            provenance[node.name] = first
+        elif layer is not None:
+            # 同一层里多个专家汇合：是共享累加这类出口，没有单一专家身份。
+            provenance[node.name] = (layer, None)
+        else:
+            # 层号未知又出现不同来源：跨层汇合，按中性输入处理。
+            provenance[node.name] = None
+    return provenance
+
+
+def _expert_tag_of(provenance: dict[str, tuple | None], node: Node) -> tuple[int, int] | None:
+    """节点的唯一专家归属；多专家或无归属返回 None。"""
+    value = provenance.get(node.name)
+    return value if isinstance(value, tuple) and value[1] is not None else None
 
 
 def _emit_moe_dispatch(builder, layer: int, route_cmd_id: int) -> int:
-    """发一个 dispatch host_op：读路由张量，把本步无 token 命中的专家写进跳过集。
+    """发一个 dispatch host_op：读 top-k 选中掩码，把本步无 token 命中的专家
+    写进跳过集。
 
-    跳过集键 (lane_key, 本命令号)：并发窗口各写各的，互不覆盖；被跳过的
-    专家 launch 已 waits 本命令，读到的一定是本步的结果。
+    命中条件只能是选中索引生成的布尔掩码：路由权重在 softmax/重归一化后
+    可能下溢为 0，用它判命中会把已选中的专家错误跳过。跳过集键
+    (lane_key, 本命令号)：并发窗口各写各的，互不覆盖；被跳过的专家 launch
+    已 waits 本命令，读到的一定是本步的结果。
     """
     def fn(hal, cmd):
-        routing = hal.result_of(route_cmd_id)
+        selected_mask = hal.result_of(route_cmd_id)
         lane = hal.current_lane_key()
-        hit = (routing != 0).any(dim=0)
+        hit = selected_mask.any(dim=0)
         hal.gate_skips[(lane, cmd.id)] = {
             int(i) for i in (~hit).nonzero().flatten().tolist()}
 
     return builder.append(
         "host_op", None, {"node": f"moe_dispatch_{layer}", "fn": fn},
         [], [], [route_cmd_id]).id
+
+def _skip_zero_nodes(nodes: list[Node], provenance: dict[str, object]) -> set[str]:
+    """哪些专家节点的输出会被专家子图之外、不会一起跳过的命令读到。
+
+    跳过发生在提交前，未命中的命令不再入队。子图内部的读者（同一 expert）
+    会一起被跳过，不需要清零；一旦有跨出子图的读者（例如未门控的累加链、
+    残差），旧值就会被读走，这条命令必须自己把输出写零。
+    """
+    needs_zero: set[str] = set()
+    for node in nodes:
+        tag = _expert_tag_of(provenance, node)
+        if tag is None:
+            continue
+        for user in node.users:
+            if _expert_tag_of(provenance, user) != tag:
+                needs_zero.add(node.name)
+                break
+    return needs_zero
+
 
 _REDISTRIBUTE_OP = {
     "all_reduce": "host_reduce",
@@ -367,8 +505,16 @@ def _dma_engine(hal, cmd) -> DmaEngine:
     )
 
 
-def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_node: Node) -> None:
-    """将一条重分布边生成包含全部段访问的命令。"""
+def _emit_redistribute(
+    builder: _PlanBuilder, edge, entry: CommPlanEntry, src_node: Node,
+    dispatch_by_layer: dict[int, int] | None = None,
+    provenance: dict[str, object] | None = None,
+) -> None:
+    """将一条重分布边生成包含全部段访问的命令。
+
+    专家子图专属的通信带上 gate/expert：未命中专家时连归约/收集一起跳过，
+    否则动态分派只省计算、不省通信。
+    """
     reads, writes = _edge_accesses(entry)
     waits = _deps_of(reads, builder.writers)
     for w in writes:
@@ -401,7 +547,19 @@ def _emit_redistribute(builder: _PlanBuilder, edge, entry: CommPlanEntry, src_no
             return primitive(entry, engine)
 
     op = _REDISTRIBUTE_OP[edge.type]
-    cmd = builder.append(op, None, {"edge_id": edge.edge_id, "fn": fn}, reads, writes, waits)
+    payload: dict = {"edge_id": edge.edge_id, "fn": fn}
+    if dispatch_by_layer is not None and provenance is not None:
+        tag = _expert_tag_of(provenance, src_node)
+        if tag is not None and tag[0] in dispatch_by_layer:
+            payload["gate"] = dispatch_by_layer[tag[0]]
+            payload["expert"] = tag[1]
+            # 跳过时若这条命令的返回值被主机闭包消费，要给零张量而不是 None：
+            # 未命中专家的贡献就是零，主机侧融合的乘加照常算出一个正确的累加。
+            if edge.dst_loc.get("device") == DEVICE_HOST:
+                payload["skip_value"] = [
+                    list(entry.shape), np.dtype(entry.dtype).name]
+            waits = waits + [payload["gate"]]
+    cmd = builder.append(op, None, payload, reads, writes, waits)
     if edge.dst_loc.get("device") == DEVICE_HOST:
         builder.host_value_of[edge.src] = cmd.id
     # 将重分布命令登记为源张量读者。
@@ -478,6 +636,11 @@ def build_execution_plan(
     emitted_edges: set[int] = set()
     # MoE 动态分派：层号 → 本层 dispatch host_op 的命令号。
     dispatch_by_layer: dict[int, int] = {}
+    # 每个节点的唯一专家归属，供整条专家子图（含分块/通信）统一打标。
+    provenance = _expert_provenance(nodes)
+    # 只有输出会跨出专家子图的命令才需要在跳过时写零；子图内部的读者会
+    # 一起被跳过，给每条命令都清零只是把省下的调度成本又花了回去。
+    skip_zero_nodes = _skip_zero_nodes(nodes, provenance)
     for node in nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
@@ -492,7 +655,9 @@ def build_execution_plan(
             if edge.edge_id in emitted_edges:
                 continue
             emitted_edges.add(edge.edge_id)
-            _emit_redistribute(builder, edge, comm_entries[edge.edge_id], by_name[edge.src])
+            _emit_redistribute(
+                builder, edge, comm_entries[edge.edge_id], by_name[edge.src],
+                dispatch_by_layer, provenance)
 
         if node.op == "output":
             # 图输出使用最后一次写入 host 的命令结果。
@@ -638,13 +803,15 @@ def build_execution_plan(
                     info = sdpa_info_of(node)
                     if info is not None:
                         payload["sdpa"] = info
-                # MoE 动态分派：专家 linear 打上 (gate=本层 dispatch, expert) 标签，
+                # MoE 动态分派：专家子图里的每条命令都打上 (gate, expert) 标签，
                 # 并把 dispatch 加进 waits——运行期先看跳过集再决定发不发内核。
-                expert = _moe_expert_of(node) if _MOE_DISPATCH else None
+                expert = _expert_tag_of(provenance, node)
                 if expert is not None and expert[0] in dispatch_by_layer:
                     payload["gate"] = dispatch_by_layer[expert[0]]
                     payload["expert"] = expert[1]
                     waits = waits + [payload["gate"]]
+                    if node.name in skip_zero_nodes:
+                        payload["skip_zero"] = True
                 cmd = builder.append(
                     "launch", dpu_id, payload,
                     reads, [write], waits,
@@ -657,9 +824,15 @@ def build_execution_plan(
         # 生成主机计算命令。
         cmd = _emit_host_op(builder, node, host_handler_of)
         builder.register_reader(node.name, None, cmd.id)
-        # MoE 门控的 scatter 落地后紧跟一个 dispatch：读 routing 结果，
-        # 把本步无 token 命中的专家写进跳过集（专家 launch 已 waits 本命令）。
-        if _MOE_DISPATCH and node.target == torch.ops.aten.scatter.src:
+        # MoE 门控的 scatter 落地后紧跟一个 dispatch：只有 top-k 选中掩码
+        # （布尔输出）才是命中来源；权重 scatter 的输出只用于加权，不能
+        # 再发一个 dispatch 覆盖同一层的门控。
+        # dtype 从统一 IR 的 spec 读（`meta["val"]` 的 dtype 只允许在
+        # spec_prop 里进入 IR）；掩码 scatter 是唯一的布尔 scatter。
+        spec = node.meta.get(SPEC_META_KEY)
+        if (node.target in (torch.ops.aten.scatter.src,
+                            torch.ops.aten.scatter.value)
+                and spec is not None and spec.dtype == "bool"):
             layer = _moe_layer_of(node, "mlp.gate.weight")
             if layer is not None:
                 dispatch_by_layer[layer] = _emit_moe_dispatch(builder, layer, cmd.id)

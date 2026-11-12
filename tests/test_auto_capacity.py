@@ -20,7 +20,7 @@ from runtime.compile import compile_llama2
 NUM_DPUS = 4
 MAX_SEQ = 16
 KV_SLOT_TOKENS = 4
-ALIGN = 256
+ALIGN = 64
 RESERVE = 1 << 20
 
 

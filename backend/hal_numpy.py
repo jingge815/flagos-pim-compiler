@@ -18,6 +18,9 @@ class NumpyBackendConfig:
     wram_bytes_per_dpu: int = 65536
     allow_device_to_device: bool = False
     num_parallel_slots: int = 1       # 同一步并发的请求上下文数，只影响线程池尺寸。
+    # MoE 动态分派是否生效：None=跟随编译时的执行语义（run_decode_loop 会按
+    # CompiledModel.moe_execution 设定），True/False=显式覆盖（A/B 基准用）。
+    moe_dispatch: bool | None = None
 
 
 @dataclass
@@ -38,6 +41,13 @@ class ExecutionContext:
     pos: int | None = None
     num_tokens: int | None = None
     events: dict[int, Event] = field(default_factory=dict)
+
+
+def _zero_accesses(hal: "NumpyBackend", dpu_id: int, accesses: list) -> None:
+    """把若干 MRAM 区间写零：被跳过的命令在语义上贡献 0。"""
+    for access in accesses:
+        hal.write_local(
+            dpu_id, access.offset, np.zeros(access.length, dtype=np.uint8))
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,12 @@ class NumpyBackend:
         # MoE 动态分派：键 (lane_key, dispatch_cmd_id)，值是本步无 token 命中的
         # 专家集合。空字典 = 不跳过任何命令，行为与引入前一致。
         self.gate_skips: dict[tuple[int, int], set[int]] = {}
+        # 每个 (泳道, dispatch) 实际放行/拦下的命令数。跳过比例与总时延都
+        # 看不出「某一层根本没挂上 gate」，计数落在提交侧才能逐层核对。
+        self.gate_stats: dict[tuple[int, int], dict[str, int]] = {}
+        # 生效值：None 时按 True 处理（计划里的门控标签默认生效），
+        # run_decode_loop 会先按编译语义把 None 解析掉。
+        self.moe_dispatch = config.moe_dispatch
         self._events_by_id: dict[int, Event] = {}
         self._ctx_local = threading.local()
         self._dpu_set: DpuSet = dpu_alloc(
@@ -219,16 +235,30 @@ class NumpyBackend:
         events = self._events_by_id if ctx is None else ctx.events
         if cmd.id in events:
             raise ValueError(f"duplicate command id {cmd.id}")
-        deps = self._dependency_futures(cmd.waits, events)
         lane_key = 0 if ctx is None else int(ctx.lane_key)
+        # MoE 动态分派：命令带 gate 标签时，先等 dispatch 算出本步命中集，再决定
+        # 要不要提交。未命中的命令根本不进执行队列——这是分派真正省时间的地方，
+        # 只在内核入口查跳过集仍要为每条命令付一次调度与清零成本。
+        if "gate" in cmd.payload and self.moe_dispatch is not False:
+            gate_id = int(cmd.payload["gate"])
+            gate_event = events.get(gate_id)
+            if gate_event is None:
+                raise ValueError(
+                    f"命令 {cmd.id} 的门控命令 {gate_id} 不在事件表里，计划顺序有误")
+            self.wait(gate_event)
+            stats = self.gate_stats.setdefault(
+                (lane_key, gate_id), {"submitted": 0, "skipped": 0})
+            if int(cmd.payload["expert"]) in self.gate_skips.get(
+                    (lane_key, gate_id), ()):
+                stats["skipped"] += 1
+                event = self._skipped_event(cmd, lane_key, events, ctx)
+                events[cmd.id] = event
+                return event
+            stats["submitted"] += 1
+        deps = self._dependency_futures(cmd.waits, events)
         if cmd.op == "launch":
             kernel = self._kernels.lookup(str(cmd.payload["kernel"]))
             tracker = HazardTracker()
-            # MoE 动态分派：专家 launch 带 gate 字段时，运行期可能被 dispatch 置入跳过集。
-            gate = (
-                (lane_key, int(cmd.payload["gate"]), int(cmd.payload["expert"]))
-                if "gate" in cmd.payload else None
-            )
 
             def run_with_tracker(dpu_id: int = int(cmd.dpu_id), cmd: Command = cmd,
                                   tracker: HazardTracker = tracker) -> object:
@@ -241,8 +271,7 @@ class NumpyBackend:
             event = Event(
                 "dpu",
                 self._submit_on_dpu(int(cmd.dpu_id), lane_key, deps, ctx,
-                                    run_with_tracker, gate=gate,
-                                    zero_writes=cmd.writes),
+                                    run_with_tracker),
             )
         elif cmd.op == "dma_in":
             data = np.ascontiguousarray(np.asarray(cmd.payload["data"])).copy()
@@ -291,6 +320,57 @@ class NumpyBackend:
             deps.append(event.future)
         return deps
 
+    def _skipped_event(
+        self,
+        cmd: Command,
+        lane_key: int,
+        events: dict[int, Event],
+        ctx: ExecutionContext | None,
+    ) -> Event:
+        """为被分派跳过的命令造一个事件：不执行内核，必要时把输出区写零。
+
+        写零只发生在「还有不会被一起跳过的读者」的命令上（计划构建时打了
+        `skip_zero`）；同专家子图内的读者会一起跳过，读到旧值的路径不存在。
+        主机命令的消费方通过事件取值，按 `skip_value` 返回零张量。
+        """
+        skip_value = cmd.payload.get("skip_value")
+
+        def zero_value() -> object:
+            if skip_value is None:
+                return None
+            return np.zeros(tuple(skip_value[0]), dtype=np.dtype(skip_value[1]))
+
+        writes_by_dpu: dict[int, list] = {}
+        if cmd.payload.get("skip_zero"):
+            for access in cmd.writes:
+                if access.loc[0] == "dpu" and access.loc[1] is not None:
+                    writes_by_dpu.setdefault(int(access.loc[1]), []).append(access)
+        if not writes_by_dpu:
+            future: Future[object] = Future()
+            future.set_result(zero_value())
+            return Event("host" if cmd.dpu_id is None else "dpu", future)
+
+        deps = self._dependency_futures(cmd.waits, events)
+        zeroing = [
+            self._submit_on_dpu(
+                dpu_id, lane_key, deps, ctx,
+                lambda dpu_id=dpu_id, accesses=accesses: _zero_accesses(
+                    self, dpu_id, accesses))
+            for dpu_id, accesses in sorted(writes_by_dpu.items())
+        ]
+        if cmd.dpu_id is not None:
+            return Event("dpu", zeroing[0])
+        # 主机命令的事件值仍是零张量；等所有 DPU 零写完成后再兑现。
+        future = Future()
+
+        def complete(_: object = None) -> None:
+            for pending in zeroing:
+                pending.result()
+            future.set_result(zero_value())
+
+        zeroing[-1].add_done_callback(complete)
+        return Event("host", future)
+
     def _submit_on_dpu(
         self,
         dpu_id: int,
@@ -299,8 +379,6 @@ class NumpyBackend:
         ctx: ExecutionContext | None,
         fn: Callable[..., object],
         *args: object,
-        gate: tuple[int, int, int] | None = None,
-        zero_writes: list | None = None,
     ) -> Future[object]:
         key = (lane_key, dpu_id)
         with self._stream_meta_lock:
@@ -315,17 +393,6 @@ class NumpyBackend:
                     prev.result()
                 for dep in deps:
                     dep.result()
-                # MoE 动态分派：等完 deps（含 dispatch）再看跳过集——本步无
-                # token 命中的专家不发内核，输出区写零（语义=该专家贡献为 0）。
-                # 必须写零而不是留旧值：下游仍会读这块缓冲乘路由权重 0，
-                # 旧值若是 inf/nan（如 fp16 归约溢出残留），inf×0=nan 会毒化累加。
-                if gate is not None and gate[2] in self.gate_skips.get(
-                        (gate[0], gate[1]), ()):
-                    for access in zero_writes or ():
-                        self.write_local(
-                            dpu_id, access.offset,
-                            np.zeros(access.length, dtype=np.uint8))
-                    return None
                 with self._install_context(ctx):
                     return fn(*args)
 

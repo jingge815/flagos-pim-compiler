@@ -1282,6 +1282,28 @@ def test_the_quant_layout_survives_into_the_delivered_pimir(
         f"分组形状与组宽不符（想要 {want_groups} 组）：\n{pimir[:500]}"
 
 
+@pytest.mark.skipif(not _has_pim_passes(),
+                    reason="当前 triton-opt 没有 PIM pass，需重跑 0-install-flagtree.sh")
+def test_text_only_b_path_uses_the_budget_written_in_the_module() -> None:
+    """只拿到文本的调用方没有「本次请求」，模块头里的预算就是硬件配置。
+
+    `_make_oplevel_mlir` 已按请求写死 4 GiB；若再拿 `pim_options()` 的默认
+    8 GiB 去比对，会把一份自洽的中间产物误判成冲突。
+    """
+    from opcompiler_bridge.driver import (
+        _make_oplevel_mlir, _run_oplevel_triton_opt)
+
+    request = OpCompileRequest(
+        op="dynamic_quant", arg_shapes=[(1, 128)], hardware=_hw(),
+        dtype="float16", group_size=128)
+    downlink = _make_oplevel_mlir(request)
+    assert '"pim.mram-bytes" = 4294967296' in downlink
+
+    pimir, _ = _run_oplevel_triton_opt(downlink)
+    assert '"pim.mram-bytes" = 4294967296' in pimir
+    assert '"pim.dma-align" = 64' in pimir
+
+
 # ---- 排布字段（Memory Layout 第 3 层）从统一 IR 走到交付的 pimir ----
 #
 # 本轮之前 `tasklet_tiled` 只收 `rank`：tasklet 无条件全铺在第 0 维，`order`

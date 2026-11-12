@@ -719,32 +719,106 @@ def test_compiler_fingerprint_covers_the_loaded_libtriton() -> None:
         "指纹没有覆盖 libtriton.so")
 
 
+# 多进程队列等待上限只用于死锁检测，不是锁语义的一部分：全量回归时
+# fork 子进程可能在 CPU 满载时迟迟得不到调度，固定 5 秒会随机器负载抖动。
+_LOCK_DRAIN_TIMEOUT_S = 60.0
+_LOCK_JOIN_TIMEOUT_S = 10.0
+
+
+def _drain_lock_events(events, count: int) -> list:
+    """等齐子进程事件，超时只可能是真死锁。"""
+    return [events.get(timeout=_LOCK_DRAIN_TIMEOUT_S) for _ in range(count)]
+
+
+def _lock_worker(queue, gate, cache_dir: str, delay: float) -> None:
+    """两个锁用例共用的子进程：延迟后等 gate 对齐，再抢同一把缓存锁。
+
+    入口必须放在模块级：spawn 只按模块名导入，测试内闭包无法序列化。
+    spawn 不继承父进程 monkeypatch 的模块状态，缓存目录随参数传入。
+    """
+    from opcompiler_bridge import driver
+
+    driver._CACHE_DIR = Path(cache_dir)
+    time.sleep(delay)
+    gate.wait(timeout=30)
+    with driver._cache_key_lock("shared-key"):
+        queue.put(("start", time.monotonic()))
+        time.sleep(0.12)
+        queue.put(("end", time.monotonic()))
+
+
+def _reap_processes(processes) -> None:
+    """回收子进程；join 超时后 terminate/kill，避免测试退出被挂住。"""
+    for process in processes:
+        process.join(timeout=_LOCK_JOIN_TIMEOUT_S)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=_LOCK_JOIN_TIMEOUT_S)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=_LOCK_JOIN_TIMEOUT_S)
+
+
 def test_cache_key_lock_serializes_processes(tmp_path, monkeypatch) -> None:
-    """同一缓存 key 的两个进程不能同时进入编译区。"""
+    """同一缓存 key 的两个进程不能同时进入编译区。
+
+    用 spawn 而不是 fork：全量回归里父进程带着大量线程与队列状态 fork 后，
+    子进程的 Queue feeder 线程可能丢事件，表现为 60 秒后 `_queue.Empty`。
+    这是 round18 问题3 只改超时没有收敛的根因，spawn 让子进程从干净解释器
+    启动，判定不再随回归套件状态抖动。
+    """
     from opcompiler_bridge import driver
 
     monkeypatch.setattr(driver, "_CACHE_DIR", tmp_path)
-    context = mp.get_context("fork")
+    context = mp.get_context("spawn")
     events = context.Queue()
-
-    def worker(queue):
-        with driver._cache_key_lock("same-key"):
-            queue.put(("start", time.monotonic()))
-            time.sleep(0.12)
-            queue.put(("end", time.monotonic()))
-
-    processes = [context.Process(target=worker, args=(events,)) for _ in range(2)]
+    barrier = context.Barrier(2)
+    processes = [
+        context.Process(
+            target=_lock_worker,
+            args=(events, barrier, str(tmp_path), 0.0))
+        for _ in range(2)
+    ]
     for process in processes:
         process.start()
-    records = [events.get(timeout=5) for _ in range(4)]
+    try:
+        records = _drain_lock_events(events, 4)
+    finally:
+        _reap_processes(processes)
     for process in processes:
-        process.join(timeout=5)
         assert process.exitcode == 0
 
     starts = sorted(t for kind, t in records if kind == "start")
     ends = sorted(t for kind, t in records if kind == "end")
     assert len(starts) == len(ends) == 2
     assert starts[1] >= ends[0] - 0.02
+
+
+def test_cache_key_lock_waits_for_a_slow_schedule(tmp_path, monkeypatch) -> None:
+    """子进程被负载拖慢时，串行化判据不能用 5 秒固定上限。
+
+    全量回归里子进程可能在 CPU 满载时迟迟得不到调度；把「5 秒内必须
+    收到队列消息」当作锁语义会让测试随机器负载抖动失败。延迟 6 秒模拟
+    旧上限之后的首次事件，spawn 保证事件不会因 fork 状态丢失。
+    """
+    from opcompiler_bridge import driver
+
+    monkeypatch.setattr(driver, "_CACHE_DIR", tmp_path)
+    context = mp.get_context("spawn")
+    events = context.Queue()
+    barrier = context.Barrier(2)
+    processes = [context.Process(
+        target=_lock_worker,
+        args=(events, barrier, str(tmp_path), 6.0)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    try:
+        records = _drain_lock_events(events, 4)
+    finally:
+        _reap_processes(processes)
+    for process in processes:
+        assert process.exitcode == 0
+    assert len(records) == 4
 
 
 def test_compile_result_carries_pim_mlir() -> None:
@@ -1061,7 +1135,7 @@ def test_default_compile_llama2_fuses_gate_silu_on_the_a_path(monkeypatch) -> No
                               intermediate_size=128, vocab_size=128,
                               num_layers=2),
         prefill_seq_len=4, max_seq=16,
-        hw=HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20),
+        hw=HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20),
         hardware=hardware)
 
     fused = [(req, res) for req, res in seen

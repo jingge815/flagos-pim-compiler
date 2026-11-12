@@ -13,9 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.architectures import ARCHITECTURES
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
-from contracts.op_contract import PIMHardwareConfig
 from genesim_bridge.paths import qwen3_8b_model_dir
-from memory.mem_planner import HwBudget
+from memory.mem_planner import default_site_capacity
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
 from runtime.executor import run_decode_loop
 from runtime.kernels import register_all
@@ -36,10 +35,9 @@ def compiled_and_backend():
     """走 vLLM 同款注册表路径：按 model_type 选加载与切分。"""
     loaded = ARCHITECTURES["qwen3"].load(str(MODEL_DIR))
     strategy = ARCHITECTURES["qwen3"].strategy(NUM_DPUS, loaded.config)
-    hw = HwBudget(mram_bytes=8 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)
-    hardware = PIMHardwareConfig(
-        num_dpus=NUM_DPUS, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
-        wram_bytes_per_dpu=65536, dma_align=64)
+    # 需求 §2.1 P0-3：容量三件套只从同一工厂派生，不手写 8 GiB/64 MiB/对齐。
+    hw, hardware = default_site_capacity(
+        num_dpus=NUM_DPUS, num_tasklets=4)
     compiled = compile_llama2(
         loaded, strategy, prefill_seq_len=8, max_seq=32,
         hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1)

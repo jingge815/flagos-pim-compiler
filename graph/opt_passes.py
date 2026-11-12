@@ -1026,6 +1026,7 @@ class OptReport:
 
 def optimize_graph(gm: GraphModule, *, wram_bytes: int = 65536,
                     tp_width: int = 1, tile: bool = True,
+                    graph_tiling: bool | None = None,
                     merge_shape_ops: bool = False) -> OptReport:
     """按固定顺序跑完五类优化，返回每步的改动数。
 
@@ -1033,7 +1034,10 @@ def optimize_graph(gm: GraphModule, *, wram_bytes: int = 65536,
     `merge_shape_ops` 只在没有流水并行时打开，见 `eliminate_common`。
     `tile` 只给 GML 路关：GML 路连融合一起跳过——切块会改掉缓冲名与字段，
     融合换出的闭包不可发射，两者都只服务执行路径。
+    `graph_tiling` 单独控制图级分块，缺省跟随 `tile`。执行路径要关掉图级分块
+    但仍保留逐元素融合时用它（MoE 的专家 linear 多而窄，图级分块会把图撑爆）。
     """
+    do_tile = tile if graph_tiling is None else graph_tiling
     report = OptReport(
         folded=fold_constants(gm),
         merged=eliminate_common(gm, merge_shape_ops=merge_shape_ops),
@@ -1041,7 +1045,7 @@ def optimize_graph(gm: GraphModule, *, wram_bytes: int = 65536,
         # 被吃掉的计算会从产物里静默消失。融合由专用 Pass 负责。
         fused=fuse_elementwise(gm) if tile else 0,
         removed=eliminate_dead(gm),
-        tiled=tile_graph(gm, wram_bytes, tp_width) if tile else 0,
+        tiled=tile_graph(gm, wram_bytes, tp_width) if do_tile else 0,
     )
     gm.recompile()
     return report

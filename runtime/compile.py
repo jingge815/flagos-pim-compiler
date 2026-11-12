@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,7 +23,9 @@ from memory.kv_layout import KVRegionSpec, kv_specs_from_strategy
 from memory.mem_planner import (
     DPUPlan, HwBudget, fit_activation_windows, fit_pool_slots, plan_dpu)
 from runtime.binding import bind_plan
-from runtime.exec_plan_gen import CompiledPlan, build_execution_plan
+from runtime.exec_plan_gen import (
+    CompiledPlan, build_execution_plan, is_moe_config,
+    resolve_moe_execution)
 
 
 @dataclass
@@ -51,6 +54,9 @@ class CompiledModel:
     prefill_plans: dict[int, list] | None = None  # 桶长 → 各窗口的 prefill 计划。
     prefill_cmd_ids: dict[int, int] | None = None  # 桶长 → 输出命令编号。
     decode_plans: list | None = None
+    # MoE 执行语义：dense_sim / dynamic_dispatch；非 MoE 模型为空串。
+    # 执行后端未显式配置时按它决定是否执行动态分派。
+    moe_execution: str = ""
 
 
 class PositionalLlama(torch.nn.Module):
@@ -218,6 +224,22 @@ def default_prefill_buckets(max_len: int) -> tuple[int, ...]:
         | {max_len}))
 
 
+def graph_tiling_enabled(cfg, tile: bool | None) -> bool:
+    """图级分块开关：显式参数 > `PIM_DISABLE_TILE` > 按架构的默认值。
+
+    MoE 的专家 linear 多而窄，图级分块按 fp32 工作集拆块会把每个专家拆成
+    上百个子节点（4 层试算 >130 万节点），而这些形状本来就由 A 路算子的
+    tt.dot 内部分块负责，所以默认对 MoE 关闭。`PIM_DISABLE_TILE=1` 是仓库内
+    受支持的关闭入口，供外部脚本与排查复现使用。
+    """
+    if tile is not None:
+        return tile
+    if os.environ.get("PIM_DISABLE_TILE", "") not in ("", "0"):
+        return False
+    # 1 专家也是 MoE：按模型身份判定，不用专家数阈值。
+    return not is_moe_config(cfg)
+
+
 def compile_llama2(
     model: torch.nn.Module,
     strategy: ShardStrategy,
@@ -234,6 +256,8 @@ def compile_llama2(
     num_parallel_slots: int | None = None,
     block_table_slots: int | None = None,
     prefill_seq_lens: tuple[int, ...] = (),
+    graph_tiling: bool | None = None,
+    moe_execution: str | None = None,
 ) -> CompiledModel:
     """编译 Llama 的 decode 图与一组按长度分桶的 prefill 图。
 
@@ -246,8 +270,22 @@ def compile_llama2(
     `num_parallel_slots` 为空时取 `min(2, num_request_slots)`，放不下时自动减到 1；
     `block_table_slots` 为空时等于它。`kv_pool_slots` 为空时按 MRAM 剩余空间
     自动定容（上限是 `num_request_slots` 个满长请求的块数再加一块）。
+    `graph_tiling` 控制图级分块：缺省按架构定（MoE 关闭，其余打开），
+    显式 True/False 可覆盖；`PIM_DISABLE_TILE=1` 也走关闭。
+
+    `moe_execution` 是 MoE 的执行语义（`dense_sim` / `dynamic_dispatch`），
+    缺省跟随 `PIM_MOE_DISPATCH`。这一份值随 CompiledModel 交给放置导出与
+    仿真配置，主链各入口不再各自读环境变量或写死。
     """
     cfg = model.config
+    # 容量与对齐是同一份契约：HwBudget 决定三区偏移，PIMHardwareConfig 决定
+    # 算子编译的 DMA 对齐，两者不一致时 sidecar 自报与真实 MLIR 会各说一套。
+    if hw.align != hardware.dma_align:
+        raise ValueError(
+            f"HwBudget.align={hw.align} 与 PIMHardwareConfig.dma_align="
+            f"{hardware.dma_align} 不一致：容量契约的对齐只有一个值，"
+            "请用 memory.mem_planner.default_site_capacity() 派生。")
+    moe_execution = resolve_moe_execution(cfg, moe_execution)
     seq_lens = tuple(sorted({*prefill_seq_lens, prefill_seq_len}))
     if seq_lens[-1] != prefill_seq_len:
         raise ValueError(
@@ -266,9 +304,11 @@ def compile_llama2(
     # 切分传播看到的必须是优化后的图，否则分块拆出的子节点没有布局。
     # 没有流水并行时各层在同一组 DPU 上，各层重复的形状类算子可以合并。
     single_stage = strategy.num_stages == 1
+    do_tiling = graph_tiling_enabled(cfg, graph_tiling)
     for gm in [*prefill_gms.values(), decode_gm]:
         optimize_graph(gm, wram_bytes=hardware.wram_bytes_per_dpu,
-                       tp_width=strategy.tp_width, merge_shape_ops=single_stage)
+                       tp_width=strategy.tp_width, merge_shape_ops=single_stage,
+                       graph_tiling=do_tiling)
 
     # PP×EP：专家输出落在互不相交的 DPU，先把 MoE 累加链改标 host 再传播规格。
     if getattr(strategy, "ep_width", 1) > 1:
@@ -469,6 +509,7 @@ def compile_llama2(
         prefill_plans=prefill_plans,
         prefill_cmd_ids=prefill_cmd_ids,
         decode_plans=_windows(decode.plan),
+        moe_execution=moe_execution,
     )
 
 

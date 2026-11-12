@@ -1,7 +1,14 @@
 # 需求文档：接入 Qwen3 MoE（Qwen3MoeForCausalLM）到 PIM 推理链路
 > 文档编号：request-qwen3-moe-20261105
 > 创建日期：2026-11-05
-> 关联项目：flagos-pim-compiler（组件 pin 263fcda）
+> 关联项目：flagos-pim-compiler（组件 pin 263fcda；实际改动区间见下）
+>
+> 实施状态（2026-11-12）：本需求已实现并通过 4 层真实权重全链验证（见
+> techdoc-qwen3-moe-20261112 与 qwen3-moe-final-20261112）。实施中有两处偏差已生效：
+> GeneSim MoE 计费后来纳入交付（§2.3 原「不包含」不再成立）；组件基线实际覆盖
+> 3ce60b6..daef534（263fcda 为 Qwen3 dense 提交）；模型实际路径以
+> `paths.json` 的 `qwen3_30b_model_dir` 为准（当前 `/data2/pengcheng-models/Qwen3-30B-A3B`）。
+> 本文保留 2026-11-05 的需求原文，供追溯。
 
 ## 一、需求背景与目标
 
@@ -61,7 +68,9 @@
 
 **P0-5 真实 Qwen3-30B-A3B 端到端**
 - 现状：模型未下载；`paths.json` 无键。
-- 需求：从 ModelScope 下载到 `/mnt/sda/butj/fjg/model/Qwen3-30B-A3B`（约 61 GB）；
+- 需求：从 ModelScope 下载到 `/mnt/sda/butj/fjg/model/Qwen3-30B-A3B`（约 61 GB；
+  实施时改用 `paths.json` 的 `qwen3_30b_model_dir`，本工作区为
+  `/data2/pengcheng-models/Qwen3-30B-A3B`）；
   新增站点路径键（`qwen3_30b_model_dir` / 环境变量同型）；真实模型贪心生成短序列
   与 HF 逐 token 一致。
 - 验收判据：新增 `tests/test_qwen3_30b_real.py` 通过（形态对齐
@@ -91,9 +100,10 @@
 ### 2.3 边界定义
 
 **包含**：P0 全部、P1 全部（同一需求分阶段交付）；注册表接入后 vLLM 白名单自动
-跟随属自然结果。**不包含**：genesim 的 MoE 稀疏计费（另立需求）、vLLM serve 实测、
-Qwen3-235B-A22B、权重量化（int8/int4）、滑窗 MoE 变体、tied 词嵌入（30B-A3B 为
-`tie=False`，不受影响；tied 缺口在 dense 文档已记录）。
+跟随属自然结果。**不包含**：vLLM serve 实测、Qwen3-235B-A22B、权重量化（int8/int4）、
+滑窗 MoE 变体、tied 词嵌入（30B-A3B 为 `tie=False`，不受影响；tied 缺口在 dense
+文档已记录）。genesim 的 MoE 计费原列为不包含（另立需求），实施中经 round01 评审
+追加到设计 §十 并纳入交付（2026-11-09）。
 
 ## 三、技术约束与依赖
 
@@ -111,8 +121,9 @@ Qwen3-235B-A22B、权重量化（int8/int4）、滑窗 MoE 变体、tied 词嵌�
 
 ## 五、验收标准
 
-1. **回归判据**：`python -m pytest tests/ -q -k "llama2_7b"`（当前基线 48 passed）
-   与 `tests/test_architectures.py` 全绿；新增 MoE 用例不改变既有架构行为。
+1. **回归判据**：`python -m pytest tests/ -q -k "llama2_7b"`（2026-11-05 历史基线
+   48 passed，本轮未重跑该慢速子集）与 `tests/test_architectures.py` 全绿；
+   新增 MoE 用例不改变既有架构行为。
 2. **逐项验收**：P0-1/2/3/4 以小随机 MoE 全链路 + `test_qwen3_moe` 系列新用例通过
    为准；P0-5 以真实 30B 短序列贪心对拍 HF 一致为准；P1-1 以 token 一致 + 加速比
    记录为准；P1-2 以 16 DPU 专家并行用例通过 + 映射均衡断言为准。

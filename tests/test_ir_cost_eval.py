@@ -397,9 +397,10 @@ def test_fusion_saves_exactly_the_absorbed_tensor_bytes(tmp_path):
         {"layer": 1, "role": "gate_proj", "activation": "silu"},
     ])
     saved = billed_bytes(off, tmp_path / "off.ir") - billed_bytes(on, tmp_path / "on.ir")
-    # decode 点上 Tq(Tp+Tq) 是 5：silu 的系数 64 是一份读加一份写的中间张量，
-    # 清零省下 64 x 5；主算子只多一次结果写回（128 字节）。两个节点都算上。
-    absorbed_tensor_bytes = 2 * (64 * point.tq * point.lkv - 64 * 2)
+    # 当前 token 的 silu 搬运是读加写两份 [Tq,64] = 2×64×2 字节；清零省下
+    # 这笔，主算子只多一次结果写回（64×2 字节）。两个被吸收节点都算上。
+    absorbed_tensor_bytes = 2 * (
+        point.tq * 64 * 2 * 2 - point.tq * 64 * 2)
     assert saved == absorbed_tensor_bytes, (saved, absorbed_tensor_bytes)
 
 
@@ -794,7 +795,7 @@ def test_fusion_skips_an_unrelated_consumer_before_the_named_activation():
         "subgraphs": [[0, 1, 2]],
     }
 
-    _mark_fused_activations(ir, {(0, "gate_proj", "silu")})
+    _mark_fused_activations(ir, {(0, "gate_proj", "silu", -1)})
 
     assert ir["operators"][0]["fused_activation"] == "silu"
     assert ir["operators"][2]["absorbed"] is True
@@ -815,7 +816,35 @@ def test_fusion_rejects_missing_named_activation_consumer():
     }
 
     with pytest.raises(ValueError, match="relu"):
-        _mark_fused_activations(ir, {(0, "gate_proj", "relu")})
+        _mark_fused_activations(ir, {(0, "gate_proj", "relu", -1)})
+
+
+def test_fusion_matches_the_named_expert():
+    """同层多个专家同角色：融合清单必须带专家号，不能吸收到别的专家。"""
+    from genesim_bridge.cost_extractor import _mark_fused_activations
+
+    ir = {
+        "operators": [
+            {"op_id": 0, "op_type": "GEMM", "semantic_role": "gate_proj",
+             "expert_id": 0},
+            {"op_id": 1, "op_type": "SILU", "semantic_role": ""},
+            {"op_id": 2, "op_type": "GEMM", "semantic_role": "gate_proj",
+             "expert_id": 1},
+            {"op_id": 3, "op_type": "SILU", "semantic_role": ""},
+        ],
+        "dependencies": [
+            {"src_op_id": 0, "dst_op_id": 1},
+            {"src_op_id": 2, "dst_op_id": 3},
+        ],
+        "subgraphs": [[0, 1, 2, 3]],
+    }
+
+    _mark_fused_activations(ir, {(0, "gate_proj", "silu", 1)})
+
+    assert ir["operators"][2]["fused_activation"] == "silu"
+    assert ir["operators"][3]["absorbed"] is True
+    assert "fused_activation" not in ir["operators"][0]
+    assert "absorbed" not in ir["operators"][1]
 
 
 @pytest.mark.parametrize("ir_level", ["oplevel", "pimir"])
@@ -851,7 +880,7 @@ def test_absorbed_ops_are_listed_for_the_simulator(tmp_path, ir_level):
 
 def test_refine_step_passes_fusion_from(tmp_path, monkeypatch):
     """精化命令必须带上放置 sidecar 的融合清单。"""
-    from scripts.run_full_pipeline import step_a2_refine_pimir_ir, _PIMIR_IR_NAME
+    from scripts.run_full_pipeline import step_a2_refine_pimir_ir
 
     genesim = tmp_path / "genesim"
     (genesim / "models").mkdir(parents=True)
@@ -865,25 +894,27 @@ def test_refine_step_passes_fusion_from(tmp_path, monkeypatch):
 
     def fake_run(cmd, cwd, log_path):
         captured["cmd"] = cmd
-        out = genesim / "models" / _PIMIR_IR_NAME
+        out = genesim / "models" / "llama2_7b_pimir.ir"
         out.write_text(ir.read_text())
 
     monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
-    step_a2_refine_pimir_ir(genesim, ir, tmp_path, placement=placement)
+    step_a2_refine_pimir_ir(
+        genesim, ir, tmp_path, "llama2_7b", placement=placement)
     assert "--fusion-from" in captured["cmd"]
     assert str(placement) in captured["cmd"]
 
 
 def test_refine_does_not_reuse_ir_when_fusion_sidecar_is_nonempty(tmp_path, monkeypatch):
     """同编号的旧精化 IR 也不能掩盖新的融合清单。"""
-    from scripts.run_full_pipeline import step_a2_refine_pimir_ir, _PIMIR_IR_NAME
+    from scripts.run_full_pipeline import step_a2_refine_pimir_ir
 
     genesim = tmp_path / "genesim"
     (genesim / "models").mkdir(parents=True)
     ir = genesim / "models" / "llama2_7b.ir"
     payload = {"operators": [{"op_id": 0, "op_type": "GEMM"}]}
     ir.write_text(json.dumps(payload))
-    (genesim / "models" / _PIMIR_IR_NAME).write_text(json.dumps(payload))
+    (genesim / "models" / "llama2_7b_pimir.ir").write_text(
+        json.dumps(payload))
     placement = tmp_path / "placement.json"
     placement.write_text(json.dumps({"fused_activations": [{"layer": 0}]}))
     captured = {}
@@ -892,7 +923,8 @@ def test_refine_does_not_reuse_ir_when_fusion_sidecar_is_nonempty(tmp_path, monk
         captured["cmd"] = cmd
 
     monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
-    step_a2_refine_pimir_ir(genesim, ir, tmp_path, placement=placement)
+    step_a2_refine_pimir_ir(
+        genesim, ir, tmp_path, "llama2_7b", placement=placement)
     assert "--fusion-from" in captured["cmd"]
 
 
@@ -971,7 +1003,7 @@ def test_stale_fused_kernels_are_rejected(tmp_path):
 
 def test_refine_sidecar_is_named_after_ir_level(tmp_path, monkeypatch):
     """没有 GPU 时精化走 oplevel，sidecar 要按档位命名，不能覆盖 pimir 那份。"""
-    from scripts.run_full_pipeline import step_a2_refine_pimir_ir, _PIMIR_IR_NAME
+    from scripts.run_full_pipeline import step_a2_refine_pimir_ir
 
     genesim = tmp_path / "genesim"
     (genesim / "models").mkdir(parents=True)
@@ -981,11 +1013,11 @@ def test_refine_sidecar_is_named_after_ir_level(tmp_path, monkeypatch):
 
     def fake_run(cmd, cwd, log_path):
         captured["cmd"] = cmd
-        (genesim / "models" / _PIMIR_IR_NAME).write_text(ir.read_text())
+        (genesim / "models" / "llama2_7b_pimir.ir").write_text(ir.read_text())
 
     monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
     monkeypatch.setattr("scripts.run_full_pipeline._refine_ir_level", lambda: "oplevel")
-    step_a2_refine_pimir_ir(genesim, ir, tmp_path)
+    step_a2_refine_pimir_ir(genesim, ir, tmp_path, "llama2_7b")
     cmd = captured["cmd"]
     assert cmd[cmd.index("--sidecar") + 1].endswith("llama2_7b_oplevel_extensions.json")
     assert cmd[cmd.index("--ir-level") + 1] == "oplevel"
@@ -993,33 +1025,41 @@ def test_refine_sidecar_is_named_after_ir_level(tmp_path, monkeypatch):
 
 def _refine_setup(tmp_path, sidecar_level):
     """已有编号一致的精化 IR，外加一份指定档位的 sidecar。"""
-    from scripts.run_full_pipeline import _PIMIR_IR_NAME
+    from genesim_bridge.cost_extractor import SIDECAR_VERSION
+    from genesim_bridge.ir_fingerprint import fingerprint_ir, fusion_signature
 
     genesim = tmp_path / "genesim"
     (genesim / "models").mkdir(parents=True)
     ir = genesim / "models" / "llama2_7b.ir"
-    payload = json.dumps({"operators": [{"op_id": 0, "op_type": "GEMM"}]})
+    skeleton = {"operators": [{"op_id": 0, "op_type": "GEMM"}]}
+    payload = json.dumps(skeleton)
     ir.write_text(payload)
-    (genesim / "models" / _PIMIR_IR_NAME).write_text(payload)
+    (genesim / "models" / "llama2_7b_pimir.ir").write_text(payload)
     if sidecar_level is not None:
+        # 缓存键 = 指纹 + 档位 + 融合清单 + 成本版本；缺一项都按未命中处理。
         (genesim / "models" / f"llama2_7b_{sidecar_level}_extensions.json").write_text(
-            json.dumps({"ir_level": sidecar_level}))
+            json.dumps({
+                "version": SIDECAR_VERSION,
+                "ir_level": sidecar_level,
+                "ir_fingerprint": fingerprint_ir(skeleton),
+                "fusion_signature": fusion_signature([]),
+            }))
     return genesim, ir
 
 
 def _refine_calls(tmp_path, monkeypatch, sidecar_level, level):
-    from scripts.run_full_pipeline import _PIMIR_IR_NAME, step_a2_refine_pimir_ir
+    from scripts.run_full_pipeline import step_a2_refine_pimir_ir
 
     genesim, ir = _refine_setup(tmp_path, sidecar_level)
     calls = []
 
     def fake_run(cmd, cwd, log_path):
         calls.append(cmd)
-        (genesim / "models" / _PIMIR_IR_NAME).write_text(ir.read_text())
+        (genesim / "models" / "llama2_7b_pimir.ir").write_text(ir.read_text())
 
     monkeypatch.setattr("scripts.run_full_pipeline._run", fake_run)
     monkeypatch.setattr("scripts.run_full_pipeline._refine_ir_level", lambda: level)
-    step_a2_refine_pimir_ir(genesim, ir, tmp_path)
+    step_a2_refine_pimir_ir(genesim, ir, tmp_path, "llama2_7b")
     return calls
 
 
@@ -1033,8 +1073,6 @@ def test_refine_reruns_when_only_other_level_sidecar_exists(tmp_path, monkeypatc
 
 def test_refine_reruns_when_sidecar_level_disagrees(tmp_path, monkeypatch):
     """同名 sidecar 里记的档位与本次不符（旧版错名写入），也要重新精化。"""
-    from scripts.run_full_pipeline import _PIMIR_IR_NAME  # noqa: F401
-
     genesim, _ = _refine_setup(tmp_path, None)
     (genesim / "models" / "llama2_7b_oplevel_extensions.json").write_text(
         json.dumps({"ir_level": "pimir"}))
@@ -1045,3 +1083,191 @@ def test_refine_reruns_when_sidecar_level_disagrees(tmp_path, monkeypatch):
 def test_refine_skips_when_same_level_sidecar_exists(tmp_path, monkeypatch):
     """IR 编号一致、本档位的 sidecar 在且档位相符：跳过，与原行为一致。"""
     assert _refine_calls(tmp_path, monkeypatch, "oplevel", "oplevel") == []
+
+
+@pytest.mark.skipif(not _passes_available(), reason="当前 triton 没有 PIM pass")
+def test_eltwise_and_activation_costs_follow_the_operator_shape(tmp_path):
+    """逐算子按真实形状测量：专家宽 768 的乘法和激活不能用 hidden 2048 代替。
+
+    design §4.2 的专家 FFN 宽度是 `moe_intermediate_size=768`，而
+    `build_recipes` 原先用模型级 `hidden_size` 发 VECTOR_MUL 的测量 IR，
+    Tq=128 时把 98304 FLOPs 记成 262144，拟合系数 6 记成 16。残差加法仍应
+    按 hidden 计，不能跟着一起缩。SILU 未融合时同样要用实际中间宽度。
+    """
+    import json
+
+    from genesim_bridge.cost_extractor import export_costs_to_genesim
+
+    def op(op_id, op_type, width):
+        return {
+            "op_id": op_id, "op_type": op_type,
+            "input_shapes": [["Tq", width], ["Tq", width]],
+            "output_shapes": [["Tq", width]],
+            "flops_coeffs": {}, "data_bytes_coeffs": {},
+        }
+
+    operators = [
+        op(0, "VECTOR_MUL", 768),
+        op(1, "VECTOR_ADD", 2048),
+        {**op(2, "SILU", 768),
+         "input_shapes": [["Tq", 768]], "output_shapes": [["Tq", 768]]},
+    ]
+    ir_path = tmp_path / "moe.ir"
+    ir_path.write_text(json.dumps({
+        "model_id": "moe-widths", "num_layers": 1, "num_heads": 16,
+        "head_dim": 128, "hidden_size": 2048,
+        "operators": operators, "dependencies": [], "subgraphs": [[0, 1, 2]],
+    }))
+    sidecar = export_costs_to_genesim(
+        ir_path, tmp_path / "out.ir", tmp_path / "out.json",
+        seq_len=128, cross_validate=False, ir_level="oplevel",
+    )
+
+    mul = sidecar["operators"]["0"]
+    assert mul["measurements"]["prefill"]["flops"] == 128 * 768
+    assert mul["measurements"]["decode"]["flops"] == 768
+    # 当前 token 的逐元素乘法只随 Tq 增长，系数是真实宽度 768。
+    assert mul["fitted_coeffs"]["flops_coeffs"]["Tq"] == pytest.approx(768.0)
+
+    residual = sidecar["operators"]["1"]
+    assert residual["measurements"]["prefill"]["flops"] == 128 * 2048
+    assert residual["fitted_coeffs"]["flops_coeffs"]["Tq"] == pytest.approx(2048.0)
+
+    silu = sidecar["operators"]["2"]
+    assert silu["measurements"]["prefill"]["flops"] == 128 * 768
+    assert silu["fitted_coeffs"]["flops_coeffs"]["Tq"] == pytest.approx(768.0)
+
+
+def test_rmsnorm_cost_follows_the_operator_shape(tmp_path):
+    """Q/K 归一化按 head_dim=128 计，仍按模型级 hidden 发 IR 会放大 16 倍。
+
+    RMSNORM 原先只在 recipe 里取 `dims["hidden_size"]`，而 Qwen3 的
+    q_norm/k_norm 作用在 head_dim 上。宽度不跟随算子形状，精化 IR 会把
+    每个头的归一化记成整层 hidden 的搬运与计算。
+    """
+    import json
+
+    from genesim_bridge.cost_extractor import export_costs_to_genesim
+
+    def norm(op_id, width):
+        return {
+            "op_id": op_id, "op_type": "RMSNORM",
+            "input_shapes": [["Tq", width]],
+            "output_shapes": [["Tq", width]],
+            "flops_coeffs": {}, "data_bytes_coeffs": {},
+        }
+
+    ir_path = tmp_path / "qk_norm.ir"
+    ir_path.write_text(json.dumps({
+        "model_id": "qk-norm-widths", "num_layers": 1, "num_heads": 32,
+        "head_dim": 128, "hidden_size": 2048,
+        "operators": [norm(0, 128), norm(1, 2048)],
+        "dependencies": [], "subgraphs": [[0, 1]],
+    }))
+    sidecar = export_costs_to_genesim(
+        ir_path, tmp_path / "out.ir", tmp_path / "out.json",
+        seq_len=128, cross_validate=False, ir_level="oplevel",
+    )
+    head_dim_cost = sidecar["operators"]["0"]["measurements"]["prefill"]["flops"]
+    hidden_cost = sidecar["operators"]["1"]["measurements"]["prefill"]["flops"]
+    assert hidden_cost == pytest.approx(head_dim_cost * 16)
+
+
+_COST_TERMS = {
+    "constant": lambda tq, tp: 1.0,
+    "Tq": lambda tq, tp: tq,
+    "Tp": lambda tq, tp: tp,
+    "Tp+Tq": lambda tq, tp: tp + tq,
+    "Tq(Tp+Tq)": lambda tq, tp: tq * (tp + tq),
+}
+
+
+def _eval_coeffs(coeffs, tq, tp):
+    return sum(value * _COST_TERMS[term](tq, tp)
+               for term, value in coeffs.items())
+
+
+def test_current_token_costs_ignore_kv_history_and_attention_tracks_it(tmp_path):
+    """当前 token 类算子按 Tq 计费，不能随 KV 历史 Tp 增长。
+
+    评审 round04 问题1：拟合把所有非 GEMM 都挂到 `Tq(Tp+Tq)` 上，decode
+    长历史下 VECTOR_MUL/RMSNORM/ROPE 等被放大到真实值几十倍。这里在
+    Tp=0/128/726 三个 decode 点核对：当前 token 类逐值不变，注意力类随历史
+    增长；同时 ROPE/MASK 按真实逐头形状测量，不再乘 num_heads。
+    """
+    import json
+
+    from genesim_bridge.cost_extractor import export_costs_to_genesim
+
+    def op(op_id, op_type, inputs, outputs):
+        return {
+            "op_id": op_id, "op_type": op_type,
+            "input_shapes": inputs, "output_shapes": outputs,
+            "flops_coeffs": {}, "data_bytes_coeffs": {},
+        }
+
+    operators = [
+        op(0, "VECTOR_MUL", [["Tq", 768], ["Tq", 768]], [["Tq", 768]]),
+        op(1, "VECTOR_ADD", [["Tq", 2048], ["Tq", 2048]], [["Tq", 2048]]),
+        op(2, "SILU", [["Tq", 768]], [["Tq", 768]]),
+        op(3, "RMSNORM", [["Tq", 128]], [["Tq", 128]]),
+        op(4, "ROPE", [["Tq", 128]], [["Tq", 128]]),
+        op(5, "MASK", [["Tq", "Tp+Tq"]], [["Tq", "Tp+Tq"]]),
+        op(6, "SOFTMAX", [["Tq", "Tp+Tq"]], [["Tq", "Tp+Tq"]]),
+        op(7, "GEMV_SCORE", [["Tq", 128], ["Tp+Tq", 128]],
+           [["Tq", "Tp+Tq"]]),
+        op(8, "GEMV_CONTEXT", [["Tq", "Tp+Tq"], ["Tp+Tq", 128]],
+           [["Tq", 128]]),
+        op(9, "PAGED_ATTN", [["Tq", 128], ["Tp+Tq", 128]], [["Tq", 128]]),
+    ]
+    ir_path = tmp_path / "mixed.ir"
+    ir_path.write_text(json.dumps({
+        "model_id": "mixed-terms", "num_layers": 1, "num_heads": 32,
+        "head_dim": 128, "hidden_size": 2048,
+        "operators": operators, "dependencies": [],
+        "subgraphs": [[op["op_id"] for op in operators]],
+    }))
+    sidecar = export_costs_to_genesim(
+        ir_path, tmp_path / "out.ir", tmp_path / "out.json",
+        seq_len=128, cross_validate=False, ir_level="oplevel",
+    )
+
+    current_token = {"VECTOR_MUL", "VECTOR_ADD", "SILU", "RMSNORM", "ROPE"}
+    history = {"MASK", "SOFTMAX", "GEMV_SCORE", "GEMV_CONTEXT", "PAGED_ATTN"}
+    for raw_id, entry in sidecar["operators"].items():
+        op_type = entry["op_type"]
+        flops = entry["fitted_coeffs"]["flops_coeffs"]
+        data_bytes = entry["fitted_coeffs"]["data_bytes_coeffs"]
+        if op_type in current_token:
+            assert set(flops) <= {"Tq", "constant"}, (op_type, flops)
+            assert set(data_bytes) <= {"Tq", "constant"}, (op_type, data_bytes)
+        elif op_type in history:
+            assert "Tq(Tp+Tq)" in flops, (op_type, flops)
+            assert "Tq(Tp+Tq)" in data_bytes, (op_type, data_bytes)
+        else:  # pragma: no cover - 上面的清单是闭合的
+            raise AssertionError(op_type)
+
+    by_type = {entry["op_type"]: entry for entry in sidecar["operators"].values()}
+    # 逐头形状：32 个 ROPE 节点各算一份，单节点 FLOPs 是 3×head_dim。
+    assert by_type["ROPE"]["fitted_coeffs"]["flops_coeffs"]["Tq"] == \
+        pytest.approx(3 * 128)
+    # MASK 也是逐头节点，每个分数元素 1 FLOP、读加写 2 元素字节。
+    assert by_type["MASK"]["fitted_coeffs"]["flops_coeffs"][
+        "Tq(Tp+Tq)"] == pytest.approx(1.0)
+
+    for op_type in current_token:
+        entry = by_type[op_type]
+        decode_measured = entry["measurements"]["decode"]["flops"]
+        for tp in (0, 128, 726):
+            self_value = _eval_coeffs(
+                entry["fitted_coeffs"]["flops_coeffs"], 1, tp)
+            assert self_value == pytest.approx(decode_measured), (
+                op_type, tp, self_value, decode_measured)
+
+    for op_type in history:
+        entry = by_type[op_type]
+        values = [
+            _eval_coeffs(entry["fitted_coeffs"]["flops_coeffs"], 1, tp)
+            for tp in (0, 128, 726)
+        ]
+        assert values[0] < values[1] < values[2], (op_type, values)

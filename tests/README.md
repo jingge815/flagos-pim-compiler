@@ -64,6 +64,7 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | torch/transformers 环境 | `pytorch_env_script` | 全部 | 导入即报错 |
 | 真实 Llama-2-7B（fp16，约 13 GB） | `llama2_7b_model_dir` | 所有 `*_llama2_7b.py`、`test_phase_source.py`、`test_gml_depends_on_opcompiler.py`、`test_oplevel_emitter_live.py` | 一般 SKIP；`test_gml_depends_on_opcompiler` 有 1 条会 ERROR |
 | 真实 Qwen3-8B（fp16，约 16 GB） | `qwen3_8b_model_dir` | `test_qwen3_8b_real.py` | SKIP |
+| 真实 Qwen3-30B-A3B（MoE，fp16，约 57 GB） | `qwen3_30b_model_dir`（或 `QWEN3_30B_MODEL_DIR`） | `test_qwen3_30b_real.py`、`run_full_pipeline.py --model-dir` | 用例 SKIP；全流程脚本需要显式给 `--model-dir` |
 | ResNet50 GML 参考产物 | `gml_reference_dir` | `test_gml_reference.py`、`test_gml_names.py` | SKIP |
 | llama2 decode-block 参考产物 | `gml_llama2_reference_dir` | `test_runtime_files_phases.py`、`test_gml_llama2_reference.py`、`test_gml_quant.py`、`test_gml_hw_table.py`、`test_gml_coverage.py`、**`test_gml_lut.py`**、**`test_phase_data.py`**、**`test_verify_layers.py`** | 前四个 SKIP；**后三个直接 ERROR** |
 | 本机最近一次 decode-block 导出图 | `gml_ours_graph`（当前未配置） | `test_gml_node_parity.py` | SKIP（整文件） |
@@ -190,10 +191,10 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | `test_prefill_buckets.py` | 21 | prefill 分桶：桶表排序、按最短可容纳原则选桶、跨桶 token 一致、各桶共享权重与 KV 布局、融合 vs 强制主机 | 小模型 | 桶几何查 `compile_llama2(prefill_seq_lens=)`；选桶查 `prefill_bucket` |
 | `test_chunked_prefill.py` | 12（2 条 `slow`） | 分块 prefill：各种切法与整段逐 token 一致、主机两遍路径同样一致、交错请求互不干扰、中间段不采样、3000 token 的 64/512 切法（slow） | 小模型（slow 用 3072 长度图，约 8 分钟/用例） | 位置错先查 `prefill_chunk` 的 `pos`/`position_ids` 与 `_host_paged_attention` 的绝对位置掩码 |
 | `test_profile_execution.py` | 6 | vLLM 调度采集：效率/并发/窗口冲突、空步不计均值、中途失败不串步、stop 还原方法 | 无 | 失败先看 `scripts/profile_execution.py` 的 `_VllmProfiler` 步号过滤；并发类用例靠线程，慢机器上慎调阈值 |
-| `test_architectures.py` | 17 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling` 与真滑窗点名拒绝、Qwen2 配置放行、GQA（4 Q 头 / 2 KV 头）的 KV 布局 / prefill 对拍 HF / 两请求 token 一致、带偏置 Qwen2 贪心生成与 HF `generate` 一致、Qwen3（qk-norm + 显式 head_dim）与 Qwen3 MoE（静态稠密模拟）贪心生成与 HF 一致、门控算子留主机、router/专家权重切分规则 | 小模型（GQA、Qwen2/Qwen3/Qwen3MoE 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束；Qwen3 的 head_dim 不等于 hidden/heads，KV 切分按 `config.head_dim` 对齐；MoE 生成分叉先查 `PIM_MOE_DISPATCH` 开关与跳过集写零 |
+| `test_architectures.py` | 25 | 架构白名单：未知 `model_type` 列出受支持项、`rope_scaling` 与真滑窗点名拒绝、Qwen2 配置放行、GQA（4 Q 头 / 2 KV 头）的 KV 布局 / prefill 对拍 HF / 两请求 token 一致、带偏置 Qwen2 贪心生成与 HF `generate` 一致、Qwen3（qk-norm + 显式 head_dim）与 Qwen3 MoE（静态稠密模拟）贪心生成与 HF 一致、未选中专家溢出不得毒化结果（inf×0）、MoE 默认关图级分块、门控算子留主机、router/专家权重切分规则、站点键可在无权重时解析、编译器导出图 ↔ GeneSim 骨架的权重身份/形状对拍（llama/qwen3/qwen3_moe） | 小模型（GQA、Qwen2/Qwen3/Qwen3MoE 用例） | 白名单改动看 `backend/architectures.py`；GQA 切分失败先查 `llama_strategy` 的 KV 头整除约束；Qwen3 的 head_dim 不等于 hidden/heads，KV 切分按 `config.head_dim` 对齐；MoE 生成分叉先查 `PIM_MOE_DISPATCH` 开关与跳过集写零；权重对拍失败先看 IR 是否缺 lm_head/q_norm/k_norm |
 | `test_qwen3_8b_real.py` | 1 | 真实 Qwen3-8B：注册表加载 → 8 DPU 切分编译 → 贪心生成与 HF `generate` 逐 token 一致 | 真 8B 权重（`qwen3_8b_model_dir`） | 生成分叉先查 `compile.py` 的 head_dim 取值是否用了 `config.head_dim`；Tied 词嵌入（1.7B 一类小模型）目前不支持 |
-| `test_qwen3_30b_real.py` | 1 | 真实 Qwen3-30B-A3B（MoE，48 层 × 128 专家）：注册表加载（静态化）→ tp4_pp2 编译 → 贪心生成与 HF 逐 token 一致（实测 8:43:25，稠密模拟 16× 计算量） | 真 30B 权重（`qwen3_30b_model_dir`） | 编译超时属预期（~4.7 万节点/图）；执行慢是稠密模拟本性，开 `PIM_MOE_DISPATCH` 看 P1 分派 |
-| `test_moe_dispatch.py` | 9 | MoE 动态分派：gate 跳过集（含泳道键隔离、跳过写零防 inf×0=nan）、计划携带 dispatch/expert 标签、端到端跳过数与生成对拍、开关 A/B 一致、双请求并发一致 | 小模型 | 跳过集为空先查 `PIM_MOE_DISPATCH`；分叉先看被跳过命令是否写零了输出区 |
+| `test_qwen3_30b_real.py` | 1 | 真实 Qwen3-30B-A3B（MoE，48 层 × 128 专家）：注册表加载（静态化）→ tp4_pp2 编译（MoE 默认关图级分块，容量三件套用 `default_site_capacity()` 的 8 DPU × 8 GiB 契约）→ 贪心生成；参考在编译后恢复 HF 原始稀疏前向，与 PIM 结果逐 token 一致 | 真 30B 权重（`qwen3_30b_model_dir`） | 编译耗时属预期（~4.7 万节点/图）；参考路径若仍是静态前向，`restore_hf_moe_forward` 的断言会先失败；容量报错打印每 DPU 所需/可用字节 |
+| `test_moe_dispatch.py` | 22 | MoE 动态分派：gate 跳过集（含泳道键隔离、跳过写零防 inf×0=nan）、计划携带 dispatch/expert 标签、端到端跳过数与生成对拍、开关 A/B 一致、双请求并发一致；强制图级分块后整条专家子图仍被识别（穿透 slice/to_copy/cat）、通信命令同受门控且次数下降、主机跳过返回零张量、剔除装载/编译后的子图命令跳过比例；新增逐层 gate 归属（decode/prefill/分块/PP 跨段）、选择归 host、后端逐 dispatch 放行/拦下计数、跨仓 plan↔IR 角色对拍 | 小模型 | 跳过集为空先查 `PIM_MOE_DISPATCH`；某层没有 gate 先看 `_expert_provenance` 的层域；分叉先看被跳过命令是否写零了输出区 |
 | `test_moe_ep.py` | 3 | 专家并行（PP×EP）：ep_width 校验与专家单 DPU 落位、累加链 host 聚合、16 DPU 端到端对拍 HF、dpu→host 读区的 WAR 保护（K3 回归守护） | 小模型 | 多 DPU 数值漂移先查 `_emit_redistribute` 的读区登记（redist 名 + DPU 键） |
 | `test_step_stats.py` | 4 | 每步指标：wave 取整与最宽值、共用块去重占用、日志字段、真实 vLLM 下 `PIM_LOG_STEPS` 有输出且 `PIM_PROFILE` 两套采集器都有数据 | 小模型 + vLLM | 日志没有输出先查 `PIM_LOG_STEPS` 是否生效；采不到步查 `profile_vllm` 的 `_step` 签名是否跟 worker 对齐 |
 
@@ -241,10 +242,11 @@ OMP_NUM_THREADS=16 python -m pytest tests/ -q -k "llama2_7b" -n 12
 | 文件 | 用例 | 验证内容 | 依赖 | 失败优先查 |
 | --- | ---: | --- | --- | --- |
 | `test_genesim_bridge.py` | 52 | TTIR/PIMIR 的 flops、DMA/WRAM、本地分片、系数拟合、mnemonic 覆盖、ODS 卫生 | 部分 PASS / GS | `genesim_bridge/ir_cost.py`、`cost_extractor.py`、`op_classify.py`；`pass 可能没生效` 先验 PIM pass；`进程内 libtriton 比方言源码旧` = 重建 FlagTree 后没同步 `.so`，跑 `0-install-flagtree.sh` |
-| `test_genesim_simulation.py` | 6 | GeneSim 端到端慢速冒烟 + 流水线参数/IR-sidecar 契约 | GS（1 条 slow） | 无 `summary.json` = GeneSim 未装或仿真崩溃；slow 用例会写真实 `genesim/results/` |
+| `test_genesim_simulation.py` | 84 | GeneSim 端到端慢速冒烟 + 流水线参数/IR-sidecar 契约；源 IR 覆盖审计、trace 来源与应覆盖集合、skip-simulation；absorbed 清单证明（主算子唯一消费者、BCD 清单先行、A2 后双向闭合）与容量三件套校验；豁免与 sidecar 放置/`host_gemms` 证据交叉核对；运行号输出隔离（哨兵、交错语义、配置路径回读） | GS（1 条 slow） | 无 `summary.json` = GeneSim 未装或仿真崩溃；slow 用例使用临时目录，不写共享 `genesim/results/`；absorbed 报错先看 `fused_activations` 与主算子 pimir；豁免报错先看 sidecar `operators` 与 `host_gemms` |
 | `test_ir_cost.py` | 1 | `#pim.phase_spec<... bytes=N>` 计入 `mram_traffic_bytes` | 无 | `genesim_bridge/ir_cost.py` 的 phase_spec 解析 |
-| `test_ir_cost_eval.py` | 30 | 融合成本可核算、导出时被吸收节点清零、ttir/pimir 口径一致、IR 可被 GeneSim 读回 | 部分 PASS / GPU / GS | 看 `out.ir`、成本 sidecar、放置 sidecar 的 `fused_activations/absorbed_ops` |
-| `test_placement_export.py` | 40 | 放置结果写进 GeneSim IR/sidecar：分片宽度、collectives、B 路 pimir、trace 来源、KV 区 | 部分 PASS / GS | A 组先看 sidecar `shards.local_in/out_features` 与 `semantic_role`；B 组看 `.opcompiler_cache` |
+| `test_ir_cost_eval.py` | 38 | 融合成本可核算、导出时被吸收节点清零、ttir/pimir 口径一致、IR 可被 GeneSim 读回、逐算子宽度（专家 768 / 残差 hidden / QK 归一化 head_dim）、精化缓存键含指纹/融合清单/成本版本 | 部分 PASS / GPU / GS | 看 `out.ir`、成本 sidecar、放置 sidecar 的 `fused_activations/absorbed_ops`；缓存不命中先看 `ir_fingerprint/fusion_signature/version` |
+| `test_placement_export.py` | 59 | 放置结果写进 GeneSim IR/sidecar：分片宽度、collectives、B 路 pimir、trace 来源、KV 区、模型级 lm_head 导出、结构指纹与容量三件套回传（写出前校验 0 预留/1 字节对齐）；导出步骤按源 IR 核对覆盖 | 部分 PASS / GS | A 组先看 sidecar `shards.local_in/out_features` 与 `semantic_role`；B 组看 `.opcompiler_cache`；lm_head 缺条目先看它是否被混进层子图 |
+| `test_ir_fingerprint.py` | 8 | 结构指纹跨仓算法一致；词表/hidden 变化必须换指纹；改内容不改指纹即失败；A2 精化缓存键含指纹/融合清单/成本版本 | GS（缺 `genesim_root` 时 SKIP） | 跨仓不一致先对 `genesim/src/ir/model_ir.py::structural_fingerprint` 与 `genesim_bridge/ir_fingerprint.py` 的字段表 |
 | `test_layout_feedback.py` | 12 | 算子编译器布局决策回传给成本模型，且必须改变产物；无死字段 | 无 | `contracts/ir_payloads.LayoutFeedback`、`genesim_bridge/ir_cost.py`、`runtime/compile.peak_kernel_mram_bytes` |
 | `test_orchestrator.py` | 33 | 层展开（422 层闭合）、Layer ID、L2 复用、`net.ini`/层 txt 渲染（CRLF） | 无 | `orchestrator/layer_expand.py`、`layer_id.py`、`l2_alloc.py`、`layer_render.py` |
 

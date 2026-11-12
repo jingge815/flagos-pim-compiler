@@ -1448,12 +1448,87 @@ def _dot_f16(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
+def _online_paged_attn_reference(q, cache, table, *, head_dim, slot_tokens,
+                                 slot_elems, k_off, v_off, pos, scale,
+                                 round_pv: bool = True):
+    """按相位存储边界复现单遍在线 softmax，独立于被测 lowering。
+
+    相位表：QK 点积落 f16 → ×scale → f16，掩码选择，exp 落 f16，f16 分数在
+    f32 里求和，每块 PV 乘积落 f16 后加进按 alpha 重标定的 f32 累加器，最后
+    除以 running sum 落 f16。
+    """
+    tokens = q.shape[0]
+    hist = pos + tokens
+    num_blocks = -(-hist // slot_tokens)
+    running_max = np.full(tokens, -1e30, dtype=np.float32)
+    running_sum = np.zeros(tokens, dtype=np.float32)
+    acc = np.zeros((tokens, head_dim), dtype=np.float32)
+    for block in range(num_blocks):
+        start = block * slot_tokens
+        rows = min(slot_tokens, hist - start)
+        slot = int(table[block])
+        k_base = k_off + slot * slot_elems
+        v_base = v_off + slot * slot_elems
+        kb = cache[k_base:k_base + rows * head_dim].reshape(rows, head_dim)
+        vb = cache[v_base:v_base + rows * head_dim].reshape(rows, head_dim)
+        scores = (_dot_f16(q, np.ascontiguousarray(kb.T)).astype(np.float32)
+                  * np.float32(scale))
+        logits = np.full((tokens, rows), np.float16(-np.inf), dtype=np.float16)
+        for t in range(tokens):
+            for r in range(rows):
+                if start + r <= pos + t:
+                    logits[t, r] = scores[t, r]
+        for t in range(tokens):
+            row = logits[t].astype(np.float32)
+            m_new = np.float32(max(running_max[t], row.max()))
+            alpha = np.float32(np.exp(np.float32(running_max[t] - m_new),
+                                      dtype=np.float32))
+            probs = np.exp((row - m_new).astype(np.float32)).astype(np.float16)
+            # 顺序累加，和 EmitC 展开的循环同一口径（BLAS 的归约顺序不保证）。
+            block_sum = np.float32(0)
+            for r in range(rows):
+                block_sum = np.float32(block_sum + np.float32(probs[r]))
+            running_sum[t] = np.float32(running_sum[t] * alpha + block_sum)
+            for d in range(head_dim):
+                dot = np.float32(0)
+                for r in range(rows):
+                    dot = np.float32(
+                        dot + np.float32(probs[r]) * np.float32(vb[r, d]))
+                product = np.float32(np.float16(dot)) if round_pv else dot
+                acc[t, d] = np.float32(acc[t, d] * alpha + product)
+            running_max[t] = m_new
+    return (acc / running_sum[:, None]).astype(np.float16)
+
+
+def _run_paged_attn(q, cache, table, *, head_dim, slot_tokens, slot_elems,
+                    k_off, v_off, pos, scale):
+    tokens = q.shape[0]
+    num_blocks = -(-(pos + tokens) // slot_tokens)
+    request = OpCompileRequest(
+        op="paged_attn",
+        arg_shapes=[(tokens, head_dim), (cache.size,), (table.size,)],
+        hardware=_HARDWARE, dtype="float16",
+        slot_tokens=slot_tokens, slot_elems=slot_elems, scale=scale,
+    )
+    result = compile_op(request, force=True)
+    fn = load_kernel(result)
+    out = np.zeros((tokens, head_dim), dtype=np.float16)
+    fn(q.ctypes.data_as(ctypes.c_void_p),
+       cache.ctypes.data_as(ctypes.c_void_p),
+       table.ctypes.data_as(ctypes.c_void_p),
+       ctypes.c_int32(k_off), ctypes.c_int32(v_off),
+       ctypes.c_int32(pos), ctypes.c_int32(num_blocks),
+       ctypes.c_int32(tokens),
+       out.ctypes.data_as(ctypes.c_void_p))
+    return out, result
+
+
 def test_paged_attn_matches_the_online_reference() -> None:
     """分页注意力：内核自己在设备上查块表，用单遍在线 softmax 算 QK 与 PV。
 
-    参考按内核的展开逐步复现：分数落 f16、掩码是一次选择、逐块维护 running
-    max / sum、指数落 f16、输出在 f32 里按 alpha 重标定，最后除以 running sum。
-    块表乱序（逻辑块 0 → 物理槽 1）时也必须按表取值。
+    参考按相位存储边界逐步复现；块表乱序（逻辑块 0 → 物理槽 1）时也必须
+    按表取值。测试数据要能区分「PV 乘积落 f16」与「不落 f16」两种口径，
+    否则这条用例抓不住契约边界。
     """
     tokens, head_dim, slot_tokens = 4, 16, 16
     plane = slot_tokens * head_dim
@@ -1461,63 +1536,53 @@ def test_paged_attn_matches_the_online_reference() -> None:
     pool_slots, max_blocks = 4, 2
     scale = 1.0 / np.sqrt(head_dim)
 
-    request = OpCompileRequest(
-        op="paged_attn",
-        arg_shapes=[(tokens, head_dim), (pool_slots * slot_elems,), (max_blocks,)],
-        hardware=_HARDWARE, dtype="float16",
-        slot_tokens=slot_tokens, slot_elems=slot_elems, scale=scale,
-    )
-    result = compile_op(request, force=True)
-    fn = load_kernel(result)
-    assert result.by_value == [False, False, False, True, True, True, True, True, False]
-
     rng = np.random.default_rng(5)
     q = (rng.standard_normal((tokens, head_dim)) * 0.5).astype(np.float16)
     cache = (rng.standard_normal(pool_slots * slot_elems) * 0.5).astype(np.float16)
     table = np.array([1, 3], dtype=np.int32)
 
-    out = np.zeros((tokens, head_dim), dtype=np.float16)
-    fn(q.ctypes.data_as(ctypes.c_void_p),
-       cache.ctypes.data_as(ctypes.c_void_p),
-       table.ctypes.data_as(ctypes.c_void_p),
-       ctypes.c_int32(0), ctypes.c_int32(plane),      # kOff / vOff
-       ctypes.c_int32(0), ctypes.c_int32(1),          # pos / 本步 token 数
-       ctypes.c_int32(tokens),
-       out.ctypes.data_as(ctypes.c_void_p))
+    out, result = _run_paged_attn(
+        q, cache, table, head_dim=head_dim, slot_tokens=slot_tokens,
+        slot_elems=slot_elems, k_off=0, v_off=plane, pos=0, scale=scale)
+    assert result.by_value == [False, False, False, True, True, True, True, True, False]
 
-    base = int(table[0]) * slot_elems
-    kb = cache[base:base + plane].reshape(slot_tokens, head_dim)[:tokens]
-    vb = cache[base + plane:base + 2 * plane].reshape(slot_tokens, head_dim)[:tokens]
-    scores = (_dot_f16(q, np.ascontiguousarray(kb.T)).astype(np.float32)
-              * np.float32(scale))
-    logits = np.empty((tokens, tokens), dtype=np.float16)
-    for t in range(tokens):
-        for r in range(tokens):
-            logits[t, r] = scores[t, r] if r <= t else np.float16(-np.inf)
-
-    running_max = np.full(tokens, -1e30, dtype=np.float32)
-    running_sum = np.zeros(tokens, dtype=np.float32)
-    acc = np.zeros((tokens, head_dim), dtype=np.float32)
-    for t in range(tokens):
-        row = logits[t].astype(np.float32)
-        m_new = np.float32(max(running_max[t], row.max()))
-        alpha = np.float32(np.exp(np.float32(running_max[t] - m_new),
-                                  dtype=np.float32))
-        probs = np.exp((row - m_new).astype(np.float32)).astype(np.float16)
-        # 顺序累加，和 EmitC 展开的循环同一口径（BLAS 的归约顺序不保证）。
-        block_sum = np.float32(0)
-        for r in range(tokens):
-            block_sum = np.float32(block_sum + np.float32(probs[r]))
-        running_sum[t] = np.float32(running_sum[t] * alpha + block_sum)
-        for d in range(head_dim):
-            dot = np.float32(0)
-            for r in range(tokens):
-                dot = np.float32(
-                    dot + np.float32(probs[r]) * np.float32(vb[r, d]))
-            acc[t, d] = acc[t, d] * alpha + dot
-        running_max[t] = m_new
-    ref = (acc / running_sum[:, None]).astype(np.float16)
+    kwargs = dict(head_dim=head_dim, slot_tokens=slot_tokens,
+                  slot_elems=slot_elems, k_off=0, v_off=plane, pos=0,
+                  scale=scale)
+    ref = _online_paged_attn_reference(q, cache, table, **kwargs)
     np.testing.assert_array_equal(out, ref)
+    unrounded = _online_paged_attn_reference(
+        q, cache, table, round_pv=False, **kwargs)
+    assert not np.array_equal(unrounded, ref), (
+        "测试数据没有落到不同的 f16 取整点，无法验证 PV 存储边界")
+
+
+def test_paged_attn_multi_block_tail_matches_the_online_reference() -> None:
+    """多块历史与尾块：每块 PV 先落 f16，块间 alpha 重标定逐块传播。"""
+    tokens, head_dim, slot_tokens = 5, 16, 2
+    plane = slot_tokens * head_dim
+    slot_elems = 2 * plane
+    pool_slots, max_blocks = 4, 3
+    scale = 1.0 / np.sqrt(head_dim)
+
+    rng = np.random.default_rng(17)
+    q = (rng.standard_normal((tokens, head_dim)) * 0.5).astype(np.float16)
+    cache = (rng.standard_normal(pool_slots * slot_elems) * 0.5).astype(np.float16)
+    table = np.array([1, 3, 2], dtype=np.int32)
+    pos = 1
+
+    out, _ = _run_paged_attn(
+        q, cache, table, head_dim=head_dim, slot_tokens=slot_tokens,
+        slot_elems=slot_elems, k_off=0, v_off=plane, pos=pos, scale=scale)
+    kwargs = dict(head_dim=head_dim, slot_tokens=slot_tokens,
+                  slot_elems=slot_elems, k_off=0, v_off=plane, pos=pos,
+                  scale=scale)
+    ref = _online_paged_attn_reference(q, cache, table, **kwargs)
+    np.testing.assert_array_equal(out, ref)
+    unrounded = _online_paged_attn_reference(
+        q, cache, table, round_pv=False, **kwargs)
+    assert not np.array_equal(unrounded, ref), (
+        "多块数据没有落到不同的 f16 取整点，无法验证 PV 存储边界")
 
 
 def test_convert_int64_matches_numpy() -> None:

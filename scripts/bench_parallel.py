@@ -23,9 +23,8 @@ from transformers import LlamaConfig, LlamaForCausalLM
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig  # noqa: E402
-from contracts.op_contract import PIMHardwareConfig  # noqa: E402
 from graph.strategy import llama_strategies  # noqa: E402
-from memory.mem_planner import HwBudget  # noqa: E402
+from memory.mem_planner import default_site_capacity  # noqa: E402
 from runtime.compile import causal_mask_of, compile_llama2, load_weights  # noqa: E402
 from runtime.executor import RequestTable, run_one_step  # noqa: E402
 from runtime.kernels import register_all  # noqa: E402
@@ -88,10 +87,9 @@ def _build(args: argparse.Namespace):
         args.num_dpus, num_heads=args.heads, num_kv_heads=args.kv_heads,
         intermediate_size=args.intermediate, vocab_size=args.vocab,
         num_layers=args.layers)[0]
-    hw = HwBudget(mram_bytes=1 << 30, align=256, sys_reserve_bytes=1 << 20)
-    hardware = PIMHardwareConfig(
-        num_dpus=args.num_dpus, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
-        wram_bytes_per_dpu=65536, dma_align=64)
+    hw, hardware = default_site_capacity(
+        num_dpus=args.num_dpus, num_tasklets=4, mram_bytes=1 << 30,
+        sys_reserve_bytes=1 << 20)
     compiled = compile_llama2(
         model, strategy, prefill_seq_len=args.prefill, max_seq=args.max_seq,
         hw=hw, hardware=hardware, num_request_slots=args.requests,

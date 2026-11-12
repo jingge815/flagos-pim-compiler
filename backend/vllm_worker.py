@@ -39,13 +39,21 @@ from backend.architectures import ARCHITECTURES
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
 from backend.metrics import StepStats
 from backend.sampling import RequestSampler, SampleResult, SamplingConfig
-from contracts.op_contract import PIMHardwareConfig
-from memory.mem_planner import HwBudget
+from contracts.op_contract import DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES
+from memory.mem_planner import default_site_capacity
 from runtime.compile import causal_mask_of, compile_llama2, default_prefill_buckets, load_weights
 from runtime.executor import RequestTable, prefill_chunk, step_request
 from runtime.kernels import register_all
 
 logger = init_logger(__name__)
+
+
+def vllm_compile_capacity(num_dpus: int, mram_bytes: int,
+                          sys_reserve_bytes: int):
+    """vLLM 编译期的容量与硬件配置，与主链共用同一工厂。"""
+    return default_site_capacity(
+        num_dpus=num_dpus, num_tasklets=4, mram_bytes=mram_bytes,
+        sys_reserve_bytes=sys_reserve_bytes)
 
 
 def _unsupported(param: str, current, supported: str, advice: str) -> ValueError:
@@ -166,7 +174,9 @@ class PIMWorker(WorkerBase):
                 f"PIM_PREFILL_SEQ_LENS 最长桶 {self.prefill_seq_lens[-1]} 超过 "
                 f"PIM_PREFILL_SEQ_LEN={self.prefill_seq_len}")
         self.num_dpus = int(os.environ.get("PIM_NUM_DPUS", "4"))
-        self.mram_bytes = int(os.environ.get("PIM_MRAM_BYTES", str(4 << 30)))
+        # 默认值取容量契约（8 GiB）；PIM_MRAM_BYTES 只作显式覆盖。
+        self.mram_bytes = int(os.environ.get(
+            "PIM_MRAM_BYTES", str(DPU_MRAM_BYTES)))
         # 交给 vLLM 的块池大小，决定了它可能分配出的块号范围。不设环境变量时
         # 编译期按 MRAM 剩余空间自动定容，上限是「并发上限 × 每请求块数 + 1」，
         # 多出的一块留给 vLLM 启动时永久占用的 null 块。
@@ -228,14 +238,10 @@ class PIMWorker(WorkerBase):
         # 不改全局梯度开关：关闭时 torch.export 会导出另一张图。
         model = arch.load(self.model_config.model)
         strategy = arch.strategy(self.num_dpus, model.config)
-        hw = HwBudget(
-            mram_bytes=self.mram_bytes, align=256,
-            sys_reserve_bytes=int(os.environ.get("PIM_SYS_RESERVE_BYTES", str(64 << 20))),
-        )
-        hardware = PIMHardwareConfig(
-            num_dpus=self.num_dpus, num_tasklets=4,
-            mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536, dma_align=64,
-        )
+        hw, hardware = vllm_compile_capacity(
+            self.num_dpus, self.mram_bytes,
+            int(os.environ.get(
+                "PIM_SYS_RESERVE_BYTES", str(DPU_SYS_RESERVE_BYTES))))
         self.compiled = compile_llama2(
             model, strategy, prefill_seq_len=self.prefill_seq_len,
             max_seq=self.max_seq, hw=hw, hardware=hardware,

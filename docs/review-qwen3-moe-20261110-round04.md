@@ -1,0 +1,44 @@
+# 代码评审报告：Qwen3-MoE 接入与图编译—算子编译—GeneSim 全推理链路验收
+> 文档编号：review-qwen3-moe-20261110-round04
+> 创建日期：2026-11-10
+> 关联需求文档：request-qwen3-moe-20261105
+> 关联设计文档：design-qwen3-moe-20261105
+> 关联实施文档：implement-qwen3-moe-20261105
+
+## 一、评审概述
+　　本轮覆盖 `genesim cdf6c99..434e147`、`flagos-pim-compiler 3ce60b6..daef534`、`FlagTree 262adb3b7..6e34f0299` 及三仓当前工作区改动，行号按当前工作区定位。共发现 4 项问题（1 严重、2 高、1 中）：4 层真实权重、真实 FlagTree 产物和两种语义的 GeneSim 全链路均已跑通，但非 GEMM 成本项在长历史 decode 下严重失真，严格产物契约与结构指纹仍有同类绕过；48 层本轮重跑尚未结束，不能据切片或历史结果宣称全模型通过。
+　　验证前已 `source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh`。所有探针、源码镜像、算子缓存、日志和产物均放在 `/tmp/qwen3-review-round04`，未运行 `-k llama2_7b` 或 CEVA 流水线，未触碰另一个 tune-loop 工作区。实际执行结果如下：
+- `QWEN3_30B_MODEL_DIR=/data2/pengcheng-work/Qwen3-30B-A3B-4L python -m pytest tests/test_architectures.py tests/test_qwen3_8b_real.py tests/test_qwen3_30b_real.py -q -p no:cacheprovider`：**26 passed、1 skipped（495.28 秒）**；8B 无权重，SKIP 记为未覆盖。
+- `python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-work/Qwen3-30B-A3B-4L --num-stages 2 --max-requests 1`：默认 dynamic_dispatch 退出码 0；显式 `--moe-execution dense_sim` 亦退出码 0。两者 IR 均为 3681 个算子，sidecar 均为 1557 个 GEMM + 1606 个算子级条目，23 份 pim mlir 哈希全部有效，tiles 为 `[32,128,512]`，各生成 **10902 条且来源全部为 pimir** 的 trace；总时长分别为 **73.593 秒、76.123 秒**。
+- `python scripts/model_parser.py --model_name /data2/pengcheng-models/Qwen3-30B-A3B --output /tmp/qwen3-review-round04/qwen3-30b-full.ir --execution_dtype float16 --moe-execution dynamic_dispatch`：48 层骨架实际生成 **44117 个算子、18673 个 GEMM，其中 18432 个专家 GEMM**；专家 0..127、top-8、宽度 768，`parameter_bytes=61064245248`，与 `30532122624×2` 一致。该结果只证明骨架，不替代全模型编译和仿真。
+- `cd genesim && ./run.sh --test sim`：**45/45 个测试文件通过**。`python -m pytest tests/ -q -k "not llama2_7b" -p no:cacheprovider`：**1897 passed、10 skipped、52 deselected、失败 0（1771.96 秒）**。既有 FlagTree 安装执行 `triton-opt test/Dialect/TritonPIM/paged_attn_phases.mlir -split-input-file -pim-expand-phases -pim-verify-gml-contract | FileCheck ...`：通过，未重建源码树。
+- 48 层同一目标命令和同一主链命令分别由 `full30b-r4.service`、`full30b-pipeline-r4.service` 执行，启动前可用内存均大于 120 GiB；报告写入时二者仍为 **Active/running**，日志分别为 `/tmp/qwen3-review-round04/target-full30b-r4.log`、`pipeline-full30b-r4.log`。因此本轮 48 层数值与 8 GiB 主链容量均记为**待验证**，K7/K8 不能关闭。
+- 反向探针实测：严格模式下缺失专家 GEMM 与 `BRAND_NEW_OP` 落到 GPU 后均未被预检拒绝；无 `trace_source` 的 trace 被主链接受；依赖边反向前后的结构指纹相同；旧式专家依赖在 decode 中按 16 字节而非预期的 2 字节计费；真实精化 IR 在长历史 decode 下的 VECTOR_MUL FLOPs/字节分别为正确值的 **5.6797/90.875 倍**。
+　　已核实且不再列为问题的契约链为：「128 专家/top-8/768 与完整执行图」→ `genesim/src/ir/model_ir.py:1314-1346,2283-2473,2732-2849` → 上述 48 层骨架及 4 层真实权重对拍；「执行语义源自编译配置」→ `runtime/exec_plan_gen.py:35-52`、`genesim_bridge/placement_export.py:733-751`、GeneSim 的元数据核对 → dynamic/dense 两份 sidecar 与 summary；「真实算子编译且乘法必须是乘法」→ `genesim_bridge/placement_export.py:312-440` → 全部哈希有效、VECTOR_MUL 均为 `pim.eltwise<mul>`、trace 全为 pimir；「8 DPU×8 GiB 容量契约」→ `memory/mem_planner.py:31-40` → sidecar 实测为 8 GiB、64 MiB 预留、64 字节对齐，GeneSim 同值核对。P1-1 的 4 层执行期 prefill 1.148×、decode 1.202×已按用户确认关闭，不作为本轮失败项。
+
+## 二、修改建议
+### 问题1（严重）: 非GEMM成本项错误，导致长历史代价失真
+　　**问题说明**：request §2.1 P0-2/P0-4 与本轮验收要求算子代价符合真实执行几何，design §4.2 明确专家宽度为 768，implement §8.2/§8.3 又把“专家乘法按 768、Q/K 归一化按 head_dim”列为已验证不变式。`genesim_bridge/cost_extractor.py:436-441` 却只给 GEMM 使用 `Tq`，其余所有算子一律使用 `Tq(Tp+Tq)` 拟合 FLOPs 与访存字节；`genesim/src/ir/model_ir.py:39-57` 在运行期按该乘积求值。VECTOR_MUL、RMSNORM、残差加等只处理当前 token，正确不变式应分别为 `Tq×width` 与 `Tq×width×元素字节`，与 KV 历史 `Tp` 无关。真实 4 层精化 IR 的 op155 被写成 `6×Tq(Tp+Tq)` FLOPs、`36×Tq(Tp+Tq)` 字节；在 `Tp+Tq=727` 的 decode 下，dynamic_dispatch 实测为 **272.625 FLOPs、26172 字节**，而按 768 宽度和 top-8/128 应分别为 **48 FLOPs、288 字节**，放大 **5.6797 倍和 90.875 倍**。同请求 q_norm 实测 3635 FLOPs，而 `5×128=640`。因此精化 IR、有效 FLOPs、访存及依赖这些系数的 roofline/效率指标均失真，不能仅凭 prefill 代表点的 98304 FLOPs 宣称成本正确。
+　　**根本原因**：旧拟合逻辑面向注意力类算子，把历史相关成本项推广到了新增整算子级 B 路的所有非 GEMM，没有让配方声明自己依赖 `Tq` 还是 `Tp+Tq`。两个代表点为 `Tq=128,Tp=0` 与 `Tq=1,Tp=128`，原点和截距拟合又允许较大点支配结果，掩盖了 decode 历史变化；`tests/test_ir_cost_eval.py:1125-1136` 只断言代表点测量值和斜率 6/16，没有断言其他 `Tp` 下的不变式，反而把错误成本项固化成测试期望。round02 问题5只修正了测量宽度，没有修正宽度之外的符号项，同一根因影响所有模型的逐元素、归一化、激活、视图及当前 token 算子；注意力得分、掩码和分页注意力才是真正需要保留历史项的路径。
+　　**涉及文件**：`flagos-pim-compiler/genesim_bridge/cost_extractor.py:81-86,427-467,632-638`；`genesim/src/ir/model_ir.py:39-57`；`flagos-pim-compiler/tests/test_ir_cost_eval.py:1087-1136`；`flagos-pim-compiler/docs/implement-qwen3-moe-20261105.md` §8.2/§8.3。
+　　**修改思路**：把成本项作为配方/算子语义的一部分显式声明，由同一描述驱动测量 IR、拟合和运行期求值：当前 token 的逐元素、归一化、激活等使用 `Tq`，注意力类按其真实形状使用 `Tq(Tp+Tq)` 或其它明确项，禁止再用“非 GEMM”一刀切。理论 FLOPs 已确定的算子应保留解析系数，访存拟合也必须采用相同依赖项；升级 `SIDECAR_VERSION` 使旧精化缓存失效。增加至少三个不同 `Tp` 的 decode 点及 prefill 对照，覆盖 VECTOR_MUL/ADD、SILU、RMSNORM、RoPE、注意力、dense/dynamic 两态，并核对精化 IR、summary 的有效 FLOPs/字节和时延，而不是只查代表点斜率；同步撤回实施文档中超出证据的“成本正确”结论。
+
+### 问题2（高）: 严格契约漏检GPU算子，导致产物覆盖失真
+　　**问题说明**：design §十.2-4 要求严格模式在生成 trace 前核对完整 IR、每个必需 pimir 及显式豁免，缺项和未知算子不得回退。`genesim/src/scheduler/gene_sim_scheduler.py:2296-2319` 先只收集已经放到 PIMVPU 的算子，2326-2396 行再检查缺项；而 450-463 行的通用分派会让无放置标注的 GEMM/未知算子进入 GPU。反向探针中，sidecar 同时声明 `requires_pimir=true` 与配置 `require_compiler_pimir=true`，缺失的专家 GEMM、`BRAND_NEW_OP` 只要放到 GPU，严格预检就直接返回且不生成任何 trace，违反“所有设备路径真实消费 pimir”的契约。主链 `scripts/run_full_pipeline.py:823-845` 又只拒绝 `template`，实测无 `trace_source` 的 trace 以 `unknown` 计数后仍通过，不等于“trace 来源全部为 pimir”。
+　　**根本原因**：产物完整性由“最终落点及已生成文件”反推，而不是由源 IR 的应覆盖集合定义；缺条目会改变落点，反而使校验对象消失。round02 问题3只修复了导出端自动豁免和已在 PIM 上的缺项，未收敛直接 GeneSim 的非 PIM 落点、skip-simulation 与来源白名单，因而本轮换路复发。相反路径已复核：`verify_sim_ir_matches_sidecar` 在主链仿真前能拒绝被删除的专家 op152，说明主链 E 并非全部失效；合法 host、模型边界和被吸收节点应继续豁免，纯放置的非严格用法也不应被误伤。`--skip-simulation` 在 986-989 行提前返回，不执行上述 IR 覆盖检查，而 `step_bcd_export` 只检查已有条目及专家号并集，不能证明逐层、逐角色、逐专家的完整覆盖。
+　　**涉及文件**：`genesim/src/scheduler/gene_sim_scheduler.py:450-463,2282-2396`；`flagos-pim-compiler/scripts/run_full_pipeline.py:354-405,467-529,755-810,814-845,986-989`；`flagos-pim-compiler/genesim_bridge/placement_export.py:635-663`；`genesim/tests/sim/test_compiler_placement.py:2226-2448`。
+　　**修改思路**：建立以源 IR 为输入、在放置和 trace 生成之前执行的统一覆盖校验，供直接 GeneSim、完整主链和 skip-simulation 共用：除显式登记的 host、模型边界、被吸收及合法非 DPU 条目外，每个设备算子都必须有可读且哈希正确的 pimir，与最终落到 GPU/CPU/PIM 无关；MoE 还需按 `(层,角色,专家号)` 核对 gate/up/down 完整集合，不能只取专家号并集。豁免须核对 IR 中的执行语义与实际落点，未知类型默认拒绝。trace 验收改为所需算子集合与实际来源集合对拍，只接受明确的 `pimir`，拒绝 `unknown`、缺算子和多余来源。补 GPU/CPU 落点、直接 GeneSim、skip-simulation、未知算子及合法 host/边界/纯放置的正反向测试。
+
+### 问题3（高）: 结构指纹遗漏拓扑，导致跨图产物复用
+　　**问题说明**：design §十.4 要求结构指纹由 IR 内容重算并证明骨架、精化 IR、sidecar 与仿真同源。`genesim/src/ir/model_ir.py:354-394` 与 `flagos-pim-compiler/genesim_bridge/ir_fingerprint.py:18-53` 的指纹只包含模型字段和算子编号/类型/形状/角色，完全没有 `dependencies` 与 `subgraphs`。实测仅把一条依赖从 `0→1` 改为 `1→0`，两边得到的 SHA256 完全相同。`_validate_model_identity`（`gene_sim_scheduler.py:639-671`）和 A2 缓存键（`run_full_pipeline.py:258-308`）都信任该指纹，因此同算子列表但连接关系、层归属或数据流不同的图会被判为同一产物，旧精化成本和放置可能继续消费。
+　　**根本原因**：round03 问题4把“模型身份”实现成算子清单摘要，没有把图拓扑纳入结构定义；测试只覆盖词表、hidden 和成本变化，没有覆盖换边、换层和依赖张量身份。该缺口同时影响直接 GeneSim 的 sidecar 校验、A2 缓存、skip-simulation 后旧产物复用及精化后的调度/通信成本。反向约束是精化可以改算子成本而不能改结构，所以不能把成本系数、设备提示、本地分片形状简单全部加入指纹，否则会误伤合法精化与放置。
+　　**涉及文件**：`genesim/src/ir/model_ir.py:326-394`；`flagos-pim-compiler/genesim_bridge/ir_fingerprint.py:18-53`；`genesim/src/scheduler/gene_sim_scheduler.py:639-671`；`flagos-pim-compiler/scripts/run_full_pipeline.py:258-308`；`flagos-pim-compiler/tests/test_ir_fingerprint.py:51-82`。
+　　**修改思路**：在双仓共享的规范化结构中补入依赖端点、结构性的张量身份和算子层归属，并升级指纹 schema；成本系数、设备提示和本地分片等精化/放置字段继续保持排除。若后续 TP 展开会重写拓扑，应把“原始骨架 lineage 指纹”和“展开后结构指纹”分开，在展开前完成同源校验，避免旧自报值变成新的假证明。测试同时覆盖换边、跨层移动、依赖张量替换的拒绝，以及只改 FLOPs/字节系数、合法精化缓存的继续放行，并保持双仓算法逐字段一致。
+
+### 问题4（中）: 旧式依赖漏动态折算，导致兼容路径虚高
+　　**问题说明**：design §十.6 要求 dynamic_dispatch 的专家通信与 any-hit 执行语义一致。`genesim/src/scheduler/gene_sim_scheduler.py:6672-6697` 的 `dependency_transfer_bytes` 对带显式系数的边正确调用 `_moe_dependency_fraction`，但 6683-6693 行处理无系数的旧式依赖时直接返回完整 `tensor_bytes`，没有应用任何命中比例。`Dependency.from_dict`（`genesim/src/ir/model_ir.py:253-266`）明确支持 `(src,dst)` 旧格式，所以这是合法入口而非非法构造。实测 `E=8,top_k=1,Tq=1`、目标算子为 `expert_work` 时，同样 16 字节的边，显式系数路径正确计为 **2 字节**，旧式路径却计为 **16 字节**；decode 可因此虚高 8 倍，Qwen3 的 top-8/128 情形下该类偏差可达 16 倍。当前 model_parser 生成的显式系数边不受此影响，问题限于旧式/兼容 IR 与由该形式构造的扩展边。
+　　**根本原因**：round02 I20 只在显式 `always_bytes` 求值点补命中比例，没有收敛同函数内的 legacy 分支；`tests/sim/test_pipeline_execution.py:365-407` 虽用旧式依赖测试动态计算，却采用零通信时延拓扑，只看总算子时延，未检查实际通信字节，使同类路径继续漏检。共享累加和 dense_sim 不应被一刀切缩放，必须与可门控专家通信分开验证。
+　　**涉及文件**：`genesim/src/scheduler/gene_sim_scheduler.py:327-357,6672-6697`；`genesim/src/ir/model_ir.py:253-266`；`genesim/tests/sim/test_pipeline_execution.py:365-407`；`genesim/tests/sim/test_moe_execution_cost.py:118-134`。
+　　**修改思路**：把“从显式系数或目标形状求原始载荷”和“按目标成本角色折算”拆成两个统一阶段，让所有分支在同一出口只折算一次，避免新增表示形式再次漏掉。增加显式与旧式依赖等价性测试，使用非零通信拓扑直接断言 `Tq=1/16` 的实际传输字节，同时覆盖 `expert_work/expert_comm/shared_reduce` 与 dense_sim；主链现有显式边应保持逐值不变，不能为修旧格式而改变已验证产物。
+
+　　上述问题修复前，implement §1.3 的“全部完成”及 F13/F15/F19/F21 的关闭结论应重新打开对应条目；48 层则以两个 systemd 单元的最终退出状态、逐 DPU 所需/可用字节和真实产物为准回填，不能用本轮 4 层结果或 round01 历史日志替代。

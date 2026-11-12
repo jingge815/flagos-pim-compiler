@@ -834,12 +834,15 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
     return _module_text(body, request)
 
 
-def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
+def _run_oplevel_triton_opt(
+    mlir_text: str, hardware: "PIMHardwareConfig | None" = None,
+) -> tuple[str, str]:
     """算子级 IR 走一遍：融合 → 展开 → 折叠 → CSE → DCE → 分块 → 校验 → 降到 EmitC。
 
     与 A 路的两次调用同构，只是 pass 列表不同：这条没有 DMA，也就没有
-    `convert-triton-to-pim` / `explicit-dma` 两段。模块头缺预算属性时按
-    `pim_options()` 补上，与 A 路同一份硬件参数。
+    `convert-triton-to-pim` / `explicit-dma` 两段。显式传入的硬件参数或缺预算
+    属性的模块头由 `with_budget` 补上；只拿到文本时沿用模块头已写的预算，
+    两者冲突仍由 `with_budget` 拒绝。
     """
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -849,7 +852,9 @@ def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
         )
     from opcompiler_bridge.pipeline import b_path_passes, with_budget
 
-    mlir_text = with_budget(mlir_text, _options_hardware())
+    mlir_text = with_budget(
+        mlir_text,
+        _options_hardware(mlir_text) if hardware is None else hardware)
     pimir = _run_passes(triton_opt, mlir_text, b_path_passes(), "pim mlir")
     emitc = _run_passes(
         triton_opt, pimir,
@@ -859,14 +864,22 @@ def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
     return pimir, emitc
 
 
-def _options_hardware():
-    """`pim_options()` 里的预算，供只拿到 IR 文本、没有请求的调用方补模块属性。"""
+def _options_hardware(mlir_text: str = ""):
+    """只拿到 IR 文本、没有请求时用的预算，供补模块属性。
+
+    模块头已写的属性是产这份 IR 的请求留下的，优先沿用；缺失项才取
+    `pim_options()`。显式传 hardware 的调用方仍由 `with_budget` 严格校验。
+    """
     import types
 
+    from opcompiler_bridge.pipeline import module_budget
+
     opts = pim_options()
-    return types.SimpleNamespace(wram_bytes_per_dpu=opts["pim_wram_bytes"],
-                                 mram_bytes_per_dpu=opts["pim_mram_bytes"],
-                                 dma_align=opts["pim_dma_align"])
+    budget = module_budget(mlir_text)
+    return types.SimpleNamespace(
+        wram_bytes_per_dpu=budget.get("pim.wram-bytes", opts["pim_wram_bytes"]),
+        mram_bytes_per_dpu=budget.get("pim.mram-bytes", opts["pim_mram_bytes"]),
+        dma_align=budget.get("pim.dma-align", opts["pim_dma_align"]))
 
 
 def _prod(shape) -> int:
@@ -1017,7 +1030,8 @@ def _compile_op_uncached(
         # B 路：整算子级 IR → 融合/展开/校验 → EmitC。没有 DMA 可显式化，
         # 所以不走 A 路那三段；降级 pass 是同一个。
         mlir_text = _make_oplevel_mlir(request)
-        pimir_text, emitc_text = _run_oplevel_triton_opt(mlir_text)
+        pimir_text, emitc_text = _run_oplevel_triton_opt(
+            mlir_text, request.hardware)
     elif request.op == "linear":
         ttir = _make_ttir(request)
         pimir_text, emitc_text = _run_triton_opt(

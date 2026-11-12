@@ -56,7 +56,14 @@ HOST_ONLY = frozenset(
         torch.ops.aten.softmax.int,
         torch.ops.aten.sum.dim_IntList,
         torch.ops.aten.scatter.src,
+        # 标量源（选中掩码 scatter 一个 True）走 value 重载，与 src 同属门控。
+        torch.ops.aten.scatter.value,
         torch.ops.aten.zeros_like.default,
+        # 7. MoE 路由掩码与选择：谓词与路由权重同在主机，PIM 原语集没有
+        #    逐元素 select（见 FlagTree 的 eltwise/mask 定义），下设备只能
+        #    借一个语义不同的原语。选择与随后的加权累加在主机闭包里一体完成。
+        torch.ops.aten.ne.Scalar,
+        torch.ops.aten.where.ScalarOther,
     }
 )
 

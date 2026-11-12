@@ -52,14 +52,36 @@ class PIMHardwareConfig:
         )
 
 
-# 默认 PIM 硬件配置。
-DEFAULT_HARDWARE_CONFIG = PIMHardwareConfig(
-    num_dpus=8,
-    num_tasklets=16,
-    mram_bytes_per_dpu=8 * 2**30,
-    wram_bytes_per_dpu=65536,
-    dma_align=8,
-)
+# 单台 DPU 的容量契约：需求 §2.1 P0-3 的 8 DPU × 8 GiB 是硬约束。
+# 架构描述、图编译、真实测试、执行期基准与 GeneSim 都从这里取值，禁止各入口
+# 再写 4/8/16 GiB 字面量；改动这一处等于改硬件参数，必须经需求确认。
+DPU_MRAM_BYTES = 8 * 2**30
+DPU_SYS_RESERVE_BYTES = 64 * 2**20
+DPU_DMA_ALIGN = 64
+
+def default_hardware_config(
+    *,
+    num_dpus: int = 8,
+    num_tasklets: int = 16,
+    mram_bytes_per_dpu: int = DPU_MRAM_BYTES,
+    wram_bytes_per_dpu: int = 65536,
+) -> PIMHardwareConfig:
+    """按容量契约三件套派生硬件配置。
+
+    对齐不是独立参数：它必须与 `HwBudget.align` 同取 `DPU_DMA_ALIGN`，
+    否则 sidecar 自报 64、真实 pim mlir 却按 8 落位。
+    """
+    return PIMHardwareConfig(
+        num_dpus=num_dpus,
+        num_tasklets=num_tasklets,
+        mram_bytes_per_dpu=mram_bytes_per_dpu,
+        wram_bytes_per_dpu=wram_bytes_per_dpu,
+        dma_align=DPU_DMA_ALIGN,
+    )
+
+
+# 默认 PIM 硬件配置：与容量契约同一份真源。
+DEFAULT_HARDWARE_CONFIG = default_hardware_config()
 
 
 def flatten_leading_dims(shape: tuple[int, ...]) -> tuple[int, int]:

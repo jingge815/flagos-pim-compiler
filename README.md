@@ -347,6 +347,11 @@ python -m pytest tests/test_vllm_compat.py -q
 - `docs/fused-rms-norm-20261102.md` — RMSNorm 链融合（934 → 718 条命令，token 逐字不变）
 - `docs/runtime-windows-20261102.md` — 运行期窗口选择与设备端分配器接口设计
 - `docs/qwen2-support-20261102.md` — 接入 Qwen2（偏置链路）与 GQA 缓存覆盖修复
+- `docs/qwen3-support-20261104.md` — 接入 Qwen3 dense（head_dim 解耦；MoE 状态见下）
+- `docs/qwen3-moe-final-20261112.md` — Qwen3 MoE 最终汇总：文档-代码一致性核对与当前状态入口
+- `docs/techdoc-qwen3-moe-20261112.md` — Qwen3 MoE 技术文档（三段证据链、改动依据、遗留问题）
+- `docs/design-qwen3-moe-20261105.md` — Qwen3 MoE 设计（含 §十 GeneSim 成本与产物契约）
+- `docs/implement-qwen3-moe-20261105.md` — Qwen3 MoE 实施记录（逐轮问题、验证命令与证据）
 - `docs/bench-regression-20261102.md` — 基准回归门限：`verify.sh --bench` 与基线文件
 - `docs/weekly-20261102.md` — 周报（10-27 → 11-02）：与 10-26 汇报逐条对照的进度
 - `docs/<module>.md` — 各模块接口与设计决策

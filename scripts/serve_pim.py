@@ -11,7 +11,7 @@ PIM 自己的开关走 `--pim-*`，解析后转成环境变量交给 `PIMWorker`
 示例：
     python scripts/serve_pim.py --model /path/to/Llama-2-7b-hf \\
         --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 4096 \\
-        --pim-num-dpus 4 --pim-mram-bytes 4294967296
+        --pim-num-dpus 4
 """
 
 from __future__ import annotations
@@ -36,13 +36,17 @@ from vllm.entrypoints.openai.cli_args import (
 )
 
 from backend.vllm_executor import PIMExecutor
+from contracts.op_contract import (
+    DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES)
+from memory.kv_layout import KVRegionSpec, build_kv_layout
+from memory.mem_planner import default_hw_budget
 
 # PIM 开关：命令行选项、参数名、对应环境变量、帮助文本。
 PIM_FLAGS = (
     ("--pim-num-dpus", "pim_num_dpus", "PIM_NUM_DPUS",
      "PIM 内部张量并行的 DPU 数（默认 4）"),
     ("--pim-mram-bytes", "pim_mram_bytes", "PIM_MRAM_BYTES",
-     "单台 DPU 的 MRAM 字节数（默认 4 GiB）"),
+     f"单台 DPU 的 MRAM 字节数（默认 {DPU_MRAM_BYTES // 2**30} GiB）"),
     ("--pim-kv-pool-slots", "pim_kv_pool_slots", "PIM_KV_POOL_SLOTS",
      "全局物理 KV 槽池大小（默认 max_num_seqs × 每请求块数 + 1）"),
     ("--pim-parallel-slots", "pim_parallel_slots", "PIM_PARALLEL_SLOTS",
@@ -52,8 +56,6 @@ PIM_FLAGS = (
     ("--pim-log-steps", "pim_log_steps", "PIM_LOG_STEPS",
      "每 N 步打印一行运行时指标（默认 0，不打印）"),
 )
-
-ALIGN = 256
 
 
 def add_pim_args(parser: argparse.ArgumentParser) -> None:
@@ -88,18 +90,28 @@ def _kv_bytes_per_dpu(model_config, block_size: int, pool_slots: int,
                       parallel_slots: int) -> int:
     """估算每台 DPU 的 KV 区字节数（块表缓冲 + 槽池）。
 
-    与 `memory/kv_layout.KVRegionSpec` 的口径一致：块表每窗口一行、槽池按本机
-    分到的 KV 头计。不含权重，真正的上限仍由编译期 `plan_dpu()` 判定，这里只拦
-    明显装不下的配置。
+    直接复用 `memory.kv_layout.build_kv_layout`，与编译期 `plan_dpu()` 同一
+    公式、同一对齐。预检和真实规划不能再各写一套对齐/取整。
     """
     hf = model_config.hf_config
     head_dim = getattr(hf, "head_dim", None) or hf.hidden_size // hf.num_attention_heads
-    kv_heads = -(-hf.num_key_value_heads // _env_int("PIM_NUM_DPUS", 4))
-    # 2（K 和 V）× 层数 × 头数 × 头维 × fp16 字节 × 槽内 token 数。
-    slot_bytes = 2 * hf.num_hidden_layers * kv_heads * head_dim * 2 * block_size
-    blocks_per_request = -(-model_config.max_model_len // block_size)
-    block_table_bytes = -(-blocks_per_request * 4 // ALIGN) * ALIGN
-    return parallel_slots * block_table_bytes + pool_slots * slot_bytes
+    num_dpus = _env_int("PIM_NUM_DPUS", 4)
+    kv_heads = -(-hf.num_key_value_heads // num_dpus)
+    spec = KVRegionSpec(
+        dpu_id=0,
+        layers=list(range(hf.num_hidden_layers)),
+        kv_heads=list(range(kv_heads)),
+        q_heads_by_kv={head: [] for head in range(kv_heads)},
+        max_seq=model_config.max_model_len,
+        head_dim=head_dim,
+        dtype_bytes=2,
+        kv_base=0,
+        slot_tokens=block_size,
+    )
+    return build_kv_layout(
+        spec, default_hw_budget().align, pool_slots=pool_slots,
+        block_table_slots=parallel_slots,
+    ).kv_allocated_bytes
 
 
 def preflight(vllm_config) -> None:
@@ -116,8 +128,8 @@ def preflight(vllm_config) -> None:
     pool_slots = int(raw_pool) if raw_pool else None
     prefill_seq_len = _env_int("PIM_PREFILL_SEQ_LEN", max_model_len)
     parallel_slots = min(num_request_slots, _env_int("PIM_PARALLEL_SLOTS", 2))
-    mram_bytes = _env_int("PIM_MRAM_BYTES", 4 << 30)
-    reserve = _env_int("PIM_SYS_RESERVE_BYTES", 64 << 20)
+    mram_bytes = _env_int("PIM_MRAM_BYTES", DPU_MRAM_BYTES)
+    reserve = _env_int("PIM_SYS_RESERVE_BYTES", DPU_SYS_RESERVE_BYTES)
 
     problems: list[str] = []
     if prefill_seq_len > max_model_len:
@@ -139,7 +151,9 @@ def preflight(vllm_config) -> None:
                 f"{prefill_seq_len}：一个 prefill 分块不超过这个预算；"
                 f"建议加 --max-num-batched-tokens {prefill_seq_len}，"
                 f"或把 --pim-prefill-seq-len 调到 {budget} 以上")
-    if pool_slots is not None:
+    if pool_slots is not None and pool_slots > blocks_per_request:
+        # 槽池装不下满长请求已在上面单独报过；这里只比装得下的配置，
+        # 避免以规划器的异常代替可读的预检结论。
         kv_bytes = _kv_bytes_per_dpu(model, block_size, pool_slots, parallel_slots)
         if kv_bytes > mram_bytes - reserve:
             problems.append(

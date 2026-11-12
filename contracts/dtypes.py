@@ -16,16 +16,23 @@ ELEMENT_DTYPES = frozenset({"int4", "int8", "int16", "int32", "float16", "float3
 # element_size() 改查 dtype 就会在这几个节点上抛错，不是等价重构。
 INDEX_DTYPES = frozenset({"int64"})
 
+# 谓词张量的类型。MoE 选中掩码 `selected_mask`（top-k 选中索引 scatter 出的
+# bool）以 bool 形式在主机上参与 `where` 选择；它同样只占内存、不参与算术，
+# 单列一类。bool 在 PyTorch 里一个元素占 1 字节，与 `element_size()` 一致。
+BOOL_DTYPES = frozenset({"bool"})
+
 _DTYPE_BYTES = {"int4": 1, "int8": 1, "int16": 2,
-                "int32": 4, "float16": 2, "float32": 4, "int64": 8}
+                "int32": 4, "float16": 2, "float32": 4, "int64": 8,
+                "bool": 1}
 
 
 def validate_dtype(name: str) -> None:
     """不在集合内直接抛错（不写防御性兜底）。"""
-    if name not in ELEMENT_DTYPES and name not in INDEX_DTYPES:
+    if (name not in ELEMENT_DTYPES and name not in INDEX_DTYPES
+            and name not in BOOL_DTYPES):
         raise ValueError(
             f"未知元素类型 {name!r}，允许 "
-            f"{sorted(ELEMENT_DTYPES | INDEX_DTYPES)}")
+            f"{sorted(ELEMENT_DTYPES | INDEX_DTYPES | BOOL_DTYPES)}")
 
 
 def dtype_bytes(name: str) -> int:

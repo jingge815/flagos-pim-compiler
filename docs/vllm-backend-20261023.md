@@ -171,7 +171,7 @@ vLLM 的 `--help` 只列配置组名，这组选项用 `--help=PIMConfig` 查看
 | `PIM_PREFILL_SEQ_LEN` | `max_model_len` | **最长** prefill 桶；prompt 补齐到选中的桶 |
 | `PIM_PREFILL_SEQ_LENS` | `128/512/2048` + 最长桶 | 逗号分隔的 prefill 桶表，见 `docs/vllm-prefill-buckets-20261101.md` |
 | `PIM_NUM_DPUS` | 4 | PIM 内部张量并行的 DPU 数 |
-| `PIM_MRAM_BYTES` | 4 GiB | 单台 DPU 的 MRAM 总量 |
+| `PIM_MRAM_BYTES` | 8 GiB（容量契约） | 单台 DPU 的 MRAM 总量 |
 | `PIM_SYS_RESERVE_BYTES` | 64 MiB | 系统预留，不参与三区规划 |
 | `PIM_KV_POOL_SLOTS` | `max_num_seqs × 每请求块数 + 1` | 全局物理槽池大小，必须 ≥ 每请求块数；多出的一块给 vLLM 的 null 块 |
 

@@ -19,7 +19,7 @@ DPU 数、MRAM 大小、槽池、窗口数、prefill 图长度全靠环境变量
 | 选项 | 环境变量 | 默认值 |
 | --- | --- | --- |
 | `--pim-num-dpus` | `PIM_NUM_DPUS` | 4 |
-| `--pim-mram-bytes` | `PIM_MRAM_BYTES` | 4 GiB |
+| `--pim-mram-bytes` | `PIM_MRAM_BYTES` | 8 GiB（容量契约） |
 | `--pim-kv-pool-slots` | `PIM_KV_POOL_SLOTS` | `max_num_seqs × 每请求块数 + 1` |
 | `--pim-parallel-slots` | `PIM_PARALLEL_SLOTS` | 2（受 `max_num_seqs` 限制） |
 | `--pim-prefill-seq-len` | `PIM_PREFILL_SEQ_LEN` | `max_model_len` |

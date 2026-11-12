@@ -148,3 +148,80 @@ def test_parser_accepts_pim_flags() -> None:
     assert args.pim_num_dpus == 8
     assert args.pim_mram_bytes == 1024
     assert args.pim_kv_pool_slots is None
+
+
+def _layout(config, *, pool_slots: int, parallel_slots: int,
+            align: int | None = None):
+    """按真实 `build_kv_layout` 计算同一 KV 几何的字节数。"""
+    from memory.kv_layout import KVRegionSpec, build_kv_layout
+    from memory.mem_planner import default_hw_budget
+
+    hf = config.model_config.hf_config
+    head_dim = getattr(hf, "head_dim", None) or (
+        hf.hidden_size // hf.num_attention_heads)
+    num_dpus = int(os.environ.get("PIM_NUM_DPUS", "4"))
+    kv_heads = -(-hf.num_key_value_heads // num_dpus)
+    spec = KVRegionSpec(
+        dpu_id=0,
+        layers=list(range(hf.num_hidden_layers)),
+        kv_heads=list(range(kv_heads)),
+        q_heads_by_kv={head: [] for head in range(kv_heads)},
+        max_seq=config.model_config.max_model_len,
+        head_dim=head_dim,
+        dtype_bytes=2,
+        kv_base=0,
+        slot_tokens=config.cache_config.block_size,
+    )
+    return build_kv_layout(
+        spec,
+        default_hw_budget().align if align is None else align,
+        pool_slots=pool_slots,
+        block_table_slots=parallel_slots,
+    ).kv_allocated_bytes
+
+
+def test_kv_estimate_reuses_the_real_layout() -> None:
+    """启动预检的 KV 估算必须与 `build_kv_layout` 同一个公式。"""
+    from scripts.serve_pim import _kv_bytes_per_dpu
+
+    config = _config()
+    assert _kv_bytes_per_dpu(config.model_config, BLOCK_SIZE, 3, 2) == _layout(
+        config, pool_slots=3, parallel_slots=2)
+
+
+def test_preflight_accepts_a_layout_that_fits_under_the_contract_alignment(
+        monkeypatch) -> None:
+    """旧预检按 256 字节对齐会拒掉实际装得下的配置；契约对齐必须放行。"""
+    from contracts.op_contract import DPU_SYS_RESERVE_BYTES
+
+    config = _config()
+    needed = _layout(config, pool_slots=3, parallel_slots=2)
+    old = _layout(config, pool_slots=3, parallel_slots=2, align=256)
+    assert old > needed, "探针前提：256 字节对齐确实会算出更大的字节数"
+    monkeypatch.setenv("PIM_KV_POOL_SLOTS", "3")
+    monkeypatch.setenv("PIM_MRAM_BYTES", str(DPU_SYS_RESERVE_BYTES + needed))
+    preflight(config)
+
+
+def test_preflight_rejects_one_byte_over_the_budget(monkeypatch) -> None:
+    """真正超过预算一个字节时仍必须拒绝，不能把判据放宽成不算。"""
+    from contracts.op_contract import DPU_SYS_RESERVE_BYTES
+
+    config = _config()
+    needed = _layout(config, pool_slots=3, parallel_slots=2)
+    monkeypatch.setenv("PIM_KV_POOL_SLOTS", "3")
+    monkeypatch.setenv(
+        "PIM_MRAM_BYTES", str(DPU_SYS_RESERVE_BYTES + needed - 1))
+    with pytest.raises(SystemExit, match="MRAM"):
+        preflight(config)
+
+
+def test_serve_pim_has_no_independent_alignment_or_old_budget() -> None:
+    """启动入口不能再写 256 对齐或示例性的 4 GiB 预算。"""
+    from pathlib import Path
+
+    import scripts.serve_pim as serve_pim
+
+    source = Path(serve_pim.__file__).read_text()
+    assert "ALIGN = 256" not in source
+    assert "4294967296" not in source

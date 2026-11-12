@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .flagtree_driver import lower_oplevel_to_pimir, run_and_capture
+from .ir_fingerprint import assert_ir_fingerprint, fusion_signature
 from .ir_cost import analyze_ir
 from .op_classify import (
     UNCOVERED_OP_TYPES,
@@ -19,7 +20,12 @@ from .op_classify import (
 )
 from .paths import pim_options
 
-SIDECAR_VERSION = "1.1"
+# 成本算法版本。1.2 让逐算子宽度（专家 768 / 残差 hidden / QK 归一化
+# head_dim）跟随真实形状；1.3 把成本项收进配方声明（当前 token 用 Tq，
+# 注意力用 Tq(Tp+Tq)），并让 ROPE/MASK 按逐头节点测量；1.4 让 host 的
+# 选择+加权累加把选择本身计入（首专家两份、其余三份 Tq*hidden）。每次
+# 改变回填/模板系数，旧精化产物都必须失效。
+SIDECAR_VERSION = "1.4"
 
 # 融合注意力交叉验证使用的 WRAM 预算。
 _PROBE_WRAM_BYTES = 256 * 1024
@@ -40,6 +46,8 @@ class Measurement:
     pim_kernels: List[Dict[str, Any]] = field(default_factory=list)
     # 按本地分片形状测量时的 (in_features, out_features)，全局口径时为 None。
     local_features: Optional[Tuple[int, int]] = None
+    # 该测量结果随哪个编译代表点变量增长，由配方的 `cost_term` 决定。
+    cost_term: str = "Tq"
 
 
 def _measure(
@@ -75,6 +83,11 @@ def _measure(
             )
         else:
             recipe = recipes["GEMM"](point, in_features, out_features)
+    elif op_type in ("VECTOR_ADD", "VECTOR_MUL", "SILU", "RMSNORM"):
+        # 逐元素、激活与归一化的宽度取当前算子自己的输出形状：专家中间宽是
+        # 768、Q/K 归一化是 head_dim、残差加是 hidden，不能统一按模型级代表。
+        recipe = recipes[op_type](
+            point, width=_element_width(op_dict, point))
     else:
         recipe = recipes[op_type](point)
 
@@ -145,6 +158,7 @@ def _measure(
         mram_traffic_bytes=total_mram if pimir else None,
         pim_kernels=pim_kernels,
         local_features=local_features,
+        cost_term=recipe.cost_term,
     )
 
 
@@ -222,6 +236,7 @@ def _measure_oplevel(
         mram_traffic_bytes=cost.mram_traffic_bytes,
         pim_kernels=[_pim_kernel_dict(cost)],
         local_features=local_features,
+        cost_term=recipe.cost_term,
     )
 
 
@@ -269,18 +284,24 @@ def _pim_kernel_dict(cost) -> Dict[str, Any]:
     }
 
 
+def _fused_activations(sidecar_path: Optional[Path]) -> list:
+    """放置 sidecar 里图编译器折过的激活清单，原样返回。"""
+    if sidecar_path is None:
+        return []
+    data = json.loads(Path(sidecar_path).read_text())
+    return data.get("fused_activations", [])
+
+
 def _fused_pairs(sidecar_path: Optional[Path]) -> set:
-    """放置 sidecar 里图编译器折过的 (层号, 投影身份, 激活名)。
+    """放置 sidecar 里图编译器折过的 (层号, 投影身份, 激活名, 专家号)。
 
     没有这份清单就按未融合处理：融合与否是图编译器的决策，不能从模型 IR
     里 gate 投影后接不接 silu 猜出来。
     """
-    if sidecar_path is None:
-        return set()
-    data = json.loads(Path(sidecar_path).read_text())
     return {
-        (entry["layer"], entry["role"], entry["activation"])
-        for entry in data.get("fused_activations", [])
+        (entry["layer"], entry["role"], entry["activation"],
+         int(entry.get("expert", -1)))
+        for entry in _fused_activations(sidecar_path)
     }
 
 
@@ -304,7 +325,7 @@ def _mark_fused_activations(ir: Dict[str, Any], fused: set) -> None:
     by_id = {op["op_id"]: op for op in ir["operators"]}
     layer_of = _layer_of(ir)
     dependencies = ir.get("dependencies", [])
-    for layer, role, activation in sorted(fused):
+    for layer, role, activation, expert in sorted(fused):
         matches = []
         for edge in dependencies:
             src = by_id.get(edge["src_op_id"])
@@ -312,6 +333,7 @@ def _mark_fused_activations(ir: Dict[str, Any], fused: set) -> None:
             if (src is None or dst is None
                     or layer_of.get(src["op_id"]) != layer
                     or src.get("semantic_role") != role
+                    or int(src.get("expert_id", -1)) != expert
                     or dst.get("op_type") != activation.upper()):
                 continue
             inputs = [item["src_op_id"] for item in dependencies
@@ -321,7 +343,8 @@ def _mark_fused_activations(ir: Dict[str, Any], fused: set) -> None:
 
         if len(matches) != 1:
             raise ValueError(
-                f"融合清单指定 layer={layer} role={role!r} activation={activation!r}，"
+                f"融合清单指定 layer={layer} role={role!r} "
+                f"expert={expert} activation={activation!r}，"
                 f"应恰好匹配一个以该投影为唯一输入的激活，实际 {len(matches)} 个"
             )
         src, dst = matches[0]
@@ -349,6 +372,23 @@ def _resolve_dim(dim: Any, point: ShapePoint) -> int:
     if dim not in table:
         raise ValueError(f"未知符号维度: {dim}")
     return table[dim]
+
+
+def _element_width(op_dict: dict, point: ShapePoint) -> int:
+    """逐元素/激活算子一行的宽度：输出形状除 Tq 外的维乘积。
+
+    形状是 `[Tq, W]`，W 就是本算子实际作用的宽度。拿不到两维时直接报错，
+    不能退回某个模型级代表值——那正是把 768 记成 2048 的来源。
+    """
+    shape = op_dict["output_shapes"][0]
+    resolved = [_resolve_dim(dim, point) for dim in shape]
+    if len(resolved) < 2:
+        raise ValueError(
+            f"op_type={op_dict['op_type']} 的输出形状 {shape} 没有可分辨的宽度维")
+    width = 1
+    for dim in resolved[1:]:
+        width *= dim
+    return width
 
 
 def _net_data_bytes(
@@ -392,24 +432,30 @@ def _net_data_bytes(
 
 
 def _fit_coeffs(
-    op_dict: dict,
     prefill: Measurement,
     decode: Measurement,
-    seq_len: int,
 ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, str]]:
-    """从 prefill 和 decode 两个测量点拟合成本系数。"""
-    op_type = op_dict["op_type"]
+    """按配方声明的成本项，从 prefill 和 decode 两个测量点拟合系数。
 
-    if op_type == "GEMM":
-        term_of = lambda p: p.tq
-        term_key = "Tq"
-    else:
-        term_of = lambda p: p.tq * p.lkv
-        term_key = "Tq(Tp+Tq)"
+    成本项是配方的一部分：当前 token 的逐元素/归一化/激活/视图类随 `Tq`
+    增长，注意力类随 `Tq(Tp+Tq)` 增长。用同一个声明驱动测量与拟合，
+    避免再按「GEMM / 非 GEMM」一刀切把 KV 历史带进所有算子。
+    """
+    term_key = prefill.cost_term
+    if decode.cost_term != term_key:
+        raise ValueError(
+            f"两个代表点的成本项不一致：{term_key!r} vs "
+            f"{decode.cost_term!r}")
+    term_of = {
+        "Tq": lambda p: p.tq,
+        "Tq(Tp+Tq)": lambda p: p.tq * p.lkv,
+    }.get(term_key)
+    if term_of is None:
+        raise ValueError(f"未知成本项 {term_key!r}")
 
     t1, t2 = term_of(prefill.point), term_of(decode.point)
     if t1 == t2:
-        raise ValueError(f"两个代表点的成本项相同 ({t1})，无法拟合 {op_type}")
+        raise ValueError(f"两个代表点的成本项相同 ({t1})，无法拟合 {term_key}")
 
     def solve(y1: float, y2: float) -> Tuple[float, float, str]:
         """拟合非负斜率和截距，必要时使用经过较大测量点的原点直线。"""
@@ -535,6 +581,11 @@ def export_costs_to_genesim(
         "version": SIDECAR_VERSION,
         "ir_level": ir_level,
         "source_ir": str(ir_path),
+        # 结构指纹与融合清单进缓存键：IR 换了模型、或同一 IR 的融合清单
+        # 变了，旧精化结果都不能复用。
+        "ir_fingerprint": assert_ir_fingerprint(ir, str(ir_path)),
+        "fusion_signature": fusion_signature(
+            _fused_activations(placement_sidecar)),
         "shape_points": {
             "prefill": {"Tq": prefill_point.tq, "Tp": prefill_point.tp},
             "decode": {"Tq": decode_point.tq, "Tp": decode_point.tp},
@@ -591,7 +642,7 @@ def export_costs_to_genesim(
         template_flops = dict(op.get("flops_coeffs", {}))
         template_bytes = dict(op.get("data_bytes_coeffs", {}))
 
-        flops_coeffs, data_coeffs, fit_mode = _fit_coeffs(op, prefill, decode, seq_len)
+        flops_coeffs, data_coeffs, fit_mode = _fit_coeffs(prefill, decode)
         # 被折进主算子的节点不再单独计费：GeneSim 读的就是这两份系数。
         # 测量结果仍留在 sidecar 里供对照。
         if absorbed:

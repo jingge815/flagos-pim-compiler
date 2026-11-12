@@ -955,9 +955,10 @@ def where_kernel(hal, dpu_id: int, cmd) -> None:
     条件选择化成"被选中的位置加上 `a - b`"，公式不动。
     """
     def mirror(cond, a, b):
-        base = b.astype(np.float32)
+        a32 = np.asarray(a, dtype=np.float32)
+        base = np.asarray(b, dtype=np.float32)
         offset = np.where(np.asarray(cond, dtype=bool),
-                          a.astype(np.float32) - base, np.float32(0.0))
+                          a32 - base, np.float32(0.0))
         return kernels_pim.mask(base, offset)
 
     _mirror(mirror)(hal, dpu_id, cmd)
@@ -1231,6 +1232,8 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
             "bt_base": int(spec.block_table_base),
             "slots_base": int(spec.slots_base),
             "slot_bytes": int(spec.slot_bytes),
+            # 物理槽总数：块表项的合法集合是 [0, pool_slots)，主机会逐项预检。
+            "pool_slots": int(spec.pool_slots),
             # 槽池的元素数：`pim.paged_attn` 用它除出物理槽总数。
             "cache_elems": int(spec.pool_slots * spec.slot_bytes // spec.dtype_bytes),
             "max_blocks": int(spec.blocks_per_request),
@@ -1353,10 +1356,9 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     }
 
     def physical_slot(owner: int, block: int) -> int:
-        slot = int(block_tables[owner][block])
-        if slot < 0:
-            raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
-        return slot
+        return _physical_slot(
+            block_tables[owner], block, int(geometry[owner]["pool_slots"]),
+            owner)
 
     written: set[tuple[int, int]] = set()
     for entry in info["heads"]:
@@ -1400,6 +1402,27 @@ def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
 
 
+def _physical_slot(block_table: np.ndarray, block: int, pool_slots: int,
+                   owner: int) -> int:
+    """块表项的合法集合是 [0, pool_slots)：负值未分配、上界越出槽池。
+
+    设备 lowering 与主机镜像共用这一条不变式；非法项不能夹成槽 0 继续算。
+    """
+    slot = int(block_table[block])
+    if not 0 <= slot < pool_slots:
+        raise RuntimeError(
+            f"dpu{owner} 块表项 block={block} 的物理槽 {slot} 越界 "
+            f"[0,{pool_slots})")
+    return slot
+
+
+def _validate_block_table(block_table: np.ndarray, num_blocks: int,
+                          pool_slots: int, owner: int) -> None:
+    """启动前逐项校验本次历史实际读取的块表项，表尾哨兵不参与。"""
+    for block in range(num_blocks):
+        _physical_slot(block_table, block, pool_slots, owner)
+
+
 def _paged_attention(hal, owner: int, entry: dict, geo: dict,
                      table: np.ndarray, q_head: np.ndarray, pos: int,
                      num_tokens: int, head_dim: int, slot_tokens: int,
@@ -1425,6 +1448,9 @@ def _paged_attention(hal, owner: int, entry: dict, geo: dict,
     if num_blocks > int(geo["max_blocks"]):
         raise RuntimeError(
             f"历史长度 {hist_len} 需要 {num_blocks} 个块，块表只有 {geo['max_blocks']} 项")
+    # 融合内核在设备上查块表，主机兜底在 `_iter_kv_blocks` 里查；两条路径
+    # 在启动前先过同一份预检，非法项明确失败而不是落到别的物理槽。
+    _validate_block_table(table, num_blocks, int(geo["pool_slots"]), owner)
     # 融合内核的分数与指数按 fp16 落盘，f32 的 KV（只有测试会造）走主机路径。
     fn = None
     if np_dtype == np.dtype(np.float16) and not uses_graph_mask:
@@ -1459,19 +1485,21 @@ def _host_paged_attention(hal, owner: int, entry: dict, geo: dict,
                           graph_mask, scale: float) -> np.ndarray:
     """主机兜底：逐块算 QKᵀ、逐行掩码与 softmax、逐块 PV 累加。
 
-    走的是相位链（`matmul` 落 f16、`add_mask` 加法、`softmax` 五相、每块 PV
-    落 f16 后在 f32 里累加），与融合内核的单遍在线形式数学等价、取整位置
-    不同，判据见 `test_kernels` 的 allclose 对拍。
+    相位存储边界与融合内核共用同一张表（见 `LowerPIMToEmitC.cpp` 的
+    paged_attn 段）：QK 点积落 f16 后乘 scale 再落 f16，exp 落 f16，每块 PV
+    乘积落 f16 后在 f32 里累加，最后除以 running sum 落 f16。取整在主机代码
+    里显式完成，不依赖 `matmul` 的返回 dtype——工具链缺席时它按 f32 兜底，
+    委托给它会让这条正是为主机回退准备的路径丢掉全部存储边界。
     """
     # 第一遍：逐物理块算 QKᵀ，把分数填进预分配矩阵，不拼 KV 历史。
     # 按 query 整批算（M=tq）是关键：逐 query 逐块重读 K 会把 K 的读放大
     # tq 倍；整批仍只读一遍，与改动前是同一份流量。
-    scores = np.empty((tq, hist_len), dtype=np.float32)
+    scores = np.empty((tq, hist_len), dtype=np.float16)
     for start, rows, k_block in _iter_kv_blocks(
             hal, owner, entry["k_off"], geo, table, hist_len,
             head_dim, slot_tokens, np_dtype):
-        scores[:, start:start + rows] = (
-            matmul(q_head, k_block.T).astype(np.float32) * scale)
+        dot = matmul(q_head, k_block.T).astype(np.float16).astype(np.float32)
+        scores[:, start:start + rows] = (dot * scale).astype(np.float16)
 
     # 掩码与 softmax 仍逐行，与改动前逐元素同一口径：`pim.mask` 一次、
     # `pim.softmax` 一次。全局 softmax 要看整行分数，所以分数矩阵仍按行
@@ -1494,11 +1522,15 @@ def _host_paged_attention(hal, owner: int, entry: dict, geo: dict,
         weights[t] = softmax(add_mask(scores[t], mask_row).astype(np.float32))
 
     # 第二遍：逐物理块算 PV，f32 累加后合并；V 历史同样不落地。
+    # 每块乘积先落 f16 再加进 f32 累加器：多块历史下这次取整会进入下一块
+    # 的累加输入，融合内核的 `roundF16(blockProduct)` 是同一条边界。
     acc = np.zeros((tq, head_dim), dtype=np.float32)
     for start, rows, v_block in _iter_kv_blocks(
             hal, owner, entry["v_off"], geo, table, hist_len,
             head_dim, slot_tokens, np_dtype):
-        acc += matmul(weights[:, start:start + rows], v_block).astype(np.float32)
+        product = matmul(
+            weights[:, start:start + rows], v_block).astype(np.float16)
+        acc += product.astype(np.float32)
     return acc
 
 
@@ -1548,9 +1580,7 @@ def _iter_kv_blocks(hal, owner: int, plane_off: int, geo: dict,
         if start >= n_tokens:
             break
         rows = min(slot_tokens, n_tokens - start)
-        slot = int(block_table[block])
-        if slot < 0:
-            raise RuntimeError(f"dpu{owner} 块表项 block={block} 未分配")
+        slot = _physical_slot(block_table, block, int(geo["pool_slots"]), owner)
         offset = plane_off + slot * geo["slot_bytes"]
         yield start, rows, hal.read_local(owner, offset, (rows, head_dim), np_dtype)
 
@@ -1729,6 +1759,8 @@ _KERNELS = {
 #              已下设备（见 `_KERNELS`）。
 # `concat_kernel` / `slice_kernel` / `gather_kernel` 仍留给算子编译器按
 # mnemonic 调，不经过这张 aten 表。
+# MoE 门控选择 `where.ScalarOther`/`ne.Scalar` 按 `graph/partition.HOST_ONLY`
+# 留在主机闭包，没有设备内核，也不在这张表里。
 
 
 def register_all(hal, *, use_compiled_linear: bool = False) -> None:

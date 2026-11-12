@@ -72,6 +72,19 @@ def b_path_passes() -> list[str]:
     ]
 
 
+def module_budget(mlir_text: str) -> dict[str, int]:
+    """读出模块头里已经写下的预算属性，只拿到文本的调用方据此复用硬件配置。"""
+    head = re.search(r"module attributes \{([^}]*)\}", mlir_text)
+    if head is None:
+        return {}
+    budget = {}
+    for name in ("pim.wram-bytes", "pim.mram-bytes", "pim.dma-align"):
+        match = re.search(rf'"{re.escape(name)}"\s*=\s*(\d+)\s*:', head.group(1))
+        if match is not None:
+            budget[name] = int(match.group(1))
+    return budget
+
+
 def with_budget(mlir_text: str, hardware) -> str:
     """给 B 路模块头补上分块要读的 WRAM、MRAM 预算与 DMA 对齐，已有的不动。"""
     head = re.search(r"module attributes \{([^}]*)\}", mlir_text)
@@ -84,13 +97,22 @@ def with_budget(mlir_text: str, hardware) -> str:
                      + mlir_text[bare.end():])
         head = re.search(r"module attributes \{([^}]*)\}", mlir_text)
     present = head.group(1)
+    wanted = {
+        "pim.wram-bytes": hardware.wram_bytes_per_dpu,
+        "pim.mram-bytes": hardware.mram_bytes_per_dpu,
+        "pim.dma-align": hardware.dma_align,
+    }
+    # 已有属性不能静默保留：旧实现只补缺失项，B 路文本里预先写死的
+    # dma-align=8 会盖住本次硬件配置，sidecar 自报 64、实产却仍是 8。
+    for name, value in wanted.items():
+        match = re.search(rf'"{re.escape(name)}"\s*=\s*(\d+)\s*:', present)
+        if match is not None and int(match.group(1)) != value:
+            raise ValueError(
+                f"B 路 IR 的 {name}={match.group(1)} 与本次硬件配置 {value} "
+                "不一致：不能用旧模块属性继续编译。")
     extra = [
         f'"{name}" = {value} : i64'
-        for name, value in (
-            ("pim.wram-bytes", hardware.wram_bytes_per_dpu),
-            ("pim.mram-bytes", hardware.mram_bytes_per_dpu),
-            ("pim.dma-align", hardware.dma_align),
-        )
+        for name, value in wanted.items()
         if f'"{name}"' not in present
     ]
     if not extra:

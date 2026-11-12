@@ -661,10 +661,9 @@ def complete_7b():
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-    from contracts.op_contract import PIMHardwareConfig
     from genesim_bridge.paths import llama2_7b_model_dir
     from graph.strategy import llama_strategies
-    from memory.mem_planner import HwBudget
+    from memory.mem_planner import default_site_capacity
 
     model_dir = llama2_7b_model_dir()
     print(f"模型目录: {model_dir}")
@@ -677,12 +676,9 @@ def complete_7b():
           f"heads={cfg.num_attention_heads} kv_heads={cfg.num_key_value_heads} "
           f"vocab={cfg.vocab_size}")
 
-    hw = HwBudget(mram_bytes=4 << 30, align=64, sys_reserve_bytes=64 << 20)
-    hardware = PIMHardwareConfig(
-        num_dpus=NUM_DPUS_7B, num_tasklets=4,
-        mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536,
-        dma_align=64,
-    )
+    # 与主链/真实测试同一份容量契约。
+    hw, hardware = default_site_capacity(
+        num_dpus=NUM_DPUS_7B, num_tasklets=4)
     strategy = llama_strategies(
         NUM_DPUS_7B, num_heads=cfg.num_attention_heads,
         num_kv_heads=cfg.num_key_value_heads,

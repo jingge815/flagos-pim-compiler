@@ -1,5 +1,10 @@
 # 接入 Qwen3（2026-11-04）
 
+> 状态注记（2026-11-12）：本文记录 2026-11-04 的 Qwen3 dense 接入。Qwen3 MoE 已在
+> 2026-11 接入，并通过 4 层真实权重全链验证（见 design-qwen3-moe-20261105、
+> techdoc-qwen3-moe-20261112、qwen3-moe-final-20261112）；下文「MoE 线未适配」
+> 已过时，保留为历史记录。
+
 ## 目的
 
 把模型覆盖从 Llama / Qwen2 扩到 Qwen3。Qwen3 与 Qwen2 用同一套算子
@@ -26,7 +31,7 @@
 | `tests/test_qwen3_8b_real.py` | 真实 8B 用例：注册表加载 → 8 DPU 编译 → 贪心生成对拍 HF `generate` |
 
 模型来源：ModelScope（`Qwen/Qwen3-8B`、`Qwen/Qwen3-1.7B`）下载到
-`/mnt/sda/butj/fjg/model/`；本机 huggingface.co 直连不稳定，hf-mirror 时通时断，
+`/mnt/sda/butj/fjg/model/`（历史路径；当前以 `paths.json` 的站点键为准）；本机 huggingface.co 直连不稳定，hf-mirror 时通时断，
 modelscope.cn 最稳（Qwen 官方分发）。
 
 ## head_dim 为什么必须改
@@ -50,13 +55,12 @@ head_dim=16 后，`kv_specs_from_placement` 把 k_proj 分片切出了 16 个"KV
 
 ## 当前不足
 
-- **只覆盖 Qwen3 dense 线**（`Qwen3ForCausalLM`，`model_type="qwen3"`）。
-  Qwen3 MoE 线（30B-A3B / 235B-A22B，`model_type="qwen3_moe"`）是另一类架构，
-  未适配：白名单按 `model_type` 精确匹配，MoE 权重目录在启动期被拒绝，不会
-  静默算错。绕过校验也走不通——MoE 的 top-k 分派是数据依赖形状，
-  `torch.export` 直接报 `data-dependent expression`。真正支持需要：shape-static
-  的 MoE 前向导出、`topk`/`gather`/`index_select` 的图规则、专家权重的放置
-  策略（专家并行或复制）、MoE 分发/归约内核、以及 30B 级专家权重的内存规划。
+- **Qwen3 MoE 线（历史状态，已过时）**：2026-11-04 时只覆盖 dense 线
+  （`Qwen3ForCausalLM`，`model_type="qwen3"`），MoE 线（`model_type="qwen3_moe"`）
+  被白名单拒绝、`torch.export` 因 top-k 数据依赖失败。该缺口已在
+  qwen3-moe-20261105 需求中补齐（静态 MoE 前向、图规则、专家放置、动态分派与
+  GeneSim 计费），当前状态见 techdoc-qwen3-moe-20261112；原始缺口描述保留在上述
+  历史记录中。
 - **Tied 词嵌入（1.7B / 0.6B / 4B 小模型）仍不支持**：tied 导出里 lm_head 直接
   消费 `embed_tokens.weight`，`spec_prop` 要求被 linear 消费的权重有切分规则，
   而 embed_tokens 同时被 embedding 查表消费，需要 vocab 并行语义（Qwen2 时代

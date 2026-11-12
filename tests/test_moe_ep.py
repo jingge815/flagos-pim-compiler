@@ -105,7 +105,7 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
         name="tp1_pp4_ep4", num_dpus=16, num_stages=4, ep_width=4,
         weight_rules=ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config).weight_rules,
     )
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     compiled = compile_llama2(
         loaded, strategy, prefill_seq_len=4, max_seq=16,
         hw=hw, hardware=PIMHardwareConfig(
@@ -128,6 +128,30 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
     ref = ref_model.generate(torch.tensor([[1, 2, 3, 4]]),
                              max_new_tokens=3, do_sample=False)
     assert got == ref[0][4:].tolist()
+
+    # EP 合法路径：每层专家计算仍挂本层 dispatch；累加链是 host 聚合，
+    # 不参与门控。层号必须逐层出现，不能只有首层生效。
+    from runtime.exec_plan_gen import _expert_provenance, _expert_tag_of
+
+    nodes = {n.name: n for n in compiled.decode_gm.graph.nodes}
+    provenance = _expert_provenance(list(nodes.values()))
+    commands = compiled.decode_plans[0].commands
+    dispatch = {
+        cmd.id: str(cmd.payload.get("node", ""))
+        for cmd in commands
+        if cmd.op == "host_op"
+        and str(cmd.payload.get("node", "")).startswith("moe_dispatch")
+    }
+    gated_layers = set()
+    for cmd in commands:
+        if cmd.op != "launch" or "gate" not in cmd.payload:
+            continue
+        layer = int(dispatch[cmd.payload["gate"]].rsplit("_", 1)[1])
+        tag = _expert_tag_of(provenance, nodes[cmd.payload["node"]])
+        assert tag is not None and tag[0] == layer
+        gated_layers.add(layer)
+    assert gated_layers == set(range(NUM_LAYERS)), (
+        f"EP 下这些层没有门控命令：{sorted(set(range(NUM_LAYERS)) - gated_layers)}")
 
     # 专家映射均衡：每层 4 专家轮转到段内 4 台 DPU，各 1 个，差 ≤ 1。
     for layer in range(NUM_LAYERS):
@@ -154,7 +178,7 @@ def test_dpu_to_host_reads_are_war_protected(ep_model_dir) -> None:
         name="pp2ep4", num_dpus=8, num_stages=2, ep_width=4,
         weight_rules=ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config).weight_rules,
     )
-    hw = HwBudget(mram_bytes=1 << 28, align=256, sys_reserve_bytes=1 << 20)
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     compiled = compile_llama2(
         loaded, strategy, prefill_seq_len=4, max_seq=16,
         hw=hw, hardware=PIMHardwareConfig(

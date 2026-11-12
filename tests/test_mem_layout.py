@@ -173,7 +173,7 @@ def test_the_shard_is_born_with_its_layout_and_alignment() -> None:
             assert detail.align_bytes == 0, "内存规划之前不该凭空有对齐"
     assert seen, "这张图上没有 DPU 分片，用例失去意义"
 
-    hw = HwBudget(mram_bytes=1 << 30, align=256, sys_reserve_bytes=0)
+    hw = HwBudget(mram_bytes=1 << 30, align=64, sys_reserve_bytes=0)
     (gm1, _), (gm2, _) = _two_appendix_a_graphs()
     nodes1, nodes2 = list(gm1.graph.nodes), list(gm2.graph.nodes)
     plan_dpu(0, nodes1, nodes2, _kv_specs(), hw)

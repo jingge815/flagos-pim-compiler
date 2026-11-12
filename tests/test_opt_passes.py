@@ -1187,6 +1187,30 @@ def test_tile_splits_oversized() -> None:
 
 
 
+def test_optimize_graph_graph_tiling_switch() -> None:
+    """`graph_tiling` 单独控制图级分块：关掉时 linear 保持整块。"""
+    def build():
+        graph = Graph()
+        x = graph.placeholder("x")
+        w = graph.placeholder("w")
+        out = graph.call_function(torch.ops.aten.linear.default, (x, w))
+        graph.output(out)
+        gm = GraphModule({}, graph)
+        _shape(gm, torch.randn(32, 16), torch.randn(8, 16))
+        return gm
+
+    off = build()
+    report = optimize_graph(off, wram_bytes=256, graph_tiling=False)
+    assert report.tiled == 0
+    assert len([n for n in off.graph.nodes
+                if n.target is torch.ops.aten.linear.default]) == 1
+
+    on = build()
+    assert optimize_graph(on, wram_bytes=256, graph_tiling=True).tiled > 0
+    assert len([n for n in on.graph.nodes
+                if n.target is torch.ops.aten.linear.default]) > 1
+
+
 def test_tile_matches_cost_model() -> None:
     """选出的切分与评估模型手算一致：2 的幂里块数最少且每块不超预算的那个。"""
     graph = Graph()
