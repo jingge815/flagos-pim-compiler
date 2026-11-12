@@ -3,7 +3,7 @@
 > 创建日期：2026-11-12
 > 关联文档：request-qwen3-moe-20261105、design-qwen3-moe-20261105、implement-qwen3-moe-20261105、review-qwen3-moe-20261109-round01 至 review-qwen3-moe-20261112-round20（共 20 份）
 > 关联项目：flagos-pim-compiler、genesim、flagOS-installers/FlagTree
-> 代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`；三仓均含未提交改动
+> 代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`；改动已提交（compiler `5b5d539`、genesim `6d24d30`、FlagTree `3690b47c2`）
 > 状态入口：qwen3-moe-final-20261112（文档-代码一致性核对与当前状态汇总）
 > 核心目标：让 `qwen3_moe`（Qwen3-30B-A3B 及其 4 层切片）走通「注册表加载 → 图编译切分 → FlagTree 算子编译 → GeneSim 仿真」链路，4 层真实权重与 HF 逐 token 一致，并交付动态分派与专家并行。
 
@@ -175,7 +175,7 @@ flowchart LR
 ## 五、改动说明
 
 ### 5.1 改动总览
-　　截至第 20 轮修复完成，代码/测试改动为 72 个文件（flagos-pim-compiler 50、genesim 20、FlagTree 2），新增 8 个文件：`genesim_bridge/ir_fingerprint.py`、`scripts/bench_moe_dispatch.py`、`scripts/check_implement_evidence.py`、`tests/test_implement_evidence.py`、`tests/test_ir_fingerprint.py`、`genesim/conf/sim_qwen3_moe_pimir.yaml`、`genesim/tests/sim/test_moe_execution_cost.py`、`FlagTree/test/Dialect/TritonPIM/paged_attn_emitc.mlir`。2026-11-12 文档整理又修改了 5 份文档（request、qwen3-support、merge-20261107、README、genesim/docs/IR.md），不改变代码/测试计数。按当前工作区 `git diff --stat`：编译器 60 个已跟踪文件 `+12,398 / -881`（代码/测试 50、文档 10）；GeneSim 21 个 `+6,975 / -519`（代码/测试 20、文档 1）；FlagTree 2 个 `+33 / -12`；另有 20 份评审、techdoc 与 qwen3-moe-final 未跟踪。核心改动集中在三仓的 MoE 静态前向、执行计划/调度、放置导出与严格验证器。
+　　截至第 20 轮修复完成，代码/测试改动 80 个文件（修改 72：flagos-pim-compiler 50、genesim 20、FlagTree 2；新增 8），文档改动 33 个（修改 11、新增 22）。新增代码/测试文件为 `genesim_bridge/ir_fingerprint.py`、`scripts/bench_moe_dispatch.py`、`scripts/check_implement_evidence.py`、`tests/test_implement_evidence.py`、`tests/test_ir_fingerprint.py`、`genesim/conf/sim_qwen3_moe_pimir.yaml`、`genesim/tests/sim/test_moe_execution_cost.py`、`FlagTree/test/Dialect/TritonPIM/paged_attn_emitc.mlir`。按三个提交统计：compiler `5b5d539` 87 个文件 `+15,847 / -881`（代码/测试 55、文档 32）；genesim `6d24d30` 23 个文件 `+7,358 / -519`（代码/测试 22、文档 1）；FlagTree `3690b47c2` 3 个文件 `+59 / -12`（代码/测试 3）。核心改动集中在三仓的 MoE 静态前向、执行计划/调度、放置导出与严格验证器。
 
 ### 5.2 文件改动清单
 　　完整清单见实施文档 §3.2（78 个修改文件 + 8 个新增文件，按文件逐条列出改动内容与对应任务 ID）。下表列出理解本次改动必需的核心文件，按「业务代码在前、测试代码在后」排序。
@@ -314,7 +314,7 @@ BPATH_PIMIR_SEMANTICS: Dict[str, PimirSemantics] = {
 ## 六、验证
 
 ### 6.1 验证环境
-　　代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`，均含未提交改动。运行环境：Linux，Python 3.10.20，torch 2.9.1+cpu，transformers 4.57.6；真实权重目录 `/data2/pengcheng-work/Qwen3-30B-A3B-4L`。
+　　代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`；改动已提交（compiler `5b5d539`、genesim `6d24d30`、FlagTree `3690b47c2`）。运行环境：Linux，Python 3.10.20，torch 2.9.1+cpu，transformers 4.57.6；真实权重目录 `/data2/pengcheng-work/Qwen3-30B-A3B-4L`。
 
 ### 6.2 验证命令与结果
 　　验证采用分层方法：既有回归确认原有功能未受影响；4 层真实权重目标命令确认 MoE 数值与 HF 一致；全链运行确认图编译、FlagTree 与 GeneSim 逐段消费；产物静态检查确认 sidecar 路径/哈希、pimir 属性与容量；证据 checker 确认文档数值可追溯到 summary。下表中标注「引用记录」的行是实施文档已记录、本次生成文档时核对日志/产物存在的命令；标注「本次重跑」的行是本次生成文档时实际执行的命令。

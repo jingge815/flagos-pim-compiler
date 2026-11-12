@@ -2,13 +2,13 @@
 > 文档编号：qwen3-moe-final-20261112
 > 创建日期：2026-11-12
 > 关联文档：request-qwen3-moe-20261105、design-qwen3-moe-20261105、implement-qwen3-moe-20261105、review-qwen3-moe-20261109-round01 至 review-qwen3-moe-20261112-round20、techdoc-qwen3-moe-20261112
-> 代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`；三仓均含未提交改动，未 commit。
+> 代码基线：flagos-pim-compiler `pengcheng@b2f07ca`、genesim `pengcheng@434e147`、FlagTree `feat/ceva-with-paged-attn@6e34f0299`；改动已提交为 compiler `5b5d539`、genesim `6d24d30`、FlagTree `3690b47c2`。
 
 ## 一、本文定位
 
 　　本文是 Qwen3 MoE 接入的**当前状态入口**，用于替代散落在需求、设计、实施与二十轮评论文档中的过时表述。过程文档仍然保留，但其角色是历史记录：需求与设计记录当时的决定，实施文档记录逐轮修复，评论文档是每轮的不可变快照。三者与当前代码冲突时，以本文、`techdoc-qwen3-moe-20261112.md` 与当前工作区代码为准。
 
-　　本次整理做三件事：第一，逐份核对文档中可被代码或产物验证的陈述（路径、函数/行号、默认值、测试名、计数、验证结果）；第二，修正或标注过时内容；第三，把当前代码状态、验证证据与遗留问题汇总成本文。整理**只改文档，不改代码，不提交**；也**没有重跑** 4 层全链、GeneSim 套件、编译器全量回归等耗时测试，数值引用最近一次记录（第 20 轮评审与第 20 轮修复自测），并在第四节标明来源与证据等级。
+　　本次整理做三件事：第一，逐份核对文档中可被代码或产物验证的陈述（路径、函数/行号、默认值、测试名、计数、验证结果）；第二，修正或标注过时内容；第三，把当前代码状态、验证证据与遗留问题汇总成本文。整理**只改文档，不改代码**；整理完成后按用户指示提交（提交号见 §3.1）。整理**没有重跑** 4 层全链、GeneSim 套件、编译器全量回归等耗时测试，数值引用最近一次记录（第 20 轮评审与第 20 轮修复自测），并在第四节标明来源与证据等级。
 
 ## 二、文档与代码状态核对结论
 
@@ -30,13 +30,13 @@
 
 ### 3.1 仓库与改动
 
-| 仓库 | HEAD | 未提交改动（git diff --stat） |
-|------|------|------------------------------|
-| flagos-pim-compiler | `b2f07ca`（pengcheng） | 60 个已跟踪文件 `+12,398 / -881`（代码/测试 50、文档 10） |
-| genesim | `434e147`（pengcheng） | 21 个已跟踪文件 `+6,975 / -519`（代码/测试 20、文档 1） |
-| FlagTree | `6e34f0299`（feat/ceva-with-paged-attn） | 2 个已跟踪文件 `+33 / -12` |
+| 仓库 | 提交 | 文件与行数 |
+|------|------|------------|
+| flagos-pim-compiler | `5b5d539`（pengcheng） | 87 个文件 `+15,847 / -881`（代码/测试 55、文档 32） |
+| genesim | `6d24d30`（pengcheng） | 23 个文件 `+7,358 / -519`（代码/测试 22、文档 1） |
+| FlagTree | `3690b47c2`（feat/ceva-with-paged-attn） | 3 个文件 `+59 / -12`（代码/测试 3） |
 
-　　另有 8 个新增源文件（`genesim_bridge/ir_fingerprint.py`、`scripts/bench_moe_dispatch.py`、`scripts/check_implement_evidence.py`、`tests/test_implement_evidence.py`、`tests/test_ir_fingerprint.py`、`genesim/conf/sim_qwen3_moe_pimir.yaml`、`genesim/tests/sim/test_moe_execution_cost.py`、`FlagTree/test/Dialect/TritonPIM/paged_attn_emitc.mlir`）与 22 份未跟踪文档（20 份评审 + techdoc + 本文）。改动全部未提交。
+　　其中新增代码/测试文件 8 个：`genesim_bridge/ir_fingerprint.py`、`scripts/bench_moe_dispatch.py`、`scripts/check_implement_evidence.py`、`tests/test_implement_evidence.py`、`tests/test_ir_fingerprint.py`、`genesim/conf/sim_qwen3_moe_pimir.yaml`、`genesim/tests/sim/test_moe_execution_cost.py`、`FlagTree/test/Dialect/TritonPIM/paged_attn_emitc.mlir`；新增文档 22 份（20 份评审 + techdoc + 本文）。上述文件均已包含在三个提交中，三仓工作区干净。
 
 ### 3.2 已落地的能力与默认值
 
