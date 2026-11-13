@@ -45,6 +45,9 @@ HEAD_INDEX_META_KEY = "pim_head_index"
 STATIC_QUANT_META_KEY = "pim_static_quant"
 VAL_META_KEY = "val"
 MODULE_STACK_META_KEY = "nn_module_stack"
+# 符号形状表达式（D2 动态形状）：动态导出时记录每个节点各维的 ShapeExpr；
+# `val` 的形状同时被取整为 T_max 包络，规划与地址只用包络整数。
+SHAPE_EXPR_META_KEY = "pim_shape_expr"
 
 # ── 键值 ────────────────────────────────────────────────────────
 DEVICE_DPU = "dpu"
@@ -70,6 +73,12 @@ META_KEYS: tuple[MetaKeySpec, ...] = (
         producer="graph.partition:partition_graph",
         consumers=("graph.spec_prop", "runtime.exec_plan_gen"),
         note="取值 DEVICE_DPU / DEVICE_HOST"),
+    MetaKeySpec(
+        SHAPE_EXPR_META_KEY, (DIM_PLACEMENT,), "list[ShapeExpr]",
+        producer="runtime.compile:export_annotated_graph（仅动态导出）",
+        consumers=("runtime.exec_plan_gen",),
+        note="动态导出时各维的符号表达式；缺省表示全静态形状。"
+             "val 形状已取整为 T_max 包络，规划只用整数"),
     MetaKeySpec(
         PART_ID_META_KEY, (DIM_PLACEMENT,), "int",
         producer="graph.partition:partition_graph",

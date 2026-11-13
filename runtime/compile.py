@@ -13,7 +13,9 @@ from comm.plan import build_comm_plan
 from contracts.graph_meta import SPEC_META_KEY
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.pim_tensor_spec import RedistributeEdge
-from contracts.unified_ir import STAGE_PLANNED, mark_stage
+from contracts.runtime_graph import ShapeExpr
+from contracts.unified_ir import (
+    SHAPE_EXPR_META_KEY, STAGE_PLANNED, VAL_META_KEY, mark_stage)
 from graph.fuse_pim import fuse_rms_norms
 from graph.opt_passes import fuse_linear_activation, optimize_graph
 from graph.partition import partition_graph
@@ -93,6 +95,87 @@ def causal_mask_of(seq_len: int, dtype: torch.dtype = torch.float16) -> torch.Te
     return mask
 
 
+def _sympy_to_shape_expr(expr, hint: int):
+    """sympy 表达式转 ShapeExpr；不支持的形状退回包络常量。
+
+    只认 `T` 这一个符号维（动态导出声明的 Dim）；形状环境派生的辅助符号
+    （s0/s30 一类）没有运行期绑定来源，按包络常量处理。
+    """
+    import sympy
+
+    if isinstance(expr, sympy.Integer):
+        return ShapeExpr.const(int(expr))
+    if isinstance(expr, sympy.Symbol):
+        if str(expr.name) == "T":
+            return ShapeExpr.dim("T")
+        return ShapeExpr.const(hint)
+    if not all(str(s) == "T" for s in expr.free_symbols):
+        return ShapeExpr.const(hint)
+    if isinstance(expr, sympy.Add):
+        parts = [_sympy_to_shape_expr(a, hint) for a in expr.args]
+        return ShapeExpr.add(*parts)
+    if isinstance(expr, sympy.Mul):
+        parts = [_sympy_to_shape_expr(a, hint) for a in expr.args]
+        return ShapeExpr.mul(*parts)
+    return ShapeExpr.const(hint)
+
+
+def capture_shape_exprs(gm: GraphModule) -> None:
+    """记录各节点的符号形状，并把 `val` 取整为 T_max 包络。
+
+    导出样例取在包络上（`seq_len == max`），SymInt 的 hint 就是包络值，
+    `int(dim)` 即规划用的整数；表达式留给运行期绑定实际 T。
+    """
+    for node in gm.graph.nodes:
+        val = node.meta.get(VAL_META_KEY)
+        if not isinstance(val, torch.Tensor):
+            continue
+        dims = tuple(val.shape)
+        if all(isinstance(d, int) for d in dims):
+            continue
+        exprs = []
+        for dim in dims:
+            if isinstance(dim, int):
+                exprs.append(None)
+                continue
+            try:
+                exprs.append(_sympy_to_shape_expr(dim.node.expr, int(dim)))
+            except Exception:
+                exprs.append(ShapeExpr.const(int(dim)))
+        node.meta[SHAPE_EXPR_META_KEY] = tuple(exprs)
+        node.meta[VAL_META_KEY] = val.new_empty(tuple(int(d) for d in dims))
+    _fold_symbolic_scalars(gm)
+
+
+def _fold_symbolic_scalars(gm: GraphModule) -> None:
+    """把产出标量 SymInt 的节点（sym_size/getitem 链）折叠成包络常量。
+
+    动态导出会把 reshape/view 的形状列表换成符号节点；计划与内核只认整数，
+    这里按 hint（=包络值）常量折叠，图结构回到与静态包络一致。
+    """
+    from torch.fx.node import map_aggregate
+
+    folded = True
+    while folded:
+        folded = False
+        for node in list(gm.graph.nodes):
+            if node.op != "call_function":
+                continue
+            val = node.meta.get(VAL_META_KEY)
+            if not isinstance(val, torch.SymInt):
+                continue
+            const = int(val)
+            for user in list(node.users):
+                def substitute(arg):
+                    if isinstance(arg, torch.fx.Node) and arg is node:
+                        return const
+                    return arg
+                user.args = map_aggregate(user.args, substitute)
+                user.kwargs = map_aggregate(user.kwargs, substitute)
+            gm.graph.erase_node(node)
+            folded = True
+
+
 def export_annotated_graph(
     model: torch.nn.Module, seq_len: int, position_ids: torch.Tensor, *,
     dtype: torch.dtype = torch.float16,
@@ -100,7 +183,8 @@ def export_annotated_graph(
 ) -> GraphModule:
     """导出图并标记节点设备和分区编号。
 
-    `dynamic_shapes` 为空时保持原来的具体形状导出；动态路径只把序列维符号化。
+    `dynamic_shapes` 为空时保持原来的具体形状导出；动态路径只把序列维符号化，
+    导出后立刻把 `val` 取整为包络，下游 pass 与内存规划只见整数。
     """
     input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
     gm = torch.export.export(
@@ -109,6 +193,8 @@ def export_annotated_graph(
         strict=True,
         dynamic_shapes=dynamic_shapes,
     ).module()
+    if dynamic_shapes is not None:
+        capture_shape_exprs(gm)
     partition_graph(gm)
     return gm
 
@@ -291,8 +377,10 @@ def compile_llama2(
     `dynamic=True` 预留给动态图路径；D0 只提供接口，真正的调度/形状绑定在
     D1/D2 实现，未实现前显式报错，避免静默退回静态行为。
     """
-    if dynamic:
-        raise NotImplementedError("动态图编译在 D1/D2 实现；当前只支持静态路径")
+    if dynamic and prefill_seq_lens:
+        raise ValueError(
+            "dynamic=True 只编译单张符号 T 的 prefill 图；额外的桶请留空 "
+            "prefill_seq_lens")
     cfg = model.config
     # 容量与对齐是同一份契约：HwBudget 决定三区偏移，PIMHardwareConfig 决定
     # 算子编译的 DMA 对齐，两者不一致时 sidecar 自报与真实 MLIR 会各说一套。
@@ -302,16 +390,24 @@ def compile_llama2(
             f"{hardware.dma_align} 不一致：容量契约的对齐只有一个值，"
             "请用 memory.mem_planner.default_site_capacity() 派生。")
     moe_execution = resolve_moe_execution(cfg, moe_execution)
-    seq_lens = tuple(sorted({*prefill_seq_lens, prefill_seq_len}))
+    seq_lens = ((prefill_seq_len,) if dynamic
+                else tuple(sorted({*prefill_seq_lens, prefill_seq_len})))
     if seq_lens[-1] != prefill_seq_len:
         raise ValueError(
             f"最长的 prefill 桶 {seq_lens[-1]} 与 prefill_seq_len="
             f"{prefill_seq_len} 不一致；把最长长度传给 prefill_seq_len")
 
     def _export_prefill(seq_len: int) -> GraphModule:
+        shapes = None
+        if dynamic:
+            from torch.export import Dim
+            t_dim = Dim("T", min=1, max=seq_len)
+            shapes = {"input_ids": {1: t_dim}, "causal_mask": {2: t_dim, 3: t_dim},
+                      "position_ids": {1: t_dim}}
         return export_annotated_graph(
             model, seq_len,
-            torch.arange(seq_len, dtype=torch.long).unsqueeze(0), dtype=dtype)
+            torch.arange(seq_len, dtype=torch.long).unsqueeze(0), dtype=dtype,
+            dynamic_shapes=shapes)
 
     prefill_gms = {seq_len: _export_prefill(seq_len) for seq_len in seq_lens}
     decode_gm = export_annotated_graph(
@@ -526,6 +622,8 @@ def compile_llama2(
         prefill_cmd_ids=prefill_cmd_ids,
         decode_plans=_windows(decode.plan),
         moe_execution=moe_execution,
+        compile_mode="dynamic" if dynamic else "static",
+        dynamic_axes=( {"T": (1, prefill_seq_len)} if dynamic else {}),
     )
 
 

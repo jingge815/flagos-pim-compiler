@@ -296,3 +296,8 @@ def layout_feedback_of_module(mlir_text: str) -> LayoutFeedback:
         wram_bytes_budget=attrs.get("pim.wram-bytes"),
         mram_bytes=attrs.get("pim.mram-bytes"),
     )
+
+
+# 动态形状（D2）的符号维度表达式。定义在 contracts/runtime_graph.py（与
+# RuntimeGraph 同层），这里 re-export 让键登记表的载荷类型校验能对上。
+from contracts.runtime_graph import ShapeExpr as ShapeExpr  # noqa: E402,F401

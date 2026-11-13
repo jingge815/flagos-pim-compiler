@@ -20,7 +20,7 @@ from contracts.graph_meta import (
     REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.op_semantics import RMS_NORM_KERNEL
-from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY
+from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY, SHAPE_EXPR_META_KEY
 from graph.spec_prop import _layer_of_node
 from runtime.dependency import deps_of as _deps_of, overlap, war_waits as _war_waits
 
@@ -231,6 +231,13 @@ def _as_torch(x: object) -> object:
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x)
     return x
+
+
+def _expr_dicts(exprs) -> list | None:
+    """把节点上的形状表达式元组转成可序列化的字典列表；无则 None。"""
+    if not exprs:
+        return None
+    return [expr.to_dict() if expr is not None else None for expr in exprs]
 
 
 def _shard_decision_of(spec, detail) -> list | None:
@@ -768,6 +775,17 @@ def build_execution_plan(
                 }
                 if fusion is not None:
                     payload["epsilon"] = fusion.epsilon
+                # 动态形状（D2）：节点带符号表达式时随命令下发，供运行期按
+                # 实际 T 绑定形状；静态导出没有这个 meta，payload 保持原样。
+                out_expr = node.meta.get(SHAPE_EXPR_META_KEY)
+                if out_expr is not None or any(
+                        arg.meta.get(SHAPE_EXPR_META_KEY) is not None
+                        for arg in flat_args if isinstance(arg, Node)):
+                    arg_exprs = [
+                        _expr_dicts(arg.meta.get(SHAPE_EXPR_META_KEY))
+                        for arg in flat_args if isinstance(arg, Node)]
+                    payload["arg_shape_exprs"] = arg_exprs
+                    payload["out_shape_expr"] = _expr_dicts(out_expr)
                 # 注意力要读的设备侧 KV 区域，编译期才知道，在这里烘进命令——
                 # 内核自己拿不到 `kv_specs`，而用模块级全局会在多个策略之间
                 # 互相覆盖（实测三种策略连着编译时后面的把前面的盖掉）。
