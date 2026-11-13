@@ -492,7 +492,7 @@ def test_tiled_dispatch_skips_expert_communication(
     counts = {"all_reduce": 0}
     original = epg._REDISTRIBUTE_FN["all_reduce"]
 
-    def counted(entry, engine):
+    def counted(entry, engine, rows=None):
         counts["all_reduce"] += 1
         return original(entry, engine)
 

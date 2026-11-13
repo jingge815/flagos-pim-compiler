@@ -23,6 +23,20 @@ from contracts.op_semantics import RMS_NORM_KERNEL
 from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY, SHAPE_EXPR_META_KEY
 from graph.spec_prop import _layer_of_node
 from runtime.dependency import deps_of as _deps_of, overlap, war_waits as _war_waits
+from runtime.shape_bind import dynamic_shape_enabled
+
+
+def _comm_rows(hal) -> int | None:
+    """通信搬运的行数钳制：仅形状绑定开启时按真实 token 数收缩。
+
+    非绑定模式下内核按包络形状读 DPU，通信先裁剪会让尾行读到旧值；
+    绑定模式内核只读实际 t 行，裁剪掉的尾行不会被消费（4 层真实权重
+    gather/scatter/组合三方向均已实测逐 token 一致）。
+    """
+    if not dynamic_shape_enabled():
+        return None
+    rows = hal.bound_num_tokens
+    return int(rows) if rows else None
 
 # MoE 执行语义。图编译器与 GeneSim 共用这两个取值；默认跟随 PIM_MOE_DISPATCH。
 MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch")
@@ -506,7 +520,7 @@ def _emit_redistribute(
 
         def fn(hal, cmd):
             engine = _dma_engine(hal, cmd)
-            scatter(entry, engine, get_host_buf(hal))
+            scatter(entry, engine, get_host_buf(hal), rows=_comm_rows(hal))
             return None
     elif edge.type == "local_slice":
         def fn(hal, cmd):
@@ -523,7 +537,7 @@ def _emit_redistribute(
 
         def fn(hal, cmd):
             engine = _dma_engine(hal, cmd)
-            return primitive(entry, engine)
+            return primitive(entry, engine, rows=_comm_rows(hal))
 
     op = _REDISTRIBUTE_OP[edge.type]
     payload: dict = {"edge_id": edge.edge_id, "fn": fn}
