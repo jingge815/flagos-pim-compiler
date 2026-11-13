@@ -210,6 +210,7 @@ def step_request(
             pos=slot.valid_len,
             num_tokens=1,
             causal_mask_standard=True,
+            mode=compiled.compile_mode,
         )
         logits = hal.wait(events[compiled.decode.output_cmd_id])
         slot.valid_len += 1
@@ -254,6 +255,7 @@ def prefill_chunk(
         pos=pos,
         num_tokens=length,
         causal_mask_standard=True,
+        mode=compiled.compile_mode,
     )
     logits = np.asarray(hal.wait(events[_prefill_output_cmd(compiled, seq_len)]))
     slot.valid_len = pos + length

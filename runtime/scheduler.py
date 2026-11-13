@@ -54,14 +54,34 @@ class EventScheduler:
         return self.events
 
     def _loop(self) -> None:
+        """按计划序逐条调度：依赖就绪才提交，且同一泳道保持计划顺序。
+
+        静态 `waits` 依赖「同 (lane, DPU) 提交序 = 计划序」的 FIFO 假设
+        （等待边折叠时丢掉了同道更早的冗余前驱）；就绪驱动的乱序提交会让
+        被折叠掉的前驱晚跑，读到旧值。因此同道必须保序，跨道仍可并行。
+        """
+        order = list(self.plan.commands)
+        lane_of = {cmd.id: ("dpu", cmd.dpu_id) if cmd.dpu_id is not None
+                   else ("host", cmd.id) for cmd in order}
+        by_lane: dict[tuple, list[int]] = {}
+        for cmd in order:
+            by_lane.setdefault(lane_of[cmd.id], []).append(cmd.id)
+        cursor: dict[tuple, int] = {key: 0 for key in by_lane}
         while True:
             with self._cv:
                 if self.error is not None or len(self.done) == len(self.commands):
                     self._cv.notify_all()
                     return
-                ready = [
-                    cid for cid in self.commands
-                    if cid not in self.started and self.waits[cid] <= self.done]
+                ready = []
+                for key, ids in by_lane.items():
+                    position = cursor[key]
+                    while position < len(ids):
+                        cid = ids[position]
+                        if self.waits[cid] - self.done:
+                            break  # 队头未就绪：同道保序，不越过。
+                        ready.append(cid)
+                        position += 1
+                    cursor[key] = position
                 if not ready:
                     self._cv.wait(timeout=0.05)
                     continue
