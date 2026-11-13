@@ -21,18 +21,18 @@
 |------|----------|------|------|------------------|
 | P0-1 | shape-static MoE 导出与架构注册 | 已完成 | `backend/architectures.py:22`（`make_static_moe_forward`）、`:210`（`qwen3_moe` 注册）；4 层目标命令 36 passed、1 skipped（日志 `/tmp/r20-fix-4l-tests.log`）；小模型 `test_qwen3_moe_generate_matches_hf` | 8B 无权重，SKIP 未覆盖 |
 | P0-2 | 图规则支持 MoE 算子链 | 已完成 | `graph/partition.py:55-66`、`graph/strategy.py:13-28`；4 层 A 阶段 3681 算子、1557 GEMM；放置 sidecar 3163 条（1557 GEMM + 1606 算子级） | 无 |
-| P0-3 | 内存规划容纳专家权重 | 部分完成 | 4 层当前代码集群常驻 `3,140,834,304 / 8,589,934,592`（36.56%），`fits=True`；48 层 round08 容量（8 GiB 扣 64 MiB 预留后可用 8,522,825,728 B）dpu0..3 所需/可用 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B` | 48 层为历史产物；当前严格契约因旧 B 路条目缺编译单位而拒绝（K16/Q12），需用当前主链重跑 A/BCD/A2/E |
+| P0-3 | 内存规划容纳专家权重 | 已完成 | 4 层当前代码集群常驻 `3,140,834,304 / 8,589,934,592`（36.56%），`fits=True`；48 层当前代码（2026-11-13 重跑）dpu0..3 所需/可用 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B`；GeneSim 集群常驻 `8,412,147,712 / 8,589,934,592`（97.93%），`fits=True` | 无；48 层数值对拍另列 |
 | P0-4 | MoE 执行路径（内核） | 已完成 | dense_sim 全链 `63.637 s / 12.493 t/s`；`runtime/exec_plan_gen.py:169`、`backend/hal_numpy.py:233`；4 层逐 token 对拍通过 | 8B 未覆盖 |
-| P0-5 | 真实 30B 端到端 | 部分完成 | 4 层真实权重当前代码 36 passed、1 skipped；48 层历史：round01 日志 23 passed、1 skipped（25,426.83 s），round06 复跑 26 passed、1 skipped（17,254.56 s） | 48 层当前代码未重跑；round02 的 `full30b-r2` 被 systemd-oomd 杀死，按补充输入为共享 CEVA 内存压力导致的环境阻塞，不是代码失败；8B SKIP |
+| P0-5 | 真实 30B 端到端 | 部分完成 | 4 层真实权重当前代码 36 passed、1 skipped；2026-11-13 当前代码 48 层主链 exit 0（A/BCD/A2/E，成本见 G5）；48 层数值历史：round01 23 passed、1 skipped（25,426.83 s），round06 26 passed、1 skipped（17,254.56 s） | 48 层数值未用当前代码重跑；round02 的 `full30b-r2` 被 systemd-oomd 杀死（共享 CEVA 内存压力，环境阻塞）；8B SKIP |
 | P1-1 | 主机动态分派原语 | 已完成 | 提交前跳过与层域门控；token 与稠密模拟完全一致；4 层执行期 prefill 1.148×、decode 1.202×（历史实测，用户已接受，本轮未重测） | 剩余执行后端优化另立需求 |
 | P1-2 | 专家并行放置维度 | 已完成 | PP×EP 落地（设计 §九.4，经用户确认）；`graph/strategy.py:40`（`ep_width`）、`:84`（`ep_dpu_of_expert`）；16 DPU 用例与映射均衡断言 | TP×EP 复合放置未实现；仅小模型验证 |
-| G1 | GeneSim MoE 图骨架与代价 | 已完成 | 4 层 IR 3681 算子、1557 GEMM、1536 专家 GEMM、`parameter_bytes=6,229,628,928`；dynamic `60.785 s / 13.079 t/s`、dense `63.637 s / 12.493 t/s` | 48 层成本证据失效（K16/Q12） |
+| G1 | GeneSim MoE 图骨架与代价 | 已完成 | 4 层 IR 3681 算子、1557 GEMM、1536 专家 GEMM、`parameter_bytes=6,229,628,928`；dynamic `60.785 s / 13.079 t/s`、dense `63.637 s / 12.493 t/s`；48 层当前代码 44117 算子、18673 GEMM、18432 专家 GEMM，`192.49 s / 4.13 t/s` | 无 |
 | G2 | 严格产物契约（五入口） | 已完成 | 23 份 pimir 全为 `dma-align=64`、`mram-bytes=8 GiB`；3163 条 sidecar 路径/哈希有效；round18–20 探针全部 REJECTED；4 层真实产物 ACCEPTED | 第 20 轮修复为修复者自测，尚未经独立评审复核 |
-| G3 | 实施证据一致性检查 | 已完成 | `scripts/check_implement_evidence.py` 本次生成文档时重跑 exit 0（「实施文档数值与产物一致」） | 历史值（alt/48l）不在机器核验范围 |
+| G3 | 实施证据一致性检查 | 已完成 | `scripts/check_implement_evidence.py` 本次生成文档时重跑 exit 0（「实施文档数值与产物一致」），48 层结果回填后再次 exit 0 | 历史值（alt 与旧 48l 条目）不在机器核验范围；48 层当前运行见 G5 |
 | G4 | FlagTree paged_attn 修复 | 已完成 | 源码对象 sha256 `068d2624…`、`518cd1e2…`；安装内 `triton-opt` 本次重跑 exit 0，输出含 1 处 `pim_block_slot` 与 5 处 `pim_f32_to_f16` | 无 |
-| G5 | 48 层全模型成本验收 | 未完成 | round08/round10 历史 `566.863 s / 1.402 t/s`；当前严格验证器拒绝旧 B 路条目 | 需当前代码重跑 48 层 A/BCD/A2/E（K16/Q12） |
+| G5 | 48 层全模型成本验收 | 已完成 | 2026-11-13 当前代码 48 层主链 exit 0：`192.49 s / 4.13 t/s`，trace `{'pimir': 106230, 'absorbed': 24576}`（130806 条），三个严格验证器 ACCEPTED；旧 round08/round10 的 `566.863 s / 1.402 t/s` 仅作历史 | 无（旧成本证据已由当前运行替代） |
 
-　　核心需求共 7 项：已完成 5 项（P0-1、P0-2、P0-4、P1-1、P1-2），部分完成 2 项（P0-3、P0-5，均因 48 层未用当前代码重跑）。评审扩展目标 G1–G4 已完成，G5 未完成。当前状态是第 20 轮修复已实施并由修复者自测通过，但尚未经第 21 轮独立评审复核；本文不把当前状态写成「全部评审通过」。
+　　核心需求共 7 项：已完成 6 项（P0-1、P0-2、P0-3、P0-4、P1-1、P1-2），部分完成 1 项（P0-5，因 48 层数值对拍未用当前代码重跑）。评审扩展目标 G1–G5 全部完成。2026-11-13 已用当前工作区重跑 48 层主链（A/BCD/A2/E），容量、成本与严格契约均以当前代码为准；当前状态仍是第 20 轮修复已实施并由修复者自测通过、尚未经第 21 轮独立评审复核，本文不把当前状态写成「全部评审通过」。
 
 ## 二、总体流程
 
@@ -80,16 +80,16 @@ flowchart LR
 | GeneSim 仿真（E） | 主链 E 调用 `./run.sh --config <run>/sim_qwen3_moe_pimir_pimir.yaml` | `<run>/pim_traces_pimir/*.pim_trace`（10906 条）、`<run>/results_pimir/summary.json`、`pim_capacity_metrics.json` | dynamic：`total_time_s=60.785`、`tokens/s=13.079`、1 请求/795 token；集群常驻 `3,140,834,304 / 8,589,934,592`（36.56%），`fits=True`。dense：`63.637 s / 12.493 t/s` | 是：summary 被 `scripts/check_implement_evidence.py` 读取并逐值核验；本次重跑 exit 0 |
 | 产物验收 | `python scripts/check_implement_evidence.py --doc docs/implement-qwen3-moe-20261105.md --summary dynamic=<run>/results_pimir/summary.json --summary dense=<dense_run>/results_pimir/summary.json` | 证据块中的 current 标签与两份 summary | 退出码 0，输出「实施文档数值与产物一致」 | 验证链终点；证明文档数值可追溯到本次产物 |
 
-　　48 层全模型走的是同一条三段链，但证据全部是历史产物：A/BCD/A2 为 round08 当轮源码、E 为 round10 当轮 GeneSim 在 round08 产物上重跑。其结构证据为 44117 算子、18673 GEMM、18432 专家 GEMM、`parameter_bytes=61,064,245,248`、23 份 pim mlir 全 64 字节对齐；容量按 8 GiB 口径（扣 64 MiB 预留后可用 8,522,825,728 B）为 dpu0..3 所需 `8,258,576,576 B`、dpu4..7 所需 `7,791,833,024 B`，E 历史值为 `566.863 s / 1.402 t/s`、130806 条 trace。round16/17 的 B 路编译单位契约要求旧 sidecar 回传 `trace_tokens`/`local_*_shapes`，round08/10 的 19,250 条 B 路条目没有这些字段，当前严格验证器在 freshness、仿真 IR 与 trace 三入口都拒绝该产物（过滤后 13,106 条被单位契约直接抓到），因此 48 层成本证据在新契约下失效，只保留结构/容量证据（K16/Q12）。
+　　48 层全模型走同一条三段链，2026-11-13 已用当前工作区重跑（A→0→BCD→A2→E）：结构为 44117 算子、18673 GEMM、18432 专家 GEMM、`parameter_bytes=61,064,245,248`、23 份 pim mlir（8 A + 15 B，全部 64 字节对齐、8 GiB）；容量 dpu0..3 所需/可用 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B`；E 为 `192.49 s / 4.13 t/s`、130806 条 trace（pimir 106230 + absorbed 24576），三个严格验证器 ACCEPTED。round08/round10 的旧主链（`566.863 s / 1.402 t/s`）是历史产物，其 19,250 条 B 路条目缺 `trace_tokens`/`local_*_shapes`，在当前契约下仍会被严格入口拒绝，只作追溯，不再作为当前成本证据（K16/Q12 已关闭）。
 
 | 环节 | 4 层切片（当前代码） | 48 层全模型 |
 |------|----------------------|-------------|
-| 图编译 A/A2 | 已跑：3681 算子、1557 GEMM、1536 专家 GEMM | round08 历史：44117 算子、18673 GEMM、18432 专家 GEMM |
-| 算子编译 FlagTree | 已跑：23 份 pim mlir（8 A 路 + 15 B 路） | round08 历史：23 份 pim mlir，全 64 字节对齐 |
-| 放置 sidecar | 已跑：3163 条（1557 GEMM + 1606 算子级） | round08 历史：37923 条（18673 GEMM + 19250 算子级） |
-| GeneSim 仿真 | 已跑：10906 条 trace，`60.785 s / 13.079 t/s` | round10 历史 E：130806 条 trace，`566.863 s / 1.402 t/s`；当前严格契约拒绝旧 B 路条目 |
-| 数值对拍 HF | 已跑：36 passed、1 skipped（8B SKIP） | round01 日志 23 passed、1 skipped（25,426.83 s）；round06 26 passed、1 skipped（17,254.56 s）；当前代码未重跑 |
-| 8 GiB 容量 | 已跑：集群 36.56%，`fits=True` | round08 历史：dpu0..3 所需/可用 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B` |
+| 图编译 A/A2 | 已跑：3681 算子、1557 GEMM、1536 专家 GEMM | 已跑（当前代码）：44117 算子、18673 GEMM、18432 专家 GEMM |
+| 算子编译 FlagTree | 已跑：23 份 pim mlir（8 A 路 + 15 B 路） | 已跑（当前代码）：23 份 pim mlir（8 A + 15 B），全 64 字节对齐 |
+| 放置 sidecar | 已跑：3163 条（1557 GEMM + 1606 算子级） | 已跑（当前代码）：37923 条（18673 GEMM + 19250 算子级），19250 条 B 路全部带单位 |
+| GeneSim 仿真 | 已跑：10906 条 trace，`60.785 s / 13.079 t/s` | 已跑（当前代码）：130806 条 trace，`192.49 s / 4.13 t/s` |
+| 数值对拍 HF | 已跑：36 passed、1 skipped（8B SKIP） | round06 历史 26 passed、1 skipped（17,254.56 s）；当前代码未重跑 |
+| 8 GiB 容量 | 已跑：集群 36.56%，`fits=True` | 已跑（当前代码）：dpu0..3 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B` |
 | 8B 真实权重 | SKIP，未覆盖 | SKIP，未覆盖 |
 
 ## 三、核心原理
@@ -137,13 +137,13 @@ flowchart LR
 　　为了让动态分派在每一层真实生效，需要把专家归属限制在本层。旧实现的 `_expert_provenance` 无层边界，上一层累加的多专家状态传到下一层后，整层被判为多专家，2 层探针的 97 条门控命令全部属于第 0 层。本文把归属改为 `(层, 专家)`/`(层, None)`，层号取 `nn_module_stack` 或权重名，跨层输入按中性、层内汇合在累加出口终止；`hal_numpy.submit` 在提交前等 dispatch 结果，未命中命令不再入队。实现位于 `runtime/exec_plan_gen.py:122`（`_expert_provenance`）、`:104`（`_node_layer_of`）、`:163`（`_expert_tag_of`）与 `backend/hal_numpy.py:233`，由 `test_every_layer_gates_its_own_experts`、`test_pp_stages_each_gate_their_own_layers` 与 4 层执行期基准验证（prefill 1.148×、decode 1.202×，用户已接受）。状态：已实测通过（加速比为历史实测，本轮未重测）。
 
 ### 4.4 8 GiB 容量三处分裂（来源：round01 问题7；round02 问题1；round03 问题2；round06/07 问题2/3；round11 问题1）
-　　为了让 30B 专家权重在 8 DPU 上可规划，必须有单一容量契约。旧实现主链写 4 GiB、真实测试写 16 GiB、GeneSim 写 8 GiB，三处各自硬编，48 层导出在原理上必然超预算。本文把单 DPU 总容量、64 MiB 系统预留与 64 字节对齐收成不可拆分的三件套：`contracts/op_contract.py:58` 定义 `DPU_MRAM_BYTES=8 GiB`，`memory/mem_planner.py:32`（`default_hw_budget`）/`:44`（`default_site_capacity`）派生 `HwBudget` 与 `PIMHardwareConfig`，sidecar 回传 `hw_budget`，GeneSim 在 `_validate_hw_budget`（`genesim/src/scheduler/gene_sim_scheduler.py:1121`）与每份 pimir 的 MLIR 属性上核对。4 层当前代码集群常驻 `3,140,834,304 / 8,589,934,592`（36.56%），`fits=True`；48 层 round08 容量 dpu0..3 `8,258,576,576 / 8,522,825,728`、dpu4..7 `7,791,833,024 / 8,522,825,728`。状态：4 层已实测通过；48 层为历史产物，当前严格契约因 B 路单位缺失拒绝（K16/Q12），待确认。
+　　为了让 30B 专家权重在 8 DPU 上可规划，必须有单一容量契约。旧实现主链写 4 GiB、真实测试写 16 GiB、GeneSim 写 8 GiB，三处各自硬编，48 层导出在原理上必然超预算。本文把单 DPU 总容量、64 MiB 系统预留与 64 字节对齐收成不可拆分的三件套：`contracts/op_contract.py:58` 定义 `DPU_MRAM_BYTES=8 GiB`，`memory/mem_planner.py:32`（`default_hw_budget`）/`:44`（`default_site_capacity`）派生 `HwBudget` 与 `PIMHardwareConfig`，sidecar 回传 `hw_budget`，GeneSim 在 `_validate_hw_budget`（`genesim/src/scheduler/gene_sim_scheduler.py:1121`）与每份 pimir 的 MLIR 属性上核对。4 层当前代码集群常驻 `3,140,834,304 / 8,589,934,592`（36.56%），`fits=True`；48 层当前代码（2026-11-13 重跑）容量 dpu0..3 `8,258,576,576 / 8,522,825,728`、dpu4..7 `7,791,833,024 / 8,522,825,728`，与 round08 一致且三入口 ACCEPTED。状态：4 层与 48 层当前代码均已实测通过（K16/Q12 关闭）。
 
 ### 4.5 严格产物契约的五个入口各自为政（来源：round04 问题2；round05 问题3/4；round08 问题4；round12 问题1；round13/14 问题3/4；round15 问题1/2）
 　　为了让五段入口消费同一份产物，必须有共享验证器。旧实现把严格性拆成配置开关与 sidecar 自报两套状态，导出、skip-simulation、freshness、仿真 IR 与 trace 各自决定检查哪些字段，导致缺哈希、缺 `moe_config`、伪造 host 豁免、专家号互换等都能从某条路径放行。本文把 MoE 元数据、结构指纹、容量三件套、逐 op_id 专家身份、吸收/豁免证据与 A/B 路 pimir 语义收进 `validate_sidecar_contract`（`scripts/run_full_pipeline.py:742`）与 `audit_sidecar_coverage`（`:1493`），严格性取「配置 ∪ 自报」，五个入口共同调用。4 层真实产物 ACCEPTED，round18–20 的假分片、错单位、A 路指向 B 路产物、host 自报等探针全部 REJECTED。状态：已实测通过；第 20 轮修复为修复者自测，尚未独立复核。
 
 ### 4.6 B 路成本单位错配（来源：round16 问题1；round17 问题1/2/3；round18 问题1/2）
-　　为了让 B 路算子的代价与真实执行几何一致，必须定义编译单位。旧实现按源 IR 全局形状与 128 token 占位生成 pimir：4 层 `VECTOR_MUL` 的 trace 是 `[Tq,192]`，字节却按 128×768 计，VECTOR_MUL 被放大到 65.244 s；48 层为 782.930 s。本文把 B 路 pimir 固定为「1 token × 该 DPU 的本地宽」，sidecar 回传 `trace_tokens` 与保留符号维的 `local_*_shapes`，pimir 带 `pim.traceTokens`，运行期按 `ceil(实际 Tq / tokens)` 重复。实现位于 `genesim_bridge/placement_export.py:338`（`_pimir_unit_shapes`）、`:579`（`_attach_bpath_pimir`）、`genesim/src/vpu/vpu.py:570`（`_unit_repetitions`）、`genesim/src/scheduler/gene_sim_scheduler.py:978`（`_validate_pimir_unit`）。4 层修复后 `VECTOR_MUL` 65.244→0.151 s，dynamic 总时长 88.483→60.785 s。状态：已实测通过。
+　　为了让 B 路算子的代价与真实执行几何一致，必须定义编译单位。旧实现按源 IR 全局形状与 128 token 占位生成 pimir：4 层 `VECTOR_MUL` 的 trace 是 `[Tq,192]`，字节却按 128×768 计，VECTOR_MUL 被放大到 65.244 s；48 层为 782.930 s。本文把 B 路 pimir 固定为「1 token × 该 DPU 的本地宽」，sidecar 回传 `trace_tokens` 与保留符号维的 `local_*_shapes`，pimir 带 `pim.traceTokens`，运行期按 `ceil(实际 Tq / tokens)` 重复。实现位于 `genesim_bridge/placement_export.py:338`（`_pimir_unit_shapes`）、`:579`（`_attach_bpath_pimir`）、`genesim/src/vpu/vpu.py:570`（`_unit_repetitions`）、`genesim/src/scheduler/gene_sim_scheduler.py:978`（`_validate_pimir_unit`）。4 层修复后 `VECTOR_MUL` 65.244→0.151 s，dynamic 总时长 88.483→60.785 s；48 层当前代码 `VECTOR_MUL` 从历史 782.930 s 降到 1.81 s，总时长 566.863→192.49 s（历史值来自错误单位，仅作对照）。状态：已实测通过。
 
 ### 4.7 A 路 GEMM 与 host 证据未绑定（来源：round19 问题1/2/3；round20 问题1）
 　　为了让 A 路 GEMM 与 host 落点不可伪造，需要把它们绑定到源 IR 与实产。旧实现只核对 GEMM 的 `pimir_path` 与哈希，1557 条 GEMM 全部指向一份逐元素产物时，五入口与直接 GeneSim 仍接受，仿真总时长从 60.785 s 降到 1.696 s；`lm_head` 自报 `device_hint=cpu` 也能跳过 A 路检查。本文要求 A 路 pimir 必须是该分片的实测分块 GEMM（`tt.dot`/`pim.matmul`、tile/循环/分片宽/`act_spec` 一致），host 判定需同时具备源 IR `device_hint=cpu`、`pimir_exempt_ops` 登记与 `host_gemms` 角色/权重证据；B 路另用 18 类闭合语义指纹表核对 pimir 内容。实现位于 `scripts/run_full_pipeline.py:1415`（`_apath_unit_problems`）、`:1274`（`_bpath_unit_contract_problems`）、`:1181`（`_BPATH_PIMIR_SEMANTICS`）与 `genesim/src/pim/pimir_trace.py:732`。4 层/48 层/llama2 真实产物 0 问题（48 层 15 份、llama2 14 份 B 路 pimir 正例），round19/20 探针在修复前四入口接受、修复后全部 REJECTED。状态：已实测通过（第 20 轮自测，未独立复核）。
@@ -329,10 +329,11 @@ BPATH_PIMIR_SEMANTICS: Dict[str, PimirSemantics] = {
 | 证据一致性 checker | `python scripts/check_implement_evidence.py --doc docs/implement-qwen3-moe-20261105.md --summary dynamic=<run>/results_pimir/summary.json --summary dense=<dense_run>/results_pimir/summary.json` | exit 0，输出「实施文档数值与产物一致」 | 通过 | 本次重跑；dynamic/dense 两份 summary 逐值核验 |
 | FlagTree lit | `/data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/build/flagtree-cmake/bin/triton-opt -split-input-file -pim-expand-phases -pim-lower-to-emitc test/Dialect/TritonPIM/paged_attn_emitc.mlir` | exit 0；输出含 1 处 `pim_block_slot` 调用、5 处 `pim_f32_to_f16` 调用 | 通过 | 本次重跑；源码对象 sha256 `068d2624…`、`518cd1e2…` |
 | 48 层数值（历史） | 同 4 层目标命令，`QWEN3_30B_MODEL_DIR=/data2/pengcheng-models/Qwen3-30B-A3B` | round01 23 passed、1 skipped（25,426.83 s）；round06 26 passed、1 skipped（17,254.56 s） | 引用历史，未执行 | `/tmp/test_target_full_30b_systemd.log`、`/tmp/qwen3-review-round06/target48l.log`；round02 的 `full30b-r2` 被 systemd-oomd 杀死（共享 CEVA 内存压力，环境阻塞） |
-| 48 层主链（历史） | `python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-models/Qwen3-30B-A3B --num-stages 2 --max-requests 1` | round08 exit 0；A 44117/18673/18432；E `566.863 s / 1.402 t/s`；容量（8 GiB 扣 64 MiB 后可用 8,522,825,728 B）dpu0..3 所需/可用 `8,258,576,576/8,522,825,728`、dpu4..7 `7,791,833,024/8,522,825,728` | 引用历史，未执行 | 当前严格契约拒绝旧 B 路条目（K16/Q12）；结构/容量保留，成本失效 |
+| 48 层主链（当前代码，2026-11-13） | `python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-models/Qwen3-30B-A3B --num-stages 2 --max-requests 1 --log-dir /data/fjg/pengcheng/qwen3-48l-verify-20261112` | exit 0；A 44117/18673/18432；BCD 18673+19250，23 份 pim mlir；E `192.49 s / 4.13 t/s`、130806 条 trace；容量 dpu0..3 `8,258,576,576/8,522,825,728`、dpu4..7 `7,791,833,024/8,522,825,728`；三入口 ACCEPTED | 通过（当前代码） | 运行目录 `/data/fjg/pengcheng/qwen3-48l-verify-20261112/qwen3_moe_tp4_pp2_dynamic_dispatch_20261112-221320-497107/`；全链约 7h17m |
+| 48 层主链（历史 round08/10） | 同上 | round08 exit 0；E `566.863 s / 1.402 t/s`；成本在新契约下失效 | 引用历史 | 仅作追溯；旧 B 路条目缺单位，严格入口仍拒绝 |
 | P1-1 执行期基准（历史） | `python scripts/bench_moe_dispatch.py --model-dir /data2/pengcheng-work/Qwen3-30B-A3B-4L --new-tokens 2 --repeat 3 --warmup 1 --num-dpus 8` | prefill 1.148×、decode 1.202×，token 完全一致 | 引用历史，用户已接受 | 本轮未重测；Q7 关闭 |
 
-　　复现命令（按执行顺序；耗时用例本轮未重跑，命令与参数照实施文档原文）：
+　　复现命令（按执行顺序；48 层主链已于 2026-11-13 重跑，48 层数值与 llama2_7b 慢速子集未重跑，命令与参数照实施文档原文）：
 
 ```bash
 source /data/fjg/pengcheng/flagOS/flagOS-installed/pytorch/env-pytorch.sh
@@ -381,7 +382,7 @@ cd /data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree
 |--------------------------|----------|------|------|
 | `python -m pytest tests/ -q -k "llama2_7b"` 基线 48 passed | 慢速回归 | 未验证 | 本轮未执行；实施文档 Q4 记录历史 48 passed（0:53:44） |
 | P0-1/2/3/4 以小随机 MoE 全链路 + `test_qwen3_moe` 系列通过 | 4 层真实权重目标命令 + 小模型用例 | 满足 | 6.2 第 1 行：36 passed、1 skipped |
-| P0-5 真实 30B 短序列贪心与 HF 一致 | 4 层切片与 48 层历史 | 部分满足 | 4 层当前代码通过；48 层历史 round01/round06；当前代码未重跑（K16/Q12） |
+| P0-5 真实 30B 短序列贪心与 HF 一致 | 4 层切片与 48 层 | 部分满足 | 4 层当前代码通过；48 层主链当前代码通过（2026-11-13）；48 层数值仍为 round01/round06 历史，当前代码未重跑数值对拍 |
 | P1-1 token 一致 + 加速比记录 | 执行期 A/B | 满足（历史） | prefill 1.148×、decode 1.202×，用户已接受（Q7） |
 | P1-2 16 DPU 专家并行 + 映射均衡 | 16 DPU 用例 | 满足（小模型） | `test_ep_16_dpu_generate_matches_hf` 等；PP×EP |
 | 不回归：Llama-2-7B 与 Qwen3-8B 既有端到端结果不变 | 慢速回归 + 8B 用例 | 未验证 | Llama2 慢回归未跑（K12）；8B 无权重 SKIP（K4） |
@@ -412,7 +413,7 @@ cd /data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree
 | 第 19 轮 | A 路 GEMM 语义未绑定、host 自报跳过检查、条目字段未对源 IR、主机分页注意力未落 f16、容量指标跨口径 | 已修复 | `_apath_unit_problems`、host 三件套、`op_type`/`semantic_role` 绑定、显式 f16 边界、判定利用率同源 |
 | 第 20 轮 | B 路 pimir 未绑定算子语义、容量文档 scope 措辞 | 已修复并自测，未独立复核 | 18 类闭合语义指纹表（两仓逐值钉住）；4L 真实产物、48L 15 份、llama2 14 份 pimir 正例；ROPE/PAGED_ATTN 互换探针两仓 REJECTED；summary 新增三个 scope 字段 |
 
-　　当前未修复项为 48 层成本证据（K16/Q12）与工具链/环境项（K4、K10、K11/Q10、K12/Q11），见第八节。跨轮重复问题按最终结果合并核对，不再按轮次重复计数。
+　　当前未修复项为 48 层数值对拍（L2）与工具链/环境项（K4、K10、K11/Q10、K12/Q11），48 层成本证据已由 2026-11-13 当前代码重跑恢复（K16/Q12 关闭），见第八节。跨轮重复问题按最终结果合并核对，不再按轮次重复计数。
 
 ## 七、与设计的差异
 
@@ -425,15 +426,15 @@ cd /data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree
 | design §4.8 | gate 标志位运行期跳过 | 提交前等 dispatch 再决定入队 | 执行期跳过没有加速，改为提交面收敛 | 是（评审 round02；用户接受 1.148×/1.202×） |
 | design §十.4 | B 路单位与产物契约 | 增加 A 路分块 GEMM、host 三件套、18 类语义表 | 评审 round16–20 逐步闭合伪造路径 | 是（评审要求；设计已同步） |
 | design §十.5 | 容量三件套与利用率 | 增加单 TensorPU/集群/诊断比三个 scope 字段 | 避免 `fits=True` 与 145% 利用率自相矛盾 | 是（评审 round19/20；设计已同步） |
-| design §4.7/§七 | 48 层全模型当前代码验收 | 仅引用 round08/10 历史产物，未重跑 | 用户明确约定不重跑；新单位契约下成本失效 | 是（用户约定；登记 K16/Q12） |
+| design §4.7/§七 | 48 层全模型当前代码验收 | 2026-11-13 用当前代码重跑 A/BCD/A2/E（`192.49 s / 4.13 t/s`，三入口 ACCEPTED） | 用户 2026-11-12 指示重跑；48 层数值仍为历史 | 是（用户指示；K16/Q12 关闭） |
 | design §4.9/§九.4 | 16 DPU 组合示例 tp2×pp2×ep4 | pp4×ep4（PP×EP） | 与 §4.9 路线修正一致 | 是（用户确认） |
 
 ## 八、当前遗留问题
 
 | 编号 | 问题描述（≤30字） | 影响范围（≤20字） | 来源 | 状态 |
 |------|-------------------|-------------------|------|------|
-| L1 | 48 层旧 B 路条目缺编译单位，成本证据失效 | 48 层代价验收 | K16/Q12 | 未修复；需当前主链重跑 A/BCD/A2/E |
-| L2 | 48 层数值为 round01/round06 历史，非当前代码 | P0-5 全模型验收 | 实施 §8.4/K15 | 未验证；当前工作区只重跑 4 层 |
+| L1 | 48 层旧 B 路条目缺编译单位，成本证据失效 | 48 层代价验收 | K16/Q12 | 已关闭（2026-11-13 当前代码重跑；三入口 ACCEPTED） |
+| L2 | 48 层数值为 round01/round06 历史，非当前代码 | P0-5 全模型验收 | 实施 §8.4/K15 | 未验证；主链已重跑，数值对拍仍为历史 |
 | L3 | 8B 无权重，用例 SKIP | P0-5 与回归 | K4 | 外部阻塞；未覆盖 |
 | L4 | P1-1 加速比未在本轮重测 | 性能验收 | Q7/实施 §9 | 已规避；1.148×/1.202× 为历史实测、用户接受 |
 | L5 | TP×EP 复合放置未实现 | 更大规模专家并行 | design §九.4 | 未实现；列为后续课题 |
@@ -442,6 +443,6 @@ cd /data/fjg/pengcheng/flagOS/flagOS-installers/FlagTree
 | L8 | 单专家真实 BCD 受 FlagTree N=1 分块限制 | 单专家全链 | K11/Q10 | 未修复；工具链能力 |
 | L9 | 第 20 轮修复未经独立评审复核 | 最终验收结论 | 20 轮上限 | 待确认；修复已实施并自测 |
 | L10 | 一次全量回归因根盘 `/tmp` 满在 51% 处 ENOSPC | 回归执行环境 | I96/日志 | 已规避；basetemp 改到 `/data` 后通过 |
-| L11 | 48 层主链容量为 round08 历史产物 | 8 GiB 全模型容量 | K7/K16 | 结构/容量证据保留；当前契约不可消费 |
+| L11 | 48 层主链容量为 round08 历史产物 | 8 GiB 全模型容量 | K7/K16 | 已关闭（2026-11-13 当前代码实测容量一致，`fits=True`） |
 
 　　当前无「已修复但未登记」的评审项；round01–20 的确认与修复记录见实施文档 §7.1。第 20 轮的两项问题已按实施文档 §7.1 登记，但其结论属于修复者自测，不是独立评审结论；在下一轮独立评审前，本文不将其表述为「已通过评审」。

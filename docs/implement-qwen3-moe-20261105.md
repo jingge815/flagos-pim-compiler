@@ -87,19 +87,21 @@ techdoc-qwen3-moe-20261112 与 qwen3-moe-final-20261112）。round20 把 B 路 p
 round18 问题3 遗留的缓存锁测试 fork/Queue 抖动改成 spawn + 模块级 worker
 （本轮全量回归复现 `_queue.Empty`，只改等待上限没有根治）。复发原因与
 其余取舍见 §7.2。
-需求验收状态：**完成（4 层）**——4 层真实权重 **36 passed、1 skipped**
-（242.71 s；8B 无权重 SKIP）、round20 重跑 4 层全链 dynamic_dispatch
-**60.785 s / 13.079 t/s**（精化 IR 与 round19 产物逐字节相同，sha256
-`43634aac…`）、dense_sim **63.637 s / 12.493 t/s**（1.047×，本轮 dense
-重跑）、GeneSim **45/45** 个测试文件、编译器全量回归 **2207 passed、
-11 skipped、52 deselected、失败 0**。48 层
-数值沿用 round06 历史
-**26 passed、1 skipped**；48 层主链 A/BCD/A2 为 round08 产物、E 为 round10
-重跑。round16/17 的单位契约使旧 48 层 B 路条目缺少 `trace_tokens`/
-`local_*_shapes` 与符号维，当前严格验证器在 freshness、仿真 IR、trace
-三入口都拒绝该产物，48 层成本证据（`total_time_s=566.863`、
-`tokens/s=1.402`）失效；按用户要求不重跑 48 层主链，保留为 K16/Q12。
-8B 无权重记为未覆盖。
+需求验收状态：**完成（4 层与 48 层主链）**——4 层真实权重 **36 passed、
+1 skipped**（242.71 s；8B 无权重 SKIP）、round20 重跑 4 层全链
+dynamic_dispatch **60.785 s / 13.079 t/s**（精化 IR 与 round19 产物逐字节
+相同，sha256 `43634aac…`）、dense_sim **63.637 s / 12.493 t/s**（1.047×，
+本轮 dense 重跑）、GeneSim **45/45** 个测试文件、编译器全量回归
+**2207 passed、11 skipped、52 deselected、失败 0**。
+2026-11-13 按用户指示用当前工作区重跑 48 层主链（A→0→BCD→A2→E），
+**exit 0**：A 44117 算子 / 18673 GEMM / 18432 专家 GEMM；BCD 18673 条
+GEMM + 19250 条算子级；23 份 pim mlir；E `total_time_s=192.49`、
+`tokens/s=4.13`，trace `{'pimir': 106230, 'absorbed': 24576}`（130806 条）；
+每 DPU 容量 dpu0..3 `8,258,576,576 / 8,522,825,728 B`、dpu4..7
+`7,791,833,024 / 8,522,825,728 B`；当前严格验证器（freshness、仿真 IR、
+trace）对本次 48 层产物三入口全部 ACCEPTED，K16/Q12 关闭。运行目录与
+summary 见 §8.4。48 层数值仍沿用 round06 历史 **26 passed、1 skipped**
+（当前代码未重跑数值对拍）。8B 无权重记为未覆盖。
 当前关键事实：
 - A/B 路分类只由源 IR 决定：`op_type == GEMM` 进 A 路，其余算子都是 B 路；
   `shards` 是被验产物自报字段，不得反过来定义类别。B 路带假分片、设备 GEMM
@@ -152,9 +154,9 @@ round18 问题3 遗留的缓存锁测试 fork/Queue 抖动改成 spawn + 模块�
   结构指纹各自一致，trace 来源只有 `pimir`/`absorbed`。
 - P1-1 用户已接受 4 层真实权重的 prefill 1.148×、decode 1.202×（旧实现
   0.994×），Q7 关闭；剩余执行后端优化另立需求。
-- 剩余事项：48 层成本待在新单位契约下重跑（K16/Q12）；Llama2 旧 sidecar
-  需用当前主链重导后跑慢速用例（K12）；8B 无权重（K4）；单专家真实 BCD 受
-  FlagTree N=1 分块限制（K11/Q10）。
+- 剩余事项：48 层数值仍为 round06 历史、未用当前代码重跑数值对拍；Llama2 旧
+  sidecar 需用当前主链重导后跑慢速用例（K12）；8B 无权重（K4）；单专家真实
+  BCD 受 FlagTree N=1 分块限制（K11/Q10）。
 
 ## 二、任务完成清单
 | 任务ID | 任务描述 | 对应设计模块 | 完成状态 | 备注 |
@@ -165,7 +167,7 @@ round18 问题3 遗留的缓存锁测试 fork/Queue 抖动改成 spawn + 模块�
 | T4 | `mlp.gate.weight` 列切规则 | §4.4 | 完成 | |
 | T5 | 小随机 MoE 端到端对拍 | §4.6 | 完成 | 组合验证，见 3.3-I1 |
 | T6a | 站点路径键 `qwen3_30b_model_dir` | §4.7 前置 | 完成 | 解析改为无权重单测，真实用例统一 skipif |
-| T6b | 真实 30B 端到端用例 | §4.7 | 完成 | 4 层切片目标命令 round18 **36 passed/1 skipped（256.34s，8B SKIP）**；48 层结果见 8.4/K7/K16 |
+| T6b | 真实 30B 端到端用例 | §4.7 | 完成 | 4 层切片目标命令 round18 **36 passed/1 skipped（256.34s，8B SKIP）**；48 层主链见 8.4（2026-11-13 当前代码重跑） |
 | R1 | P1-1 动态分派原语 | §4.8 | 完成 | 子图/通信整条门控；跳过写零防 inf×0=nan |
 | R2 | P1-2 专家并行维度 | §4.9 | 完成 | PP×EP（设计 §九.4 路线）；16 DPU 用例与 K3 守护 |
 | F1 | GeneSim MoE 图骨架与元数据 | 评审问题1 | 完成 | router + 每专家三件套；54 GiB 专家驻留 |
@@ -566,17 +568,15 @@ round18 问题3 遗留的缓存锁测试 fork/Queue 抖动改成 spawn + 模块�
     没有改变数值路径。
   - 48 层全模型：round06 源码数值 **26 passed、1 skipped in 17254.56s（4:47:34）**，
     30B 通过、8B SKIP；round01 历史日志 23 passed、1 skipped（25426.83s）；
-    round02 的 `full30b-r2` 为 oom-kill（环境阻塞）。round08 用当轮源码重跑
-    48 层主链（A→0→BCD→A2→E）**exit 0**：total_time_s=566.863、
-    tokens/s=1.402、trace `{'pimir': 106230, 'absorbed': 24576}`；round10 在
-    round08 的 48 层 A/BCD/A2 产物上用当轮 GeneSim 代码重跑 E 阶段，
-    **与 round08 逐位一致（total_time_s=566.863、tokens/s=1.402、通信字节
-    166,702,607,112）**，审计 ACCEPTED。round11～round16 沿用该 summary 作为
-    48 层既有证据，不重复启动长任务；当前 round20 工作区只重跑了 4 层。
-    round16/17 的单位契约使旧 48 层 B 路条目缺少 `trace_tokens`/`local_*_shapes`
-    与符号维，当前验证器在 freshness、仿真 IR 与 trace 三入口都 REJECTED
-    （13106 条 B 路条目），48 层成本证据失效，见 8.4/K16/Q12；
-    48 层数值用例保留 round06 历史。
+    round02 的 `full30b-r2` 为 oom-kill（环境阻塞）。2026-11-13 用当前工作区
+    重跑 48 层主链（A→0→BCD→A2→E）**exit 0**：A 44117 算子 / 18673 GEMM /
+    18432 专家 GEMM；BCD 18673 条 GEMM + 19250 条算子级，23 份 pim mlir；
+    E total_time_s=192.49、tokens/s=4.13、trace `{'pimir': 106230,
+    'absorbed': 24576}`；当前严格验证器三入口 ACCEPTED，容量与成本见 8.4。
+    round08/round10 的旧主链结果（total_time_s=566.863、tokens/s=1.402、
+    通信字节 166,702,607,112）是历史产物，在新单位契约下失效，仅作追溯；
+    当前 48 层成本以本次运行为准。48 层数值用例仍保留 round06 历史，当前
+    代码没有重跑数值对拍。
 - 本机无 Qwen3-8B 权重：8B 用例 SKIP，如实记为未覆盖，不作为通过。
 - 全链路历史记录（Qwen3 入口，4 层切片，round11 重跑；`tp1_pp4` 对照继续
   沿用该轮）：
@@ -1174,8 +1174,8 @@ measurements:
 | K12 | `genesim/models` 的 Llama2-7B sidecar 生成于严格契约之前，缺 `hw_budget`/`ir_fingerprint`；按当前规则属于应重新导出的旧产物 | `pytest -m slow` 的 Llama2 仿真冒烟 | 未关闭 | 本轮只处理 Qwen3-MoE；旧 Llama2 产物需用当前主链重新导出后再跑慢速用例（Q11） |
 | K13 | 证据块的 `measurements`（bench 加速比与历史淘汰值）与 `facts`（容量/通信/trace 计数等）来自执行期日志、历史记录或旁路审计，checker 只做声明与语境绑定，不复算这些值 | 非 summary 证据 | 已规避（记录） | 这些值没有 summary 产物可复算；独立命名空间禁止它们冒充 current，带 `run` 的 facts 还会按最近标签核对运行语境；current 运行时仍逐值由 summary 核验 |
 | K14 | 正文的『某运行更高/更低』若不带具体数值，checker 无法判定结论真假 | 实施证据检查 | 已规避（记录） | 没有数值锚点就无法机器比较；证据性结论统一写成带数值的形式（如 `dynamic 60.785 s 低于 dense 63.637 s`），带数值的比较已由 `_check_comparisons` 逐条判定 |
-| K15 | 当前 round16～19 工作区都没有重跑 48 层数值与主链；48 层证据是 round06 数值、round08/round10 主链历史产物 | 48 层「当前代码」结论的适用范围 | 已规避（记录） | §8.4 按「源码/产物来源—时间—层数—本轮是否重跑」分栏，明确历史产物不等于当前代码重跑；round16/17 的 B 路单位契约使旧 48 层三入口都无法通过严格复核，成本证据转 K16/Q12 |
-| K16 | round16/17 的 B 路编译单位契约要求 sidecar 回传 `trace_tokens`/`local_*_shapes` 且保留 `Tq`/`Tp+Tq` 符号维；round08/10 的 48 层 19,250 条 B 路条目没有这些字段，当前验证器在 freshness、仿真 IR、trace 三入口都拒绝该产物（13106 条 B 路条目的单位不完整），48 层成本结论（total_time_s=566.863、tokens/s=1.402）在新契约下失效 | 48 层代价验收 | 未关闭 | 用户明确要求直接引用 48 层历史产物、不重跑主链；结构证据（算子数/容量/trace 计数）保留为历史，成本证据待用当前主链重跑 A/BCD/A2/E 后恢复（Q12） |
+| K15 | 当前 round16～19 工作区都没有重跑 48 层数值与主链；48 层证据是 round06 数值、round08/round10 主链历史产物 | 48 层「当前代码」结论的适用范围 | 已关闭（2026-11-13 主链；数值仍历史） | 2026-11-13 用当前工作区重跑 48 层主链 A/BCD/A2/E（见 §8.4）；48 层数值仍是 round06 历史，未重跑数值对拍 |
+| K16 | round16/17 的 B 路编译单位契约要求 sidecar 回传 `trace_tokens`/`local_*_shapes` 且保留 `Tq`/`Tp+Tq` 符号维；round08/10 的 48 层 19,250 条 B 路条目没有这些字段，当前验证器在 freshness、仿真 IR、trace 三入口都拒绝旧产物（13106 条 B 路条目的单位不完整），旧成本结论（total_time_s=566.863、tokens/s=1.402）在新契约下失效 | 48 层代价验收 | 已关闭（2026-11-13） | 用户 2026-11-12 指示用当前代码重跑 48 层主链：A/BCD/A2/E 均重新生成，19,250 条 B 路条目全部带编译单位，三入口 ACCEPTED；当前成本 total_time_s=192.49、tokens/s=4.13（旧值仅作历史，见 §8.4） |
 
 ### 5.2 偏差说明
 | 设计条目 | 设计方案 | 实际实现 | 差异原因 | 是否经确认 |
@@ -1248,7 +1248,7 @@ measurements:
 | Q9 | 旧代码的 48 层主链任务与 4 层主链共用 `genesim/models` 同名产物 | 已规避 | round06 的 48 层任务使用独立的 `GENESIM_ROOT=/tmp/qwen3-review-round06/genesim-full48`，不写本仓 `genesim/models`；round09 的 4 层 dynamic/dense 主链已用当前代码完整重跑并逐段核对同源（K9） |
 | Q10 | FlagTree 对 N=1 的 GEMM 输出没有合法分块，1 专家/top-1 模型无法走完真实 BCD | 未关闭 | 属工具链能力（K11）；合法/非法策略入口已由 parser、`resolve_strategy` 与真实主链非法分支覆盖，不通过放宽专家约束绕过 |
 | Q11 | `genesim/models` 的 Llama2-7B 旧 sidecar 缺 `hw_budget`/`ir_fingerprint`，严格契约下需重导 | 未关闭 | 本轮只处理 Qwen3-MoE；用当前主链重新导出 Llama2 产物后再跑 `pytest -m slow`（K12） |
-| Q12 | 在新 B 路编译单位契约下重跑 48 层 A/BCD/A2/E，恢复 48 层成本证据 | 未关闭 | round16～19 只重跑 4 层；48 层旧 B 路条目缺单位且无符号维，严格验证器在 freshness/仿真 IR/trace 三入口都拒绝该产物（K16）。内存可用（`free -g` ≥ 120 GB）时用 systemd 重跑，并回填 §8.4/§9.2 |
+| Q12 | 在新 B 路编译单位契约下重跑 48 层 A/BCD/A2/E，恢复 48 层成本证据 | 已关闭（2026-11-13） | 2026-11-13 用当前工作区重跑 48 层主链（`/data/fjg/pengcheng/qwen3-48l-verify-20261112/`），A/BCD/A2/E 全部重新生成，三入口 ACCEPTED；成本 total_time_s=192.49、tokens/s=4.13，容量与 trace 见 §8.4 |
 | Q13 | 独立入口的共享 `genesim/models/` 产物需随主链刷新 | 已关闭 | round17 用当前主链 4L dynamic 产物刷新 6 个文件；模板说明与输出目录已修正，编译器产品测试钉住执行语义=默认、指纹与严格契约（F71） |
 
 ## 七、评审问题修复记录
@@ -2031,22 +2031,40 @@ QWEN3_30B_MODEL_DIR=/data2/pengcheng-models/Qwen3-30B-A3B \
 
 ### 8.4 真实 30B 证据
 
-证据按「源码/产物来源—时间—层数—本轮是否重跑」分栏。当前 round20 工作区
-只重跑了 4 层；48 层没有用当前工作区重新生成。round16/17 的 B 路编译单位
-契约使 round08/10 的 48 层 B 路 trace 缺少 `trace_tokens`/`local_*_shapes`，
-当前严格验证器拒绝这些 trace（31,538 条），因此 48 层结构证据保留为历史、
-成本证据在新契约下失效（K16/Q12），不能当作「当前代码重跑过」。
+证据按「源码/产物来源—时间—层数—本轮是否重跑」分栏。2026-11-13 按用户
+指示用当前工作区重跑了 48 层主链（A→0→BCD→A2→E），结构、容量、成本与
+严格契约均已用当前代码验证；48 层数值对拍仍是 round06 历史，未重跑。
+round08/round10 的旧主链产物保留为历史追溯，其 B 路 trace 在新单位契约下
+仍会被严格入口拒绝，不再作为当前成本证据。
 
 | 证据 | 源码/产物来源 | 时间 | 层数 | 本轮是否重跑 |
 |------|----------------|------|------|----------------|
+| 48 层主链 A/0/BCD/A2 | 当前工作区 | 2026-11-13 | 48 | 是 |
+| 48 层主链 E | 当前工作区 | 2026-11-13 | 48 | 是 |
+| 48 层严格验证（freshness/仿真 IR/trace） | 当前工作区 | 2026-11-13 | 48 | 是，三入口 ACCEPTED |
 | 48 层数值目标用例 | round06 源码与日志 | round06 | 48 | 否，历史 |
-| 48 层主链 A/0/BCD/A2 | round08 当轮源码，systemd `full30b-pipeline-r8-qwen3` | round08 | 48 | 否，历史产物 |
-| 48 层主链 E | round10 当轮 GeneSim 代码在 round08 产物上重跑 | round10 | 48 | 否 |
-| 48 层既有产物静态复核 | 当前验证器（freshness/仿真 IR/trace + B 路语义指纹） | round20 | 48 | 否；A 路分块 GEMM 与 B 路语义指纹在旧产物上 0 问题，但 B 路单位契约要求 `trace_tokens`/`local_*_shapes` 与符号维，旧产物缺字段，三入口全部 REJECTED（K16） |
+| 48 层主链 A/0/BCD/A2（旧） | round08 当轮源码，systemd `full30b-pipeline-r8-qwen3` | round08 | 48 | 否，历史（旧 B 路缺单位，仅追溯） |
+| 48 层主链 E（旧） | round10 当轮 GeneSim 代码在 round08 产物上重跑 | round10 | 48 | 否，历史 |
+| 48 层既有产物静态复核 | 当前验证器（freshness/仿真 IR/trace + B 路语义指纹） | round20 | 48 | 否；旧产物三入口 REJECTED（K16，历史结论） |
 | 4 层数值目标用例 | 当前工作区 | round20 | 4 | 是 |
 | 4 层全链（dynamic） | 当前工作区 | round20 | 4 | 是 |
 | 4 层 dense 对照 | 当前工作区 | round20 | 4 | 是（同一入口 dense_sim） |
 
+- 48 层当前代码主链（2026-11-13）：
+  `python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-models/Qwen3-30B-A3B --num-stages 2 --max-requests 1 --log-dir /data/fjg/pengcheng/qwen3-48l-verify-20261112`
+  → exit 0，运行目录
+  `/data/fjg/pengcheng/qwen3-48l-verify-20261112/qwen3_moe_tp4_pp2_dynamic_dispatch_20261112-221320-497107/`：
+  A 44117 算子 / 18673 GEMM / 18432 专家 GEMM；BCD 18673 + 19250 条，
+  23 份 pim mlir（8 A + 15 B，全部 `pim.dma-align=64`、`pim.mram-bytes=8 GiB`，
+  15 份带 `pim.traceTokens`），19250 条 B 路条目全部带编译单位；A2 44117 算子、
+  指纹与骨架一致；E total_time_s=192.49、tokens/s=4.13、trace
+  48 层当前代码 trace `{'pimir': 106230, 'absorbed': 24576}`（130806 条）；48 层容量 dpu0..3
+  `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B`；
+  GeneSim 集群常驻 `8,412,147,712 / 8,589,934,592 B`（97.93%），`fits=True`；
+  `verify_sidecar_freshness`、`verify_sim_ir_matches_sidecar`、
+  `verify_trace_provenance` 全部 ACCEPTED。全链耗时约 7h17m（BCD 约 5h14m、
+  A2 约 21m、E 约 1h42m）。本次运行的 summary 未加入下方机器可读证据块
+  （48l 标签保留为 round10 历史），精确值以运行目录的 summary 为准。
 - 4 层真实权重目标命令（当前代码，本轮 round20 重跑）：
   `QWEN3_30B_MODEL_DIR=/data2/pengcheng-work/Qwen3-30B-A3B-4L python -m pytest tests/test_architectures.py tests/test_qwen3_8b_real.py tests/test_qwen3_30b_real.py -q -p no:cacheprovider`
   → **36 passed、1 skipped、2 warnings in 242.71s（0:04:02）**，日志
@@ -2057,8 +2075,8 @@ QWEN3_30B_MODEL_DIR=/data2/pengcheng-models/Qwen3-30B-A3B \
   `/tmp/qwen3-review-round06/target48l.log`）：
   **26 passed、1 skipped in 17254.56s（4:47:34）**，`test_qwen3_30b_generate_matches_hf`
   PASS、8B SKIP，systemd 峰值内存 63.1 GiB。round01 历史日志为 23 passed、
-  1 skipped（25426.83s）。当前工作区没有重跑 48 层数值；48 层主链见下方
-  round08/round10 历史产物，本轮只用当前验证器复核既有产物。
+  1 skipped（25426.83s）。当前工作区没有重跑 48 层数值；48 层主链已由
+  2026-11-13 的当前代码运行替代（见上），round08/round10 仅作历史追溯。
 - `--skip-simulation`：round16 当轮跑过同一入口（`/tmp/r16-pipeline-skip.log`，
   退出码 0）；round17 没有重跑整条 BCD/A2，只把新产物交给同一共享验证器：
   `validate_sidecar_contract(..., strict_pimir=True)` 对 4L 新产物通过，对
@@ -2243,7 +2261,8 @@ QWEN3_30B_MODEL_DIR=/data2/pengcheng-models/Qwen3-30B-A3B \
   吸收/豁免过滤后由单位契约直接抓到），31,538 条 B 路 trace 也因此无法证明
   与运行期形状同源。这是 round16/17 单位契约的预期结果，不是代码回归；
   48 层结构/容量证据保留为历史，成本证据失效，待用当前主链重跑后恢复
-  （K16/Q12）。本条不代表当前工作区重新生成了 48 层产物。
+  （K16/Q12）。2026-11-13 已用当前工作区重跑 48 层 A/BCD/A2/E 并三入口
+  ACCEPTED，K16/Q12 关闭；本条记录的是 round20 对旧产物的复核结论。
 
 - FlagTree 重建与既有产物复核（round14）：在
   `/data/fjg/pengcheng/flagOS/flagOS-installed/flagTree/build/flagtree-cmake`

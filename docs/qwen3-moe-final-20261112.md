@@ -10,6 +10,8 @@
 
 　　本次整理做三件事：第一，逐份核对文档中可被代码或产物验证的陈述（路径、函数/行号、默认值、测试名、计数、验证结果）；第二，修正或标注过时内容；第三，把当前代码状态、验证证据与遗留问题汇总成本文。整理**只改文档，不改代码**；整理完成后按用户指示提交（提交号见 §3.1）。整理**没有重跑** 4 层全链、GeneSim 套件、编译器全量回归等耗时测试，数值引用最近一次记录（第 20 轮评审与第 20 轮修复自测），并在第四节标明来源与证据等级。
 
+　　2026-11-13 按用户指示补跑了 48 层全链（A/BCD/A2/E，约 7 小时），容量、成本与严格契约均以当前已提交代码为准；第四、六节已按该结果更新，K16/Q12 关闭。
+
 ## 二、文档与代码状态核对结论
 
 | 文档 | 定位 | 核对结果 | 本次处理 |
@@ -70,11 +72,12 @@
 | 4 层全链 dense_sim | exit 0，`63.637 s / 12.493 t/s` | round20 修复自测（dense） | 已实测 |
 | GeneSim 套件 | 45/45 个测试文件通过 | round20 修复自测 `/tmp/r20-genesim-sim.log` | 已实测 |
 | 编译器全量回归（排除 llama2_7b） | 2207 passed、11 skipped、52 deselected、0 failed in 1,373.42 s | round20 修复自测 `/tmp/r20-regression.log` | 已实测 |
-| 证据一致性 checker | exit 0（「实施文档数值与产物一致」） | round20 修复自测 | 已实测 |
+| 证据一致性 checker | exit 0（「实施文档数值与产物一致」） | round20 修复自测；2026-11-13 回填 48 层结果后重跑 exit 0 | 已实测 |
 | FlagTree 源码=安装对象 | sha256 `068d2624…`、`518cd1e2…`；`triton-opt` FileCheck exit 0（1 处 `pim_block_slot`、5 处 `pim_f32_to_f16`） | round20 评审 | 已实测 |
 | 严格契约探针 | round18–20 的假分片、错单位、A 路指向 B 路产物、host 自报、`op_type`/语义互换等全部 REJECTED；4L 真实产物 ACCEPTED | round20 评审与修复自测 | 已实测 |
-| 48 层结构/容量 | round08 历史：44117 算子/18673 GEMM/18432 专家 GEMM；容量 dpu0..3 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B` | round08 产物与日志 | 历史 |
-| 48 层成本 | round10 历史 `566.863 s / 1.402 t/s`；当前严格契约拒绝旧 B 路条目（缺 `trace_tokens`/`local_*_shapes`），成本证据失效（K16/Q12） | round10 summary、round20 静态复核 | 失效 |
+| 48 层结构/容量（当前代码） | 44117 算子/18673 GEMM/18432 专家 GEMM；容量 dpu0..3 `8,258,576,576 / 8,522,825,728 B`、dpu4..7 `7,791,833,024 / 8,522,825,728 B`；集群 `8,412,147,712 / 8,589,934,592 B`（97.93%），`fits=True` | 2026-11-13 运行目录 `/data/fjg/pengcheng/qwen3-48l-verify-20261112/qwen3_moe_tp4_pp2_dynamic_dispatch_20261112-221320-497107/` | 已实测 |
+| 48 层成本（当前代码） | exit 0，`192.49 s / 4.13 t/s`；trace `{'pimir': 106230, 'absorbed': 24576}`（130806 条）；三个严格验证器 ACCEPTED | 同一运行目录 `results_pimir/summary.json` | 已实测 |
+| 48 层成本（历史） | round10 `566.863 s / 1.402 t/s`；旧 B 路条目缺单位，严格入口拒绝，仅作追溯 | round10 summary、round20 静态复核 | 历史 |
 | 48 层数值 | round06 历史 26 passed、1 skipped；当前代码未重跑 | round06 日志 | 历史 |
 | 8B 真实权重 | SKIP，未覆盖 | 4 层目标用例 | 未覆盖 |
 | P1-1 加速比 | prefill 1.148×、decode 1.202×（历史实测，用户已接受） | 实施文档 Q7 | 历史 |
@@ -105,8 +108,8 @@
 
 | 编号 | 问题 | 影响 | 状态 |
 |------|------|------|------|
-| K16/Q12 | 48 层旧 B 路 sidecar 缺 `trace_tokens`/`local_*_shapes`，当前严格验证器拒绝 | 48 层成本证据（566.863 s/1.402 t/s）失效 | 未闭环；需用当前代码重跑 48 层 A/BCD/A2/E |
-| Q4 | 48 层数值为 round06 历史结果（26 passed、1 skipped） | 当前代码未重跑 48 层数值 | 未覆盖 |
+| K16/Q12 | 48 层旧 B 路 sidecar 缺 `trace_tokens`/`local_*_shapes`，当前严格验证器拒绝 | 48 层成本证据（566.863 s/1.402 t/s）失效 | 已闭环（2026-11-13 当前代码重跑 48 层 A/BCD/A2/E，19250 条 B 路全部带单位，三入口 ACCEPTED；新成本 192.49 s/4.13 t/s） |
+| Q4 | 48 层数值为 round06 历史结果（26 passed、1 skipped） | 48 层数值对拍未用当前代码重跑 | 未覆盖（主链与成本已当前代码验证） |
 | — | 8B 真实权重无权重 | 8B 未覆盖 | SKIP |
 | — | P1-1 加速比未重测 | 1.148×/1.202× 为历史实测 | 用户已接受 |
 | — | A 路 `pim.matmul` 无真实产物 | 该分支仅代码推理 | 待验证 |
@@ -128,6 +131,10 @@ QWEN3_30B_MODEL_DIR=/data2/pengcheng-work/Qwen3-30B-A3B-4L \
 python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-work/Qwen3-30B-A3B-4L \
   --num-stages 2 --max-requests 1
 
+# 48 层全链（约 7 小时；产物建议写 /data，避免根盘占满）
+python scripts/run_full_pipeline.py --model-dir /data2/pengcheng-models/Qwen3-30B-A3B \
+  --num-stages 2 --max-requests 1 --log-dir /data/fjg/pengcheng/qwen3-48l-verify-20261112
+
 # GeneSim 套件
 cd ../genesim && ./run.sh --test sim
 
@@ -141,7 +148,7 @@ python scripts/check_implement_evidence.py --doc docs/implement-qwen3-moe-202611
   --summary dense=<dense_run>/results_pimir/summary.json
 ```
 
-　　注意：`-k llama2_7b` 慢速子集（历史约 2.5 小时）按用户约定不重跑；CEVA 流水线不在本需求范围。
+　　注意：48 层主链已于 2026-11-13 重跑（约 7 小时）；`-k llama2_7b` 慢速子集（历史约 2.5 小时）与 48 层数值对拍未重跑；CEVA 流水线不在本需求范围。
 
 ## 八、文档权威关系
 
