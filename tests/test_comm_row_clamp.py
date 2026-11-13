@@ -85,3 +85,20 @@ def test_broadcast_rows_passes_through() -> None:
     engine = _RecordingEngine()
     broadcast(entry, engine, host, rows=1)
     assert len(engine.calls) == 2  # 每行两段，rows=1 只留第 0 行
+
+
+def test_clamped_entry_truncates_segments_spanning_multiple_rows() -> None:
+    """跨多行的整段必须截到 rows*R，尾行旧值不能进 host 缓冲。"""
+    seg = CommSegment(
+        edge_id=0, type="all_gather", src_dpu=0,
+        src_local_range=(0, 8), global_range=(0, 8),
+        dst_dpu=None, dst_local_offset=0, nbytes=16, src_addr=0)
+    entry = CommPlanEntry(
+        edge_id=0, type="all_gather", reduce=None, shape=(1, 4, 2),
+        dtype=np.dtype(np.float16), dst_loc={"device": "host"},
+        wait_for=(), segments=[seg])
+    clamped = clamped_entry(entry, rows=2)
+    assert len(clamped.segments) == 1
+    assert clamped.segments[0].global_range == (0, 4)
+    assert clamped.segments[0].nbytes == 8
+    assert clamped_entry(entry, None) is entry

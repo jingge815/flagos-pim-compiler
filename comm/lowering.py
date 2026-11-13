@@ -95,11 +95,11 @@ class DmaEngine:
 
 
 def clamped_entry(entry: CommPlanEntry, rows: int | None) -> CommPlanEntry:
-    """按实际行数裁剪通信段（D2-full）：丢弃行号 ≥ rows 的段。
+    """按实际行数裁剪通信段（D2-full）：截断到前 rows 行。
 
     段的 global_range 落在摊平行主序数组上：列切片段每段恰好一行内连续，
-    整行段也是行号单位，因此按 行号 = global_range[0] // R 过滤即可让
-    collect/writeback 只搬运前 rows 行。行几何不整除或 rows 为空时原样返回。
+    整行段则可能跨多行，必须把段尾截到 rows*R 并同步 nbytes，否则会把
+    DPU 尾行的旧值读进 host。行几何不整除或 rows 为空时原样返回。
     """
     if rows is None or not entry.shape:
         return entry
@@ -107,9 +107,19 @@ def clamped_entry(entry: CommPlanEntry, rows: int | None) -> CommPlanEntry:
     if t_env <= 0 or entry.numel % t_env:
         return entry
     row_elems = entry.numel // t_env
-    keep = [s for s in entry.segments
-            if s.global_range[0] // row_elems < rows]
-    return replace(entry, segments=keep)
+    limit = rows * row_elems
+    itemsize = entry.dtype.itemsize
+    segments = []
+    for seg in entry.segments:
+        start, end = seg.global_range
+        if start >= limit:
+            continue
+        end = min(end, limit)
+        if end != seg.global_range[1]:
+            seg = replace(seg, global_range=(start, end),
+                          nbytes=(end - start) * itemsize)
+        segments.append(seg)
+    return replace(entry, segments=segments)
 
 
 def _check_entry(entry: CommPlanEntry, expect: str) -> None:
