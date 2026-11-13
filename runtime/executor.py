@@ -345,7 +345,8 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
                  pos: int | None = None,
                  num_tokens: int | None = None,
                  causal_mask_standard: bool = False,
-                 mode: str = "static") -> dict[int, object]:
+                 mode: str = "static",
+                 drain: bool = True) -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。
 
     命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
@@ -354,12 +355,24 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
     为空时沿用全局事件表，保持旧的单请求语义。
     `causal_mask_standard` 声明本次传入的掩码就是标准因果掩码，注意力内核
     据此走融合路径；自定义掩码（滑动窗口、bias）不要置位。
-    `mode` 是静态/动态执行路径的显式入口；D0 只提供分派缝，动态调度在 D1 实现。
+    `mode` 是静态/动态执行路径的显式入口；dynamic 走事件驱动调度，`drain=False`
+    时只启动调度并返回事件表，由调用方按输出命令等待。
     """
-    if mode != "static":
-        raise NotImplementedError("动态调度在 D1 实现；当前只支持 static 模式")
+    if mode not in ("static", "dynamic"):
+        raise ValueError(f"未知执行模式：{mode!r}")
     if causal_mask_standard:
         values = {**(values or {}), "causal_mask_standard": True}
+    if mode == "dynamic":
+        if ctx is None:
+            hal.reset_events()
+            hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
+        else:
+            ctx.events.clear()
+            ctx.values = values or {}
+            ctx.pos = pos
+            ctx.num_tokens = num_tokens
+        from runtime.scheduler import EventScheduler
+        return EventScheduler(plan, hal, ctx).run(drain=drain)
     if ctx is None:
         hal.reset_events()
         hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)

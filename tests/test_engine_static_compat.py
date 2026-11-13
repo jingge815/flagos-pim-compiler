@@ -36,9 +36,9 @@ def test_dynamic_entry_points_default_to_static() -> None:
     assert fields["kernel_classes"].default == ()
 
 
-def test_dynamic_execute_is_explicitly_unimplemented() -> None:
-    with pytest.raises(NotImplementedError):
-        execute_plan(ExecutionPlan([]), None, mode="dynamic")
+def test_unknown_execute_mode_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        execute_plan(ExecutionPlan([]), None, mode="bogus")
 
 
 def test_dependency_helpers_are_reexported() -> None:
