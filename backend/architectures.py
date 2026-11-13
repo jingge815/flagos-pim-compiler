@@ -21,7 +21,6 @@ from graph.strategy import ShardStrategy, llama_strategies
 
 def make_static_moe_forward(blk: torch.nn.Module) -> Callable:
     """把 Qwen3MoE 的稀疏前向换成形状静态的稠密模拟版。
-
     HF 原版按「命中专家」动态循环并按 token 子集 gather，形状依赖数据，
     torch.export 导不出。这里改成 topk/scatter 生成稀疏门控权重后全专家
     加权累加：未选中专家权重为 0，乘加恒等；按专家号升序累加与 HF 的
@@ -37,8 +36,7 @@ def make_static_moe_forward(blk: torch.nn.Module) -> Callable:
             top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
         # 命中与否只由 top-k 选中索引决定；路由权重只参与加权。权重下溢为 0
         # 的已选中专家仍要执行（HF 会算 0×输出），不能用非零权重当命中条件。
-        selected_mask = torch.zeros_like(probs, dtype=torch.bool).scatter(
-            1, selected, True)
+        selected_mask = torch.zeros_like(probs, dtype=torch.bool).scatter( 1, selected, True)
         routing = torch.zeros_like(probs).scatter(1, selected, top_weights.to(probs.dtype))
 
         def expert_out(e: int) -> torch.Tensor:
