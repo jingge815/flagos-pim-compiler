@@ -29,3 +29,10 @@
 - **D2-full（未做）**：运行期按实际 T 裁剪 DPU 行数——需 `comm/lowering` 段拷贝与内核形状读取的行数钳制；当前动态图收益是编译面（一张图替代桶表），执行仍走包络。
 - **D3/D4（未做）**：`torch.cond`/`while_loop` 下降为 RTControl、调度器物化分支；预规划槽池 alloc/free（D4b 需先确认 op compiler 是否把 `mram_offset` 烧进代码）。
 - 明确不做：设备内分支、DPU 直连、动态 KV 物理扩容、异步 DMA 重叠（一阶段约束）。
+
+## 终版数字（2026-11-13 收口，4 层真实 MoE）
+
+- static 70.0s / dynamic 69.5s / dynamic+PIM_DYN_SHAPE=1 67.7s，token 逐位一致。
+- 全量回归 2233 passed、0 failed（排除 llama2_7b）。
+- 调度器终版：计划序全量提交 + 逐命令形状绑定；就绪调度经剖析（65% 墙钟零并发）证伪并移除。
+- 提交链：e81754f → 3a2fc2c → 0059a45 → a884afc → 73deddd → 8e73dbc → 4b0de02 → 7f4bf92 → ce99ca9。
