@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from contracts.op_contract import PimOptimizations
+
 from .paths import pim_options
 
 
@@ -33,13 +35,30 @@ def lower_ttir_to_pimir(
     *,
     tile_to_budget: bool = True,
     wram_bytes: Optional[int] = None,
+    hardware=None,
 ) -> str:
-    """将 TTIR 文本转换为 PIM IR，并可按预算选择矩阵乘分块。"""
+    """将 TTIR 文本转换为 PIM IR，并可按预算选择矩阵乘分块。
+
+    给了 `hardware` 就用它的五元组，与图/算子编译同源；没给时退回全局
+    `pim_options()`，保持旧单次链路的行为。
+    """
     from triton._C.libtriton import ir, passes
 
     _check_inprocess_matches_triton_opt()
+    optimizations = getattr(hardware, "optimizations", None) or PimOptimizations()
 
-    options = pim_options()
+    if hardware is None:
+        # 旧单次链路显式保留全局覆盖；正式链路一律从请求契约取目标。
+        options = pim_options()
+    else:
+        options = {
+            "pim_target": hardware.compiler_target,
+            "pim_num_dpus": hardware.num_dpus,
+            "pim_num_tasklets": hardware.num_tasklets,
+            "pim_wram_bytes": hardware.wram_bytes_per_dpu,
+            "pim_mram_bytes": hardware.mram_bytes_per_dpu,
+            "pim_dma_align": hardware.dma_align,
+        }
     if wram_bytes is not None:
         options = {**options, "pim_wram_bytes": int(wram_bytes)}
     with tempfile.NamedTemporaryFile("w", suffix=".ttir", delete=False) as handle:
@@ -64,17 +83,21 @@ def lower_ttir_to_pimir(
             enable_source_remat=False,
         )
         # 五类优化，顺序与 opcompiler_bridge.pipeline.a_path_passes 一致。
-        # canonicalize 与 cse 先清一遍 TTIR 里的 arith。
-        # 分块无条件加入：没有点积也没有可切循环时它保持原样，不再报错。
+        # canonicalize 与 cse 先清一遍 TTIR 里的 arith。开关只决定是否加入
+        # 对应 pass；融合与显式 DMA 是目标格式要求，始终执行。
         passes.common.add_canonicalizer(manager)
-        passes.common.add_cse(manager)
+        if optimizations.cse:
+            passes.common.add_cse(manager)
         # 循环不变量外提：地址与布局转换不随内层迭代变化。
         passes.common.add_licm(manager)
-        passes.pim.add_constant_fold(manager)
-        passes.pim.add_pim_cse(manager)
+        if optimizations.constant_fold:
+            passes.pim.add_constant_fold(manager)
+        if optimizations.cse:
+            passes.pim.add_pim_cse(manager)
         passes.pim.add_fuse_activation(manager)
-        passes.pim.add_pim_dce(manager)
-        if tile_to_budget:
+        if optimizations.dce:
+            passes.pim.add_pim_dce(manager)
+        if tile_to_budget and optimizations.loop_tiling:
             passes.pim.add_tile_to_budget(
                 manager, full_m=full_m, full_n=full_n, full_k=full_k
             )
@@ -212,7 +235,7 @@ def _check_inprocess_matches_triton_opt() -> None:
     _INPROCESS_CHECKED = True
 
 
-def lower_oplevel_to_pimir(mlir_text: str) -> str:
+def lower_oplevel_to_pimir(mlir_text: str, hardware=None) -> str:
     """将**整算子级** PIM IR 展开成相位 SSA，返回 pimir 文本。
 
     与 `lower_ttir_to_pimir` 是两条不同的入口：那条从 Triton kernel 出发，
@@ -235,8 +258,11 @@ def lower_oplevel_to_pimir(mlir_text: str) -> str:
     from opcompiler_bridge.pipeline import b_path_passes, with_budget
 
     return _run_passes(
-        _triton_opt(), with_budget(mlir_text, _options_hardware()),
-        b_path_passes(), "整算子级 pim mlir",
+        _triton_opt(),
+        with_budget(mlir_text,
+                    hardware if hardware is not None else _options_hardware()),
+        b_path_passes(getattr(hardware, "optimizations", None)),
+        "整算子级 pim mlir",
     )
 
 
@@ -246,6 +272,7 @@ def capture_kernels(
     *,
     tile_to_budget: bool = True,
     wram_bytes: Optional[int] = None,
+    hardware=None,
 ) -> List[CapturedKernel]:
     """在上下文中捕获 FlagGems 内核启动及其可选 PIM IR。"""
     from flag_gems.utils.libentry import LibEntry
@@ -284,6 +311,7 @@ def capture_kernels(
             pimir = lower_ttir_to_pimir(
                 ttir, full_m=full_m, full_n=full_n, full_k=full_k,
                 tile_to_budget=tile_to_budget, wram_bytes=wram_bytes,
+                hardware=hardware,
             )
         captured.append(CapturedKernel(
             name=kernel.name,
@@ -387,6 +415,7 @@ def run_and_capture(
     *,
     tile_to_budget: bool = True,
     wram_bytes: Optional[int] = None,
+    hardware=None,
 ) -> List[CapturedKernel]:
     """执行预热调用，并捕获后续调用发射的内核。
 
@@ -416,8 +445,15 @@ def run_and_capture(
 
     # 要按真实预算出 pim mlir 时，预热之前就收紧候选：预热会把选中的内核缓存下来。
     if emit_pimir and tile_to_budget:
-        budget = wram_bytes if wram_bytes is not None else pim_options()["pim_wram_bytes"]
-        tuning = _autotune_within_wram(budget, pim_options()["pim_dma_align"])
+        if hardware is not None:
+            budget = (wram_bytes if wram_bytes is not None
+                      else hardware.wram_bytes_per_dpu)
+            dma_align = hardware.dma_align
+        else:
+            budget = (wram_bytes if wram_bytes is not None
+                      else pim_options()["pim_wram_bytes"])
+            dma_align = pim_options()["pim_dma_align"]
+        tuning = _autotune_within_wram(budget, dma_align)
     else:
         tuning = nullcontext()
 
@@ -430,6 +466,7 @@ def run_and_capture(
             emit_pimir=emit_pimir,
             tile_to_budget=tile_to_budget,
             wram_bytes=wram_bytes,
+            hardware=hardware,
         ) as captured:
             with _use_gems():
                 fn()

@@ -1,0 +1,74 @@
+# 策略搜索：通用 PIM 画像、三种算法可换、tasklet 与八类放置移动。
+# 换算法：加 --algorithm genetic_algorithm 或 tabu_search。
+version: 1
+run_name: tune-strategy
+model:
+  model_dir: null
+  ir: null
+  prefill_seq_len: 16
+  max_seq: null
+  trace:
+    path: trace_quick.json
+    num_requests: 1
+    synthetic: null
+profile:
+  path: ../../contracts/profiles/generic.json
+# 编译优化开关；融合与相位展开是目标格式硬要求，始终执行。
+optimization:
+  constant_fold: true
+  cse: true
+  dce: true
+  loop_tiling: true
+space:
+  strategy:
+    enabled: true
+    num_dpus: [8, 16]
+    num_stages: [1, 2, 4]
+  op:
+    enabled: true
+    num_tasklets: [4, 8]
+  hardware:
+    enabled: false
+    fields: {}
+placement:
+  enabled: true
+  algorithm: simulated_annealing
+  evaluation_backend: pipeline
+  validation_backend: pipeline
+  objective_metric: total_time_s
+  objective_weights: {compute: 0.5, communication: 0.25, memory: 0.25}
+  max_evaluations: 2
+  max_time_s: 0
+  max_proposals: null
+  seed: 0
+  moves:
+    max_segment_ops: 8
+    max_layer_block_layers: 4
+    weights:
+      op_relocate: 1.0
+      op_swap: 1.0
+      connected_segment_relocate: 1.0
+      attention_branch_relocate: 1.0
+      kv_group_pack_or_spread: 1.0
+      layer_block_relocate: 1.0
+      layer_boundary_shift: 1.0
+      pim_rebalance_or_swap: 1.0
+  algorithm_params: {initial_temperature_ratio: 0.05, cooling_rate: 0.9}
+search:
+  algorithm: simulated_annealing
+  seed: 0
+  max_evaluations: 4
+  max_time_s: 0
+  max_proposals: null
+  layer_weights: {strategy: 0.4, op: 0.4, hardware: 0.2}
+  algorithm_params: {min_improvement: 0.0}
+cache: {mode: fast}
+simulation: {use_cost_sidecar: false}
+calibration: {validation_report: null}
+sweep:
+  fields: {}
+  core_policy: fixed_dpus
+  knee_improvement_threshold: 0.05
+  pareto: {resource: total_physical_memory_bytes, direction: minimize}
+output:
+  dir: ../../test-results/tune-strategy

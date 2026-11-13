@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -35,16 +36,14 @@ from contracts.partition_plan import PartitionPlan
 from genesim_bridge.paths import genesim_models_dir, llama2_7b_model_dir
 from genesim_bridge.placement_export import (
     count_sidecar_classes,
-    export_placement_to_genesim,
+    export_placement_for_strategy,
 )
 from graph.strategy import (
     format_strategy,
     llama_strategy,
     strategy_from_partition_plan,
 )
-from graph.fuse_pim import fuse_for_pim
 from memory.mem_planner import HwBudget
-from runtime.compile import compile_llama2
 
 NUM_DPUS = 8
 NUM_TASKLETS = 4
@@ -69,7 +68,9 @@ def build_hw_budget(mram_bytes: int, sys_reserve_bytes: int) -> HwBudget:
 
 
 def _fuse_for_placement(gm):
-    """给 GeneSim 放置导出图补上融合标记。"""
+    """保留旧的私有入口，内部仍走同一条融合路径。"""
+    from graph.fuse_pim import fuse_for_pim
+
     return fuse_for_pim(gm)
 
 
@@ -170,36 +171,26 @@ def main() -> None:
     hw = build_hw_budget(args.mram_bytes, args.sys_reserve_bytes)
     hardware = PIMHardwareConfig(
         num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
-        mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536, dma_align=64,
+        mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536,
+        dma_align=64,
     )
     print(
         f"MRAM 预算: 物理 {hw.mram_bytes} B，"
         f"预留 {hw.sys_reserve_bytes} B，"
         f"可用 {hw.mram_bytes - hw.sys_reserve_bytes} B"
     )
-    compiled = compile_llama2(
-        model, strategy, prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
-        hw=hw, hardware=hardware,
-    )
-    fusion = _fuse_for_placement(compiled.prefill_gm)
-    print(f"GeneSim 代价评估融合: {fusion}")
-
-    out_ir = out_dir / f"llama2_7b_{strategy.name}_placed.ir"
-    sidecar_path = out_dir / f"llama2_7b_{strategy.name}_placement.json"
-    sidecar = export_placement_to_genesim(
-        compiled.prefill_gm, ir_path, out_ir, sidecar_path,
-        dtype="float16",
-        hardware=hardware,
-        # 与 HwBudget 同一份预留：sidecar 里要能对账物理量、预留和可用量。
-        sys_reserve_bytes=hw.sys_reserve_bytes,
+    result = export_placement_for_strategy(
+        model, ir_path, out_dir,
+        strategy=strategy, plan=plan, hw=hw, hardware=hardware,
+        prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
+        force_compile=False,
         measure_kernel_tiles=args.measure_kernel_tiles,
-        # GeneSim 给了方案就把它的 Cluster 映射原样带进 sidecar，往返用同一份声明。
-        dpu_to_cluster=plan.dpu_to_cluster if plan is not None else None,
-        # 非 GEMM 算子按所在层钉到该层流水段的第一台 DPU。
-        strategy=strategy,
-        # KV 规格决定哪些算子读的是 KV 区，随 sidecar 传给 GeneSim 选每字节周期。
-        kv_specs=compiled.kv_specs,
+        # 旧单次链路沿用带策略名的文件名，不能和共享目录里的其他策略相撞。
+        file_stem=f"llama2_7b_{strategy.name}",
     )
+    out_ir = result.placed_ir
+    sidecar_path = result.sidecar
+    sidecar = json.loads(sidecar_path.read_text())
 
     # 按 stage 汇总，便于肉眼核对流水段和 DPU 的对应关系。一个 GEMM 可能切在多台
     # DPU 上（TP 宽度 > 1），每台参与的 DPU 都记一次，而不是只数代表 DPU。

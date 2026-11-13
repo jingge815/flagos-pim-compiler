@@ -48,6 +48,8 @@ def _measure(
     dims: Dict[str, int],
     ir_level: str,
     local_features: Optional[Tuple[int, int]] = None,
+    hardware=None,
+    force_compile: bool = False,
 ) -> Measurement:
     """编译一个形状点的算子，并测量其成本。
 
@@ -79,10 +81,12 @@ def _measure(
         recipe = recipes[op_type](point)
 
     if ir_level == "oplevel":
-        return _measure_oplevel(recipe, op_dict, point, local_features)
+        return _measure_oplevel(recipe, op_dict, point, local_features,
+                                hardware)
     if op_type == "GEMM":
         return _measure_gemm_linear(op_dict, point, in_features, out_features,
-                                    local_features, ir_level)
+                                    local_features, ir_level, hardware,
+                                    force_compile)
 
     if recipe.build is None:
         raise ValueError(
@@ -91,7 +95,8 @@ def _measure(
         )
 
     pimir = ir_level == "pimir"
-    captured = run_and_capture(recipe.build, emit_pimir=pimir)
+    captured = run_and_capture(recipe.build, emit_pimir=pimir,
+                               hardware=hardware)
     if not captured:
         from opcompiler_bridge.cpu_host import gpu_hardware_present
 
@@ -155,6 +160,8 @@ def _measure_gemm_linear(
     out_features: int,
     local_features: Optional[Tuple[int, int]],
     ir_level: str,
+    hardware=None,
+    force_compile: bool = False,
 ) -> Measurement:
     """A 路 GEMM：用本仓 linear 内核测量，与放置导出同一口径。
 
@@ -164,18 +171,20 @@ def _measure_gemm_linear(
     from contracts.op_contract import OpCompileRequest, PIMHardwareConfig
     from opcompiler_bridge.driver import _make_ttir, compile_op
 
-    opts = pim_options()
-    hardware = PIMHardwareConfig(
-        num_dpus=opts["pim_num_dpus"], num_tasklets=opts["pim_num_tasklets"],
-        mram_bytes_per_dpu=opts["pim_mram_bytes"],
-        wram_bytes_per_dpu=opts["pim_wram_bytes"], dma_align=opts["pim_dma_align"])
+    if hardware is None:
+        opts = pim_options()
+        hardware = PIMHardwareConfig(
+            num_dpus=opts["pim_num_dpus"], num_tasklets=opts["pim_num_tasklets"],
+            mram_bytes_per_dpu=opts["pim_mram_bytes"],
+            wram_bytes_per_dpu=opts["pim_wram_bytes"],
+            dma_align=opts["pim_dma_align"])
     request = OpCompileRequest(
         op="linear", arg_shapes=[(point.tq, in_features), (out_features, in_features)],
         hardware=hardware, dtype="float16", num_tasklets=hardware.num_tasklets,
         activation=op_dict.get("fused_activation"))
     pimir = ir_level == "pimir"
     if pimir:
-        result = compile_op(request)
+        result = compile_op(request, force=force_compile)
         text = result.pimir if result.pimir is not None else Path(result.pimir_path).read_text()
     else:
         text = _make_ttir(request)
@@ -199,6 +208,7 @@ def _measure_oplevel(
     op_dict: dict,
     point: ShapePoint,
     local_features: Optional[Tuple[int, int]],
+    hardware=None,
 ) -> Measurement:
     """B 路测量：发整算子级 IR，展开成相位链，交给 `ir_cost`。
 
@@ -207,7 +217,7 @@ def _measure_oplevel(
     `analyze_ir` 按 `pimir` 口径逐行计费（计算类记 flops、视图类记搬运）。
     """
     assert recipe.pimir is not None, f"{op_dict['op_type']} 没有 B 路配方"
-    text = lower_oplevel_to_pimir(recipe.pimir())
+    text = lower_oplevel_to_pimir(recipe.pimir(), hardware)
     cost = analyze_ir(text, recipe.mnemonic.replace(".", "_"), (1,), {},
                       ir_level="oplevel")
     return Measurement(
@@ -502,6 +512,8 @@ def export_costs_to_genesim(
     ir_level: str = "pimir",
     local_shapes: Optional[Dict[int, Tuple[int, int]]] = None,
     placement_sidecar: Optional[Path] = None,
+    hardware=None,
+    force_compile: bool = False,
 ) -> Dict[str, Any]:
     """更新 GeneSim 成本系数，并写入 IR 文件和 sidecar 文件。
 
@@ -542,8 +554,11 @@ def export_costs_to_genesim(
         "coverage": {"bridged": [], "template": []},
         "operators": {},
     }
-    if ir_level == "pimir":
-        # 保存 sidecar 对应的 PIM pass 参数。
+    if hardware is not None:
+        # 成本提取与 A/B 路读到的是同一份画像，可逐项对账。
+        sidecar["hardware"] = hardware.to_payload()
+    if ir_level == "pimir" and hardware is None:
+        # 只有旧单次链路才记录全局 pass 参数；给了画像时以硬件五元组为准。
         sidecar["pim_options"] = pim_options()
 
     recipe_types = set(build_recipes(dims))
@@ -583,8 +598,10 @@ def export_costs_to_genesim(
                op.get("fused_activation"))
         if key not in cache:
             cache[key] = (
-                _measure(op, prefill_point, dims, ir_level, local_features),
-                _measure(op, decode_point, dims, ir_level, local_features),
+                _measure(op, prefill_point, dims, ir_level, local_features,
+                         hardware, force_compile),
+                _measure(op, decode_point, dims, ir_level, local_features,
+                         hardware, force_compile),
             )
         prefill, decode = cache[key]
 

@@ -23,6 +23,7 @@ NUM_DPUS = 4
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 176
 NUM_HEADS = 4
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(scope="module")
@@ -561,6 +562,11 @@ def test_non_gemm_ops_are_pinned_to_their_layer_stage(tmp_path) -> None:
 
     gemm = sidecar["operators"]["0"]
     assert gemm["shards"], "GEMM 的分片被钉层逻辑冲掉了"
+    assert gemm["pimir_route"] == "a", gemm
+    header = Path(gemm["pimir_path"]).read_text().split("}", 1)[0]
+    for name in ("pim.num-dpus", "pim.num-tasklets", "pim.mram-bytes",
+                 "pim.wram-bytes", "pim.dma-align", "pim.target"):
+        assert name in header, (name, header)
 
 
 def test_bpath_entries_keep_the_sidecar_shape() -> None:
@@ -592,6 +598,14 @@ def test_bpath_entries_keep_the_sidecar_shape() -> None:
         assert entry is not None, f"{op_type} 没进 sidecar"
         assert entry["op_type"] == op_type
         assert "pimir_path" in entry, f"{op_type} 没有 pimir_path"
+        # 消费方按路由核对实际写出的预算属性；B 路也必须写 DPU/tasklet，
+        # 否则改 tasklet 时 B 路 PIMIR 字节不变，无法证明参数进了产物。
+        assert entry["pimir_route"] == "b", entry
+        header = Path(entry["pimir_path"]).read_text().split("}", 1)[0]
+        for name in ("pim.num-dpus", "pim.num-tasklets", "pim.mram-bytes",
+                     "pim.wram-bytes", "pim.dma-align", "pim.target"):
+            assert name in header, (op_type, name, header)
+        assert "kind = replicate" in header, (op_type, header)
         # 关键：缺了它，消费方 `entry["shards"]` 会抛 KeyError。
         assert "shards" in entry, f"{op_type} 的条目没有 shards"
 
@@ -719,7 +733,7 @@ def test_local_shard_widths_follow_each_projection(
             assert shard["local_in_features"] == want_in, (op_id, entry)
             assert shard["local_out_features"] == want_out, (op_id, entry)
 
-    assert sidecar["version"] == 4
+    assert sidecar["version"] == 5
     assert sidecar["ir_num_operators"] == 11
 
 
@@ -752,7 +766,7 @@ def test_sidecar_exports_the_same_byte_budget(
         sys_reserve_bytes=reserve,
     )
 
-    assert sidecar["version"] == 4
+    assert sidecar["version"] == 5
     assert sidecar["hardware"] == {
         "mram_bytes_per_dpu": 8000000000,
         "sys_reserve_bytes": reserve,
@@ -1570,6 +1584,37 @@ def test_fused_gate_kernel_carries_the_activation(annotated_tiny_llama, tmp_path
     assert up_ops.count(OPCODE_LUT) == 0
 
 
+def test_sidecar_records_compiler_strategy_and_profile_hash(
+        annotated_tiny_llama, tmp_path) -> None:
+    """sidecar 要能回读策略、DPU 映射、三档容量与编译画像摘要。"""
+    from contracts.hardware_profile import load_profile
+    from graph.strategy import llama_strategy
+
+    profile = load_profile(
+        Path(__file__).resolve().parent.parent / "contracts" / "profiles"
+        / "generic.json")
+    strategy = llama_strategy(
+        4, num_stages=1, num_heads=NUM_HEADS, num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE, vocab_size=32000, num_layers=1)
+    hardware = profile.to_pim_hardware_config(4, 4)
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "sc.json", hardware=hardware, strategy=strategy,
+        profile=profile, sys_reserve_bytes=0,
+        dpu_to_cluster=((0, 0), (0, 1), (0, 2), (0, 3)))
+    compiler = sidecar["compiler"]
+    assert compiler["strategy"]["name"] == strategy.name
+    assert compiler["strategy"]["tp_width"] == 4
+    assert compiler["hardware"]["optimizations"] == (
+        hardware.optimizations.to_payload())
+    assert compiler["compile_profile_sha256"] == profile.compile_profile_sha256()
+    assert compiler["physical_mram_bytes"] == profile.cluster_memory_bytes
+    assert compiler["usable_mram_bytes"] == profile.cluster_memory_bytes
+    assert sidecar["dpu_to_cluster"] == [[0, 0], [0, 1], [0, 2], [0, 3]]
+
+
 def test_placement_export_prepares_fusion_before_sidecar(annotated_tiny_llama, tmp_path) -> None:
     """放置导出入口应先运行图融合，sidecar 才能带上融合清单。"""
     from scripts.export_pp_placement import _fuse_for_placement
@@ -1702,3 +1747,139 @@ def test_fused_activations_follow_tiled_gate_blocks() -> None:
         {"layer": 0, "role": "gate_proj", "activation": "silu"}]
     (weight,) = [n for n in gm.graph.nodes if n.op == "get_attr"]
     assert _activation_of(weight) == "silu"
+
+
+def test_export_declares_toolchain_identity(annotated_tiny_llama, tmp_path):
+    """外置输出目录也要能从 sidecar 读出编译源码与工具内容身份。"""
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    sidecar = export_placement_to_genesim(
+        annotated_tiny_llama, ir_path, tmp_path / "placed.ir",
+        tmp_path / "sidecar.json")
+    toolchain = sidecar["compiler"]["toolchain"]
+    assert len(toolchain["graph_compiler"]["source_sha256"]) == 64
+    assert toolchain["tools"]["triton_opt"]["sha256"]
+    assert toolchain["tools"]["gcc"]["path"]
+
+
+def test_tensor_pu_capacity_aggregates_residents_on_the_same_pu() -> None:
+    """两个单块都合法但落在同一 TensorPU 时，合计超限必须拒绝。"""
+    from types import SimpleNamespace
+
+    from contracts.hardware_profile import load_profile
+    from genesim_bridge.placement_export import validate_tensor_pu_capacity
+    from memory.mem_planner import ResidentAllocation
+
+    generic = load_profile(REPO_ROOT / "contracts" / "profiles" / "generic.json")
+    profile = generic.with_fields(tensors_per_cluster=2)
+    capacity = profile.tensor_pu_memory_bytes
+    six_tenths = capacity * 6 // 10
+
+    def plan(*allocations):
+        return SimpleNamespace(resident_allocations=tuple(allocations))
+
+    # 索引 0 与 1 轮转到不同 TPU：同量分散合法，不能按整簇占用误拒。
+    spread = SimpleNamespace(mem_plans={0: plan(
+        ResidentAllocation("w0", "w0", six_tenths),
+        ResidentAllocation("w1", "w1", six_tenths))})
+    assert validate_tensor_pu_capacity(profile, spread) == six_tenths
+
+    # 索引 0 与 2 轮转到同一 TPU：单块都小于限额，合计 1.2 倍必须拒绝。
+    together = SimpleNamespace(mem_plans={0: plan(
+        ResidentAllocation("w0", "w0", six_tenths),
+        ResidentAllocation("w1", "w1", 0),
+        ResidentAllocation("w2", "w2", six_tenths))})
+    with pytest.raises(ValueError, match="TensorPU"):
+        validate_tensor_pu_capacity(profile, together)
+
+
+def test_tensor_pu_capacity_rejects_one_oversized_block() -> None:
+    from types import SimpleNamespace
+
+    from contracts.hardware_profile import load_profile
+    from genesim_bridge.placement_export import validate_tensor_pu_capacity
+    from memory.mem_planner import ResidentAllocation
+
+    generic = load_profile(REPO_ROOT / "contracts" / "profiles" / "generic.json")
+    capacity = generic.tensor_pu_memory_bytes
+    compiled = SimpleNamespace(mem_plans={0: SimpleNamespace(
+        resident_allocations=(
+            ResidentAllocation("w0", "w0", capacity + 1),))})
+    with pytest.raises(ValueError, match="TensorPU"):
+        validate_tensor_pu_capacity(generic, compiled)
+
+
+def test_export_rejects_single_tensor_pu_overflow_before_products(
+        tmp_path, monkeypatch) -> None:
+    """图编译导出在写放置产物之前就拒绝单 PU 装不下的方案。"""
+    from types import SimpleNamespace
+
+    import runtime.compile as runtime_compile
+    from contracts.hardware_profile import load_profile
+    from genesim_bridge.placement_export import export_placement_for_strategy
+    from memory.mem_planner import ResidentAllocation
+
+    generic = load_profile(REPO_ROOT / "contracts" / "profiles" / "generic.json")
+    capacity = generic.tensor_pu_memory_bytes
+    compiled = SimpleNamespace(mem_plans={0: SimpleNamespace(
+        resident_allocations=(
+            ResidentAllocation("w0", "w0", capacity + 1),))})
+    monkeypatch.setattr(
+        runtime_compile, "compile_llama2", lambda *args, **kwargs: compiled)
+
+    strategy = SimpleNamespace(
+        num_dpus=8, num_stages=4, weight_rules=(), dpu_ids=tuple(range(8)))
+    with pytest.raises(ValueError, match="TensorPU"):
+        export_placement_for_strategy(
+            object(), tmp_path / "base.ir", tmp_path / "out",
+            strategy=strategy, hw=generic.to_hw_budget(),
+            hardware=generic.to_pim_hardware_config(8, 4),
+            prefill_seq_len=16, max_seq=32, profile=generic)
+    assert not (tmp_path / "out" / "placement.json").exists()
+
+
+# ---- 评审 round05：逐请求 KV 峰值与并发上限进入单 PU 容量判据 ----
+
+def test_tensor_pu_capacity_uses_the_request_concurrency() -> None:
+    """并发上限改变请求峰值；编译前置与仿真用同一 top-N 口径。"""
+    from types import SimpleNamespace
+
+    from contracts.hardware_profile import load_profile
+    from genesim_bridge.placement_export import validate_tensor_pu_capacity
+    from memory.mem_planner import ResidentAllocation
+
+    generic = load_profile(REPO_ROOT / "contracts" / "profiles" / "generic.json")
+    capacity = generic.tensor_pu_memory_bytes
+    tensor = ResidentAllocation(
+        "kv-unit", "kv:0:0:k", 0,
+        (capacity * 6 // 10, capacity * 6 // 10))
+    compiled = SimpleNamespace(mem_plans={0: SimpleNamespace(
+        resident_allocations=(tensor,))})
+    assert validate_tensor_pu_capacity(
+        generic, compiled, concurrency=1) == capacity * 6 // 10
+    with pytest.raises(ValueError, match="TensorPU"):
+        validate_tensor_pu_capacity(generic, compiled, concurrency=2)
+
+
+def test_export_single_pu_limit_is_the_usable_capacity_share() -> None:
+    """导出前置消费画像的单 PU 限额，预留后的物理均分不再被接受。"""
+    from types import SimpleNamespace
+
+    from contracts.hardware_profile import load_profile
+    from genesim_bridge.placement_export import validate_tensor_pu_capacity
+    from memory.mem_planner import ResidentAllocation
+
+    profile = load_profile(
+        REPO_ROOT / "contracts" / "profiles" / "generic.json").with_fields(
+        sys_reserve_bytes=1024)
+    limit = profile.tensor_pu_memory_bytes
+    legacy = profile.cluster_memory_bytes // profile.tensors_per_cluster
+    assert legacy > limit
+
+    def compiled(size):
+        return SimpleNamespace(mem_plans={0: SimpleNamespace(
+            resident_allocations=(ResidentAllocation("w", "w", size),))})
+
+    assert validate_tensor_pu_capacity(profile, compiled(limit)) == limit
+    with pytest.raises(ValueError, match="TensorPU"):
+        validate_tensor_pu_capacity(profile, compiled(legacy))

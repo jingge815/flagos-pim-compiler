@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
@@ -60,6 +61,13 @@ def _activation_of(weight_node) -> str | None:
     return None
 
 
+
+
+def _compiler_identity() -> dict:
+    """按需导入驱动层身份，避免放置导出模块反向依赖调优包。"""
+    from opcompiler_bridge.driver import compiler_identity
+
+    return compiler_identity()
 
 
 def _graph_seq_len(gm: GraphModule) -> int:
@@ -209,6 +217,7 @@ def _measure_kernel_tile_n(
     hardware: "PIMHardwareConfig | None",
     cache: Dict[tuple[int, int, str | None], tuple[int, str, int | None]],
     activation: str | None = None,
+    force_compile: bool = False,
 ) -> tuple[int, str, int | None]:
     """编译一个本地分片形状，返回 `(tile_n, pim mlir 路径)`。
 
@@ -247,7 +256,7 @@ def _measure_kernel_tile_n(
         # 激活随请求下发，由算子层 -pim-fuse-activation 折进 tt.dot。
         activation=activation,
     )
-    result = compile_op(request)
+    result = compile_op(request, force=force_compile)
     if not result.pimir:
         raise RuntimeError(
             f"算子编译没有产出 pim mlir（本地形状 {local_in}->{local_out}）。"
@@ -283,7 +292,9 @@ def _measure_kernel_tile_n(
 _SYMBOLIC_DIM = 128
 
 
-def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
+def _bpath_pimir(mnemonic: str, input_shapes, output_shapes,
+                 hardware: "PIMHardwareConfig | None" = None,
+                 *, force_compile: bool = False) -> str:
     """给一个算子级 mnemonic 编一份 B 路 pimir，返回落盘路径。
 
     与 `_measure_kernel_tile_n` 对称：那条只服务 GEMM（A 路），这条服务其余
@@ -295,16 +306,21 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
     次数由运行时绑定，IR 只需要一个具体的静态形状才能过 verifier，但折成
     字面 1 会让搬运量比真实 prefill（序列长度几百到几千）小几个数量级，
     128 只是一个不退化的占位，不是真实形状。
+
+    硬件预算进缓存键：同一段 IR 在 4 KB 与 8 KB WRAM 下会选出不同分块，
+    只按文本哈希会让第二个候选捡到第一个候选的产物。
     """
-    from opcompiler_bridge.driver import compile_op
+    from opcompiler_bridge.driver import (
+        _CACHE_DIR, _compiler_fingerprint, _run_oplevel_triton_opt)
     from opcompiler_bridge.oplevel_kernel import (
         concat_kernel, dynamic_quant_kernel, eltwise_kernel, gather_kernel, kv_cache_kernel,
         lut_kernel, mask_kernel, matmul_kernel, normalize_kernel,
         reshape_kernel, rope_kernel, softmax_kernel, split_heads_kernel,
         transpose_kernel,
     )
-    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
-    from genesim_bridge.op_classify import _attention_matmul_body, _module
+    from contracts.op_contract import (
+        DEFAULT_HARDWARE_CONFIG, DpuShard, OpCompileRequest)
+    from genesim_bridge.op_classify import _attention_matmul_body
 
     def n(dim):
         return _SYMBOLIC_DIM if isinstance(dim, str) else int(dim)
@@ -347,13 +363,22 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes) -> str:
         raise RuntimeError(
             f"{mnemonic} 的 B 路 IR 缺 stationarity 标记，KV 缓存会被当成模型权值"
         )
-    from opcompiler_bridge.driver import _run_oplevel_triton_opt, _CACHE_DIR
+    from opcompiler_bridge.driver import (
+        _CACHE_DIR, _module_text, _run_oplevel_triton_opt)
     import hashlib, os
-    text = _module(body)
-    key = hashlib.sha256(text.encode()).hexdigest()[:16]
+    hw = DEFAULT_HARDWARE_CONFIG if hardware is None else hardware
+    # B 路算子按复制档进入每个 DPU；模块头要写 DPU/tasklet，仿真才能证明
+    # 这批 B 路产物吃的是本候选的编译参数，而不是另一套默认值。
+    request = OpCompileRequest(
+        op=mnemonic, arg_shapes=[tuple(shape) for shape in ins], hardware=hw,
+        shard=DpuShard(dim=-1, num_dpus=hw.num_dpus, kind="replicate"))
+    text = _module_text(body, request)
+    key = hashlib.sha256(
+        f"{text}:{hw.to_payload()}:{_compiler_fingerprint()}".encode()
+    ).hexdigest()[:16]
     out = _CACHE_DIR / f"bpath-{key}.pimir.mlir"
-    if not out.is_file():
-        expanded, _ = _run_oplevel_triton_opt(text)
+    if force_compile or not out.is_file():
+        expanded, _ = _run_oplevel_triton_opt(text, hw)
         tmp = out.with_suffix(".tmp")
         tmp.write_text(expanded)
         os.replace(tmp, out)
@@ -392,12 +417,13 @@ def _pin_unsharded_ops(ir, sidecar, strategy) -> None:
         entry["dpu_id"] = int(strategy.dpus_of_layer(layer, num_layers)[0])
 
 
-def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
+def _attach_bpath_pimir(operators_by_id, sidecar, hardware=None,
+                        *, force_compile: bool = False) -> None:
     """给每个算子级节点编一份 B 路 pimir 并写进 sidecar。
 
-    同一 (mnemonic, 形状) 只编一次。编不出来直接抛：静默跳过的那条条目会缺
-    `pimir_path`，仿真侧退回手写模板，而现场只看到「缺路径」这个结果，看不到
-    是谁、为什么编不出。契约不满足就让原因立刻暴露。
+    同一 (mnemonic, 形状, 硬件) 只编一次。编不出来直接抛：静默跳过的那条条目
+    会缺 `pimir_path`，仿真侧退回手写模板，而现场只看到「缺路径」这个结果，
+    看不到是谁、为什么编不出。契约不满足就让原因立刻暴露。
     """
     cache: dict = {}
     for op_id, op in operators_by_id.items():
@@ -409,7 +435,8 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         if key not in cache:
             try:
                 cache[key] = _bpath_pimir(
-                    mnemonic, op["input_shapes"], op["output_shapes"])
+                    mnemonic, op["input_shapes"], op["output_shapes"],
+                    hardware, force_compile=force_compile)
             except Exception as exc:
                 raise RuntimeError(
                     f"op{op_id}（{op['op_type']} -> {mnemonic}，形状 "
@@ -424,6 +451,9 @@ def _attach_bpath_pimir(operators_by_id, sidecar) -> None:
         })
         entry["pimir_path"] = cache[key]
         entry["pimir_sha256"] = _file_sha256(cache[key])
+        # 算子级节点走 B 路：只出现 MRAM/WRAM/DMA/目标，DPU/tasklet 编码
+        # 不在这条路径上；消费侧按路由决定哪些属性必须存在。
+        entry["pimir_route"] = "b"
         # 符号维在 PIM MLIR 里按固定占位值编译；仿真侧据此把整算子轨迹的
         # 静态工作量缩放到本次请求形状，避免运行时再按 Tq 重复一次。
         entry["symbolic_dim_placeholder"] = {
@@ -547,6 +577,8 @@ def export_placement_to_genesim(
     dpu_to_cluster: tuple[tuple[int, int], ...] | None = None,
     strategy: "ShardStrategy | None" = None,
     kv_specs: "Dict[int, Any] | None" = None,
+    profile=None,
+    force_compile: bool = False,
 ) -> Dict[str, Any]:
     """更新 GEMM 的设备提示并输出 IR 文件和代表 DPU 编号。
 
@@ -568,6 +600,7 @@ def export_placement_to_genesim(
     if hardware is None:
         from contracts.op_contract import DEFAULT_HARDWARE_CONFIG
         hardware = DEFAULT_HARDWARE_CONFIG
+    from contracts.op_contract import PimOptimizations as _PimOptimizations
     if (
         isinstance(sys_reserve_bytes, bool)
         or not isinstance(sys_reserve_bytes, int)
@@ -588,7 +621,9 @@ def export_placement_to_genesim(
     # 真正可校验的是内容——算子总数和每个被放置算子的 op_type，见
     # GeneSim 侧 _load_compiler_placement 的比对。
     sidecar: Dict[str, Any] = {
-        "version": 4,
+        # schema 5 起必须带完整编译契约：toolchain、hardware、strategy 与
+        # 每个 PIM MLIR 的 A/B 编译路由，消费侧按版本失败关闭。
+        "version": 5,
         "source_ir": str(ir_path),
         "ir_num_operators": len(ir["operators"]),
         # 与编译本地形状时下发的 PIMHardwareConfig 同源：物理总量、系统预留
@@ -612,6 +647,40 @@ def export_placement_to_genesim(
         # 顶层字段而非 per-op：它描述的是"逻辑 DPU k 落在哪个 ClusterPU"，
         # 与算子无关。GeneSim 侧按它分配，缺失则退回取模换算。
         sidecar["dpu_to_cluster"] = [list(entry) for entry in dpu_to_cluster]
+    # 编译口径的可回读副本：策略、五元组与三档容量，加上编译字段摘要。
+    # 时钟等只影响仿真的字段不进这个摘要，扫时钟不需要假装重编过。
+    sidecar["compiler"] = {
+        "strategy": None if strategy is None else {
+            "name": strategy.name,
+            "num_dpus": strategy.num_dpus,
+            "num_stages": strategy.num_stages,
+            "tp_width": strategy.tp_width,
+            "dpu_ids": list(strategy.dpu_ids or ()),
+        },
+        "hardware": {
+            "num_dpus": hardware.num_dpus,
+            "num_tasklets": hardware.num_tasklets,
+            "mram_bytes_per_dpu": int(hardware.mram_bytes_per_dpu),
+            "wram_bytes_per_dpu": int(hardware.wram_bytes_per_dpu),
+            "dma_align": int(hardware.dma_align),
+            # 编译目标与五元组同属请求级契约，仿真前按画像逐项核对。
+            "compiler_target": hardware.compiler_target,
+            # 优化开关同属编译请求：仿真侧据此证明消费的是同一批 pass 产物。
+            "optimizations": getattr(
+                hardware, "optimizations", _PimOptimizations()).to_payload(),
+        },
+        "compile_profile_sha256": (
+            None if profile is None else profile.compile_profile_sha256()
+        ),
+        "physical_mram_bytes": int(hardware.mram_bytes_per_dpu),
+        "reserved_mram_bytes": int(sys_reserve_bytes),
+        "usable_mram_bytes": (
+            int(hardware.mram_bytes_per_dpu) - int(sys_reserve_bytes)
+        ),
+        # 编译源码与实际工具的内容身份；GeneSim 只消费这份显式契约，
+        # 不再从 PIM MLIR 的物理路径反推源码仓库。
+        "toolchain": _compiler_identity(),
+    }
 
     # GeneSim 只展开了 all_reduce 的收集方向。all_gather 与 scatter 在它的图上
     # 没有边，通信时延被漏计；all_reduce 再写一遍会和归约节点双计，local_slice
@@ -711,6 +780,7 @@ def export_placement_to_genesim(
                 tile_n, pimir_path, placed = _measure_kernel_tile_n(
                     int(rep_in), int(rep_out), dtype, hardware, tile_cache,
                     activation=_activation_of(weight_node),
+                    force_compile=force_compile,
                 )
                 entry["kernel_tile_n"] = tile_n
                 # 算子编译器回传的单台 MRAM 占用。GeneSim 用它核对常驻容量，
@@ -724,6 +794,9 @@ def export_placement_to_genesim(
                 # 在 `scheduler.pimir_search_dirs` 里再找一遍——文件名是算子编译
                 # 缓存的内容哈希，同名即同一份产物。
                 entry["pimir_path"] = pimir_path
+                # GEMM 走 A 路整图编译：PIM MLIR 必须写全 DPU/tasklet 等六项
+                # 预算属性，消费侧按路由逐项核对。
+                entry["pimir_route"] = "a"
                 # 内容哈希一并记下：GeneSim 侧把它放进 trace 缓存签名，这样
                 # 「同形状、同分块、但 pim mlir 换了」不会复用旧 trace。缓存里
                 # 真实存在这样的碰撞（同为 out=2048 in=4096 tile_n=512，但
@@ -734,7 +807,8 @@ def export_placement_to_genesim(
     # 非 GEMM 的算子级节点也写 pimir_path：相位链与视图类的真实 IR 才能进
     # GeneSim 的 trace 编译。之前只有 GEMM 写，相位链那一支在生产里没人喂。
     if measure_kernel_tiles:
-        _attach_bpath_pimir(operators_by_id, sidecar)
+        _attach_bpath_pimir(operators_by_id, sidecar, hardware,
+                            force_compile=force_compile)
 
     # 放在 B 路回填之后：非 GEMM 的条目是那里新建的，之前还没有可钉的对象。
     _pin_unsharded_ops(ir, sidecar, strategy)
@@ -747,3 +821,133 @@ def export_placement_to_genesim(
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
     Path(sidecar_path).write_text(json.dumps(sidecar, indent=2))
     return sidecar
+
+
+@dataclass(frozen=True)
+class PlacementExportResult:
+    """一个候选的图/算子编译产物，全部落在同一个目录里。"""
+
+    out_dir: Path
+    placed_ir: Path
+    sidecar: Path
+    partition_plan: Path
+    pimir_paths: tuple[Path, ...]
+
+
+def validate_tensor_pu_capacity(profile, compiled,
+                                *, concurrency: int | None = None) -> int:
+    """按逐张量分配台账核验每个 TensorPU 的常驻容量。
+
+    同一簇的多个 TPU 可以共享整簇容量，但每笔常驻分配只能落在一个 TPU：
+    按初始放置顺序轮转分组后，同 PU 的张量按身份去重模型常驻，逐请求
+    峰值按请求下标相加后取最大的 concurrency 个。两块各自合法但合计
+    超限必须在图编译后立即拒绝，不能等 GeneSim 完成执行图构造才发现。
+    返回本图最大的单 PU 常驻字节数。
+    """
+    from memory.mem_planner import tensor_pu_usage
+
+    plans = getattr(compiled, "mem_plans", None) or {}
+    maximum = 0
+    for dpu_id, plan in sorted(plans.items()):
+        allocations = getattr(plan, "resident_allocations", ())
+        usage = tensor_pu_usage(
+            allocations, profile.tensors_per_cluster,
+            concurrency=concurrency)
+        for slot, stats in sorted(usage.items()):
+            if stats["total_bytes"] > profile.tensor_pu_memory_bytes:
+                raise ValueError(
+                    f"dpu{dpu_id} 的 TensorPU {slot} 常驻 {stats['total_bytes']} B"
+                    f"（模型 {stats['model_bytes']} + 请求 "
+                    f"{stats['request_bytes']}），超过单个 TensorPU 容量 "
+                    f"{profile.tensor_pu_memory_bytes} B")
+            maximum = max(maximum, stats["total_bytes"])
+    return maximum
+
+
+def export_placement_for_strategy(
+    model,
+    ir_path: Path,
+    out_dir: Path,
+    *,
+    strategy,
+    plan=None,
+    hw,
+    hardware,
+    prefill_seq_len: int,
+    max_seq: int,
+    profile=None,
+    force_compile: bool = False,
+    measure_kernel_tiles: bool = True,
+    dtype: str = "float16",
+    kv_dtype_bytes: int = 2,
+    file_stem: str | None = None,
+    request_kv_tokens: tuple[int, ...] | None = None,
+    max_concurrent_requests: int | None = None,
+) -> PlacementExportResult:
+    """按候选编译图与算子，产出一份完整放置目录。
+
+    这是调优器与旧单次链路共用的唯一图编译入口：内部仍调用
+    `runtime.compile.compile_llama2`，不另写一条只服务调优的路径。
+    调用方负责先把 `out_dir` 建成临时目录，校验完整后再原子发布。
+
+    `plan` 给了就按方案编译并原样落盘；没给时按 `strategy` 合成一份同源方案，
+    保证产物目录里始终能读到「实际使用的切分」。
+    """
+    from contracts.partition_plan import PartitionPlan
+    from graph.fuse_pim import fuse_for_pim
+    from runtime.compile import compile_llama2
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if plan is None:
+        plan = PartitionPlan(
+            num_dpus=strategy.num_dpus,
+            num_stages=strategy.num_stages,
+            weight_rules=tuple(strategy.weight_rules),
+            dpu_ids=(tuple(strategy.dpu_ids) if strategy.dpu_ids else None),
+            source="tune_strategy",
+        )
+    plan_path = out_dir / (f"{file_stem}_plan.json" if file_stem
+                           else "partition_plan.json")
+    plan.write(plan_path)
+
+    compiled = compile_llama2(
+        model, strategy, prefill_seq_len=prefill_seq_len, max_seq=max_seq,
+        hw=hw, hardware=hardware, kv_dtype_bytes=kv_dtype_bytes,
+        force_compile=force_compile,
+        request_kv_tokens=request_kv_tokens,
+    )
+    # 多 TensorPU 的簇按整簇容量共享 MRAM，但单块张量只能落在一个 TensorPU。
+    # 请求峰值按本轮轨迹逐请求登记，并发上限与仿真同一配置。
+    if profile is not None:
+        validate_tensor_pu_capacity(
+            profile, compiled, concurrency=max_concurrent_requests)
+    fuse_for_pim(compiled.prefill_gm)
+    placed_ir = out_dir / (f"{file_stem}_placed.ir" if file_stem
+                           else "placed.ir")
+    sidecar_path = out_dir / (f"{file_stem}_placement.json" if file_stem
+                              else "placement.json")
+    sidecar = export_placement_to_genesim(
+        compiled.prefill_gm, Path(ir_path), placed_ir, sidecar_path,
+        dtype=dtype,
+        hardware=hardware,
+        sys_reserve_bytes=hw.sys_reserve_bytes,
+        measure_kernel_tiles=measure_kernel_tiles,
+        dpu_to_cluster=plan.dpu_to_cluster,
+        strategy=strategy,
+        kv_specs=compiled.kv_specs,
+        profile=profile,
+        force_compile=force_compile,
+    )
+    pimir_paths = tuple(sorted({
+        Path(entry["pimir_path"])
+        for entry in sidecar["operators"].values()
+        if entry.get("pimir_path")
+    }))
+    return PlacementExportResult(
+        out_dir=out_dir,
+        placed_ir=placed_ir,
+        sidecar=sidecar_path,
+        partition_plan=plan_path,
+        pimir_paths=pimir_paths,
+    )

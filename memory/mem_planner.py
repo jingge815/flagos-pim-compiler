@@ -38,6 +38,22 @@ class DPUPlan:
     total: int                           # 持久区 + max(两图激活峰值)
     pending_readers_prefill: dict[tuple, list[str]]
     pending_readers_decode: dict[tuple, list[str]]
+    # 单块最大常驻/瞬时分配的字节数。多 TensorPU 的簇可以整簇共享容量，
+    # 但任何一块张量必须能放进单个 TensorPU。
+    peak_allocation_bytes: int = 0
+    # 逐常驻分配台账：权重分片、KV 与内核 tile。同一 TensorPU 上按
+    # tensor_key 去重模型常驻，请求峰值再相加，与 GeneSim 的容量语义一致。
+    resident_allocations: tuple["ResidentAllocation", ...] = ()
+
+
+@dataclass(frozen=True)
+class ResidentAllocation:
+    """一笔常驻分配；owner 是初始放置单元，tensor_key 用于去重。"""
+
+    owner: str
+    tensor_key: str
+    model_bytes: int = 0
+    request_bytes_by_request: tuple[int, ...] = ()
 
 
 @dataclass
@@ -279,13 +295,15 @@ def plan_dpu(
     hw: HwBudget,
     *,
     kernel_mram_bytes: int = 0,
+    request_kv_tokens: tuple[int, ...] | None = None,
 ) -> DPUPlan:
     """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
 
     `kernel_mram_bytes` 是算子编译器回传的单台内核 tile 占用
     （`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。它与三区占的是同一
     块 MRAM，所以算进容量判据。默认 0 = 没有回传可用，判据退回只看三区，
-    与改动前逐字节等价。
+    与改动前逐字节等价。`request_kv_tokens` 是本轮轨迹逐请求的上下文上界，
+    缺省时 KV 台账按最大序列长度登记一个请求峰值。
     """
     weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
 
@@ -339,6 +357,12 @@ def plan_dpu(
         raise ValueError(
             f"dpu{dpu_id} 内存超限: peak={peak}{detail} > 可用预算={budget}")
 
+    peak_allocation = _peak_single_allocation(
+        dpu_id, prefill_nodes, decode_nodes, prefill_tensors, decode_tensors,
+        kv_spec, hw, kernel_bytes)
+    allocations = _resident_allocations(
+        dpu_id, prefill_nodes, decode_nodes, kv_spec, kernel_bytes, hw.align,
+        request_kv_tokens=request_kv_tokens)
     return DPUPlan(
         weight=weight,
         kv_base=kv_base,
@@ -348,7 +372,234 @@ def plan_dpu(
         total=total,
         pending_readers_prefill=pending_readers_of_reused_addresses(prefill_tensors, act_prefill, dpu_id),
         pending_readers_decode=pending_readers_of_reused_addresses(decode_tensors, act_decode, dpu_id),
+        peak_allocation_bytes=peak_allocation,
+        resident_allocations=allocations,
     )
+
+
+def _peak_single_allocation(
+    dpu_id: int,
+    prefill_nodes: list[Node],
+    decode_nodes: list[Node],
+    prefill_tensors: list[TransientTensor],
+    decode_tensors: list[TransientTensor],
+    kv_spec: KVRegionSpec,
+    hw: HwBudget,
+    kernel_bytes: int,
+) -> int:
+    """单块最大分配：任一权重分片、KV 张量、激活张量或内核 tile。
+
+    整簇容量可以被多个 TensorPU 共享，但单块张量只能落在一个 TensorPU；
+    用整簇预算去核验「单 PU 常驻」会让仿真前才暴露非法候选。
+    """
+    sizes = [max(0, int(kernel_bytes))]
+    sizes.append(kv_spec.max_seq * kv_spec.head_dim * kv_spec.dtype_bytes)
+    for nodes in (prefill_nodes, decode_nodes):
+        for node in weights_of(nodes, dpu_id).values():
+            spec = node.meta[SPEC_META_KEY]
+            detail = spec.shard_map[dpu_id]
+            size = bytes_of(
+                detail.local_shape, dtype_bytes(spec.dtype), detail.elem_strides)
+            sizes.append(align_up(size, hw.align))
+    for tensor in (*prefill_tensors, *decode_tensors):
+        sizes.append(align_up(tensor.size, hw.align))
+    return max(sizes)
+
+
+def _weight_owner_map(
+    dpu_id: int,
+    prefill_nodes: list[Node],
+    decode_nodes: list[Node],
+) -> dict[str, tuple[tuple[int, int], Node, str]]:
+    """权重名 → (执行序, 消费算子名, 节点)。
+
+    权重按**消费它的执行算子**归组，而不是按权重名排序：同一次执行单元
+    的权重必须落在同一个 TensorPU，权重名的字典序与算子执行顺序无关。
+    两张图共用的权重取较早出现的那个消费者。
+    """
+    positions: dict[Node, tuple[int, int]] = {}
+    for rank, nodes in enumerate((prefill_nodes, decode_nodes)):
+        for index, node in enumerate(nodes):
+            positions.setdefault(node, (rank, index))
+    owners: dict[str, tuple[tuple[int, int], Node, str]] = {}
+    for rank, nodes in enumerate((prefill_nodes, decode_nodes)):
+        for name, node in weights_of(nodes, dpu_id).items():
+            consumers = [user for user in node.users if user in positions]
+            if consumers:
+                first = min(consumers, key=lambda user: positions[user])
+                order = positions[first]
+                owner = first.name
+            else:
+                order = (rank, len(nodes))
+                owner = f"weight:{name}"
+            current = owners.get(name)
+            if current is None or order < current[0]:
+                owners[name] = (order, node, owner)
+    return owners
+
+
+def _attention_unit_map(nodes: list[Node]) -> dict[int, str]:
+    """层号 → 该层 attention 执行算子名；没有 attention 的图返回空。"""
+    from runtime.compile import _q_proj_layer_of
+
+    units: dict[int, str] = {}
+    for node in nodes:
+        if "scaled_dot_product_attention" not in str(
+                getattr(node, "target", "")):
+            continue
+        try:
+            layer = _q_proj_layer_of(node)
+        except ValueError:
+            continue
+        units.setdefault(layer, node.name)
+    return units
+
+
+def _kv_request_bytes(
+    kv_spec: KVRegionSpec,
+    max_seq: int,
+    request_kv_tokens: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    """KV 张量的逐请求峰值：优先用本轮轨迹，缺省退回最大序列长度。"""
+    per_token = kv_spec.head_dim * kv_spec.dtype_bytes
+    if request_kv_tokens is None:
+        return (max_seq * per_token,)
+    if not request_kv_tokens or any(
+            isinstance(tokens, bool) or not isinstance(tokens, int)
+            or tokens <= 0 for tokens in request_kv_tokens):
+        raise ValueError(
+            f"逐请求 KV 上下文长度必须是正整数：{request_kv_tokens!r}")
+    return tuple(tokens * per_token for tokens in request_kv_tokens)
+
+
+def _resident_allocations(
+    dpu_id: int,
+    prefill_nodes: list[Node],
+    decode_nodes: list[Node],
+    kv_spec: KVRegionSpec,
+    kernel_bytes: int,
+    align: int,
+    request_kv_tokens: tuple[int, ...] | None = None,
+) -> tuple[ResidentAllocation, ...]:
+    """逐笔常驻分配台账：权重分片、KV 请求与内核 tile。
+
+    权重记录所属执行算子并按执行顺序排列；KV 按每层、每 KV head 的
+    K/V 两份逐块登记，同一 KV head 的两块共用所属 attention 执行单元，
+    请求峰值按本轮轨迹逐请求给出。激活是两图复用的瞬时区，已计入三区
+    总量，不作为跨请求常驻重复计。
+    """
+    owners = _weight_owner_map(dpu_id, prefill_nodes, decode_nodes)
+    grouped: dict[str, list[tuple[str, int]]] = {}
+    order_keys: dict[str, tuple[int, int]] = {}
+    for name, (order, node, owner) in owners.items():
+        spec = node.meta[SPEC_META_KEY]
+        detail = spec.shard_map[dpu_id]
+        size = bytes_of(
+            detail.local_shape, dtype_bytes(spec.dtype), detail.elem_strides)
+        grouped.setdefault(owner, []).append((name, align_up(size, align)))
+        order_keys.setdefault(owner, order)
+    allocations = []
+    for owner in sorted(grouped, key=lambda name: order_keys[name]):
+        for tensor_name, size in sorted(grouped[owner]):
+            allocations.append(ResidentAllocation(
+                owner=owner, tensor_key=tensor_name, model_bytes=size))
+    attention = (_attention_unit_map(prefill_nodes)
+                 or _attention_unit_map(decode_nodes))
+    request_bytes = _kv_request_bytes(
+        kv_spec, kv_spec.max_seq, request_kv_tokens)
+    for layer in sorted(kv_spec.layers):
+        # 同一层同一 KV head 的 K/V 属于同一个执行单元，必须落在同一 PU。
+        unit = f"{attention[layer]}#kv" if layer in attention else f"kv:{layer}"
+        for head in sorted(kv_spec.kv_heads):
+            for which in ("k", "v"):
+                allocations.append(ResidentAllocation(
+                    owner=f"{unit}:{head}",
+                    tensor_key=f"kv:{layer}:{head}:{which}",
+                    request_bytes_by_request=request_bytes,
+                ))
+    if kernel_bytes:
+        allocations.append(ResidentAllocation(
+            owner="kernel", tensor_key="kernel",
+            model_bytes=int(kernel_bytes)))
+    return tuple(allocations)
+
+
+def tensor_pu_usage(
+    allocations,
+    tensors_per_cluster: int,
+    *,
+    concurrency: int | None = None,
+) -> dict[int, dict[str, int]]:
+    """按执行单元轮转的初始放置聚合常驻占用。
+
+    与 GeneSim `tensor_pu_capacity_metrics` 相同的容量语义：同一 TensorPU
+    上的同一 tensor_key 只算一次模型常驻；逐请求峰值按请求下标相加后，
+    再取最大的 concurrency 个请求求和。轮转单位是执行单元（同一算子的
+    全部权重与 KV 块落在同一 PU），而不是逐笔分配的下标。
+    """
+    if isinstance(tensors_per_cluster, bool) or not isinstance(
+            tensors_per_cluster, int) or tensors_per_cluster <= 0:
+        raise ValueError(
+            f"tensors_per_cluster 必须是正整数，收到 {tensors_per_cluster!r}")
+    unit_order: list[str] = []
+    by_unit: dict[str, list] = {}
+    for allocation in allocations:
+        if allocation.owner not in by_unit:
+            unit_order.append(allocation.owner)
+            by_unit[allocation.owner] = []
+        by_unit[allocation.owner].append(allocation)
+    per_pu: dict[int, dict[str, dict]] = {}
+    for unit_index, owner in enumerate(unit_order):
+        slot = unit_index % tensors_per_cluster
+        tensors = per_pu.setdefault(slot, {})
+        for allocation in by_unit[owner]:
+            entry = tensors.setdefault(
+                allocation.tensor_key, {"model_bytes": 0, "requests": ()})
+            entry["model_bytes"] = max(
+                entry["model_bytes"], int(allocation.model_bytes))
+            requests = tuple(int(value) for value in
+                             allocation.request_bytes_by_request)
+            if requests:
+                if entry["requests"]:
+                    width = max(len(entry["requests"]), len(requests))
+                    padded = tuple(entry["requests"]) + (0,) * (
+                        width - len(entry["requests"]))
+                    incoming = requests + (0,) * (width - len(requests))
+                    entry["requests"] = tuple(
+                        max(left, right)
+                        for left, right in zip(padded, incoming))
+                else:
+                    entry["requests"] = requests
+    usage: dict[int, dict[str, int]] = {}
+    for slot, tensors in per_pu.items():
+        model_bytes = sum(
+            entry["model_bytes"] for entry in tensors.values())
+        # 与 GeneSim `tensor_pu_capacity_metrics` 相同：先把各张量的逐请求
+        # 峰值按请求下标相加，再取最大的 concurrency 个请求求和。
+        totals: list[int] = []
+        for entry in tensors.values():
+            for index, value in enumerate(entry["requests"]):
+                if index == len(totals):
+                    totals.append(0)
+                totals[index] += value
+        request_bytes = _top_requests(tuple(totals), concurrency)
+        usage[slot] = {
+            "model_bytes": model_bytes,
+            "request_bytes": request_bytes,
+            "total_bytes": model_bytes + request_bytes,
+        }
+    return usage
+
+
+def _top_requests(values: tuple[int, ...], concurrency: int | None) -> int:
+    """请求峰值上界：取最大的若干个请求占用相加。"""
+    if not values:
+        return 0
+    if concurrency is None or concurrency >= len(values):
+        return sum(values)
+    if concurrency <= 0:
+        return 0
+    return sum(sorted(values, reverse=True)[:concurrency])
 
 
 def format_mem_plan(plans: dict[int, DPUPlan], hw: HwBudget) -> str:

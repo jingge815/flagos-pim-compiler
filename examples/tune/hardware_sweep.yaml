@@ -1,0 +1,71 @@
+# 硬件扫描：核数、容量与跨簇链路；改核数或容量的点必须重编，
+# 时钟与路由只改仿真。
+# 先跑 quick，再：
+#   python scripts/tune_sweep.py --config examples/tune/hardware_sweep.yaml \
+#       --best test-results/tune-quick/best.json
+version: 1
+run_name: tune-sweep
+model:
+  model_dir: null
+  ir: null
+  prefill_seq_len: 16
+  max_seq: null
+  trace:
+    path: trace_quick.json
+    num_requests: 1
+    synthetic: null
+profile:
+  path: ../../contracts/profiles/ceva_64core_4e.json
+# 编译优化开关；融合与相位展开是目标格式硬要求，始终执行。
+optimization:
+  constant_fold: true
+  cse: true
+  dce: true
+  loop_tiling: true
+space:
+  strategy:
+    enabled: true
+    num_dpus: [8]
+    num_stages: [2]
+  op:
+    enabled: true
+    num_tasklets: [4]
+  hardware:
+    enabled: false
+    fields: {}
+placement:
+  enabled: false
+  algorithm: simulated_annealing
+  evaluation_backend: pipeline
+  validation_backend: pipeline
+  objective_metric: total_time_s
+  objective_weights: {compute: 0.5, communication: 0.25, memory: 0.25}
+  max_evaluations: 1
+  max_time_s: 0
+  max_proposals: null
+  seed: 0
+  moves: {max_segment_ops: 8, max_layer_block_layers: 4, weights: {}}
+  algorithm_params: {}
+search:
+  algorithm: enumerate
+  seed: 0
+  max_evaluations: 1
+  max_time_s: 0
+  max_proposals: null
+  layer_weights: {strategy: 1, op: 0, hardware: 0}
+  algorithm_params: {}
+cache: {mode: fast}
+simulation: {use_cost_sidecar: false}
+calibration: {validation_report: null}
+sweep:
+  # CEVA 固定单设备、每簇一个 TensorPU；核数按每设备簇数扫，改核数会重编。
+  fields:
+    clusters_per_device: [64, 128]
+    cluster_memory_bytes: [8000000000, 8589934592]
+    clock_period_ns: [0.63, 0.5]
+    inter_cluster_communication: [direct, host_relay]
+  core_policy: fixed_dpus
+  knee_improvement_threshold: 0.05
+  pareto: {resource: total_physical_memory_bytes, direction: minimize}
+output:
+  dir: ../../test-results/tune-sweep

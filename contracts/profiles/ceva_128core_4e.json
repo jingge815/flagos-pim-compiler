@@ -1,0 +1,310 @@
+{
+  "version": 1,
+  "name": "ceva_128core_4e",
+  "compiler_target": "pim:v1",
+  "pim_type": "CEVA-NPM",
+  "num_pim_devices": 1,
+  "clusters_per_device": 128,
+  "tensors_per_cluster": 1,
+  "cluster_memory_bytes": 8000000000,
+  "sys_reserve_bytes": 0,
+  "wram_bytes_per_dpu": 65536,
+  "dma_align": 64,
+  "clock_period_ns": 0.63,
+  "multipliers": 4,
+  "cycle_costs": {
+    "LOAD": 12,
+    "STORE": 10,
+    "MAC": 1,
+    "MUL": 1,
+    "REDUCE": 20,
+    "LUT": 6,
+    "QUANT": 4,
+    "GELU": 8,
+    "SILU": 6,
+    "RSQRT": 8,
+    "CONTEXT_MAC": 1,
+    "SCORE_MAC": 1,
+    "SCORE_TILE": 0,
+    "CONTEXT_TILE": 0,
+    "CONTEXT_SETUP": 0,
+    "SOFTMAX_SETUP": 0,
+    "GELU_SETUP": 0,
+    "SILU_SETUP": 0,
+    "RMSNORM_SETUP": 0,
+    "ROPE": 8,
+    "GATHER": 10,
+    "TRANSPOSE": 2,
+    "RESHAPE": 1,
+    "CONCAT": 2,
+    "SPLIT": 2,
+    "MASK": 2,
+    "LOADN": 12,
+    "STOREN": 10,
+    "LOADN_PER_BYTE": 0.125,
+    "STOREN_PER_BYTE": 0.1,
+    "LOOP_BEGIN": 1,
+    "LOOP_BEGIN_INDIRECT": 1,
+    "LOOP_BEGIN_INDIRECT_LONG": 1,
+    "LOOP_END": 1,
+    "SYNC": 3
+  },
+  "zone_cycle_factors": {
+    "weight": 1.0,
+    "kv": 2.0,
+    "activation": 2.0
+  },
+  "tile_size": 32,
+  "mac_width": 8,
+  "chunk_size": 16,
+  "max_bulk_transfer_bytes": 16320,
+  "bytes_per_element": 2,
+  "use_long_loop_counts": true,
+  "inter_cluster_communication": "direct",
+  "host_relay_overhead_ns": 100.0,
+  "links": [
+    {
+      "name": "HOST_to_PIM",
+      "src_domain": "HOST",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 64.0,
+      "latency_base_ns": 500.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PIM_to_HOST",
+      "src_domain": "PIM",
+      "dst_domain": "HOST",
+      "bandwidth_gbps": 64.0,
+      "latency_base_ns": 500.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "CPU_to_HOST",
+      "src_domain": "CPU",
+      "dst_domain": "HOST",
+      "bandwidth_gbps": 64.0,
+      "latency_base_ns": 100.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "HOST_to_CPU",
+      "src_domain": "HOST",
+      "dst_domain": "CPU",
+      "bandwidth_gbps": 64.0,
+      "latency_base_ns": 100.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PIM_Inter_Cluster",
+      "src_domain": "PIM",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 128.0,
+      "latency_base_ns": 2000.0,
+      "inter_cluster_only": true,
+      "is_full_duplex": false,
+      "intra_cluster_only": false
+    }
+  ],
+  "cpu_model": {
+    "base_latency_us": 10.0,
+    "peak_flops": 1000000000000.0,
+    "peak_bandwidth_gbs": 100.0
+  },
+  "parameter_sources": {
+    "ceva.local_memory_bytes": {
+      "origin": "assumption",
+      "evidence": "甲方标称每核 8 GB，未确认十进制/二进制口径，按 8,000,000,000 B 假设",
+      "unit": "byte",
+      "scope": "per npm core"
+    },
+    "ceva.engines_per_core": {
+      "origin": "ceva_measured",
+      "evidence": "CEVA env.sh 引用的目标 TDF 记录 Number Of Engines=4",
+      "unit": "count",
+      "scope": "per npm core"
+    },
+    "pim.clock_period_ns": {
+      "origin": "assumption",
+      "evidence": "时钟域未确认，沿用现有配置的 0.63 ns 假设",
+      "unit": "ns",
+      "scope": "npm core"
+    },
+    "pim.tensor_pu_config.multipliers": {
+      "origin": "assumption",
+      "evidence": "整核峰值参数的抽象占位值，待按精度和作用域确认",
+      "unit": "count",
+      "scope": "per tensor pu"
+    },
+    "pim.compile.tile_size": {
+      "origin": "assumption",
+      "evidence": "实际分块由算子编译器给出，此值只在模板路径使用",
+      "unit": "rows",
+      "scope": "per tile"
+    },
+    "pim.compile.chunk_size": {
+      "origin": "assumption",
+      "evidence": "softmax 分块模板参数，待按编译产物核对",
+      "unit": "elements",
+      "scope": "per chunk"
+    },
+    "pim.compile.mac_width": {
+      "origin": "assumption",
+      "evidence": "抽象计量粒度，不照抄 TDF 的 32K INT8 MAC",
+      "unit": "lanes",
+      "scope": "per instruction"
+    },
+    "pim.compile.bytes_per_element": {
+      "origin": "assumption",
+      "evidence": "FP16 联调口径；混合精度须按每个操作数的物理布局计量",
+      "unit": "byte",
+      "scope": "per element"
+    },
+    "pim.compile.max_bulk_transfer_bytes": {
+      "origin": "assumption",
+      "evidence": "当前 trace 的 14 位立即数分段上限，不是 CEVA SysDMA 硬件上限",
+      "unit": "byte",
+      "scope": "per dma"
+    },
+    "pim.compile.use_long_loop_counts": {
+      "origin": "assumption",
+      "evidence": "循环编码开关，按完整次数选择 24 位长循环；编码成本尚无 CEVA 侧测量",
+      "unit": "mode",
+      "scope": "per dynamic loop"
+    },
+    "pim.pim_trace_cycle_costs.MAC": {
+      "origin": "assumption",
+      "evidence": "占位单价，待按整核目标、精度和阶段校准",
+      "unit": "cycle",
+      "scope": "per work unit"
+    },
+    "pim.pim_trace_cycle_costs.LOADN": {
+      "origin": "assumption",
+      "evidence": "占位启动成本，待按读测量拟合",
+      "unit": "cycle",
+      "scope": "per transfer"
+    },
+    "pim.pim_trace_cycle_costs.LOADN_PER_BYTE": {
+      "origin": "assumption",
+      "evidence": "占位每字节成本，待按读测量拟合",
+      "unit": "cycle",
+      "scope": "per byte"
+    },
+    "pim.pim_trace_cycle_costs.STOREN": {
+      "origin": "assumption",
+      "evidence": "占位启动成本，待按写测量拟合",
+      "unit": "cycle",
+      "scope": "per transfer"
+    },
+    "pim.pim_trace_cycle_costs.STOREN_PER_BYTE": {
+      "origin": "assumption",
+      "evidence": "占位每字节成本，待按写测量拟合",
+      "unit": "cycle",
+      "scope": "per byte"
+    },
+    "pim.pim_trace_cycle_costs.LOOP_BEGIN": {
+      "origin": "assumption",
+      "evidence": "固定循环控制占位成本，待按实际指令流水校准",
+      "unit": "cycle",
+      "scope": "per loop"
+    },
+    "pim.pim_trace_cycle_costs.LOOP_BEGIN_INDIRECT": {
+      "origin": "assumption",
+      "evidence": "运行时绑定循环的占位成本，待按实际指令流水校准",
+      "unit": "cycle",
+      "scope": "per loop"
+    },
+    "pim.pim_trace_cycle_costs.LOOP_BEGIN_INDIRECT_LONG": {
+      "origin": "assumption",
+      "evidence": "长循环入口占位成本，待按实际指令流水校准",
+      "unit": "cycle",
+      "scope": "per loop"
+    },
+    "pim.pim_trace_cycle_costs.LOOP_END": {
+      "origin": "assumption",
+      "evidence": "循环出口占位成本，待按实际指令流水校准",
+      "unit": "cycle",
+      "scope": "per loop"
+    },
+    "pim.pim_trace_cycle_costs.SYNC": {
+      "origin": "assumption",
+      "evidence": "整核同步占位成本，待按实际同步行为校准",
+      "unit": "cycle",
+      "scope": "per sync"
+    },
+    "pim.zone_cycle_factors.weight": {
+      "origin": "assumption",
+      "evidence": "权重常驻区间，按单一周期计",
+      "unit": "ratio",
+      "scope": "weight region"
+    },
+    "pim.zone_cycle_factors.kv": {
+      "origin": "assumption",
+      "evidence": "KV 按 token 反复搬运，假设为权重的 2 倍",
+      "unit": "ratio",
+      "scope": "kv region"
+    },
+    "pim.zone_cycle_factors.activation": {
+      "origin": "assumption",
+      "evidence": "激活按 token 反复搬运，假设为权重的 2 倍",
+      "unit": "ratio",
+      "scope": "activation region"
+    },
+    "comm_config.host_relay_overhead_ns": {
+      "origin": "assumption",
+      "evidence": "HOST 中转固定开销未获甲方测量，沿用旧配置的 100 ns 假设",
+      "unit": "ns",
+      "scope": "per relayed transfer"
+    },
+    "comm_config.links": {
+      "origin": "assumption",
+      "evidence": "甲方互连参数未提供，按共享链路假设",
+      "unit": "gbps",
+      "scope": "host and inter-core"
+    },
+    "pim.inter_cluster_communication": {
+      "origin": "assumption",
+      "evidence": "甲方互连拓扑未确认，按跨簇直连（direct）假设",
+      "unit": "mode",
+      "scope": "inter-cluster"
+    },
+    "system.num_cpus": {
+      "origin": "assumption",
+      "evidence": "主机编排按单核整核等效假设，核数未获甲方确认",
+      "unit": "count",
+      "scope": "host cpu"
+    },
+    "cpu_model.base_latency_us": {
+      "origin": "assumption",
+      "evidence": "主机编排基础延迟未获测量，沿用通用缺省值 10 us 作为占位",
+      "unit": "us",
+      "scope": "per orchestration op"
+    },
+    "cpu_model.peak_flops": {
+      "origin": "assumption",
+      "evidence": "主机算力未获甲方确认，沿用通用缺省值 1 TFLOP/s 作为占位",
+      "unit": "flop/s",
+      "scope": "per host cpu"
+    },
+    "cpu_model.peak_bandwidth_gbs": {
+      "origin": "assumption",
+      "evidence": "主机带宽未获甲方确认，沿用通用缺省值 100 GB/s 作为占位",
+      "unit": "GB/s",
+      "scope": "per host cpu"
+    }
+  },
+  "base_genesim_config": "conf/ceva_128core_4e.yaml",
+  "ceva": {
+    "engines_per_core": 4,
+    "target_name": "m32k_vpu500_dtcm64_8m_1024k_4e",
+    "local_memory_bytes": 8000000000
+  }
+}

@@ -38,6 +38,8 @@ _PIM_DEFAULTS = {
 }
 
 _PIM_ENV_VARS = {
+    # 目标覆盖只服务不使用画像的旧进程内捕获入口；正式编译链路的
+    # 目标由 PIMHardwareConfig.compiler_target 派生，不读这里。
     "pim_target": "FLAGTREE_PIM_TARGET",
     "pim_num_dpus": "FLAGTREE_PIM_NUM_DPUS",
     "pim_num_tasklets": "FLAGTREE_PIM_NUM_TASKLETS",

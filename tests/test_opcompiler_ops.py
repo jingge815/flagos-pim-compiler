@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from contracts.op_contract import (
     DEFAULT_HARDWARE_CONFIG,
+    DpuShard,
     OpCompileRequest,
 )
 from opcompiler_bridge.driver import compile_op, load_kernel
@@ -364,6 +365,41 @@ def test_matmul_group_boundary_is_in_the_emitted_loops() -> None:
     plain = dataclasses.replace(request, group_size=None)
     plain_result = compile_op(plain, force=True)
     assert "groupDequantAccum" not in plain_result.pimir
+
+
+def test_matmul_split_across_tasklets_keeps_the_numbers() -> None:
+    """B 路矩阵乘按 tasklet 切 M：循环块数随 tasklet 增加，数值仍与镜像一致。
+
+    复制档下发 `pim.num-tasklets` 后降级把 M 行切成静态块，每个 tasklet 只写
+    自己的行。块数必须真的增加，否则参数只写进了模块头、没落到代码。
+    """
+    from opcompiler_bridge.driver import _run_passes, _triton_opt
+
+    hardware = dataclasses.replace(
+        _HARDWARE, num_dpus=8, mram_bytes_per_dpu=1 << 20)
+    rng = np.random.default_rng(3)
+    a = rng.integers(-8, 8, size=(16, 128)).astype(np.int8)
+    w = rng.integers(-8, 8, size=(128, 8)).astype(np.int8)
+    scales = rng.uniform(0.5, 2.0, size=(1, 8)).astype(np.float16)
+    ref = mirrors.matmul(a, w, group_size=128, scales=scales)
+
+    blocks = []
+    for tasklets in (1, 2, 4):
+        request = OpCompileRequest(
+            op="matmul", arg_shapes=[(16, 128), (128, 8)],
+            hardware=dataclasses.replace(hardware, num_tasklets=tasklets),
+            dtype="int8", group_size=128, num_tasklets=tasklets,
+            shard=DpuShard(dim=-1, num_dpus=8, kind="replicate"),
+        )
+        result = compile_op(request, force=True)
+        emitc = _run_passes(
+            _triton_opt(), result.pimir, ["-pim-lower-to-emitc"], "emitc")
+        blocks.append(emitc.count("emitc.for"))
+        got = _call(load_kernel(result), a, w, scales,
+                    out_shape=(16, 8), out_dtype=np.int8)
+        assert np.array_equal(got, ref), (
+            f"tasklet={tasklets} 时矩阵乘结果与镜像不一致")
+    assert blocks == [1, 2, 4], f"M 循环块应随 tasklet 增加，实际 {blocks}"
 
 
 def _compile_shapes(op: str, shapes: list, **kw):

@@ -93,7 +93,8 @@ def test_compile_request_uses_explicit_hardware_budget(monkeypatch) -> None:
         return "module {}"
 
     def fake_run(ttir, hardware, shard=None, elem_strides=(),
-                 mram_offset=0, align_bytes=0):
+                 mram_offset=0, align_bytes=0,
+                 full_m=-1, full_n=-1, full_k=-1):
         seen["hardware"] = hardware
         seen["shard"] = shard
         # 现在返回 (pim mlir, EmitC) 两段：pim mlir 要留给 GeneSim 的成本模型。
@@ -108,7 +109,7 @@ def test_compile_request_uses_explicit_hardware_budget(monkeypatch) -> None:
     monkeypatch.setattr(driver, "_translate_to_c", lambda _: "void k(float *a, float *b, float *c) {}")
 
     def fake_subprocess_run(cmd, *args, **kwargs):
-        if cmd and cmd[0] == "gcc":
+        if cmd and Path(cmd[0]).name == "gcc":
             Path(cmd[5]).write_bytes(b"")
         return type("P", (), {"returncode": 0, "stderr": ""})()
 

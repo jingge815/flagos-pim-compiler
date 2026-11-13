@@ -114,10 +114,14 @@ def _run(cmd: list[str], *, cwd: Path, log_path: Path, env: Optional[dict] = Non
         )
 
 
-def step_a_model_ir(genesim: Path, model_dir: Path, log_dir: Path) -> Path:
-    """(A) 从 HF config 生成 GeneSim 图骨架，核对投影身份标全了。"""
+def step_a_model_ir(genesim: Path, model_dir: Path, log_dir: Path,
+                    *, out_path: Path | None = None) -> Path:
+    """(A) 从 HF config 生成 GeneSim 图骨架，核对投影身份标全了。
+
+    `out_path` 给了就写到指定位置（调优候选目录），缺省仍是共享的 models/。
+    """
     print("\n[A] HuggingFace config → GeneSim 图骨架 IR")
-    ir_path = genesim / "models" / "llama2_7b.ir"
+    ir_path = Path(out_path) if out_path else genesim / "models" / "llama2_7b.ir"
     _run(
         ["python", "scripts/model_parser.py",
          "--model_name", str(model_dir), "--output", str(ir_path)],
@@ -669,16 +673,21 @@ def verify_sim_ir_matches_sidecar(genesim: Path, config: str | Path) -> None:
             "genesim/scripts/refine_ir_with_flagtree.py。")
 
 
-def verify_trace_provenance(genesim: Path) -> None:
+def verify_trace_provenance(genesim: Path, *, trace_dir: Path | None = None,
+                            allowed_sources: set[str] | None = None) -> None:
     """核对每个算子的 trace 来源，避免"跑通了但其实走的是手写模板"。
 
     原先只扫 GEMM。注意力那一组（ROPE、MASK、SOFTMAX、GEMV）退回模板时
     这里看不见，仿真照样算通过，而那些算子的分块根本没进代价链。
+
+    `trace_dir` 缺省仍是 genesim/pim_traces；`allowed_sources` 给了就额外要求
+    每条 trace 的来源都在白名单里（调优正式路径要求零模板、零未知）。
     """
     sources: Dict[str, int] = {}
     by_op: Dict[str, Dict[str, int]] = {}
     tiles: Dict[Any, int] = {}
-    for path in sorted((genesim / "pim_traces").glob("op_*.pim_trace")):
+    root = Path(trace_dir) if trace_dir is not None else genesim / "pim_traces"
+    for path in sorted(root.glob("op_*.pim_trace")):
         meta = _trace_metadata(path)
         source = (meta.get("compile_signature") or {}).get("trace_source", "unknown")
         op_type = str(meta.get("op_type", "unknown"))
@@ -701,6 +710,10 @@ def verify_trace_provenance(genesim: Path) -> None:
             f"{sources['template']} 个算子退回了手写模板（{', '.join(templated)}）；"
             "算子编译器的分块没有进入代价链。"
         )
+    if allowed_sources is not None:
+        extra = sorted(set(sources) - set(allowed_sources))
+        if extra:
+            raise StepFailed(f"trace 来源 {extra} 不在允许集合 {sorted(allowed_sources)} 里")
 
 
 

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from contracts.graph_meta import REDISTRIBUTE_META_KEY
 from graph.partition import partition_graph
 from graph.spec_prop import propagate_specs
-from memory.kv_layout import KVRegionSpec
+from memory.kv_layout import KVRegionSpec, kv_bytes
 from memory.mem_planner import (
     HwBudget,
     TransientTensor,
@@ -313,6 +313,21 @@ def test_the_kernel_tile_footprint_counts_against_the_same_budget() -> None:
     plan_dpu(0, nodes1, nodes2, kv_specs, roomy, kernel_mram_bytes=4096)
 
 
+def test_plan_reports_peak_single_allocation() -> None:
+    """单块最大分配进入计划，供多 TensorPU 容量核验使用。"""
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    (gm1, _), (gm2, _) = _two_appendix_a_graphs()
+    kv_specs = _kv_specs()
+    nodes1, nodes2 = list(gm1.graph.nodes), list(gm2.graph.nodes)
+    plan = plan_dpu(0, nodes1, nodes2, kv_specs, hw)
+    # KV 单张量 = max_seq × head_dim × dtype = 8 × 4 × 4 = 128 B。
+    assert plan.peak_allocation_bytes >= 128
+    assert plan.peak_allocation_bytes < plan.total + 1
+    with_kernel = plan_dpu(
+        0, nodes1, nodes2, kv_specs, hw, kernel_mram_bytes=4096)
+    assert with_kernel.peak_allocation_bytes == 4096
+
+
 def test_format_mem_plan_printable() -> None:
     hw = HwBudget(mram_bytes=1 << 16, align=64, sys_reserve_bytes=1024)
     plans, _, _ = _plan_both_dpus(hw)
@@ -359,3 +374,358 @@ def test_shared_redistribute_edge_merges_landing_lifetime() -> None:
     # 生命周期并到最后一个消费者，读者是全部三个。
     assert landing.last_read_at == node_step[c3]
     assert set(landing.readers) == {c1.name, c2.name, c3.name}
+
+
+# ---- 评审 round03：逐张量常驻台账与逐 TensorPU 聚合 ----
+
+def test_plan_reports_per_tensor_resident_ledger() -> None:
+    """计划必须给出逐笔常驻分配，而不是只给一个最大单块。"""
+    from memory.mem_planner import ResidentAllocation
+
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    (gm1, _), (gm2, _) = _two_appendix_a_graphs()
+    kv_specs = _kv_specs()
+    nodes1, nodes2 = list(gm1.graph.nodes), list(gm2.graph.nodes)
+    plan = plan_dpu(0, nodes1, nodes2, kv_specs, hw,
+                    kernel_mram_bytes=4096)
+    weights = [item for item in plan.resident_allocations
+               if item.tensor_key in plan.weight]
+    assert weights
+    assert all(isinstance(item, ResidentAllocation) for item in weights)
+    assert all(item.model_bytes > 0 for item in weights)
+    # 权重必须记录所属执行算子，不能把权重名当成放置单元。
+    assert all(allocation.owner != allocation.tensor_key for allocation in weights)
+    kv_blocks = [
+        item for item in plan.resident_allocations
+        if item.tensor_key.startswith("kv:")]
+    # 单层单头：K/V 两份各 128 B，请求峰值合计等于完整 KV 口径。
+    assert len(kv_blocks) == 2
+    assert {item.tensor_key for item in kv_blocks} == {"kv:0:0:k", "kv:0:0:v"}
+    assert sum(item.request_bytes_by_request[0] for item in kv_blocks) == (
+        kv_bytes(kv_specs[0]))
+    assert kv_bytes(kv_specs[0]) == 256
+    kernel = next(
+        item for item in plan.resident_allocations
+        if item.tensor_key == "kernel")
+    assert kernel.model_bytes == 4096
+
+
+def test_tensor_pu_usage_dedupes_and_tracks_concurrency() -> None:
+    """同 PU 同身份只算一次；并发请求增加时占用不得下降。"""
+    from memory.mem_planner import ResidentAllocation, tensor_pu_usage
+
+    duplicated = [
+        ResidentAllocation("w", "w", 100),
+        ResidentAllocation("w-alias", "w", 100),
+    ]
+    usage = tensor_pu_usage(duplicated, tensors_per_cluster=1)
+    assert usage[0]["model_bytes"] == 100
+
+    base = [ResidentAllocation("kv", "kv", 0, (10,))]
+    more = base + [ResidentAllocation("kv2", "kv2", 0, (10, 20))]
+    one_request = tensor_pu_usage(base, 1, concurrency=2)[0]["request_bytes"]
+    two_requests = tensor_pu_usage(more, 1, concurrency=2)[0]["request_bytes"]
+    assert two_requests >= one_request
+    assert one_request == 10
+    assert two_requests == 40
+
+
+def test_tensor_pu_usage_rejects_invalid_cluster_size() -> None:
+    from memory.mem_planner import tensor_pu_usage
+
+    with pytest.raises(ValueError, match="tensors_per_cluster"):
+        tensor_pu_usage([], tensors_per_cluster=0)
+
+
+# ---- 评审 round04：执行算子归属、完整 KV 与两侧台账对账 ----
+
+def _execution_order_graph():
+    """weight 名字典序与算子执行顺序相反的两层图。"""
+    from graph.strategy import ShardStrategy
+    from graph.spec_prop import propagate_specs
+    from torch.fx import Graph, GraphModule
+
+    root = torch.nn.Module()
+    root.register_buffer("zz_first", torch.empty(6, 4))
+    root.register_buffer("aa_second", torch.empty(4, 6))
+    graph = Graph()
+    x = graph.placeholder("x")
+    first_weight = graph.get_attr("zz_first")
+    second_weight = graph.get_attr("aa_second")
+    y1 = graph.call_function(torch.ops.aten.linear.default, (x, first_weight))
+    y2 = graph.call_function(torch.ops.aten.linear.default, (y1, second_weight))
+    graph.output(y2)
+    gm = GraphModule(root, graph)
+    x.meta["val"] = torch.empty(1, 4)
+    first_weight.meta["val"] = root.zz_first
+    second_weight.meta["val"] = root.aa_second
+    y1.meta["val"] = torch.empty(1, 6)
+    y2.meta["val"] = torch.empty(1, 4)
+    partition_graph(gm)
+    propagate_specs(gm, ShardStrategy(
+        name="execution_order", num_dpus=1,
+        weight_rules=(("zz_first", "col"), ("aa_second", "row"))))
+    return gm, {"y1": y1, "y2": y2, "zz_first": first_weight,
+                "aa_second": second_weight}
+
+
+def test_weight_ledger_follows_execution_operator_not_name_order() -> None:
+    """权重按消费它的执行算子分组，顺序是执行顺序而不是名称字典序。"""
+    gm, nodes = _execution_order_graph()
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    spec = KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=8, head_dim=4, dtype_bytes=4, kv_base=0)
+    plan = plan_dpu(0, list(gm.graph.nodes), list(gm.graph.nodes),
+                    {0: spec}, hw)
+    weight_owners = [
+        item.owner for item in plan.resident_allocations
+        if item.tensor_key in ("zz_first", "aa_second")]
+    # 执行顺序是 zz_first 所在算子 -> aa_second 所在算子；名称字典序相反。
+    assert weight_owners == [nodes["y1"].name, nodes["y2"].name]
+    assert weight_owners != ["aa_second", "zz_first"]
+
+
+def test_kv_ledger_registers_every_layer_head_and_side() -> None:
+    """多层多头 KV 必须按每层、每 head、K/V 两份逐块登记。"""
+    gm, _ = _execution_order_graph()
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    spec = KVRegionSpec(
+        dpu_id=0, layers=[0, 1], kv_heads=[0, 1],
+        q_heads_by_kv={0: [0], 1: [1]},
+        max_seq=16, head_dim=8, dtype_bytes=2, kv_base=0)
+    plan = plan_dpu(0, list(gm.graph.nodes), list(gm.graph.nodes),
+                    {0: spec}, hw)
+    blocks = [item for item in plan.resident_allocations
+              if item.tensor_key.startswith("kv:")]
+    assert len(blocks) == 2 * 2 * 2
+    assert sum(item.request_bytes_by_request[0] for item in blocks) == (
+        kv_bytes(spec))
+    assert kv_bytes(spec) == 2 * 2 * 2 * 16 * 8 * 2
+
+
+def test_tensor_pu_usage_groups_all_tensors_of_one_unit() -> None:
+    """同一执行算子的多块权重不能被拆到不同 TensorPU。"""
+    from memory.mem_planner import ResidentAllocation, tensor_pu_usage
+
+    allocations = [
+        ResidentAllocation("opA", "a0", 100),
+        ResidentAllocation("opB", "b0", 40),
+        ResidentAllocation("opA", "a1", 60),
+    ]
+    usage = tensor_pu_usage(allocations, tensors_per_cluster=2)
+    assert usage[0]["model_bytes"] == 160
+    assert usage[1]["model_bytes"] == 40
+
+
+def test_tensor_pu_ledger_matches_genesim_capacity_usage() -> None:
+    """同一批常驻张量在编译侧与 GeneSim 侧得到逐 PU 相同字节数。"""
+    from unittest.mock import MagicMock
+
+    from tune._genesim import _ensure_genesim_path
+
+    _ensure_genesim_path()
+    from autotune.placement import PlacementProblem
+    from ir.model_ir import ModelIR, Operator
+    from vpu.vpu import PIMVPU
+
+    from memory.mem_planner import ResidentAllocation, tensor_pu_usage
+
+    operators = [
+        Operator(op_id=op_id, op_type="GEMM",
+                 input_shapes=[(1, 16)], output_shapes=[(1, 16)])
+        for op_id in (0, 1)
+    ]
+    ir = ModelIR(
+        model_id="ledger-test", num_layers=1, num_heads=1, head_dim=1,
+        hidden_size=1, operators=operators, dependencies=[],
+        subgraphs=[[0, 1]])
+    resources = [
+        PIMVPU(vpu_id=index, node_id=0, backend=MagicMock(), pu_id=index,
+               pim_device_id=0, cluster_id=0, tensor_id=index,
+               device_local_pu_id=index)
+        for index in (0, 1)
+    ]
+    problem = PlacementProblem(
+        ir, resources, pim_supported_ops={"GEMM"},
+        tensor_pu_capacity_bytes=1 << 20, cluster_capacity_bytes=1 << 21,
+        resident_tensors_by_op={
+            0: [("weight-0", "model", 100)],
+            1: [("weight-1", "model", 200)],
+        },
+    )
+    state = problem.state_from_vpu_ids({0: 0, 1: 1})
+    genesim = problem.capacity_usage(state)["tensor_pus"]
+    compiler = tensor_pu_usage(
+        [ResidentAllocation("op0", "weight-0", 100),
+         ResidentAllocation("op1", "weight-1", 200)],
+        tensors_per_cluster=2)
+    assert genesim == {0: 100, 1: 200}
+    assert {slot: stats["model_bytes"] for slot, stats in compiler.items()} == (
+        genesim)
+
+
+# ---- 评审 round05：KV 按执行单元归属、逐请求峰值与两侧算法同源 ----
+
+def test_kv_ledger_groups_each_heads_two_sides_under_one_unit() -> None:
+    """同一执行单元（层 + KV head）的 K/V 两块必须同一 owner、同一 PU。"""
+    gm, _ = _execution_order_graph()
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    spec = KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0, 1],
+        q_heads_by_kv={0: [0], 1: [1]},
+        max_seq=16, head_dim=8, dtype_bytes=2, kv_base=0)
+    plan = plan_dpu(0, list(gm.graph.nodes), list(gm.graph.nodes),
+                    {0: spec}, hw)
+    kv = [item for item in plan.resident_allocations
+          if item.tensor_key.startswith("kv:")]
+    owners_by_head = {}
+    for item in kv:
+        head_key = item.tensor_key.rsplit(":", 1)[0]
+        owners_by_head.setdefault(head_key, set()).add(item.owner)
+    # 每 head 的 K/V 共用一个 owner；两个 head 是不同执行单元。
+    assert all(len(owners) == 1 for owners in owners_by_head.values())
+    assert len({next(iter(owners)) for owners in owners_by_head.values()}) == 2
+
+    from memory.mem_planner import tensor_pu_usage
+
+    usage = tensor_pu_usage(plan.resident_allocations, 2)
+    # 两个 head 轮转到不同 PU；每 PU 的 K/V 两块合计 2 × 16 × 8 × 2 B。
+    assert usage[0]["request_bytes"] == 512
+    assert usage[1]["request_bytes"] == 512
+
+
+def test_kv_request_peaks_follow_the_trace_and_concurrency() -> None:
+    """KV 台账按轨迹逐请求登记峰值，并按并发上限取最大的若干个。"""
+    gm, _ = _execution_order_graph()
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    spec = KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0],
+        q_heads_by_kv={0: [0]},
+        max_seq=32, head_dim=8, dtype_bytes=2, kv_base=0)
+    plan = plan_dpu(0, list(gm.graph.nodes), list(gm.graph.nodes),
+                    {0: spec}, hw, request_kv_tokens=(10, 20, 5))
+    kv = [item for item in plan.resident_allocations
+          if item.tensor_key.startswith("kv:")]
+    # 每 token 16 B：逐请求峰值 = tokens × head_dim × dtype_bytes。
+    assert {item.request_bytes_by_request for item in kv} == {
+        (160, 320, 80)}
+
+    from memory.mem_planner import tensor_pu_usage
+
+    usage_one = tensor_pu_usage(
+        plan.resident_allocations, 1, concurrency=1)
+    usage_two = tensor_pu_usage(
+        plan.resident_allocations, 1, concurrency=2)
+    # 单 PU 上 K/V 两块，各取最大 1 或 2 个请求峰值后相加。
+    assert usage_one[0]["request_bytes"] == 2 * 320
+    assert usage_two[0]["request_bytes"] == 2 * (320 + 160)
+
+
+def test_tensor_pu_usage_sums_request_peaks_by_index() -> None:
+    """逐请求峰值按请求下标相加后再取 top-N，与 GeneSim 最终审计一致。"""
+    from memory.mem_planner import ResidentAllocation, tensor_pu_usage
+
+    allocations = [
+        ResidentAllocation("a", "tensor-a", 0, (10, 0)),
+        ResidentAllocation("b", "tensor-b", 0, (0, 10)),
+    ]
+    usage = tensor_pu_usage(allocations, 1, concurrency=1)
+    # 请求 0 合计 10、请求 1 合计 10，top-1 是 10 而不是逐张量 top 再相加。
+    assert usage[0]["request_bytes"] == 10
+    usage_both = tensor_pu_usage(allocations, 1, concurrency=2)
+    assert usage_both[0]["request_bytes"] == 20
+
+
+def test_shared_kv_tensor_is_counted_once_per_tensor_pu() -> None:
+    """GQA 多个消费者引用同一 KV 张量时，同一 PU 上只计一次。"""
+    from memory.mem_planner import ResidentAllocation, tensor_pu_usage
+
+    allocations = [
+        ResidentAllocation("q-head-0", "layer.0.k_cache.0", 0, (100,)),
+        ResidentAllocation("q-head-1", "layer.0.k_cache.0", 0, (100,)),
+    ]
+    usage = tensor_pu_usage(allocations, 1, concurrency=1)
+    assert usage[0]["request_bytes"] == 100
+
+
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_kv_ledger_matches_genesim_capacity_audit(concurrency) -> None:
+    """同一批 KV 张量在编译侧与 GeneSim 最终容量审计得到相同字节数。"""
+    from types import SimpleNamespace
+
+    from tune._genesim import _ensure_genesim_path
+
+    _ensure_genesim_path()
+    from ir.model_ir import Dependency, HOST_OP_ID, ModelIR, Operator
+    from ir.trace_ir import Request
+    from pim.capacity import tensor_pu_capacity_metrics
+
+    from memory.mem_planner import tensor_pu_usage
+
+    ir = ModelIR(
+        model_id="kv-peak", num_layers=1, num_heads=1, head_dim=1,
+        hidden_size=1,
+        operators=[Operator(0, "GEMV_SCORE", [], [])],
+        dependencies=[
+            Dependency(
+                HOST_OP_ID, 0,
+                resident_bytes_coeffs={"Tp+Tq": 16.0},
+                first_use_scope="request",
+                tensor_id="layer.0.k_cache.0"),
+            Dependency(
+                HOST_OP_ID, 0,
+                resident_bytes_coeffs={"Tp+Tq": 16.0},
+                first_use_scope="request",
+                tensor_id="layer.0.v_cache.0"),
+        ],
+        subgraphs=[[0]],
+    )
+    ir.operators[0].vpu_id = 5
+    ir.operators[0].node_id = 0
+    ir.operators[0].attached_pu_id = 0
+    requests = [
+        Request(request_id="r0", input_tokens=[], seq_len=10,
+                output_length=3, arrival_time_ns=0, is_prefill=False),
+        Request(request_id="r1", input_tokens=[], seq_len=5,
+                output_length=2, arrival_time_ns=0, is_prefill=False),
+    ]
+    vpu = SimpleNamespace(
+        vpu_type="PIM", vpu_id=5, node_id=0, pim_device_id=0,
+        cluster_id=0, tensor_id=0)
+    metrics = tensor_pu_capacity_metrics(
+        ir, requests, {5: vpu}, limit_bytes=1 << 20,
+        tensors_per_cluster=1, max_concurrent_requests=concurrency)
+    genesim_bytes = metrics["tensor_pus"]["5"]["request_bytes"]
+
+    gm, _ = _execution_order_graph()
+    hw = HwBudget(mram_bytes=1 << 20, align=64, sys_reserve_bytes=0)
+    spec = KVRegionSpec(
+        dpu_id=0, layers=[0], kv_heads=[0], q_heads_by_kv={0: [0]},
+        max_seq=13, head_dim=8, dtype_bytes=2, kv_base=0)
+    plan = plan_dpu(0, list(gm.graph.nodes), list(gm.graph.nodes),
+                    {0: spec}, hw, request_kv_tokens=(13, 7))
+    usage = tensor_pu_usage(
+        plan.resident_allocations, 1, concurrency=concurrency)[0]
+    assert genesim_bytes == (416 if concurrency == 1 else 640)
+    assert usage["request_bytes"] == genesim_bytes
+
+
+def test_kv_owner_uses_the_real_attention_execution_unit() -> None:
+    """有 attention 节点时，KV 的 owner 取自真实执行节点与 KV head。"""
+    import torch
+    from torch.fx import Graph
+
+    from memory.mem_planner import _attention_unit_map
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    weight = graph.get_attr(
+        "model.model.layers.0.self_attn.q_proj.weight")
+    projected = graph.call_function(
+        torch.ops.aten.linear.default, (x, weight))
+    sdpa = graph.call_function(
+        torch.ops.aten.scaled_dot_product_attention.default,
+        (projected, projected, projected))
+    units = _attention_unit_map(list(graph.nodes))
+    assert units == {0: sdpa.name}

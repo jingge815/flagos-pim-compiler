@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 from contracts.op_semantics import oplevel_ops
@@ -25,7 +26,6 @@ from contracts.op_contract import (
 )
 from genesim_bridge.paths import flagtree_prefix, pim_options
 from contracts import mlir_layout
-from opcompiler_bridge.oplevel_emitter import PIM_TARGET
 from opcompiler_bridge.oplevel_kernel import (
     _CONTRACT_DTYPES,
     concat_kernel,
@@ -115,27 +115,120 @@ def _mlir_translate() -> Path:
     return flagtree_prefix() / "llvm-7d5de303" / "bin" / "mlir-translate"
 
 
-def _compiler_fingerprint() -> str:
-    """内核源码与降级工具链的指纹，让缓存随编译器一起失效。
+def _gcc() -> Path | None:
+    """实际参与编译 C 文本的 gcc；解析失败时返回 None。"""
+    import shutil
 
-    缓存键原先只含请求参数。改了 `kernel_src.py` 的内核结构或 FlagTree 的
-    降级 pass 之后，磁盘上的 `.pimir.mlir` 与 `.so` 不会被判失效，新的形状
-    请求可能命中旧内核编出来的产物——形状相关的逻辑再改一次就会踩到。
+    override = os.environ.get("CC")
+    if override:
+        resolved = shutil.which(override)
+        return Path(resolved) if resolved else Path(override)
+    resolved = shutil.which("gcc")
+    return Path(resolved) if resolved else None
+
+
+def _file_digest(path: Path | None) -> tuple[str | None, str | None]:
+    if path is None or not path.is_file():
+        return None, None
+    return str(path.resolve()), hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _tool_identity() -> dict:
+    """降级、翻译、进程内库与末段链接工具的内容身份。
+
+    工具内容在一个进程内只读一次；产物核对与 sidecar 生成共用同一份摘要。
+    """
+    tools = {
+        "triton_opt": _triton_opt(),
+        "libtriton": _loaded_libtriton(),
+        "mlir_translate": _mlir_translate(),
+        "gcc": _gcc(),
+    }
+    identity = {}
+    for name, path in tools.items():
+        resolved, digest = _file_digest(path)
+        identity[name] = {"path": resolved, "sha256": digest}
+    return identity
+
+
+_COMPILE_SOURCE_DIRS = (
+    "contracts", "graph", "comm", "memory", "runtime",
+    "opcompiler_bridge", "genesim_bridge",
+)
+
+
+def _graph_source_digest() -> str:
+    """参与编译的图/算子源码内容摘要；未提交改动也会改变身份。"""
+    root = Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for name in _COMPILE_SOURCE_DIRS:
+        for path in sorted((root / name).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            digest.update(path.relative_to(root).as_posix().encode())
+            digest.update(path.read_bytes())
+    digest.update((root / "paths.json").read_bytes())
+    return digest.hexdigest()
+
+
+def compiler_identity() -> dict:
+    """图编译器显式写进产物的内容身份，供 GeneSim 在外置目录消费。
+
+    身份只由源码与工具内容决定，不依赖产物所在路径，也不以 HEAD 或
+    dirty 标记代替未提交内容。
+    """
+    root = Path(__file__).resolve().parent.parent
+    try:
+        prefix = flagtree_prefix()
+    except Exception:
+        prefix = None
+    return {
+        "version": 1,
+        "graph_compiler": {
+            "root": str(root),
+            "source_sha256": _graph_source_digest(),
+            "source_dirs": list(_COMPILE_SOURCE_DIRS),
+        },
+        "flagtree": {"prefix": None if prefix is None else str(prefix)},
+        "tools": _tool_identity(),
+        "compiler_fingerprint": _compiler_fingerprint(),
+    }
+
+
+def _compiler_fingerprint() -> str:
+    """内核源码与降级工具链的内容摘要，让缓存随编译器一起失效。
+
+    缓存键原先只含请求参数。改了内核源码或 FlagTree 的降级 pass 之后，磁盘上的
+    `.pimir.mlir` 与 `.so` 不会被判失效，新的形状请求可能命中旧内核编出来的
+    产物。这里全部按**内容**计算，不只看文件大小或修改时间：同尺寸同时间戳的
+    替换二进制也能被发现。
+
+    工具链内容在一个进程内只算一次：已加载的 `libtriton.so` 本来就不能中途
+    刷新，工具变化必须新起进程，摘要跟着进程走即可。
     """
     digest = hashlib.sha256()
-    # 生成 IR 的源文件都要入摘要：kernel_src 是 A 路，oplevel_* 是 B 路。
-    # 漏掉后两份时，改了 convert 类型表或 eltwise dtype 也不会让缓存失效。
-    for name in ("kernel_src.py", "oplevel_kernel.py", "oplevel_emitter.py"):
+    # 生成 IR 与下发 pass 的源文件都要入摘要：漏掉后两份时，改了 convert 类型表
+    # 或 pass 顺序也不会让缓存失效。
+    for name in ("kernel_src.py", "oplevel_kernel.py", "oplevel_emitter.py",
+                 "driver.py", "pipeline.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
-    # 工具链本身也是编译器的一部分：pass 改了，同一份 TTIR 会降出不同的 C。
-    # 降级 pass 编进两份产物：`triton-opt` 给离线编译用，`libtriton.so` 是
-    # 进程内实际加载的那份。只盯其中一个，另一个被单独重编时缓存不会失效，
-    # 运行时就会拿旧内核的产物去对拍。
-    for tool in (_triton_opt(), _loaded_libtriton()):
-        if tool is not None and tool.is_file():
-            stat = tool.stat()
-            digest.update(f"{tool}:{stat.st_size}:{stat.st_mtime_ns}".encode())
+    digest.update(Path(mlir_layout.__file__).read_bytes())
+    digest.update(_tool_content_digest().encode())
     return digest.hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def _tool_content_digest() -> str:
+    """实际编译/翻译/链接工具的内容摘要；每个进程只算一次。"""
+    digest = hashlib.sha256()
+    # 降级 pass 编进两份产物：`triton-opt` 给离线编译用，`libtriton.so` 是
+    # 进程内实际加载的那份；`mlir-translate` 决定最终 C 文本，`gcc` 决定
+    # 最终 `.so`；四者都算编译器。
+    for tool in (_triton_opt(), _loaded_libtriton(), _mlir_translate(), _gcc()):
+        if tool is not None and tool.is_file():
+            digest.update(tool.read_bytes())
+    return digest.hexdigest()
 
 
 def _loaded_libtriton() -> Path | None:
@@ -154,7 +247,7 @@ def _cache_key(request: OpCompileRequest) -> str:
     # 第二次 `load_kernel` 拿到的是第一份的代码，数值全错而形状全对。
     payload = (
         f"{request.op}:{request.arg_shapes}:{request.dtype}:"
-        f"{request.num_tasklets}:{request.group_size}:{request.activation}:"
+        f"{request.resolved_num_tasklets()}:{request.group_size}:{request.activation}:"
         f"{request.kind}:{request.tail_card_value}:{request.sf_multiplier}:"
         f"{request.out_dtype}:"
         f"{request.hardware.to_payload()}:"
@@ -172,17 +265,13 @@ def _cache_key(request: OpCompileRequest) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _kernel_launcher(request: OpCompileRequest):
-    if request.op != "linear":
-        raise NotImplementedError(
-            f"opcompiler_bridge 第一期只覆盖 linear，收到: {request.op!r}"
-        )
+def _matmul_extents(request: OpCompileRequest) -> tuple[int, int, int]:
+    """返回 linear 的 `(M, N, K)`，并校验 x 与权重的 K 维一致。"""
     if len(request.arg_shapes) != 2:
         raise ValueError(
             f"linear 契约要求 arg_shapes=[x.shape, weight.shape]，收到: "
             f"{request.arg_shapes!r}"
         )
-    # 将输入前导维合并为 M，权重保持二维。
     m, k = flatten_leading_dims(request.arg_shapes[0])
     n, k2 = request.arg_shapes[1]
     if k != k2:
@@ -190,6 +279,16 @@ def _kernel_launcher(request: OpCompileRequest):
             f"x 和 weight 的 K 维不一致: x.shape={request.arg_shapes[0]!r} "
             f"weight.shape={request.arg_shapes[1]!r}"
         )
+    return m, n, k
+
+
+def _kernel_launcher(request: OpCompileRequest):
+    if request.op != "linear":
+        raise NotImplementedError(
+            f"opcompiler_bridge 第一期只覆盖 linear，收到: {request.op!r}"
+        )
+    # 将输入前导维合并为 M，权重保持二维。
+    m, n, k = _matmul_extents(request)
     if k < 16:
         raise ValueError(
             f"tl.dot 要求 K>=16（Triton 自身对 tensor-core 输入的硬约束），"
@@ -286,7 +385,9 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig,
                     shard=None,
                     elem_strides: tuple[int, ...] = (),
                     mram_offset: int = 0,
-                    align_bytes: int = 0) -> tuple[str, str]:
+                    align_bytes: int = 0,
+                    full_m: int = -1, full_n: int = -1,
+                    full_k: int = -1) -> tuple[str, str]:
     """将 TTIR 转换为 PIM IR 和 EmitC 文本，两者都返回。
 
     分两次调用 `triton-opt`，而不是把五个 pass 串成一条命令：pim mlir 是
@@ -305,7 +406,6 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig,
                                  elem_strides=elem_strides,
                                  mram_offset=mram_offset,
                                  align_bytes=align_bytes)
-    opts = pim_options()
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
         raise ToolchainUnavailable(
@@ -316,10 +416,15 @@ def _run_triton_opt(ttir: str, hardware: PIMHardwareConfig,
 
     # 第一段到 pim mlir：这一层带 !pim.memdesc、pim.dma_load/store 和真实分块。
     # pass 顺序的真源在 pipeline.py，五类优化插在转换与显式 DMA 之间。
+    # 目标只取请求级契约，不再读全局 `pim_options()`：后者会让环境把另一套
+    # 目标产物写进同一缓存身份，而候选键与续跑身份看不到这条旁路。
     from opcompiler_bridge.pipeline import a_path_passes
 
     pimir = _run_passes(
-        triton_opt, ttir, a_path_passes(hardware, target=opts["pim_target"]),
+        triton_opt, ttir,
+        a_path_passes(hardware, target=hardware.compiler_target,
+                      full_m=full_m, full_n=full_n, full_k=full_k,
+                      optimizations=getattr(hardware, "optimizations", None)),
         "pim mlir",
     )
     # 第二段到 EmitC：后续 mlir-translate 生成 C 的输入。
@@ -429,7 +534,7 @@ def _module_text(body: str, request: OpCompileRequest) -> str:
     它比的是「模块说的」与「编码记的」，少了一边就无从比较。两路都发之后那条
     校验在两条路上都活。
     """
-    attrs = [f'pim.target = "{PIM_TARGET}"']
+    attrs = [f'pim.target = "{request.hardware.compiler_target}"']
     shard = request.shard
     if shard is not None and shard.num_dpus > 1:
         attrs.extend(mlir_layout.module_attributes(request.hardware))
@@ -793,12 +898,13 @@ def _make_oplevel_mlir(request: OpCompileRequest) -> str:
     return _module_text(body, request)
 
 
-def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
+def _run_oplevel_triton_opt(mlir_text: str,
+                            hardware: PIMHardwareConfig | None = None) -> tuple[str, str]:
     """算子级 IR 走一遍：融合 → 展开 → 折叠 → CSE → DCE → 分块 → 校验 → 降到 EmitC。
 
     与 A 路的两次调用同构，只是 pass 列表不同：这条没有 DMA，也就没有
-    `convert-triton-to-pim` / `explicit-dma` 两段。模块头缺预算属性时按
-    `pim_options()` 补上，与 A 路同一份硬件参数。
+    `convert-triton-to-pim` / `explicit-dma` 两段。模块头缺预算属性时用本次请求
+    的硬件补上；`hardware=None` 是只拿到 IR 文本的调用方，退回全局 `pim_options()`。
     """
     triton_opt = _triton_opt()
     if not triton_opt.is_file():
@@ -808,8 +914,13 @@ def _run_oplevel_triton_opt(mlir_text: str) -> tuple[str, str]:
         )
     from opcompiler_bridge.pipeline import b_path_passes, with_budget
 
-    mlir_text = with_budget(mlir_text, _options_hardware())
-    pimir = _run_passes(triton_opt, mlir_text, b_path_passes(), "pim mlir")
+    mlir_text = with_budget(
+        mlir_text, hardware if hardware is not None else _options_hardware())
+    optimizations = (
+        getattr(hardware, "optimizations", None)
+        if hardware is not None else None)
+    pimir = _run_passes(
+        triton_opt, mlir_text, b_path_passes(optimizations), "pim mlir")
     emitc = _run_passes(
         triton_opt, pimir,
         ["-pim-lower-to-emitc", "-convert-func-to-emitc"],
@@ -974,15 +1085,18 @@ def _compile_op_uncached(
 ) -> OpCompileResult:
     if request.op in _OPLEVEL_OPS:
         # B 路：整算子级 IR → 融合/展开/校验 → EmitC。没有 DMA 可显式化，
-        # 所以不走 A 路那三段；降级 pass 是同一个。
+        # 所以不走 A 路那三段；降级 pass 是同一个。硬件预算用本次请求的画像。
         mlir_text = _make_oplevel_mlir(request)
-        pimir_text, emitc_text = _run_oplevel_triton_opt(mlir_text)
+        pimir_text, emitc_text = _run_oplevel_triton_opt(
+            mlir_text, request.hardware)
     elif request.op == "linear":
         ttir = _make_ttir(request)
+        full_m, full_n, full_k = _matmul_extents(request)
         pimir_text, emitc_text = _run_triton_opt(
             ttir, request.hardware, _a_path_shard(request),
             elem_strides=request.elem_strides,
-            mram_offset=request.mram_offset, align_bytes=request.align_bytes)
+            mram_offset=request.mram_offset, align_bytes=request.align_bytes,
+            full_m=full_m, full_n=full_n, full_k=full_k)
     else:
         # 名字不认识就在这里断掉。放到 A 路里面判会让 `arg_shapes[1]` 先解包，
         # 未知名拿到的是 IndexError，看现场只看到"列表越界"，看不出是名字错了。
@@ -1007,8 +1121,8 @@ def _compile_op_uncached(
         proc = subprocess.run(
             # `-lm`：算子级的 LUT 相用 `expf`。glibc 新版已把 libm 并进 libc，
             # 显式带上，老环境也不会漏。
-            ["gcc", "-shared", "-fPIC", "-O2", "-o", str(so_tmp_path),
-             str(c_path), "-lm"],
+            [str(_gcc() or "gcc"), "-shared", "-fPIC", "-O2",
+             "-o", str(so_tmp_path), str(c_path), "-lm"],
             capture_output=True,
             text=True,
         )

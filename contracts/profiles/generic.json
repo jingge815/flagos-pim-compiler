@@ -1,0 +1,190 @@
+{
+  "version": 1,
+  "name": "generic",
+  "compiler_target": "pim:v1",
+  "pim_type": "HBM-PIM",
+  "num_pim_devices": 8,
+  "clusters_per_device": 8,
+  "tensors_per_cluster": 16,
+  "cluster_memory_bytes": 8589934592,
+  "sys_reserve_bytes": 0,
+  "wram_bytes_per_dpu": 65536,
+  "dma_align": 64,
+  "clock_period_ns": 0.63,
+  "multipliers": 4,
+  "cycle_costs": {
+    "LOAD": 12,
+    "STORE": 10,
+    "MAC": 1,
+    "CONTEXT_MAC": 1,
+    "SCORE_MAC": 1,
+    "SCORE_TILE": 0,
+    "CONTEXT_TILE": 0,
+    "CONTEXT_SETUP": 0,
+    "SOFTMAX_SETUP": 0,
+    "GELU_SETUP": 0,
+    "SILU_SETUP": 0,
+    "RMSNORM_SETUP": 0,
+    "SEND": 5,
+    "REDUCE": 20,
+    "SOFTMAX_CHUNK": 50,
+    "LOADN": 12,
+    "LOADN_PER_BYTE": 0.125,
+    "STOREN": 10,
+    "STOREN_PER_BYTE": 0.1,
+    "EXP": 4,
+    "DIV": 4,
+    "MAX": 2,
+    "MUL": 1,
+    "GELU": 8,
+    "SILU": 6,
+    "RSQRT": 8,
+    "LUT": 6,
+    "ROPE": 8,
+    "QUANT": 4,
+    "GATHER": 10,
+    "TRANSPOSE": 2,
+    "RESHAPE": 1,
+    "CONCAT": 2,
+    "SPLIT": 2,
+    "MASK": 2
+  },
+  "zone_cycle_factors": {
+    "weight": 1.0,
+    "kv": 1.0,
+    "activation": 1.0
+  },
+  "tile_size": 32,
+  "mac_width": 8,
+  "chunk_size": 16,
+  "max_bulk_transfer_bytes": 16320,
+  "bytes_per_element": 2,
+  "use_long_loop_counts": false,
+  "inter_cluster_communication": "direct",
+  "host_relay_overhead_ns": 100.0,
+  "links": [
+    {
+      "name": "PCIe_Gen5_x16",
+      "src_domain": "HOST",
+      "dst_domain": "GPU",
+      "bandwidth_gbps": 512.0,
+      "latency_base_ns": 80.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PCIe_Gen5_x16_GPU_to_HOST",
+      "src_domain": "GPU",
+      "dst_domain": "HOST",
+      "bandwidth_gbps": 512.0,
+      "latency_base_ns": 80.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "DDR5_Channel_Host_to_PIM",
+      "src_domain": "HOST",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 307.2,
+      "latency_base_ns": 10.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "DDR5_Channel_PIM_to_HOST",
+      "src_domain": "PIM",
+      "dst_domain": "HOST",
+      "bandwidth_gbps": 307.2,
+      "latency_base_ns": 10.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "GPU_to_PIM",
+      "src_domain": "GPU",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 512.0,
+      "latency_base_ns": 80.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PIM_to_GPU",
+      "src_domain": "PIM",
+      "dst_domain": "GPU",
+      "bandwidth_gbps": 512.0,
+      "latency_base_ns": 80.0,
+      "is_full_duplex": false,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "GPU_to_GPU",
+      "src_domain": "GPU",
+      "dst_domain": "GPU",
+      "bandwidth_gbps": 17280.0,
+      "latency_base_ns": 1000.0,
+      "is_full_duplex": true,
+      "intra_cluster_only": false,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PIM_Intra_Cluster",
+      "src_domain": "PIM",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 4096.0,
+      "latency_base_ns": 1000.0,
+      "is_full_duplex": true,
+      "intra_cluster_only": true,
+      "inter_cluster_only": false
+    },
+    {
+      "name": "PIM_Inter_Cluster",
+      "src_domain": "PIM",
+      "dst_domain": "PIM",
+      "bandwidth_gbps": 1024.0,
+      "latency_base_ns": 2000.0,
+      "is_full_duplex": true,
+      "inter_cluster_only": true,
+      "intra_cluster_only": false
+    }
+  ],
+  "cpu_model": {
+    "base_latency_us": 10.0,
+    "peak_flops": 1000000000000.0,
+    "peak_bandwidth_gbs": 100.0
+  },
+  "parameter_sources": {
+    "pim.cluster_memory_capacity_gb": {
+      "origin": "assumption",
+      "evidence": "通用 PIM 基线容量，取自 conf/sim.yaml",
+      "unit": "GiB",
+      "scope": "per cluster"
+    },
+    "pim.clock_period_ns": {
+      "origin": "assumption",
+      "evidence": "取自 conf/sim.yaml 的 0.63 ns",
+      "unit": "ns",
+      "scope": "per tensor pu"
+    },
+    "pim.pim_trace_cycle_costs": {
+      "origin": "assumption",
+      "evidence": "通用 PIM 占位单价，未校准",
+      "unit": "cycle",
+      "scope": "per work unit"
+    },
+    "comm_config.links": {
+      "origin": "assumption",
+      "evidence": "通用 PIM 链路参数取自 conf/sim.yaml",
+      "unit": "gbps",
+      "scope": "host and inter-cluster"
+    }
+  },
+  "base_genesim_config": "conf/sim.yaml",
+  "ceva": null
+}

@@ -6,6 +6,45 @@ from dataclasses import dataclass, field
 from math import prod
 
 
+# 编译器目标固定为 pim:v1；它是编译契约的一部分，不另走全局环境。
+PIM_COMPILER_TARGET = "pim:v1"
+
+# 可由调优配置开关的四类优化。融合与相位展开是目标格式的硬要求，
+# 不进开关，始终执行。
+OPTIMIZATION_FIELDS = ("constant_fold", "cse", "dce", "loop_tiling")
+
+
+@dataclass(frozen=True)
+class PimOptimizations:
+    """编译优化开关；缺省全开，保持改动前的五类优化行为。"""
+
+    constant_fold: bool = True
+    cse: bool = True
+    dce: bool = True
+    loop_tiling: bool = True
+
+    def __post_init__(self) -> None:
+        for name in OPTIMIZATION_FIELDS:
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool, got {value!r}")
+
+    def to_payload(self) -> dict[str, bool]:
+        return {name: bool(getattr(self, name)) for name in OPTIMIZATION_FIELDS}
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "PimOptimizations":
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "optimizations payload must be a dict, got "
+                f"{type(payload).__name__}")
+        unknown = set(payload) - set(OPTIMIZATION_FIELDS)
+        if unknown:
+            raise ValueError(f"optimizations payload 有未知字段：{sorted(unknown)}")
+        return cls(**{
+            name: payload.get(name, True) for name in OPTIMIZATION_FIELDS})
+
+
 @dataclass(frozen=True)
 class PIMHardwareConfig:
     num_dpus: int
@@ -13,6 +52,10 @@ class PIMHardwareConfig:
     mram_bytes_per_dpu: int
     wram_bytes_per_dpu: int
     dma_align: int
+    # 编译目标与硬件五元组同属请求级契约；缓存键与下发文本都从它派生。
+    compiler_target: str = PIM_COMPILER_TARGET
+    # 优化开关同属编译请求：换开关必须换缓存键与产物身份。
+    optimizations: PimOptimizations = field(default_factory=PimOptimizations)
 
     def __post_init__(self) -> None:
         for name in (
@@ -25,18 +68,29 @@ class PIMHardwareConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive int, got {value!r}")
+        if (not isinstance(self.compiler_target, str)
+                or not self.compiler_target.strip()):
+            raise ValueError(
+                "compiler_target must be a non-empty string, got "
+                f"{self.compiler_target!r}")
         if self.num_dpus & (self.num_dpus - 1):
             raise ValueError(f"num_dpus must be a power of two, got {self.num_dpus}")
         if self.dma_align & (self.dma_align - 1):
             raise ValueError(f"dma_align must be a power of two, got {self.dma_align}")
+        if not isinstance(self.optimizations, PimOptimizations):
+            raise ValueError(
+                "optimizations must be a PimOptimizations, got "
+                f"{type(self.optimizations).__name__}")
 
-    def to_payload(self) -> dict[str, int]:
+    def to_payload(self) -> dict[str, object]:
         return {
             "num_dpus": self.num_dpus,
             "num_tasklets": self.num_tasklets,
             "mram_bytes_per_dpu": self.mram_bytes_per_dpu,
             "wram_bytes_per_dpu": self.wram_bytes_per_dpu,
             "dma_align": self.dma_align,
+            "compiler_target": self.compiler_target,
+            "optimizations": self.optimizations.to_payload(),
         }
 
     @classmethod
@@ -49,6 +103,12 @@ class PIMHardwareConfig:
             mram_bytes_per_dpu=int(payload["mram_bytes_per_dpu"]),
             wram_bytes_per_dpu=int(payload["wram_bytes_per_dpu"]),
             dma_align=int(payload["dma_align"]),
+            # 旧 payload 没有目标键时按固定目标读回。
+            compiler_target=str(
+                payload.get("compiler_target", PIM_COMPILER_TARGET)),
+            # 旧 payload 没有优化块时按全开读回，旧产物行为不变。
+            optimizations=PimOptimizations.from_payload(
+                payload.get("optimizations", {})),
         )
 
 
@@ -172,8 +232,9 @@ class OpCompileRequest:
     hardware: PIMHardwareConfig
     # MRAM 数据类型，如 `float16` 或 `float32`。
     dtype: str = "float32"
-    # 单台 DPU 使用的 tasklet 数。
-    num_tasklets: int = 4
+    # 单台 DPU 使用的 tasklet 数。None 表示取 `hardware.num_tasklets`；
+    # 显式给值时必须与硬件配置一致，避免两处各取一边。
+    num_tasklets: int | None = None
     # 复用字段，含义随 `op` 变：dynamic_quant / matmul 的组宽、kv_cache 的
     # 是否散写、split_heads 的头数、concat 的拼接轴。A 路 linear 不看它。
     # concat 必须显式给，省略不再默认 0。
@@ -203,6 +264,21 @@ class OpCompileRequest:
     # 0 表示从基址起、没有额外对齐，下发文本与改动前逐字节相同。
     mram_offset: int = 0
     align_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_tasklets is not None:
+            self.resolved_num_tasklets()
+
+    def resolved_num_tasklets(self) -> int:
+        """取实际 tasklet 数；显式值与硬件不一致时直接报错。"""
+        if self.num_tasklets is None:
+            return self.hardware.num_tasklets
+        if self.num_tasklets != self.hardware.num_tasklets:
+            raise ValueError(
+                f"num_tasklets={self.num_tasklets} 与 "
+                f"hardware.num_tasklets={self.hardware.num_tasklets} 不一致；"
+                "tasklet 数只能有一个来源")
+        return self.num_tasklets
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import glob
+import json
 import os
 import threading
 from dataclasses import dataclass
@@ -234,8 +235,9 @@ def compiled_linear_kernel(hal, dpu_id: int, cmd) -> None:
     num_tasklets = hardware.num_tasklets
     # 键包含数据类型、tasklet 数和硬件配置；activation 变了要重编。
     ctx = _ctx_of(cmd)
+    # 硬件 payload 含嵌套的优化开关，先转成稳定 JSON 串再作缓存键。
     key = (ctx, "linear", arg_shapes, dtype, cmd.payload.get("activation"),
-           tuple(hardware.to_payload().items()))
+           json.dumps(hardware.to_payload(), sort_keys=True))
     fn = _COMPILED_KERNEL_CACHE.get(key)
     if fn is None:
         # 锁内检查编译缓存。

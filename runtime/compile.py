@@ -109,7 +109,8 @@ def _q_proj_layer_of(node) -> int:
 
 
 def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
-                           widths: dict | None = None) -> int:
+                           widths: dict | None = None,
+                           force_compile: bool = False) -> int:
     """计划里各内核回传的单台 MRAM 占用取最大值，取不到回传时返回 0。
 
     `widths` 非空时，顺手把回传的元素宽度按 GML op_type 收进去，
@@ -173,7 +174,7 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
                     hardware=hardware, dtype=dtype,
                     num_tasklets=hardware.num_tasklets,
                     shard=None if raw is None else DpuShard.from_payload(raw),
-                    activation=activation))
+                    activation=activation), force=force_compile)
             except (RuntimeError, ValueError):
                 # 这是**探测**，不是编译：拿不到就跳过这个形状，绝不让它打断
                 # 整个 compile_llama2。三种拿不到的情形都走这里：
@@ -206,8 +207,14 @@ def compile_llama2(
     hardware: PIMHardwareConfig,
     kv_dtype_bytes: int = 2,
     dtype: torch.dtype = torch.float16,
+    force_compile: bool = False,
+    request_kv_tokens: tuple[int, ...] | None = None,
 ) -> CompiledModel:
-    """编译 Llama 的两张图，返回共享内存蓝图的命令计划。"""
+    """编译 Llama 的两张图，返回共享内存蓝图的命令计划。
+
+    `force_compile=True` 表示本轮要真实重编：图测量阶段的内核探测不走缓存，
+    与放置/成本侧的 strict 档共用同一个开关。
+    """
     cfg = model.config
     prefill_gm = export_annotated_graph(
         model, prefill_seq_len,
@@ -252,10 +259,12 @@ def compile_llama2(
     # 算子编译器知道（它定分块），这里问它回传；工具链不在位时退回 0，判据只看
     # 三区，与改动前逐字节等价。
     kernel_mram = peak_kernel_mram_bytes(prefill_nodes + decode_nodes,
-                                         hardware=hardware)
+                                         hardware=hardware,
+                                         force_compile=force_compile)
     mem_plans = {
         dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
-                         kernel_mram_bytes=kernel_mram)
+                         kernel_mram_bytes=kernel_mram,
+                         request_kv_tokens=request_kv_tokens)
         for dpu_id in strategy.dpu_ids
     }
     # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
@@ -293,10 +302,12 @@ def compile_llama2(
     prefill = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
         hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gm),
+        num_tasklets=hardware.num_tasklets,
     )
     decode = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
         hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
+        num_tasklets=hardware.num_tasklets,
     )
 
     return CompiledModel(

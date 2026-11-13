@@ -1,0 +1,142 @@
+# =============================================================================
+# 快速调优配置：一个真实请求 + 四维 16 个候选
+#
+# 四个搜索维度（每个维度两个值，2×2×2×2 = 16）：
+#   1. DPU 数：      space.strategy.num_dpus  = [4, 8]
+#   2. PP 段数：     space.strategy.num_stages = [2, 4]（TP 宽度 = DPU 数 / 段数）
+#   3. tasklet 数：  space.op.num_tasklets     = [4, 8]
+#   4. 优化开关：    space.optimization.field  = cse，values = [true, false]
+#
+# 一键运行：
+#   scripts/tune_oneclick.sh examples/tune/quick.yaml
+# 只检查候选组合、不编译：
+#   python scripts/tune_pipeline.py --config examples/tune/quick.yaml --dry-run
+# 结果目录：test-results/tune-quick-4d/
+# =============================================================================
+version: 1
+run_name: tune-quick
+
+model:
+  # 模型目录；null 表示用 paths.json 里的默认 Llama-2-7B。
+  model_dir: null
+  # 图骨架；null 表示按模型现场生成。
+  ir: null
+  # prefill 长度，必须覆盖请求的最长提示。
+  prefill_seq_len: 16
+  # 上下文上界；null 表示按请求的输入+输出推导。
+  max_seq: null
+  trace:
+    # 请求轨迹文件，路径相对本 YAML 所在目录。
+    path: trace_quick.json
+    # 从轨迹里取几个请求。
+    num_requests: 1
+    # 合成轨迹；与 path 二选一，例如 {seed: 0, num_requests: 10}。
+    synthetic: null
+
+profile:
+  # 硬件画像；这里用 CEVA 64 核画像。
+  path: ../../contracts/profiles/ceva_64core_4e.json
+
+# 所有候选的基线开关。space.optimization 只覆盖其中一个，其余三个用这里的值。
+# 四个开关：constant_fold、cse、dce、loop_tiling。默认全开。
+optimization:
+  constant_fold: true
+  cse: true
+  dce: true
+  loop_tiling: true
+
+# =============================================================================
+# 搜索空间：每一层给多个值就参与枚举，只给一个值表示冻结。
+# =============================================================================
+space:
+  strategy:
+    # 是否搜索这一层。false 表示冻结，此时每个字段只能有一个值。
+    enabled: true
+    # DPU 数：必须是 2 的幂，且不超过画像的物理簇总数（CEVA 画像是 64）。
+    num_dpus: [4, 8]
+    # PP 流水段数：必须整除 DPU 数；层数要能被段数均分。
+    # TP 宽度不单独配置，等于 num_dpus / num_stages，必须是 2 的幂，
+    # 且注意力头数、KV 头数、中间维、词表大小都要能被它整除。
+    # 例：4 台 DPU、2 段 -> tp2_pp2；8 台、2 段 -> tp4_pp2；8 台、4 段 -> tp2_pp4。
+    num_stages: [2, 4]
+
+  op:
+    # 是否搜索 tasklet 数。
+    enabled: true
+    # 每台 DPU 的 tasklet 数；常用 1 / 2 / 4 / 8。
+    # 它会写进 A/B 两路 PIMIR 的 pim.num-tasklets，并影响仿真成本。
+    num_tasklets: [4, 8]
+
+  optimization:
+    # 是否搜索优化开关。一次只扫描 field 指定的一个开关。
+    enabled: true
+    # field 只能取以下四个之一：
+    #   constant_fold、cse、dce、loop_tiling
+    # 建议用 cse：开/关都能编过。注意某些 workload 上开关不改变编译文本，
+    # 两个候选的分数可能相同；它们仍是独立候选（编译键不同）。
+    # 不建议用 loop_tiling：关闭后 PIMIR 没有 pim.tile-*，
+    # 当前本地形状推导会读不到输出分块。
+    field: cse
+    # field 的候选值，布尔列表。例如 [true, false] 表示开、关各一个候选。
+    values: [true, false]
+
+  hardware:
+    # 是否搜索硬件画像字段。false 表示不搜索，fields 必须为空。
+    enabled: false
+    # 打开后每个字段给一个取值列表，例如：
+    #   clock_period_ns: [0.63, 0.5]
+    #   wram_bytes_per_dpu: [65536, 131072]
+    # 字段会与上面三层做笛卡尔积，组合数会迅速变大。
+    fields: {}
+
+# 内层放置搜索：CEVA 画像是一对一映射，必须关闭。
+# 通用 PIM 画像可改成 enabled: true，并配置 algorithm / moves 等。
+placement:
+  enabled: false
+  algorithm: simulated_annealing
+  evaluation_backend: pipeline
+  validation_backend: pipeline
+  objective_metric: total_time_s
+  objective_weights: {compute: 0.5, communication: 0.25, memory: 0.25}
+  max_evaluations: 2
+  max_time_s: 0
+  max_proposals: null
+  seed: 0
+  moves: {max_segment_ops: 8, max_layer_block_layers: 4, weights: {}}
+  algorithm_params: {}
+
+# =============================================================================
+# 外层搜索：enumerate 按顺序跑完 16 个候选。
+# =============================================================================
+search:
+  algorithm: enumerate
+  seed: 0
+  # 最多评估多少个候选；enumerate 时要至少等于合法组合数。
+  max_evaluations: 16
+  # 墙钟预算（秒）；0 表示不限。
+  max_time_s: 0
+  max_proposals: null
+  # 各层被提案的权重；只有搜索算法使用。要让算法也搜索优化开关，
+  # 加 optimization 权重，例如 {strategy: 0.3, op: 0.3, hardware: 0.1, optimization: 0.3}。
+  layer_weights: {strategy: 0.4, op: 0.4, hardware: 0.2}
+  algorithm_params: {}
+
+# fast 复用完整产物；strict 强制重编，用于严格复现。
+cache: {mode: fast}
+
+# 是否让仿真消费成本 sidecar。
+simulation: {use_cost_sidecar: false}
+
+# 代价模型校准报告；null 表示不校准。
+calibration: {validation_report: null}
+
+# 硬件参数扫描，由 tune_sweep.py 使用；空映射表示不扫描。
+sweep:
+  fields: {}
+  core_policy: fixed_dpus
+  knee_improvement_threshold: 0.05
+  pareto: {resource: total_physical_memory_bytes, direction: minimize}
+
+output:
+  # 输出目录；换新目录可以避免撞上旧的 responses.jsonl。
+  dir: ../../test-results/tune-quick-4d
