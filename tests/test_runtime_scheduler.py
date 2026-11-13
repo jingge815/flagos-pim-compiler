@@ -43,6 +43,7 @@ class _FakeHAL:
         self.moe_dispatch = True
         self.gate_skips: dict[tuple, set[int]] = {}
         self.gate_stats: dict[tuple, dict[str, int]] = {}
+        self.bound_num_tokens = None
         self.submitted_event = threading.Event()
 
     def events_table(self, ctx=None):
