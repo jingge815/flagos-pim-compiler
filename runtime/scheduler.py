@@ -103,12 +103,12 @@ class EventScheduler:
         event.future.add_done_callback(
             lambda _future, cid=cmd.id: self._on_done(cid))
 
-    @staticmethod
-    def _ungated(cmd: Command) -> Command:
-        """跳过 HAL 的同步 gate 分支；依赖已由调度器满足，waits 保留做记录。"""
-        payload = {key: value for key, value in cmd.payload.items()
-                   if key != "gate"}
-        return replace(cmd, payload=payload)
+    def _shape_env(self) -> dict[str, int]:
+        """本次执行的符号维取值：T = 真实 token 数。"""
+        num_tokens = (None if self.ctx is None else self.ctx.num_tokens)
+        if num_tokens is None:
+            num_tokens = self.hal.bound_num_tokens
+        return {"T": int(num_tokens)} if num_tokens else {}
 
     def _on_done(self, cid: int) -> None:
         with self._cv:
