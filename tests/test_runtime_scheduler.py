@@ -125,7 +125,8 @@ def test_dynamic_execution_matches_static_on_appendix_a() -> None:
     assert np.allclose(dynamic_result, static_result, atol=1e-6)
 
 
-def test_gate_waits_for_dispatch_without_blocking_the_scheduler() -> None:
+def test_scheduler_submits_all_commands_in_plan_order() -> None:
+    """计划序全量提交：gate 由 HAL 在 submit 内同步解析，调度器不拦提交。"""
     gate_future: Future = Future()
     hal = _FakeHAL(gate_future)
     from runtime.scheduler import EventScheduler
@@ -133,26 +134,8 @@ def test_gate_waits_for_dispatch_without_blocking_the_scheduler() -> None:
     scheduler = EventScheduler(_gate_plan(), hal)
     scheduler.run(drain=False)
     assert hal.submitted_event.wait(1.0)
-    assert hal.submitted == [0]
-    assert hal.skipped == []
-
-    gate_future.set_result(None)
-    scheduler.wait()
     assert hal.submitted == [0, 1, 2]
-    assert hal.gate_stats[(0, 0)] == {"submitted": 1, "skipped": 0}
-
-
-def test_skipped_command_never_enters_the_execution_queue() -> None:
-    gate_future: Future = Future()
-    hal = _FakeHAL(gate_future)
-    hal.gate_skips[(0, 0)] = {3}
-    from runtime.scheduler import EventScheduler
-
-    scheduler = EventScheduler(_gate_plan(), hal)
-    scheduler.run(drain=False)
-    assert hal.submitted_event.wait(1.0)
+    assert hal.skipped == []
     gate_future.set_result(None)
     scheduler.wait()
-    assert hal.submitted == [0, 2]
-    assert hal.skipped == [1]
-    assert hal.gate_stats[(0, 0)] == {"submitted": 0, "skipped": 1}
+    assert hal.gate_stats == {}  # 跳过判定在 HAL 的 submit 里，不在调度器。

@@ -54,54 +54,30 @@ class EventScheduler:
         return self.events
 
     def _loop(self) -> None:
-        """按计划序逐条调度：依赖就绪才提交，且同一泳道保持计划顺序。
+        """按计划序全量提交（gate 由 HAL 在 submit 内同步解析）。
 
-        静态 `waits` 依赖「同 (lane, DPU) 提交序 = 计划序」的 FIFO 假设
-        （等待边折叠时丢掉了同道更早的冗余前驱）；就绪驱动的乱序提交会让
-        被折叠掉的前驱晚跑，读到旧值。因此同道必须保序，跨道仍可并行。
+        剖析（4 层 MoE）：就绪驱动的提交让 65% 墙钟零并发（static 为 32%），
+        而保序约束下它相对静态提交没有额外收益——HAL worker 池本就按 waits
+        等待。调度器保留的价值：逐命令形状绑定（PIM_DYN_SHAPE）与统一的
+        动态入口；gate 异步化需计划期分段子计划，另立工作项。
         """
-        order = list(self.plan.commands)
-        lane_of = {cmd.id: ("dpu", cmd.dpu_id) if cmd.dpu_id is not None
-                   else ("host", cmd.id) for cmd in order}
-        by_lane: dict[tuple, list[int]] = {}
-        for cmd in order:
-            by_lane.setdefault(lane_of[cmd.id], []).append(cmd.id)
-        cursor: dict[tuple, int] = {key: 0 for key in by_lane}
-        while True:
+        try:
+            for cmd in self.plan.commands:
+                self._submit_plain(cmd)
+        except BaseException as exc:
             with self._cv:
-                if self.error is not None or len(self.done) == len(self.commands):
-                    self._cv.notify_all()
-                    return
-                ready = []
-                for key, ids in by_lane.items():
-                    position = cursor[key]
-                    while position < len(ids):
-                        cid = ids[position]
-                        if self.waits[cid] - self.done:
-                            break  # 队头未就绪：同道保序，不越过。
-                        ready.append(cid)
-                        position += 1
-                    cursor[key] = position
-                if not ready:
-                    self._cv.wait(timeout=0.05)
-                    continue
-                for cid in ready:
-                    self.started.add(cid)
-            for cid in sorted(ready):
-                try:
-                    self._submit(self.commands[cid])
-                except BaseException as exc:  # 调度线程不能静默退出
-                    with self._cv:
-                        self.error = exc
-                        self._cv.notify_all()
-                    return
+                self.error = exc
+                self._cv.notify_all()
 
-    def _shape_env(self) -> dict[str, int]:
-        """本次执行的符号维取值：T = 真实 token 数。"""
-        num_tokens = (None if self.ctx is None else self.ctx.num_tokens)
-        if num_tokens is None:
-            num_tokens = self.hal.bound_num_tokens
-        return {"T": int(num_tokens)} if num_tokens else {}
+    def _submit_plain(self, cmd: Command) -> None:
+        if dynamic_shape_enabled():
+            env = self._shape_env()
+            if env:
+                cmd = bind_command_shapes(cmd, env)
+        event = self.hal.submit(cmd, self.ctx)
+        self.events[cmd.id] = event
+        event.future.add_done_callback(
+            lambda _future, cid=cmd.id: self._on_done(cid))
 
     def _submit(self, cmd: Command) -> None:
         if self.plan is not None and dynamic_shape_enabled():
