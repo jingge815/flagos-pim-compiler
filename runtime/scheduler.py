@@ -6,6 +6,7 @@ import threading
 from dataclasses import replace
 
 from contracts.exec_plan import Command, ExecutionPlan
+from runtime.shape_bind import bind_command_shapes, dynamic_shape_enabled
 
 
 class EventScheduler:
@@ -75,7 +76,18 @@ class EventScheduler:
                         self._cv.notify_all()
                     return
 
+    def _shape_env(self) -> dict[str, int]:
+        """本次执行的符号维取值：T = 真实 token 数。"""
+        num_tokens = (None if self.ctx is None else self.ctx.num_tokens)
+        if num_tokens is None:
+            num_tokens = self.hal.bound_num_tokens
+        return {"T": int(num_tokens)} if num_tokens else {}
+
     def _submit(self, cmd: Command) -> None:
+        if self.plan is not None and dynamic_shape_enabled():
+            env = self._shape_env()
+            if env:
+                cmd = bind_command_shapes(cmd, env)
         if "gate" in cmd.payload and self.hal.moe_dispatch is not False:
             gate_id = int(cmd.payload["gate"])
             lane_key = 0 if self.ctx is None else int(self.ctx.lane_key)
