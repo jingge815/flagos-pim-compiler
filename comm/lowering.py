@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from dataclasses import replace
 from backend.dpu_sdk import (
     DPU_XFER_FROM_DPU,
     DPU_XFER_TO_DPU,
@@ -93,13 +94,33 @@ class DmaEngine:
         )
 
 
+def clamped_entry(entry: CommPlanEntry, rows: int | None) -> CommPlanEntry:
+    """按实际行数裁剪通信段（D2-full）：丢弃行号 ≥ rows 的段。
+
+    段的 global_range 落在摊平行主序数组上：列切片段每段恰好一行内连续，
+    整行段也是行号单位，因此按 行号 = global_range[0] // R 过滤即可让
+    collect/writeback 只搬运前 rows 行。行几何不整除或 rows 为空时原样返回。
+    """
+    if rows is None or not entry.shape:
+        return entry
+    t_env = entry.shape[1] if entry.shape[0] == 1 else entry.shape[0]
+    if t_env <= 0 or entry.numel % t_env:
+        return entry
+    row_elems = entry.numel // t_env
+    keep = [s for s in entry.segments
+            if s.global_range[0] // row_elems < rows]
+    return replace(entry, segments=keep)
+
+
 def _check_entry(entry: CommPlanEntry, expect: str) -> None:
     if entry.type != expect:
         raise ValueError(f"{expect} 收到 type={entry.type} 的条目（edge {entry.edge_id}）")
 
 
-def _collect(entry: CommPlanEntry, engine: DmaEngine) -> list[tuple[CommSegment, np.ndarray]]:
+def _collect(entry: CommPlanEntry, engine: DmaEngine,
+             rows: int | None = None) -> list[tuple[CommSegment, np.ndarray]]:
     """收集阶段：执行全部收集传输，返回 (段, 该段 host 缓冲) 对。"""
+    entry = clamped_entry(entry, rows)
     out: list[tuple[CommSegment, np.ndarray]] = []
     for op in dma_sequence(entry):
         if op.kind in ("copy_from", "push_from"):
@@ -107,8 +128,10 @@ def _collect(entry: CommPlanEntry, engine: DmaEngine) -> list[tuple[CommSegment,
     return out
 
 
-def _writeback(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray) -> None:
+def _writeback(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
+               rows: int | None = None) -> None:
     """将主机缓冲区写回目标 DPU。"""
+    entry = clamped_entry(entry, rows)
     for op in dma_sequence(entry):
         if op.kind in ("copy_to", "push_to", "broadcast_to"):
             engine.run_writeback(op, host_buf)
@@ -125,11 +148,12 @@ def _merged(entry: CommPlanEntry, collected: list[tuple[CommSegment, np.ndarray]
 # 通信原语：收集、主机处理和回写。
 
 
-def all_reduce(entry: CommPlanEntry, engine: DmaEngine) -> np.ndarray:
+def all_reduce(entry: CommPlanEntry, engine: DmaEngine,
+          rows: int | None = None) -> np.ndarray:
     """收集各 DPU 分片并执行求和或求均值，返回全局形状数组。"""
     _check_entry(entry, "all_reduce")
     acc = np.zeros(entry.numel, dtype=entry.dtype)
-    for seg, buf in _collect(entry, engine):
+    for seg, buf in _collect(entry, engine, rows):
         acc[seg.global_range[0] : seg.global_range[1]] += buf
     if entry.reduce == "mean":
         acc /= len(entry.collect_segments)
@@ -137,34 +161,38 @@ def all_reduce(entry: CommPlanEntry, engine: DmaEngine) -> np.ndarray:
     return acc.reshape(entry.shape)
 
 
-def all_gather(entry: CommPlanEntry, engine: DmaEngine) -> np.ndarray:
+def all_gather(entry: CommPlanEntry, engine: DmaEngine,
+          rows: int | None = None) -> np.ndarray:
     """收集各 DPU 分片并按全局偏移拼接，返回全局形状数组。"""
     _check_entry(entry, "all_gather")
-    merged = _merged(entry, _collect(entry, engine))
+    merged = _merged(entry, _collect(entry, engine, rows))
     _writeback(entry, engine, merged)
     return merged.reshape(entry.shape)
 
 
-def all_to_all(entry: CommPlanEntry, engine: DmaEngine) -> np.ndarray:
+def all_to_all(entry: CommPlanEntry, engine: DmaEngine,
+          rows: int | None = None) -> np.ndarray:
     """按全局区间重排分片并写回目标 DPU，返回摊平后的全局数组。"""
     _check_entry(entry, "all_to_all")
-    staging = _merged(entry, _collect(entry, engine))
+    staging = _merged(entry, _collect(entry, engine, rows))
     _writeback(entry, engine, staging)
     return staging.reshape(entry.shape)
 
 
-def scatter(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray) -> None:
+def scatter(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
+           rows: int | None = None) -> None:
     """将与条目形状一致的主机数组按目标分片写入各 DPU。"""
     _check_entry(entry, "scatter")
     flat = np.ascontiguousarray(host_buf, dtype=entry.dtype).reshape(-1)
     if flat.size != entry.numel:
         raise ValueError(f"scatter 的 host_buf 元素数 {flat.size} != 条目 numel {entry.numel}")
-    _writeback(entry, engine, flat)
+    _writeback(entry, engine, flat, rows)
 
 
-def broadcast(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray) -> None:
+def broadcast(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
+             rows: int | None = None) -> None:
     """将主机数组完整复制到条目列出的各 DPU。"""
     flat = np.ascontiguousarray(host_buf, dtype=entry.dtype).reshape(-1)
     if flat.size != entry.numel:
         raise ValueError(f"broadcast 的 host_buf 元素数 {flat.size} != 条目 numel {entry.numel}")
-    _writeback(entry, engine, flat)
+    _writeback(entry, engine, flat, rows)
