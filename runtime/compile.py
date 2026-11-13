@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -57,6 +57,11 @@ class CompiledModel:
     # MoE 执行语义：dense_sim / dynamic_dispatch；非 MoE 模型为空串。
     # 执行后端未显式配置时按它决定是否执行动态分派。
     moe_execution: str = ""
+    # 动态图路径：static 走现有静态蓝图；dynamic 由 RuntimeGraph 绑定执行。
+    compile_mode: str = "static"
+    runtime_graph: object | None = None
+    dynamic_axes: dict[str, tuple[int, int]] = field(default_factory=dict)
+    kernel_classes: tuple[tuple[int, ...], ...] = ()
 
 
 class PositionalLlama(torch.nn.Module):
@@ -91,13 +96,18 @@ def causal_mask_of(seq_len: int, dtype: torch.dtype = torch.float16) -> torch.Te
 def export_annotated_graph(
     model: torch.nn.Module, seq_len: int, position_ids: torch.Tensor, *,
     dtype: torch.dtype = torch.float16,
+    dynamic_shapes: dict | None = None,
 ) -> GraphModule:
-    """导出图并标记节点设备和分区编号。"""
+    """导出图并标记节点设备和分区编号。
+
+    `dynamic_shapes` 为空时保持原来的具体形状导出；动态路径只把序列维符号化。
+    """
     input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
     gm = torch.export.export(
         PositionalLlama(model),
         (input_ids, causal_mask_of(seq_len, dtype), position_ids),
         strict=True,
+        dynamic_shapes=dynamic_shapes,
     ).module()
     partition_graph(gm)
     return gm
@@ -258,6 +268,7 @@ def compile_llama2(
     prefill_seq_lens: tuple[int, ...] = (),
     graph_tiling: bool | None = None,
     moe_execution: str | None = None,
+    dynamic: bool = False,
 ) -> CompiledModel:
     """编译 Llama 的 decode 图与一组按长度分桶的 prefill 图。
 
@@ -276,7 +287,12 @@ def compile_llama2(
     `moe_execution` 是 MoE 的执行语义（`dense_sim` / `dynamic_dispatch`），
     缺省跟随 `PIM_MOE_DISPATCH`。这一份值随 CompiledModel 交给放置导出与
     仿真配置，主链各入口不再各自读环境变量或写死。
+
+    `dynamic=True` 预留给动态图路径；D0 只提供接口，真正的调度/形状绑定在
+    D1/D2 实现，未实现前显式报错，避免静默退回静态行为。
     """
+    if dynamic:
+        raise NotImplementedError("动态图编译在 D1/D2 实现；当前只支持静态路径")
     cfg = model.config
     # 容量与对齐是同一份契约：HwBudget 决定三区偏移，PIMHardwareConfig 决定
     # 算子编译的 DMA 对齐，两者不一致时 sidecar 自报与真实 MLIR 会各说一套。

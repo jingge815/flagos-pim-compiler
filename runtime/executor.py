@@ -344,7 +344,8 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
                  values: dict[str, object] | None = None,
                  pos: int | None = None,
                  num_tokens: int | None = None,
-                 causal_mask_standard: bool = False) -> dict[int, object]:
+                 causal_mask_standard: bool = False,
+                 mode: str = "static") -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。
 
     命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
@@ -353,7 +354,10 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
     为空时沿用全局事件表，保持旧的单请求语义。
     `causal_mask_standard` 声明本次传入的掩码就是标准因果掩码，注意力内核
     据此走融合路径；自定义掩码（滑动窗口、bias）不要置位。
+    `mode` 是静态/动态执行路径的显式入口；D0 只提供分派缝，动态调度在 D1 实现。
     """
+    if mode != "static":
+        raise NotImplementedError("动态调度在 D1 实现；当前只支持 static 模式")
     if causal_mask_standard:
         values = {**(values or {}), "causal_mask_standard": True}
     if ctx is None:
