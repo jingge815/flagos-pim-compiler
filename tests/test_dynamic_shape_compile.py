@@ -12,6 +12,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+from comm.plan import t_axes_from_exprs
 from contracts.runtime_graph import ShapeExpr
 from contracts.unified_ir import SHAPE_EXPR_META_KEY, VAL_META_KEY
 from contracts.op_contract import PIMHardwareConfig
@@ -99,9 +100,10 @@ def test_dynamic_compile_records_mode_and_single_bucket(dynamic) -> None:
 
 
 def test_dynamic_export_concretizes_meta_and_keeps_exprs(dynamic) -> None:
-    """规划用的 val 形状全为整数；符号维留了 T 的表达式。"""
+    """规划用的 val 形状全为整数；符号维留的是真正的 T 表达式。"""
     compiled, _ = dynamic
     symbolic = 0
+    dim_exprs = 0
     for node in compiled.prefill_gm.graph.nodes:
         val = node.meta.get(VAL_META_KEY)
         if not isinstance(val, torch.Tensor):
@@ -115,7 +117,9 @@ def test_dynamic_export_concretizes_meta_and_keeps_exprs(dynamic) -> None:
         for expr, dim in zip(exprs, val.shape):
             if expr is not None:
                 assert expr.eval({"T": MAX_SEQ}) == dim
+                dim_exprs += expr.kind == "dim"
     assert symbolic > 0, "动态导出应至少在一个节点上记录符号维"
+    assert dim_exprs > 0, "符号维必须记成 dim(T)，不能退化成包络常量"
 
 
 def test_dynamic_plan_carries_shape_exprs(dynamic) -> None:
@@ -125,11 +129,32 @@ def test_dynamic_plan_carries_shape_exprs(dynamic) -> None:
         for cmd in plan.commands if "out_shape_expr" in cmd.payload
     ]
     assert carriers, "动态计划的 launch 命令应携带形状表达式"
-    dims = [entry for entry in carriers[0].payload["out_shape_expr"]
-            if entry is not None]
-    assert dims, "至少一个输出维是符号表达式"
+    dims = [entry for entries in
+            (cmd.payload["out_shape_expr"] for cmd in carriers)
+            for entry in entries if entry is not None and entry["kind"] == "dim"]
+    assert dims, "至少一个输出维是 dim(T) 表达式"
     expr = ShapeExpr.from_dict(dims[0])
-    assert 1 <= expr.eval({"T": MAX_SEQ}) <= MAX_SEQ
+    assert expr.eval({"T": 5}) == 5
+
+
+def test_dynamic_export_annotates_shape_list_args(dynamic) -> None:
+    """view/reshape 的形状列表记下符号元素，并能在运行期改成实际 T。"""
+    from contracts.unified_ir import ARG_EXPR_META_KEY
+
+    compiled, _ = dynamic
+    annotated = []
+    for node in compiled.prefill_gm.graph.nodes:
+        ann = node.meta.get(ARG_EXPR_META_KEY)
+        if ann is None:
+            continue
+        for arg, entry in zip(node.args, ann):
+            if isinstance(arg, list) and isinstance(entry, list):
+                for literal, expr in zip(arg, entry):
+                    if expr is not None:
+                        assert expr.kind == "dim"
+                        annotated.append((literal, expr.eval({"T": 5})))
+    assert annotated, "动态导出的形状列表实参应带符号元素"
+    assert any(literal != value for literal, value in annotated)
 
 
 def test_static_plan_has_no_shape_expr_payload(baseline) -> None:
@@ -148,3 +173,26 @@ def test_dynamic_tokens_match_static_baseline(prompt_len, baseline, dynamic) -> 
     prompt = [1 + i for i in range(prompt_len)]
     assert _run(dyn_compiled, dyn_backend, prompt) == _run(
         base_compiled, base_backend, prompt)
+
+
+def test_dynamic_comm_entries_carry_t_axes(dynamic, baseline) -> None:
+    """动态 prefill 的通信条目按源节点表达式标出 T 轴；静态条目保持空。"""
+    from comm.plan import build_comm_plan
+    from runtime.compile import _shape_exprs_of
+
+    dyn_compiled, _ = dynamic
+    dyn_entries = build_comm_plan(
+        dyn_compiled.prefill_edges, _shape_exprs_of(dyn_compiled.prefill_gm))
+    assert any(entry.t_axes for entry in dyn_entries), \
+        "动态 prefill 应至少有一条通信条目依赖 T"
+    for entry in dyn_entries:
+        if entry.shape_exprs:
+            assert len(entry.shape_exprs) == len(entry.shape)
+            assert entry.t_axes == t_axes_from_exprs(
+                entry.shape, entry.shape_exprs)
+
+    base_compiled, _ = baseline
+    base_entries = build_comm_plan(
+        base_compiled.prefill_edges, _shape_exprs_of(base_compiled.prefill_gm))
+    assert all(not entry.t_axes for entry in base_entries)
+    assert all(not entry.shape_exprs for entry in base_entries)

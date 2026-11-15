@@ -15,7 +15,8 @@ from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.pim_tensor_spec import RedistributeEdge
 from contracts.runtime_graph import ShapeExpr
 from contracts.unified_ir import (
-    SHAPE_EXPR_META_KEY, STAGE_PLANNED, VAL_META_KEY, mark_stage)
+    ARG_EXPR_META_KEY, SHAPE_EXPR_META_KEY, STAGE_PLANNED, VAL_META_KEY,
+    mark_stage)
 from graph.fuse_pim import fuse_rms_norms
 from graph.opt_passes import fuse_linear_activation, optimize_graph
 from graph.partition import partition_graph
@@ -95,66 +96,110 @@ def causal_mask_of(seq_len: int, dtype: torch.dtype = torch.float16) -> torch.Te
     return mask
 
 
-def _sympy_to_shape_expr(expr, hint: int):
+def _sympy_to_shape_expr(expr, hint: int, dyn_symbol: str = "T"):
     """sympy 表达式转 ShapeExpr；不支持的形状退回包络常量。
 
-    只认 `T` 这一个符号维（动态导出声明的 Dim）；形状环境派生的辅助符号
-    （s0/s30 一类）没有运行期绑定来源，按包络常量处理。
+    `dyn_symbol` 是导出器为 Dim("T") 生成的符号名（如 `s30`），只有它映射到
+    运行期绑定维 T；形状环境派生的辅助符号没有绑定来源，按包络常量处理。
     """
     import sympy
 
     if isinstance(expr, sympy.Integer):
         return ShapeExpr.const(int(expr))
     if isinstance(expr, sympy.Symbol):
-        if str(expr.name) == "T":
+        if str(expr.name) == dyn_symbol:
             return ShapeExpr.dim("T")
         return ShapeExpr.const(hint)
-    if not all(str(s) == "T" for s in expr.free_symbols):
+    if not all(str(s) == dyn_symbol for s in expr.free_symbols):
         return ShapeExpr.const(hint)
     if isinstance(expr, sympy.Add):
-        parts = [_sympy_to_shape_expr(a, hint) for a in expr.args]
+        parts = [_sympy_to_shape_expr(a, hint, dyn_symbol) for a in expr.args]
         return ShapeExpr.add(*parts)
     if isinstance(expr, sympy.Mul):
-        parts = [_sympy_to_shape_expr(a, hint) for a in expr.args]
+        parts = [_sympy_to_shape_expr(a, hint, dyn_symbol) for a in expr.args]
         return ShapeExpr.mul(*parts)
     return ShapeExpr.const(hint)
 
 
-def capture_shape_exprs(gm: GraphModule) -> None:
+def _shape_exprs_of(gm: GraphModule):
+    """返回按节点名查逐维形状表达式的函数；静态图的节点没有该元数据。"""
+    exprs = {node.name: node.meta.get(SHAPE_EXPR_META_KEY) for node in gm.graph.nodes}
+    return exprs.get
+
+
+def capture_shape_exprs(gm: GraphModule, dyn_symbol: str = "T") -> None:
     """记录各节点的符号形状，并把 `val` 取整为 T_max 包络。
 
     导出样例取在包络上（`seq_len == max`），SymInt 的 hint 就是包络值，
     `int(dim)` 即规划用的整数；表达式留给运行期绑定实际 T。
+    `dyn_symbol` 是导出器给动态维生成的符号名。
+
+    必须先读完全部 sympy 表达式再取 `int`：对一个 SymInt 取整会让图中其余
+    SymInt 的 `.node.expr` 一并退化成常量，之后读到的就只剩包络值。
     """
+    carriers = []
+    scalar_raw: dict[str, object] = {}
     for node in gm.graph.nodes:
         val = node.meta.get(VAL_META_KEY)
+        if isinstance(val, torch.SymInt):
+            scalar_raw[node.name] = val.node.expr
+            continue
         if not isinstance(val, torch.Tensor):
             continue
         dims = tuple(val.shape)
         if all(isinstance(d, int) for d in dims):
             continue
+        raws = tuple(None if isinstance(d, int) else d.node.expr for d in dims)
+        carriers.append((node, val, dims, raws))
+    for node, val, dims, raws in carriers:
         exprs = []
-        for dim in dims:
-            if isinstance(dim, int):
+        for dim, raw in zip(dims, raws):
+            if raw is None:
                 exprs.append(None)
                 continue
             try:
-                exprs.append(_sympy_to_shape_expr(dim.node.expr, int(dim)))
+                exprs.append(_sympy_to_shape_expr(raw, int(dim), dyn_symbol))
             except Exception:
                 exprs.append(ShapeExpr.const(int(dim)))
         node.meta[SHAPE_EXPR_META_KEY] = tuple(exprs)
         node.meta[VAL_META_KEY] = val.new_empty(tuple(int(d) for d in dims))
-    _fold_symbolic_scalars(gm)
+    nodes = {node.name: node for node in gm.graph.nodes}
+    scalar_exprs = {
+        name: _sympy_to_shape_expr(
+            raw, int(nodes[name].meta[VAL_META_KEY]), dyn_symbol)
+        for name, raw in scalar_raw.items()}
+    _fold_symbolic_scalars(gm, scalar_exprs)
 
 
-def _fold_symbolic_scalars(gm: GraphModule) -> None:
+def _annotate_arg_exprs(user, node, expr) -> None:
+    """在用户节点的实参位置上记下符号元素，供运行期绑定字面量形状列表。"""
+    if user.op != "call_function":
+        return
+    ann = list(user.meta.get(ARG_EXPR_META_KEY) or [None] * len(user.args))
+    if len(ann) < len(user.args):
+        ann.extend([None] * (len(user.args) - len(ann)))
+    for index, arg in enumerate(user.args):
+        if arg is node:
+            ann[index] = expr
+        elif isinstance(arg, (list, tuple)) and any(item is node for item in arg):
+            elems = ann[index] if isinstance(ann[index], list) else [None] * len(arg)
+            for pos, item in enumerate(arg):
+                if item is node:
+                    elems[pos] = expr
+            ann[index] = elems
+    user.meta[ARG_EXPR_META_KEY] = ann
+
+
+def _fold_symbolic_scalars(gm: GraphModule, scalar_exprs=None) -> None:
     """把产出标量 SymInt 的节点（sym_size/getitem 链）折叠成包络常量。
 
     动态导出会把 reshape/view 的形状列表换成符号节点；计划与内核只认整数，
     这里按 hint（=包络值）常量折叠，图结构回到与静态包络一致。
+    折叠前把符号表达式记到用户节点上，运行期再按实际 T 重算这些字面量。
     """
     from torch.fx.node import map_aggregate
 
+    scalar_exprs = scalar_exprs or {}
     folded = True
     while folded:
         folded = False
@@ -165,7 +210,10 @@ def _fold_symbolic_scalars(gm: GraphModule) -> None:
             if not isinstance(val, torch.SymInt):
                 continue
             const = int(val)
+            expr = scalar_exprs.get(node.name)
             for user in list(node.users):
+                if expr is not None and expr.kind != "const":
+                    _annotate_arg_exprs(user, node, expr)
                 def substitute(arg):
                     if isinstance(arg, torch.fx.Node) and arg is node:
                         return const
@@ -187,14 +235,19 @@ def export_annotated_graph(
     导出后立刻把 `val` 取整为包络，下游 pass 与内存规划只见整数。
     """
     input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-    gm = torch.export.export(
+    program = torch.export.export(
         PositionalLlama(model),
         (input_ids, causal_mask_of(seq_len, dtype), position_ids),
         strict=True,
         dynamic_shapes=dynamic_shapes,
-    ).module()
+    )
+    gm = program.module()
     if dynamic_shapes is not None:
-        capture_shape_exprs(gm)
+        symbols = {str(sym) for sym in program.range_constraints}
+        if len(symbols) != 1:
+            raise ValueError(
+                f"动态导出应只有一个符号维 T，实际得到 {sorted(symbols)}")
+        capture_shape_exprs(gm, symbols.pop())
     partition_graph(gm)
     return gm
 
@@ -576,7 +629,8 @@ def compile_llama2(
     prefill_cmd_ids: dict[int, int] = {}
     prefill_plan_max = None
     for seq_len in seq_lens:
-        entries = {e.edge_id: e for e in build_comm_plan(prefill_edges_of[seq_len])}
+        entries = {e.edge_id: e for e in build_comm_plan(
+            prefill_edges_of[seq_len], _shape_exprs_of(prefill_gms[seq_len]))}
         pending: dict = {}
         for plan in mem_plans_of[seq_len].values():
             pending.update(plan.pending_readers_prefill)
@@ -589,7 +643,8 @@ def compile_llama2(
         if seq_len == prefill_seq_len:
             prefill_plan_max = compiled_plan
 
-    decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
+    decode_entries = {e.edge_id: e for e in build_comm_plan(
+        decode_edges, _shape_exprs_of(decode_gm))}
     pending_decode: dict = {}
     for plan in mem_plans.values():
         pending_decode.update(plan.pending_readers_decode)

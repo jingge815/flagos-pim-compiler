@@ -103,7 +103,15 @@ def clamped_entry(entry: CommPlanEntry, rows: int | None) -> CommPlanEntry:
     """
     if rows is None or not entry.shape:
         return entry
-    t_env = entry.shape[1] if entry.shape[0] == 1 else entry.shape[0]
+    if not entry.t_axes:
+        raise ValueError(
+            f"通信条目 {entry.edge_id} 缺少 t_axes：行收缩只允许显式声明 T 维的"
+            "条目（D2-full 未完成，禁止静默按启发式裁剪）")
+    if len(entry.t_axes) > 1:
+        raise NotImplementedError(
+            f"通信条目 {entry.edge_id} 有多个 T 轴 {entry.t_axes}："
+            "多 T 轴布局重映射尚未实现")
+    t_env = entry.shape[entry.t_axes[0]]
     if t_env <= 0 or entry.numel % t_env:
         return entry
     row_elems = entry.numel // t_env

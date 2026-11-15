@@ -28,7 +28,7 @@ from contracts.fusion_contract import (
     GATE_ACTIVATIONS, GATE_TARGETS, LINEAR_TAIL_ACTIVATIONS)
 from contracts.op_semantics import ELEMENTWISE, FOLDABLE
 from contracts.pim_tensor_spec import RedistributeEdge
-from contracts.unified_ir import VAL_META_KEY
+from contracts.unified_ir import SHAPE_EXPR_META_KEY, VAL_META_KEY
 from graph.fuse_pim import _match_rms_norm, _real_users, is_float_cast
 
 # torch 的 dtype 到契约里的类型名。分块只为算字节数，类型不在这张表里就
@@ -412,6 +412,10 @@ def fuse_elementwise(gm: GraphModule) -> int:
             merged = gm.graph.call_function(target, merged_args)
         if "val" in consumer.meta:
             merged.meta["val"] = consumer.meta["val"]
+        # 合并节点与消费者同形，动态图的形状表达式必须一起搬过来，
+        # 否则下游拿不到 T 绑定（静态图本来就没有这个键）。
+        if consumer.meta.get(SHAPE_EXPR_META_KEY) is not None:
+            merged.meta[SHAPE_EXPR_META_KEY] = consumer.meta[SHAPE_EXPR_META_KEY]
         # 合并算子是普通函数，不是 OpOverload，partition 会把它判成主机。
         merged.meta[DEVICE_META_KEY] = DEVICE_HOST
         # 跳过生产者：它的参数里可能指着消费者（消费者的结果又被生产者

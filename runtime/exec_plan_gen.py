@@ -20,7 +20,9 @@ from contracts.graph_meta import (
     REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 from contracts.op_contract import DpuShard, PIMHardwareConfig
 from contracts.op_semantics import RMS_NORM_KERNEL
-from contracts.unified_ir import ABSORBED_META_KEY, RMS_NORM_META_KEY, SHAPE_EXPR_META_KEY
+from contracts.unified_ir import (
+    ABSORBED_META_KEY, ARG_EXPR_META_KEY, RMS_NORM_META_KEY,
+    SHAPE_EXPR_META_KEY)
 from graph.spec_prop import _layer_of_node
 from runtime.dependency import deps_of as _deps_of, overlap, war_waits as _war_waits
 
@@ -238,6 +240,15 @@ def _expr_dicts(exprs) -> list | None:
     if not exprs:
         return None
     return [expr.to_dict() if expr is not None else None for expr in exprs]
+
+
+def _encode_arg_expr(expr):
+    """字面量实参的形状表达式：标量或逐元素列表，编码成可序列化字典。"""
+    if expr is None:
+        return None
+    if isinstance(expr, (list, tuple)):
+        return [None if item is None else item.to_dict() for item in expr]
+    return expr.to_dict()
 
 
 def _shard_decision_of(spec, detail) -> list | None:
@@ -702,7 +713,17 @@ def build_execution_plan(
                 arg_kinds = []
                 arg_shapes = []
                 arg_dtypes = []
+                arg_elem_exprs: list = []
                 arg_decisions: list[tuple] = []
+                # 字面量形状实参（view/reshape 的第二实参等）在折叠时留下了
+                # 逐元素表达式；按非 Node 实参的顺序与 flat_args 对齐。
+                literal_exprs = []
+                if fusion is None and node.meta.get(ARG_EXPR_META_KEY):
+                    ann = node.meta[ARG_EXPR_META_KEY]
+                    for index, arg in enumerate(node.args):
+                        if not isinstance(arg, Node):
+                            literal_exprs.append(
+                                ann[index] if index < len(ann) else None)
                 # 权重切片的起止是全局下标，每台的本地权重只是全局的一段。
                 # 下发前换算成本地区间并夹到本地长度，否则每台都用全局下标
                 # 切自己的本地权重，越界的被夹成空、没越界的读到别人的行。
@@ -714,6 +735,8 @@ def build_execution_plan(
                         arg_kinds.append(arg)
                         arg_shapes.append(None)
                         arg_dtypes.append(None)
+                        arg_elem_exprs.append(
+                            literal_exprs.pop(0) if literal_exprs else None)
                         continue
                     held = arg.meta.get(SPEC_META_KEY)
                     if (held is not None and held.placement.kind == "Partial"
@@ -722,8 +745,10 @@ def build_execution_plan(
                         arg_kinds.append(0.0)
                         arg_shapes.append(None)
                         arg_dtypes.append(None)
+                        arg_elem_exprs.append(None)
                         continue
                     arg_kinds.append("tensor")
+                    arg_elem_exprs.append(None)
                     if (arg.name in landing_by_src
                             and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", [])):
                         arg_spec_here = landing_by_src[arg.name].dst_spec
@@ -734,6 +759,7 @@ def build_execution_plan(
                     if (node.target is torch.ops.aten.cat.default
                             and dpu_id not in arg_spec_here.shard_map):
                         arg_kinds.pop()
+                        arg_elem_exprs.pop()
                         continue
                     arg_detail = arg_spec_here.shard_map[dpu_id]
                     arg_shapes.append(arg_detail.local_shape)
@@ -786,6 +812,9 @@ def build_execution_plan(
                         for arg in flat_args if isinstance(arg, Node)]
                     payload["arg_shape_exprs"] = arg_exprs
                     payload["out_shape_expr"] = _expr_dicts(out_expr)
+                encoded = [_encode_arg_expr(expr) for expr in arg_elem_exprs]
+                if any(entry is not None for entry in encoded):
+                    payload["arg_elem_exprs"] = encoded
                 # 注意力要读的设备侧 KV 区域，编译期才知道，在这里烘进命令——
                 # 内核自己拿不到 `kv_specs`，而用模块级全局会在多个策略之间
                 # 互相覆盖（实测三种策略连着编译时后面的把前面的盖掉）。

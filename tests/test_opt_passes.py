@@ -2509,3 +2509,25 @@ def test_fuse_elementwise_activation_outside_the_old_table(act, ref) -> None:
 
     assert torch.allclose(Interpreter(gm).run(x_val, y_val),
                           ref(x_val * y_val))
+
+
+def test_fuse_copies_shape_exprs() -> None:
+    """动态图融合后，合并节点保留消费者的形状表达式。"""
+    from contracts.runtime_graph import ShapeExpr
+    from contracts.unified_ir import SHAPE_EXPR_META_KEY
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    neg = graph.call_function(torch.ops.aten.neg.default, (x,))
+    out = graph.call_function(torch.ops.aten.tanh.default, (neg,))
+    graph.output(out)
+    gm = GraphModule({}, graph)
+    expr = (ShapeExpr.dim("T"), None)
+    neg.meta[SHAPE_EXPR_META_KEY] = expr
+    out.meta[SHAPE_EXPR_META_KEY] = expr
+
+    fuse_elementwise(gm)
+
+    merged = [n for n in gm.graph.nodes if n.op == "call_function"]
+    assert len(merged) == 1
+    assert merged[0].meta[SHAPE_EXPR_META_KEY] == expr

@@ -9,6 +9,7 @@ from typing import Iterator, Literal
 import numpy as np
 
 from contracts.pim_tensor_spec import PIMTensorSpec, RedistributeEdge, TensorShardDetail
+from contracts.runtime_graph import ShapeExpr
 
 CommType = Literal["all_reduce", "all_gather", "all_to_all", "scatter", "local_slice"]
 
@@ -43,6 +44,10 @@ class CommPlanEntry:
     dst_loc: dict                  # {"device": "host"} 或 {"device": "dpu", "dpus": [...]}
     wait_for: tuple[int, ...]      # 边级读前等待：全部源 DPU（host 源为空）
     segments: list[CommSegment] = field(default_factory=list)
+    # 动态形状（D2-full）：依赖 T 的维与逐维表达式。空 = 静态形状；多个
+    # T 轴当前不支持行收缩（如 4-D mask (1,1,T,T)），由 comm.lowering 显式拒绝。
+    t_axes: tuple[int, ...] = ()
+    shape_exprs: tuple = ()
 
     @property
     def numel(self) -> int:
@@ -225,7 +230,21 @@ def _check_endpoint_location(name: str, location: dict, spec: PIMTensorSpec) -> 
         raise ValueError(f"edge endpoint {name}={location} 与 spec={expected} 不一致")
 
 
-def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
+def t_axes_from_exprs(shape: tuple[int, ...], exprs) -> tuple[int, ...]:
+    """从逐维 ShapeExpr 字典求依赖 T 的轴；形状或表达式不齐时返回空。"""
+    if not exprs or len(exprs) != len(shape):
+        return ()
+    axes = []
+    for axis, entry in enumerate(exprs):
+        if entry is None:
+            continue
+        expr = ShapeExpr.from_dict(entry) if isinstance(entry, dict) else entry
+        if "T" in expr.free_dims():
+            axes.append(axis)
+    return tuple(axes)
+
+
+def _entry_of_edge(edge: RedistributeEdge, exprs=None) -> CommPlanEntry:
     try:
         dtype = np.dtype(edge.dtype)
     except TypeError:
@@ -236,6 +255,7 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
     _check_endpoint_location("src_loc", edge.src_loc, edge.src_spec)
     _check_endpoint_location("dst_loc", edge.dst_loc, edge.dst_spec)
     wait_for = tuple(edge.src_loc["dpus"]) if edge.src_loc["device"] == "dpu" else ()
+    exprs = tuple(exprs) if exprs else ()
     entry = CommPlanEntry(
         edge_id=edge.edge_id,
         type=edge.type,
@@ -244,6 +264,8 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
         dtype=dtype,
         dst_loc=edge.dst_loc,
         wait_for=wait_for,
+        t_axes=t_axes_from_exprs(edge.shape, exprs),
+        shape_exprs=exprs,
     )
     if edge.type == "local_slice":
         # Replicate → Shard，两端在同一组 DPU 上：每台 DPU 从自己那份完整
@@ -297,9 +319,16 @@ def _entry_of_edge(edge: RedistributeEdge) -> CommPlanEntry:
     return entry
 
 
-def build_comm_plan(edges: list[RedistributeEdge]) -> list[CommPlanEntry]:
-    """将重分布边列表转换为同序的通信计划条目。"""
-    return [_entry_of_edge(edge) for edge in edges]
+def build_comm_plan(edges: list[RedistributeEdge],
+                    shape_exprs_of=None) -> list[CommPlanEntry]:
+    """将重分布边列表转换为同序的通信计划条目。
+
+    `shape_exprs_of` 按源节点名返回逐维 ShapeExpr；动态图用它标记 T 轴，
+    静态图缺省为空。
+    """
+    def exprs_for(edge):
+        return shape_exprs_of(edge.src) if shape_exprs_of else None
+    return [_entry_of_edge(edge, exprs_for(edge)) for edge in edges]
 
 
 # DMA 序列展开。

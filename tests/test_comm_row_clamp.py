@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -48,7 +49,7 @@ def _col_shard_entry() -> CommPlanEntry:
     return CommPlanEntry(
         edge_id=0, type="scatter", reduce=None, shape=(1, 4, 8),
         dtype=np.dtype(np.float16), dst_loc={"device": "dpu", "dpus": [0, 1]},
-        wait_for=(), segments=segs)
+        wait_for=(), segments=segs, t_axes=(1,))
 
 
 def test_clamped_entry_drops_segments_beyond_actual_rows() -> None:
@@ -96,9 +97,19 @@ def test_clamped_entry_truncates_segments_spanning_multiple_rows() -> None:
     entry = CommPlanEntry(
         edge_id=0, type="all_gather", reduce=None, shape=(1, 4, 2),
         dtype=np.dtype(np.float16), dst_loc={"device": "host"},
-        wait_for=(), segments=[seg])
+        wait_for=(), segments=[seg], t_axes=(1,))
     clamped = clamped_entry(entry, rows=2)
     assert len(clamped.segments) == 1
     assert clamped.segments[0].global_range == (0, 4)
     assert clamped.segments[0].nbytes == 8
     assert clamped_entry(entry, None) is entry
+
+
+def test_clamped_entry_rejects_missing_or_multi_t_axes() -> None:
+    entry = _col_shard_entry()
+    entry_no_axes = entry.__class__(**{**entry.__dict__, "t_axes": ()})
+    with pytest.raises(ValueError, match="缺少 t_axes"):
+        clamped_entry(entry_no_axes, rows=2)
+    entry_multi = entry.__class__(**{**entry.__dict__, "t_axes": (1, 2)})
+    with pytest.raises(NotImplementedError, match="多个 T 轴"):
+        clamped_entry(entry_multi, rows=2)
