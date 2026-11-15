@@ -68,3 +68,15 @@
 - `dense_sim + PIM_DYN_SHAPE=1`：tokens `[6722, 4849, 35579, 1197, 5434, 5434]`，与 static/dynamic 逐位一致，run 70.05s。
 - `dynamic_dispatch + PIM_DYN_SHAPE=1`：tokens 同为 `[6722, 4849, 35579, 1197, 5434, 5434]`，run 70.58s；与 dense 一致，说明先前发散来自前缀布局，不是 MoE 分派。
 - 本轮三臂（同机同负载）：static run 63.42s / dynamic 67.95s / dynamic_bind 70.58s；绑定收益被 numpy 镜像与调度开销掩盖，尚未调优。
+
+## D2-lite 去填充（2026-11-15）
+
+动态 prefill 不再把输入补到包络长度：
+
+- `prefill_bucket` 在 `compile_mode=="dynamic"` 时按实际 token 数返回；`prefill_chunk` 的 `input_ids`/`position_ids` 按实际 T 建，掩码仍取 `prefill_seq_len` 包络（`(1,1,T,T)` 行宽随 T 变，只能保持包络；标准因果掩码的融合注意力不读值）。
+- `scatter` 在动态执行时只写实际 T 行：`_scatter_rows` 仅对“单 T 轴且 T 在最外层非单位维”的条目返回实际行数，其余保持整包络；`_check_host_size` 在 rows 给定时把主机缓冲下界放宽为 `rows*R`。
+- `_prefill_plan` 在动态图（实际长度不是桶键）时落到唯一 T_max 计划的对应窗口。
+
+验证：tiny Llama 动态用例 13 passed、tiny Qwen3-MoE 绑定用例 5 passed（1/2/3/5/7 token 与静态逐 token 一致）；静态 prefill/comm 子集 85 passed。
+
+4L 真实 MoE（prompt 5 token，8 DPU，prefill 8）：去填充后 `dynamic_bind` tokens 仍为 `[6722, 4849, 35579, 1197, 5434, 5434]`，与 static 逐位一致；run 52.09s，低于同轮 static 63.42s 与未去填充的 dynamic_bind 70.58s。

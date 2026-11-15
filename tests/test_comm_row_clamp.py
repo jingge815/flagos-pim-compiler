@@ -113,3 +113,12 @@ def test_clamped_entry_rejects_missing_or_multi_t_axes() -> None:
     entry_multi = entry.__class__(**{**entry.__dict__, "t_axes": (1, 2)})
     with pytest.raises(NotImplementedError, match="多个 T 轴"):
         clamped_entry(entry_multi, rows=2)
+
+
+def test_scatter_accepts_short_actual_host_buffer() -> None:
+    """动态缩行后主机缓冲只有实际行数：rows 给定时不再要求整包络大小。"""
+    entry = _col_shard_entry()
+    host = np.arange(16, dtype=np.float16)   # 2 行 * 8 元素
+    engine = _RecordingEngine()
+    scatter(entry, engine, host, rows=2)
+    assert len(engine.calls) == 4

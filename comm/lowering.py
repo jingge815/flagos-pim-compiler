@@ -163,6 +163,23 @@ def _merged(entry: CommPlanEntry, collected: list[tuple[CommSegment, np.ndarray]
     return host_buf
 
 
+def _check_host_size(entry: CommPlanEntry, flat: np.ndarray, rows: int | None) -> None:
+    """主机缓冲必须盖住要写的范围；动态收缩时下界是实际行数，不是包络。"""
+    if rows is None:
+        if flat.size != entry.numel:
+            raise ValueError(
+                f"scatter/broadcast 的 host_buf 元素数 {flat.size} != 条目 numel {entry.numel}")
+        return
+    if not entry.t_axes:
+        raise ValueError(
+            f"通信条目 {entry.edge_id} 缺少 t_axes：行收缩只允许显式声明 T 维的条目")
+    row_elems = entry.numel // entry.shape[entry.t_axes[0]]
+    if flat.size < rows * row_elems:
+        raise ValueError(
+            f"scatter/broadcast 的 host_buf 元素数 {flat.size} 少于实际 "
+            f"{rows} 行所需的 {rows * row_elems}")
+
+
 # 通信原语：收集、主机处理和回写。
 
 
@@ -202,8 +219,7 @@ def scatter(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
     """将与条目形状一致的主机数组按目标分片写入各 DPU。"""
     _check_entry(entry, "scatter")
     flat = np.ascontiguousarray(host_buf, dtype=entry.dtype).reshape(-1)
-    if flat.size != entry.numel:
-        raise ValueError(f"scatter 的 host_buf 元素数 {flat.size} != 条目 numel {entry.numel}")
+    _check_host_size(entry, flat, rows)
     _writeback(entry, engine, flat, rows)
 
 
@@ -211,6 +227,5 @@ def broadcast(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
              rows: int | None = None) -> None:
     """将主机数组完整复制到条目列出的各 DPU。"""
     flat = np.ascontiguousarray(host_buf, dtype=entry.dtype).reshape(-1)
-    if flat.size != entry.numel:
-        raise ValueError(f"broadcast 的 host_buf 元素数 {flat.size} != 条目 numel {entry.numel}")
+    _check_host_size(entry, flat, rows)
     _writeback(entry, engine, flat, rows)

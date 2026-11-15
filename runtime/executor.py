@@ -231,16 +231,22 @@ def prefill_chunk(
     pad_id: int = 0,
     slot_index: int = 0,
 ) -> np.ndarray:
-    """把 `[pos, pos+len(token_ids))` 这段 token 写进 KV，返回 `[1, 桶长, vocab]` logits。
+    """把 `[pos, pos+len(token_ids))` 这段 token 写进 KV，返回逐 token 的 logits。
 
-    桶按**本段长度**选，右侧补 pad（不参与计算、不写 KV）；`pos` 之前的历史
-    已在 KV 里，注意力按绝对位置读取。`causal_mask_of` 生成标准因果掩码，
+    静态路径按**本段长度**选桶，右侧补 pad（不参与计算、不写 KV）；动态路径
+    只有一张符号 T 图，输入按实际长度建，掩码仍取包络形状。`pos` 之前的
+    历史已在 KV 里，注意力按绝对位置读取。`causal_mask_of` 生成标准因果掩码，
     据此走融合内核。分块 prefill 的中间段不采样，由调用方决定。
     """
     length = len(token_ids)
     _apply_moe_execution(compiled, hal)
     seq_len = prefill_bucket(compiled, length)
     ids = list(token_ids) + [pad_id] * (seq_len - length)
+    # 动态图只把输入建到实际长度；掩码保持包络形状，掩码行宽随 T 变，
+    # 不能按前缀收缩，注意力走标准因果掩码的融合路径，不读值。
+    mask_len = (compiled.prefill_seq_len
+                if getattr(compiled, "compile_mode", "static") == "dynamic"
+                else seq_len)
     slot.blocks.ensure(_blocks_for(pos + length, compiled.kv_slot_tokens))
     _write_block_table(compiled, hal, slot, slot_index)
     events = execute_plan(
@@ -248,7 +254,7 @@ def prefill_chunk(
         ctx=ExecutionContext(lane_key=slot_index),
         values={
             "input_ids": _as_batch_tensor(ids),
-            "causal_mask": causal_mask_of(seq_len),
+            "causal_mask": causal_mask_of(mask_len),
             "position_ids": torch.arange(
                 pos, pos + seq_len, dtype=torch.long).unsqueeze(0),
         },
@@ -263,7 +269,12 @@ def prefill_chunk(
 
 
 def prefill_bucket(compiled, n_tokens: int) -> int:
-    """选最小的能放下 n_tokens 行的 prefill 桶；没有桶表时按原长。"""
+    """选能放下 n_tokens 行的 prefill 桶；动态图只有一张 T_max 图，按原长。
+
+    静态路径没有桶表时也按原长（手搓蓝图）。
+    """
+    if getattr(compiled, "compile_mode", "static") == "dynamic":
+        return n_tokens
     lengths = getattr(compiled, "prefill_seq_lens", ()) or ()
     if not lengths:
         return n_tokens
@@ -276,12 +287,18 @@ def prefill_bucket(compiled, n_tokens: int) -> int:
 
 
 def _prefill_plan(compiled, seq_len: int, slot_index: int):
-    """取第 `seq_len` 桶第 `slot_index` 号窗口的计划；没有桶表时退回原计划。"""
+    """取第 `seq_len` 桶第 `slot_index` 号窗口的计划。
+
+    动态图只有一张 T_max 图，实际长度不是桶键，落到唯一的计划上。
+    """
     plans = getattr(compiled, "prefill_plans", None) or {}
     windows = plans.get(seq_len)
-    if windows:
+    if windows and slot_index < len(windows):
         return windows[slot_index]
-    return compiled.prefill.plan
+    for windows in plans.values():
+        if slot_index < len(windows):
+            return windows[slot_index]
+    return _window_plan(compiled, "prefill", slot_index)
 
 
 def _prefill_output_cmd(compiled, seq_len: int) -> int:

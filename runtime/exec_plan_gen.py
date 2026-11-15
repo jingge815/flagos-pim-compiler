@@ -25,6 +25,7 @@ from contracts.unified_ir import (
     SHAPE_EXPR_META_KEY)
 from graph.spec_prop import _layer_of_node
 from runtime.dependency import deps_of as _deps_of, overlap, war_waits as _war_waits
+from runtime.shape_bind import dynamic_shape_enabled
 
 # MoE 执行语义。图编译器与 GeneSim 共用这两个取值；默认跟随 PIM_MOE_DISPATCH。
 MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch")
@@ -495,6 +496,22 @@ def _dma_engine(hal, cmd) -> DmaEngine:
     )
 
 
+def _scatter_rows(hal, entry: CommPlanEntry) -> int | None:
+    """动态执行时 scatter 只写实际 T 行。
+
+    多 T 轴或 T 不在最外层非单位维的条目保持包络：行宽/内层步长会变，
+    按行前缀裁剪会写错位置。
+    """
+    if not dynamic_shape_enabled() or hal.bound_num_tokens is None:
+        return None
+    if len(entry.t_axes) != 1:
+        return None
+    axis = entry.t_axes[0]
+    if any(dim != 1 for dim in entry.shape[:axis]):
+        return None
+    return int(hal.bound_num_tokens)
+
+
 def _emit_redistribute(
     builder: _PlanBuilder, edge, entry: CommPlanEntry, src_node: Node,
     dispatch_by_layer: dict[int, int] | None = None,
@@ -517,7 +534,8 @@ def _emit_redistribute(
 
         def fn(hal, cmd):
             engine = _dma_engine(hal, cmd)
-            scatter(entry, engine, get_host_buf(hal))
+            scatter(entry, engine, get_host_buf(hal),
+                    rows=_scatter_rows(hal, entry))
             return None
     elif edge.type == "local_slice":
         def fn(hal, cmd):

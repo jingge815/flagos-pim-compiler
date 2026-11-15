@@ -196,3 +196,13 @@ def test_dynamic_comm_entries_carry_t_axes(dynamic, baseline) -> None:
         base_compiled.prefill_edges, _shape_exprs_of(base_compiled.prefill_gm))
     assert all(not entry.t_axes for entry in base_entries)
     assert all(not entry.shape_exprs for entry in base_entries)
+
+
+def test_dynamic_prefill_uses_actual_length(dynamic, baseline) -> None:
+    """动态 prefill 不再补 pad；静态路径仍按桶长补齐。"""
+    from runtime.executor import prefill_bucket
+
+    dyn_compiled, _ = dynamic
+    base_compiled, _ = baseline
+    assert prefill_bucket(dyn_compiled, 5) == 5
+    assert prefill_bucket(base_compiled, 5) == MAX_SEQ
