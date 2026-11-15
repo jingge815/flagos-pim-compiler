@@ -1,20 +1,30 @@
-"""事件驱动调度器：按依赖就绪度提交命令，gate 在调度侧异步解析。"""
+"""执行计划调度器：计划序提交 + 逐命令形状绑定（动态模式）。"""
 
 from __future__ import annotations
 
 import threading
-from dataclasses import replace
 
-from contracts.exec_plan import Command, ExecutionPlan
+from contracts.exec_plan import ExecutionPlan
 from runtime.shape_bind import bind_command_shapes, dynamic_shape_enabled
+
+# waits 引用校验按计划身份只做一次；计划常驻 CompiledModel，id 不会复用。
+_VALIDATED: set[int] = set()
+
+
+def _validate_plan(plan: ExecutionPlan) -> None:
+    ids = {cmd.id for cmd in plan.commands}
+    unknown = {dep for cmd in plan.commands for dep in cmd.waits
+               if dep not in ids}
+    if unknown:
+        raise ValueError(f"计划依赖了不存在的命令：{sorted(unknown)}")
+    _VALIDATED.add(id(plan))
 
 
 class EventScheduler:
-    """把静态计划交给运行期调度：依赖完成才提交，跳过命令不进执行队列。
+    """按计划序把命令交给 HAL，完成等待直接落在命令 future 上。
 
-    D1 仍以计划的 `waits` 作为依赖 DAG（含 host 闭包的数据依赖），区别是提交
-    时机由事件回调驱动，不再一次性全量 submit；gate 命令在依赖就绪后直接判定
-    跳过/提交，主线程不再阻塞在 `hal.submit` 里等 dispatch。
+    D1 的就绪驱动提交经剖析证伪（保序约束下相对全量提交无收益），调度器
+    保留的价值是逐命令形状绑定（PIM_DYN_SHAPE）与统一的动态入口。
     """
 
     def __init__(self, plan: ExecutionPlan, hal, ctx=None) -> None:
@@ -22,20 +32,13 @@ class EventScheduler:
         self.hal = hal
         self.ctx = ctx
         self.events = hal.events_table(ctx)
-        self.commands = {cmd.id: cmd for cmd in plan.commands}
-        self.waits = {cmd.id: set(cmd.waits) for cmd in plan.commands}
-        unknown = {dep for waits in self.waits.values() for dep in waits
-                   if dep not in self.commands}
-        if unknown:
-            raise ValueError(f"计划依赖了不存在的命令：{sorted(unknown)}")
-        self.done: set[int] = set()
-        self.started: set[int] = set()
         self.error: BaseException | None = None
-        self._cv = threading.Condition()
+        self._events: list = []  # 本次 run 提交的 event，wait() 逐个直等
         self._thread: threading.Thread | None = None
+        _validate_plan(plan)
 
     def run(self, drain: bool = True) -> dict[int, object]:
-        """启动调度线程；`drain=True` 时等全部命令完成再返回。"""
+        """启动提交线程；`drain=True` 时等全部命令完成再返回。"""
         self._thread = threading.Thread(
             target=self._loop, name="event-scheduler", daemon=True)
         self._thread.start()
@@ -44,64 +47,31 @@ class EventScheduler:
         return self.events
 
     def wait(self) -> dict[int, object]:
-        """等待全部命令完成；调度线程里的异常在这里抛出。"""
-        with self._cv:
-            self._cv.wait_for(
-                lambda: self.error is not None
-                or len(self.done) == len(self.commands))
-            if self.error is not None:
-                raise self.error
+        """等待本次 run 的全部命令完成；提交或执行异常在这里抛出。
+
+        旧的「逐命令回调 + 条件变量 notify」让每条命令完成都唤醒主线程一次
+        （万级命令 = 万级线程切换，4L decode 每步多耗 ~1s），改为 join 提交
+        线程后逐 future 等待，与静态路径同构。
+        """
+        if self._thread is not None:
+            self._thread.join()
+        if self.error is not None:
+            raise self.error
+        for event in self._events:
+            event.future.result()
         return self.events
 
     def _loop(self) -> None:
-        """按计划序全量提交（gate 由 HAL 在 submit 内同步解析）。
-
-        剖析（4 层 MoE）：就绪驱动的提交让 65% 墙钟零并发（static 为 32%），
-        而保序约束下它相对静态提交没有额外收益——HAL worker 池本就按 waits
-        等待。调度器保留的价值：逐命令形状绑定（PIM_DYN_SHAPE）与统一的
-        动态入口；gate 异步化需计划期分段子计划，另立工作项。
-        """
         try:
+            env = self._shape_env() if dynamic_shape_enabled() else None
             for cmd in self.plan.commands:
-                self._submit_plain(cmd)
+                if env:
+                    cmd = bind_command_shapes(cmd, env)
+                event = self.hal.submit(cmd, self.ctx)
+                self.events[cmd.id] = event
+                self._events.append(event)
         except BaseException as exc:
-            with self._cv:
-                self.error = exc
-                self._cv.notify_all()
-
-    def _submit_plain(self, cmd: Command) -> None:
-        if dynamic_shape_enabled():
-            env = self._shape_env()
-            if env:
-                cmd = bind_command_shapes(cmd, env)
-        event = self.hal.submit(cmd, self.ctx)
-        self.events[cmd.id] = event
-        event.future.add_done_callback(
-            lambda _future, cid=cmd.id: self._on_done(cid))
-
-    def _submit(self, cmd: Command) -> None:
-        if self.plan is not None and dynamic_shape_enabled():
-            env = self._shape_env()
-            if env:
-                cmd = bind_command_shapes(cmd, env)
-        if "gate" in cmd.payload and self.hal.moe_dispatch is not False:
-            gate_id = int(cmd.payload["gate"])
-            lane_key = 0 if self.ctx is None else int(self.ctx.lane_key)
-            expert = int(cmd.payload["expert"])
-            stats = self.hal.gate_stats.setdefault(
-                (lane_key, gate_id), {"submitted": 0, "skipped": 0})
-            if expert in self.hal.gate_skips.get((lane_key, gate_id), ()):
-                stats["skipped"] += 1
-                event = self.hal.make_skipped_event(
-                    cmd, lane_key, self.events, self.ctx)
-            else:
-                stats["submitted"] += 1
-                event = self.hal.submit(self._ungated(cmd), self.ctx)
-        else:
-            event = self.hal.submit(cmd, self.ctx)
-        self.events[cmd.id] = event
-        event.future.add_done_callback(
-            lambda _future, cid=cmd.id: self._on_done(cid))
+            self.error = exc
 
     def _shape_env(self) -> dict[str, int]:
         """本次执行的符号维取值：T = 真实 token 数。"""
@@ -109,8 +79,3 @@ class EventScheduler:
         if num_tokens is None:
             num_tokens = self.hal.bound_num_tokens
         return {"T": int(num_tokens)} if num_tokens else {}
-
-    def _on_done(self, cid: int) -> None:
-        with self._cv:
-            self.done.add(cid)
-            self._cv.notify_all()

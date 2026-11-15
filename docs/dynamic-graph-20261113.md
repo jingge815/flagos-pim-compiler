@@ -104,3 +104,26 @@
 - 4L 真实 MoE（prompt 5 token，8 DPU，prefill 8）：见下。
 
 4L 真实 MoE 结果（同轮各跑一次、独占机器）：dynamic_bind tokens `[6722, 4849, 35579, 1197, 5434, 5434]`，与 static 逐位一致；run static 50.18s / dynamic_bind 62.22s。行收缩在 numpy 镜像上只减少拷贝次数与字节（段结构不变、尾段被裁掉），不会引入开销；跨轮绝对值波动大（同一代码历史区间 52–70s），绑定/收缩的性能调优仍以 numpy 镜像与调度开销为主，另立工作项。
+
+## 调度器等待路径调优（2026-11-15 晚）
+
+4L 同轮 dynamic_bind 62.22s vs static 50.18s（124%）超出计划 Go/No-Go 的 105% 上限，cProfile 定位 decode 步（剖析器下 10.04s/步）两处调度器开销：
+
+| 开销 | 位置 | 量级 | 根因 |
+| --- | --- | --- | --- |
+| 每步重建计划索引 | `EventScheduler.__init__` 的 `commands`/`waits` 两个 dictcomp + 未知依赖校验 | 0.885s/步（9%） | 调度器每次 `execute_plan` 新建，索引却是计划派生的静态数据 |
+| 逐命令完成唤醒 | `_on_done` 拿条件变量锁 + `notify_all`，`wait()` 的 `wait_for` 谓词每次被唤醒都重算 | 17876 条命令/步 = 万级锁操作 + 万级线程切换/步 | 每条命令完成都把主线程拽醒一次检查谓词 |
+
+改造（`runtime/scheduler.py` 117 → 77 行，净 −40）：
+
+- `wait()` 改为 join 提交线程后逐 future 直等（本次 run 自己提交的 event 列表），与静态路径的等待方式同构；不再有完成回调、条件变量、`done` 计数。附带修复：命令 future 的执行异常现在会从 `wait()` 抛出（旧路径只传播提交异常，执行异常静默）。
+- waits 未知依赖校验改为模块级 `_validate_plan` 按计划身份只做一次（计划常驻 `CompiledModel`，id 不复用）；每步只剩构造器常量赋值。
+- 删死代码：`_submit`（gate 判定已移入 HAL submit，无调用方）、`started` 死字段；单调用者 `_submit_plain` 内联进 `_loop`，`_shape_env` 提到每步一次（原先每条命令重算）。
+
+效果（4L，8 DPU，同轮独占对照）：
+
+- 剖析：`__init__` 0.885s → 0.071s/步；`future.result()` 等待为真实 worker 计算时间。
+- 墙钟：static 48.83s / dynamic_bind 49.94s = **102.3%**，达标（上限 105%）；tokens `[6722, 4849, 35579, 1197, 5434, 5434]` 逐位一致。dynamic_bind 相对上一轮同判据的 62.22s 减少 20%。
+- 测试：scheduler/dynamic/binding/parallel 25 项 + exec_plan/moe_dispatch/prefill_buckets/comm/compat 113 项全绿；全量回归见下。
+
+decode 两路本就执行同一份 decode 计划（`_window_plan` 不分 mode），动态路径的 decode 开销即调度器本身；本轮修完后 dynamic decode ≈ static decode + 线程切换（毫秒级）。prefill 侧动态图一张 T_max 图 + 去填充，不劣于静态桶。剩余 ~2% 差值主要在 prefill 的形状绑定与未绑定命令的包络执行，属 numpy 镜像本底，不再单列工作项。
