@@ -174,3 +174,81 @@ def test_megatron_pair_end_to_end_matches_torch() -> None:
     acc = all_reduce(reduce_entry, engine)
 
     torch.testing.assert_close(torch.from_numpy(acc), ref, rtol=1e-5, atol=1e-6)
+
+
+# ── 行收缩（D2-full）：收缩结果 == 包络结果的行前缀，尾行不被触碰 ──
+
+DST_OFFSET = 256   # 回写区与收集源区（addr 0）分开，尾行检查才有效
+
+
+def _t_entry(edge_type: str, reduce_type: str | None = None):
+    """(1,4,8) 按末维切两半、t_axes=(1,) 的通信条目；reduce 目标地址偏移。"""
+    shape = (1, 4, 8)
+    if edge_type == "all_reduce":
+        src = _dpu_spec(Placement("Partial", reduce_type=reduce_type or "sum"),
+                        shape, (0, 1))
+        dst = _dpu_spec(REPLICATE, shape, (0, 1), mram_offset=DST_OFFSET)
+    elif edge_type == "all_gather":
+        src, dst = _dpu_spec(Placement("Shard", 2), shape, (0, 1)), _host_spec()
+    else:
+        raise ValueError(f"用例未覆盖的条目类型 {edge_type}")
+    (entry,) = build_comm_plan([_edge(0, edge_type, src, dst, shape)])
+    entry.t_axes = (1,)
+    return entry
+
+
+def _fill_shards(engine, global_tensor):
+    """按末维列切的本地布局填两台 DPU：dpu0 左半列、dpu1 右半列。"""
+    engine.copy_to_dpu(0, 0, np.ascontiguousarray(global_tensor[:, :, 0:4]).reshape(-1))
+    engine.copy_to_dpu(1, 0, np.ascontiguousarray(global_tensor[:, :, 4:8]).reshape(-1))
+    return engine
+
+
+def _run_rows(entry, rows):
+    """填好两 DPU 分片后执行一次通信，返回 (返回值, 回写区读回)。"""
+    global_tensor = np.arange(32, dtype=np.float32).reshape(1, 4, 8)
+    engine = _fill_shards(_engine(), global_tensor)
+    if entry.type == "all_reduce":
+        for dpu_id in (0, 1):  # Partial 布局：每台交出整张的全局副本（部分和）。
+            engine.copy_to_dpu(dpu_id, 0,
+                               np.arange(32, dtype=np.float32) + 100 * dpu_id)
+        fn = all_reduce
+    else:
+        fn = all_gather
+    out = fn(entry, engine, rows=rows)
+    return out, _read(engine, 0, 32, addr=DST_OFFSET)
+
+
+def test_all_reduce_rows_equals_envelope_prefix() -> None:
+    entry = _t_entry("all_reduce")
+    envelope, env_dst = _run_rows(entry, None)
+    clamped, clamp_dst = _run_rows(entry, 2)
+
+    assert envelope.shape == (1, 4, 8)
+    assert clamped.shape == (1, 2, 8)
+    assert np.array_equal(clamped, envelope[:, :2])
+    # 回写只落前两行，DPU 回写区尾行保持零不被触碰。
+    assert np.array_equal(clamp_dst[:16], env_dst[:16])
+    assert np.all(clamp_dst[16:] == 0)
+
+
+def test_all_reduce_rows_mean_keeps_participant_count() -> None:
+    """mean 的除数是参与者个数，不随行收缩的段数变化。"""
+    entry = _t_entry("all_reduce", reduce_type="mean")
+    partial_sums = [np.ones(32, dtype=np.float32) * (i + 1) for i in (0, 1)]
+    outs = []
+    for rows in (None, 3):
+        engine = _engine()
+        for dpu_id, part in enumerate(partial_sums):
+            engine.copy_to_dpu(dpu_id, 0, part)
+        outs.append(all_reduce(entry, engine, rows=rows))
+    assert np.array_equal(outs[1], outs[0][:, :3])
+
+
+def test_all_gather_rows_equals_envelope_prefix() -> None:
+    entry = _t_entry("all_gather")
+    global_tensor = np.arange(32, dtype=np.float32).reshape(1, 4, 8)
+    envelope = all_gather(entry, _fill_shards(_engine(), global_tensor))
+    clamped = all_gather(entry, _fill_shards(_engine(), global_tensor), rows=2)
+    assert clamped.shape == (1, 2, 8)
+    assert np.array_equal(clamped, envelope[:, :2])

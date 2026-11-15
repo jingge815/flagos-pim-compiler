@@ -99,22 +99,19 @@ def clamped_entry(entry: CommPlanEntry, rows: int | None) -> CommPlanEntry:
 
     段的 global_range 落在摊平行主序数组上：列切片段每段恰好一行内连续，
     整行段则可能跨多行，必须把段尾截到 rows*R 并同步 nbytes，否则会把
-    DPU 尾行的旧值读进 host。行几何不整除或 rows 为空时原样返回。
+    DPU 尾行的旧值读进 host。rows 为空时原样返回。
     """
     if rows is None or not entry.shape:
         return entry
     if not entry.t_axes:
         raise ValueError(
             f"通信条目 {entry.edge_id} 缺少 t_axes：行收缩只允许显式声明 T 维的"
-            "条目（D2-full 未完成，禁止静默按启发式裁剪）")
+            "条目（禁止静默按启发式裁剪）")
     if len(entry.t_axes) > 1:
         raise NotImplementedError(
             f"通信条目 {entry.edge_id} 有多个 T 轴 {entry.t_axes}："
             "多 T 轴布局重映射尚未实现")
-    t_env = entry.shape[entry.t_axes[0]]
-    if t_env <= 0 or entry.numel % t_env:
-        return entry
-    row_elems = entry.numel // t_env
+    row_elems = entry.numel // entry.shape[entry.t_axes[0]]
     limit = rows * row_elems
     itemsize = entry.dtype.itemsize
     segments = []
@@ -155,9 +152,27 @@ def _writeback(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,
             engine.run_writeback(op, host_buf)
 
 
-def _merged(entry: CommPlanEntry, collected: list[tuple[CommSegment, np.ndarray]]) -> np.ndarray:
+def _row_elems(entry: CommPlanEntry) -> int:
+    """T 轴之外一行的元素数（行收缩的搬运粒度）。"""
+    return entry.numel // entry.shape[entry.t_axes[0]]
+
+
+def _actual_shape(entry: CommPlanEntry, rows: int) -> tuple[int, ...]:
+    """行收缩后的实际形状：T 维换成实际行数。"""
+    axis = entry.t_axes[0]
+    return (*entry.shape[:axis], rows, *entry.shape[axis + 1:])
+
+
+def _out_shape(entry: CommPlanEntry, rows: int | None) -> tuple[int, ...]:
+    """收缩时返回实际形状，否则包络形状。"""
+    return _actual_shape(entry, rows) if rows is not None else entry.shape
+
+
+def _merged(entry: CommPlanEntry, collected: list[tuple[CommSegment, np.ndarray]],
+            rows: int | None = None) -> np.ndarray:
     """按全局区间将各段缓冲合并为摊平数组。"""
-    host_buf = np.zeros(entry.numel, dtype=entry.dtype)
+    total = rows * _row_elems(entry) if rows is not None else entry.numel
+    host_buf = np.zeros(total, dtype=entry.dtype)
     for seg, buf in sorted(collected, key=lambda item: item[0].global_range[0]):
         host_buf[seg.global_range[0] : seg.global_range[1]] = buf
     return host_buf
@@ -187,31 +202,33 @@ def all_reduce(entry: CommPlanEntry, engine: DmaEngine,
           rows: int | None = None) -> np.ndarray:
     """收集各 DPU 分片并执行求和或求均值，返回全局形状数组。"""
     _check_entry(entry, "all_reduce")
-    acc = np.zeros(entry.numel, dtype=entry.dtype)
+    total = rows * _row_elems(entry) if rows is not None else entry.numel
+    acc = np.zeros(total, dtype=entry.dtype)
     for seg, buf in _collect(entry, engine, rows):
         acc[seg.global_range[0] : seg.global_range[1]] += buf
     if entry.reduce == "mean":
+        # 除数取原始条目的收集段数：行收缩只减少搬运量，不改变参与者个数。
         acc /= len(entry.collect_segments)
-    _writeback(entry, engine, acc)
-    return acc.reshape(entry.shape)
+    _writeback(entry, engine, acc, rows)
+    return acc.reshape(_out_shape(entry, rows))
 
 
 def all_gather(entry: CommPlanEntry, engine: DmaEngine,
           rows: int | None = None) -> np.ndarray:
     """收集各 DPU 分片并按全局偏移拼接，返回全局形状数组。"""
     _check_entry(entry, "all_gather")
-    merged = _merged(entry, _collect(entry, engine, rows))
-    _writeback(entry, engine, merged)
-    return merged.reshape(entry.shape)
+    merged = _merged(entry, _collect(entry, engine, rows), rows)
+    _writeback(entry, engine, merged, rows)
+    return merged.reshape(_out_shape(entry, rows))
 
 
 def all_to_all(entry: CommPlanEntry, engine: DmaEngine,
           rows: int | None = None) -> np.ndarray:
     """按全局区间重排分片并写回目标 DPU，返回摊平后的全局数组。"""
     _check_entry(entry, "all_to_all")
-    staging = _merged(entry, _collect(entry, engine, rows))
-    _writeback(entry, engine, staging)
-    return staging.reshape(entry.shape)
+    staging = _merged(entry, _collect(entry, engine, rows), rows)
+    _writeback(entry, engine, staging, rows)
+    return staging.reshape(_out_shape(entry, rows))
 
 
 def scatter(entry: CommPlanEntry, engine: DmaEngine, host_buf: np.ndarray,

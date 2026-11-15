@@ -122,3 +122,25 @@ def test_scatter_accepts_short_actual_host_buffer() -> None:
     engine = _RecordingEngine()
     scatter(entry, engine, host, rows=2)
     assert len(engine.calls) == 4
+
+
+def test_clamped_rows_requires_dyn_env_and_prefix_layout(monkeypatch) -> None:
+    """行数门控：动态开关 + 绑定 token 数 + 单 T 轴且在最外层缺一不可。"""
+    from types import SimpleNamespace
+
+    from runtime.exec_plan_gen import _clamped_rows
+
+    entry = _col_shard_entry()               # (1,4,8)，t_axes=(1,) 前缀兼容
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    hal = SimpleNamespace(bound_num_tokens=2)
+    assert _clamped_rows(hal, entry) == 2
+    monkeypatch.delenv("PIM_DYN_SHAPE")
+    assert _clamped_rows(hal, entry) is None
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    assert _clamped_rows(SimpleNamespace(bound_num_tokens=None), entry) is None
+    # 多 T 轴（(1,1,T,T) 掩码）与 T 在中间维：不能按行前缀收缩。
+    mask = CommPlanEntry(**{**entry.__dict__, "shape": (1, 1, 4, 4),
+                            "t_axes": (2, 3)})
+    assert _clamped_rows(hal, mask) is None
+    mid = CommPlanEntry(**{**entry.__dict__, "shape": (1, 4, 8), "t_axes": (2,)})
+    assert _clamped_rows(hal, mid) is None

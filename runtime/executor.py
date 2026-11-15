@@ -12,6 +12,7 @@ import torch
 from backend.hal_numpy import ExecutionContext
 from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import write_block_table
+from runtime.shape_bind import dynamic_shape_enabled
 
 
 class KVSlotPool:
@@ -242,10 +243,12 @@ def prefill_chunk(
     _apply_moe_execution(compiled, hal)
     seq_len = prefill_bucket(compiled, length)
     ids = list(token_ids) + [pad_id] * (seq_len - length)
-    # 动态图只把输入建到实际长度；掩码保持包络形状，掩码行宽随 T 变，
-    # 不能按前缀收缩，注意力走标准因果掩码的融合路径，不读值。
+    # 形状绑定开启时动态图只把输入建到实际长度；掩码保持包络形状，掩码
+    # 行宽随 T 变，不能按前缀收缩，注意力走标准因果掩码的融合路径，不读值。
+    # 绑定关闭时整个执行回退包络（含补 pad），与通信的严格检查一致。
     mask_len = (compiled.prefill_seq_len
                 if getattr(compiled, "compile_mode", "static") == "dynamic"
+                and dynamic_shape_enabled()
                 else seq_len)
     slot.blocks.ensure(_blocks_for(pos + length, compiled.kv_slot_tokens))
     _write_block_table(compiled, hal, slot, slot_index)
@@ -269,11 +272,12 @@ def prefill_chunk(
 
 
 def prefill_bucket(compiled, n_tokens: int) -> int:
-    """选能放下 n_tokens 行的 prefill 桶；动态图只有一张 T_max 图，按原长。
+    """选能放下 n_tokens 行的 prefill 桶；动态图开绑定时只有一张 T_max 图，按原长。
 
     静态路径没有桶表时也按原长（手搓蓝图）。
     """
-    if getattr(compiled, "compile_mode", "static") == "dynamic":
+    if getattr(compiled, "compile_mode", "static") == "dynamic" \
+            and dynamic_shape_enabled():
         return n_tokens
     lengths = getattr(compiled, "prefill_seq_lens", ()) or ()
     if not lengths:

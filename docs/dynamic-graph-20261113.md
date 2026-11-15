@@ -80,3 +80,27 @@
 验证：tiny Llama 动态用例 13 passed、tiny Qwen3-MoE 绑定用例 5 passed（1/2/3/5/7 token 与静态逐 token 一致）；静态 prefill/comm 子集 85 passed。
 
 4L 真实 MoE（prompt 5 token，8 DPU，prefill 8）：去填充后 `dynamic_bind` tokens 仍为 `[6722, 4849, 35579, 1197, 5434, 5434]`，与 static 逐位一致；run 52.09s，低于同轮 static 63.42s 与未去填充的 dynamic_bind 70.58s。
+
+## D2-full gather 收缩（2026-11-15 下午）
+
+收集方向（`all_reduce`/`all_gather`/`all_to_all`）接入实际 T 行数：
+
+- `runtime/exec_plan_gen.py`：`_scatter_rows` 更名 `_clamped_rows`，scatter 写入与 gather 收集/回写共用同一个「单 T 轴 + T 在最外层非单位维」门控；专家子图条目（gate 打标）一律包络——路由缓冲按每专家 token 混排，行数不是 T 的行前缀。
+- `comm/lowering.py`：三个收集原语按 rows 收缩——`clamped_entry` 截段后，`_merged`/`all_reduce` 的缓冲按 `rows*R` 分配，返回值 reshape 成实际形状（T 维换成 rows）；mean 归约除数仍取原始条目的收集段数（行收缩只减搬运量，不改参与者个数）。`clamped_entry` 里「行几何不整除则原样返回」的死分支删除（numel 必整除自己的维，留着会让调用方的 rows 缓冲与包络段错位）。
+
+| 边界 | 规则 | 原因 |
+| --- | --- | --- |
+| d2h（结果回主机） | 不收缩 | 主机闭包混用包络形状的兄弟实参：小 MoE 里 `where(selected_mask, expert_out, 0)` 一侧是 launch 绑定出的实际 T 行、另一侧是包络，形状对不上直接崩。主机可见形状要全链统一实际 T 才能收缩，尚未做到 |
+| 专家子图（gate 打标） | 不收缩 | 路由缓冲行数非 T 前缀；跳过专家的 `skip_value` 也是包络零张量 |
+| d2d/d2c（结果只进 MRAM） | 收缩 | 下游 launch 绑定读实际 T 行；未绑定命令读包络尾行，与去填充后的「尾行是旧值」一致，不引入新污染 |
+
+另修一处 c9aeb0f 留下的不一致：executor 按 `compile_mode=="dynamic"` 无条件去填充，而 scatter 放宽检查要求 `PIM_DYN_SHAPE=1`——动态编译不带环境变量跑必炸（host_buf 元素数 1 != 包络 16）。现在去填充/实际长度同样挂在 `dynamic_shape_enabled()` 上：关绑定时整个执行回退包络（补 pad），与通信严格检查一致。
+
+验证：
+- 新增单测：三个收集原语的行收缩等价（收缩结果 == 包络结果的行前缀、DPU 回写区尾行不被触碰、mean 除数不变）、`_clamped_rows` 门控（开关/绑定缺失/多 T 轴/T 在中间维）。
+- tiny Llama 14 项 + tiny Qwen3-MoE 5 项 + 形状绑定 8 项全绿；token 对拍用例改为自带 `PIM_DYN_SHAPE=1`（此前依赖外部环境变量，裸跑必炸），并新增「关绑定回退包络」用例。
+- 静态定向子集（comm/prefill/exec/scheduler/dispatch）231 passed。
+- 全量回归（默认排除 slow/llama2_7b）：**2260 passed、11 skipped、0 failed**（1423 s）。
+- 4L 真实 MoE（prompt 5 token，8 DPU，prefill 8）：见下。
+
+4L 真实 MoE 结果（同轮各跑一次、独占机器）：dynamic_bind tokens `[6722, 4849, 35579, 1197, 5434, 5434]`，与 static 逐位一致；run static 50.18s / dynamic_bind 62.22s。行收缩在 numpy 镜像上只减少拷贝次数与字节（段结构不变、尾段被裁掉），不会引入开销；跨轮绝对值波动大（同一代码历史区间 52–70s），绑定/收缩的性能调优仍以 numpy 镜像与调度开销为主，另立工作项。

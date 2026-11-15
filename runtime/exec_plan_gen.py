@@ -496,8 +496,8 @@ def _dma_engine(hal, cmd) -> DmaEngine:
     )
 
 
-def _scatter_rows(hal, entry: CommPlanEntry) -> int | None:
-    """动态执行时 scatter 只写实际 T 行。
+def _clamped_rows(hal, entry: CommPlanEntry) -> int | None:
+    """动态执行时通信只搬实际 T 行（scatter 写入 / gather 收集与回写）。
 
     多 T 轴或 T 不在最外层非单位维的条目保持包络：行宽/内层步长会变，
     按行前缀裁剪会写错位置。
@@ -520,8 +520,19 @@ def _emit_redistribute(
     """将一条重分布边生成包含全部段访问的命令。
 
     专家子图专属的通信带上 gate/expert：未命中专家时连归约/收集一起跳过，
-    否则动态分派只省计算、不省通信。
+    否则动态分派只省计算、不省通信。行收缩只做在「结果不回主机」的条目上：
+    主机闭包会混用包络形状的兄弟实参（如 MoE 的 where(mask, expert_out, 0)），
+    收缩主机可见形状要求全链闭包统一实际 T，尚未做到；专家条目一律包络，
+    路由缓冲的行数不是 T 的行前缀。
     """
+    # 专家打标提前算好：行收缩的豁免判断和跳过 payload 用同一份。
+    tag = None
+    if dispatch_by_layer is not None and provenance is not None:
+        found = _expert_tag_of(provenance, src_node)
+        if found is not None and found[0] in dispatch_by_layer:
+            tag = found
+    clamped = tag is None and edge.dst_loc.get("device") != DEVICE_HOST
+
     reads, writes = _edge_accesses(entry)
     waits = _deps_of(reads, builder.writers)
     for w in writes:
@@ -535,7 +546,7 @@ def _emit_redistribute(
         def fn(hal, cmd):
             engine = _dma_engine(hal, cmd)
             scatter(entry, engine, get_host_buf(hal),
-                    rows=_scatter_rows(hal, entry))
+                    rows=_clamped_rows(hal, entry) if clamped else None)
             return None
     elif edge.type == "local_slice":
         def fn(hal, cmd):
@@ -552,21 +563,20 @@ def _emit_redistribute(
 
         def fn(hal, cmd):
             engine = _dma_engine(hal, cmd)
-            return primitive(entry, engine)
+            rows = _clamped_rows(hal, entry) if clamped else None
+            return primitive(entry, engine, rows=rows)
 
     op = _REDISTRIBUTE_OP[edge.type]
     payload: dict = {"edge_id": edge.edge_id, "fn": fn}
-    if dispatch_by_layer is not None and provenance is not None:
-        tag = _expert_tag_of(provenance, src_node)
-        if tag is not None and tag[0] in dispatch_by_layer:
-            payload["gate"] = dispatch_by_layer[tag[0]]
-            payload["expert"] = tag[1]
-            # 跳过时若这条命令的返回值被主机闭包消费，要给零张量而不是 None：
-            # 未命中专家的贡献就是零，主机侧融合的乘加照常算出一个正确的累加。
-            if edge.dst_loc.get("device") == DEVICE_HOST:
-                payload["skip_value"] = [
-                    list(entry.shape), np.dtype(entry.dtype).name]
-            waits = waits + [payload["gate"]]
+    if tag is not None:
+        payload["gate"] = dispatch_by_layer[tag[0]]
+        payload["expert"] = tag[1]
+        # 跳过时若这条命令的返回值被主机闭包消费，要给零张量而不是 None：
+        # 未命中专家的贡献就是零，主机侧融合的乘加照常算出一个正确的累加。
+        if edge.dst_loc.get("device") == DEVICE_HOST:
+            payload["skip_value"] = [
+                list(entry.shape), np.dtype(entry.dtype).name]
+        waits = waits + [payload["gate"]]
     cmd = builder.append(op, None, payload, reads, writes, waits)
     if edge.dst_loc.get("device") == DEVICE_HOST:
         builder.host_value_of[edge.src] = cmd.id

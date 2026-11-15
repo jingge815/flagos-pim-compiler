@@ -166,11 +166,27 @@ def test_static_plan_has_no_shape_expr_payload(baseline) -> None:
 
 
 @pytest.mark.parametrize("prompt_len", [1, 2, 3, 5, 8, 12, MAX_SEQ - MAX_NEW_TOKENS])
-def test_dynamic_tokens_match_static_baseline(prompt_len, baseline, dynamic) -> None:
+def test_dynamic_tokens_match_static_baseline(prompt_len, baseline, dynamic,
+                                              monkeypatch) -> None:
     """单张符号 T 图在任意 prompt 长度下与静态基线逐 token 一致。"""
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
     base_compiled, base_backend = baseline
     dyn_compiled, dyn_backend = dynamic
     prompt = [1 + i for i in range(prompt_len)]
+    assert _run(dyn_compiled, dyn_backend, prompt) == _run(
+        base_compiled, base_backend, prompt)
+
+
+def test_dynamic_without_binding_falls_back_envelope(baseline, dynamic,
+                                                     monkeypatch) -> None:
+    """PIM_DYN_SHAPE 关闭时动态编译回退包络执行：补 pad、token 仍一致。"""
+    monkeypatch.delenv("PIM_DYN_SHAPE", raising=False)
+    from runtime.executor import prefill_bucket
+
+    base_compiled, base_backend = baseline
+    dyn_compiled, dyn_backend = dynamic
+    assert prefill_bucket(dyn_compiled, 5) == MAX_SEQ
+    prompt = [1 + i for i in range(5)]
     assert _run(dyn_compiled, dyn_backend, prompt) == _run(
         base_compiled, base_backend, prompt)
 
@@ -198,8 +214,10 @@ def test_dynamic_comm_entries_carry_t_axes(dynamic, baseline) -> None:
     assert all(not entry.shape_exprs for entry in base_entries)
 
 
-def test_dynamic_prefill_uses_actual_length(dynamic, baseline) -> None:
-    """动态 prefill 不再补 pad；静态路径仍按桶长补齐。"""
+def test_dynamic_prefill_uses_actual_length(dynamic, baseline,
+                                            monkeypatch) -> None:
+    """动态 prefill 开绑定时不再补 pad；静态路径仍按桶长补齐。"""
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
     from runtime.executor import prefill_bucket
 
     dyn_compiled, _ = dynamic
