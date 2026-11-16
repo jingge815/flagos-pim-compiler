@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import sys
 import threading
-import time
 from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,12 +33,11 @@ def _done_future(value=None) -> Future:
 
 
 class _FakeHAL:
-    """最小的调度器 HAL：记录提交/跳过，gate 命令的完成由测试控制。"""
+    """最小的调度器 HAL：记录提交顺序，gate 命令的完成由测试控制。"""
 
     def __init__(self, gate_future: Future) -> None:
         self.events: dict[int, Event] = {}
         self.submitted: list[int] = []
-        self.skipped: list[int] = []
         self.gate_future = gate_future
         self.moe_dispatch = True
         self.gate_skips: dict[tuple, set[int]] = {}
@@ -57,11 +56,29 @@ class _FakeHAL:
         self.events[cmd.id] = event
         return event
 
-    def make_skipped_event(self, cmd, lane_key, events, ctx=None) -> Event:
-        self.skipped.append(cmd.id)
-        event = Event("host", _done_future())
-        events[cmd.id] = event
-        return event
+
+class _FailingHAL(_FakeHAL):
+    """可控失败的 HAL：在指定命令上抛提交异常或返回失败 future。"""
+
+    def __init__(self, gate_future: Future, fail_at: int, exc: Exception,
+                 fail_in_future: bool = False) -> None:
+        super().__init__(gate_future)
+        self.fail_at = fail_at
+        self.exc = exc
+        self.fail_in_future = fail_in_future
+
+    def submit(self, cmd: Command, ctx=None) -> Event:
+        if cmd.id == self.fail_at and self.fail_in_future:
+            self.submitted.append(cmd.id)
+            self.submitted_event.set()
+            future: Future = Future()
+            future.set_exception(self.exc)
+            event = Event("dpu", future)
+            self.events[cmd.id] = event
+            return event
+        if cmd.id == self.fail_at:
+            raise self.exc
+        return super().submit(cmd, ctx)
 
 
 def _gate_plan() -> ExecutionPlan:
@@ -133,10 +150,65 @@ def test_scheduler_submits_all_commands_in_plan_order() -> None:
     from runtime.scheduler import EventScheduler
 
     scheduler = EventScheduler(_gate_plan(), hal)
-    scheduler.run(drain=False)
+    thread = threading.Thread(target=scheduler._loop, daemon=True)
+    thread.start()
     assert hal.submitted_event.wait(1.0)
     assert hal.submitted == [0, 1, 2]
-    assert hal.skipped == []
     gate_future.set_result(None)
+    thread.join(1.0)
     scheduler.wait()
     assert hal.gate_stats == {}  # 跳过判定在 HAL 的 submit 里，不在调度器。
+
+
+def test_submit_error_surfaces_from_wait() -> None:
+    """提交线程里的异常必须原样从 wait() 抛出，不允许静默吞掉。"""
+    from runtime.scheduler import EventScheduler
+
+    boom = RuntimeError("提交失败")
+    hal = _FailingHAL(_done_future(), fail_at=1, exc=boom)
+    scheduler = EventScheduler(_gate_plan(), hal)
+    with pytest.raises(RuntimeError) as excinfo:
+        scheduler.run()
+    assert excinfo.value is boom
+    assert hal.submitted == [0]  # 提交线程在第 1 条停下
+
+
+def test_execution_error_surfaces_from_wait() -> None:
+    """命令执行异常经 future 从 wait() 透传，静默化会立刻翻红。"""
+    from runtime.scheduler import EventScheduler
+
+    boom = RuntimeError("内核执行失败")
+    hal = _FailingHAL(_done_future(), fail_at=2, exc=boom, fail_in_future=True)
+    scheduler = EventScheduler(_gate_plan(), hal)
+    with pytest.raises(RuntimeError) as excinfo:
+        scheduler.run()
+    assert excinfo.value is boom
+    assert hal.submitted == [0, 1, 2]
+
+
+def test_plan_with_unknown_wait_is_rejected() -> None:
+    """waits 引用不存在的命令时构造调度器即报错（fail-fast 防线）。"""
+    from runtime.scheduler import EventScheduler
+
+    bad = ExecutionPlan([
+        Command(0, "host_op", None, {"node": "a"}),
+        Command(1, "host_op", None, {"node": "b"}, waits=[7]),
+    ])
+    with pytest.raises(ValueError, match="不存在的命令"):
+        EventScheduler(bad, _FakeHAL(_done_future()))
+
+
+def test_validation_cache_drops_collected_plans() -> None:
+    """计划被回收后校验条目必须消失，id 复用不能让新计划跳过 waits 校验。"""
+    import gc
+
+    from runtime import scheduler as scheduler_module
+    from runtime.scheduler import EventScheduler
+
+    plan = ExecutionPlan([Command(0, "host_op", None, {"node": "a"})])
+    key = id(plan)
+    EventScheduler(plan, _FakeHAL(_done_future()))
+    assert key in scheduler_module._VALIDATED
+    del plan
+    gc.collect()
+    assert key not in scheduler_module._VALIDATED

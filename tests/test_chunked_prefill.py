@@ -31,7 +31,7 @@ LONG_PROMPT_LEN = 3000
 
 
 def _build(max_seq: int, buckets: tuple[int, ...], kv_slot_tokens: int,
-           kv_pool_slots: int):
+           kv_pool_slots: int, dynamic: bool = False):
     """编译一个微型 Llama 并装好后端，供同模块的用例共用。"""
     torch.manual_seed(0)
     model = LlamaForCausalLM(LlamaConfig(
@@ -49,7 +49,8 @@ def _build(max_seq: int, buckets: tuple[int, ...], kv_slot_tokens: int,
     compiled = compile_llama2(
         model, strategy, prefill_seq_len=max_seq, max_seq=max_seq, hw=hw,
         hardware=hardware, num_request_slots=2, kv_slot_tokens=kv_slot_tokens,
-        kv_pool_slots=kv_pool_slots, prefill_seq_lens=buckets)
+        kv_pool_slots=kv_pool_slots,
+        prefill_seq_lens=() if dynamic else buckets, dynamic=dynamic)
     backend = NumpyBackend(NumpyBackendConfig(
         num_dpus=NUM_DPUS, mram_bytes_per_dpu=hw.mram_bytes,
         num_parallel_slots=compiled.num_parallel_slots))
@@ -70,6 +71,12 @@ def long_compiled_and_backend():
     return _build(LONG_SEQ, LONG_BUCKETS, kv_slot_tokens=128, kv_pool_slots=32)
 
 
+@pytest.fixture(scope="module")
+def dynamic_compiled_and_backend():
+    """动态编译产物：单张符号 T 图，KV 几何与静态短句产物一致。"""
+    return _build(MAX_SEQ, (), kv_slot_tokens=4, kv_pool_slots=8, dynamic=True)
+
+
 def _whole(compiled, backend, prompt: list[int]) -> list[int]:
     """一次跑完整段 prompt，再解码，返回生成的 token。"""
     table = RequestTable(2, compiled.kv_pool_slots)
@@ -78,13 +85,26 @@ def _whole(compiled, backend, prompt: list[int]) -> list[int]:
             for _ in range(NEW_TOKENS)]
 
 
-def _chunked(compiled, backend, prompt: list[int], chunk: int) -> list[int]:
-    """按 chunk 切段跑完 prefill，再用解码续上，返回生成的 token。"""
+def _chunked(compiled, backend, prompt: list[int],
+             chunk: int | list[int]) -> list[int]:
+    """按 chunk 切段跑完 prefill，再用解码续上，返回生成的 token。
+
+    chunk 为整数时按固定步长切段；为列表时按给定各段长度切段（如 [1, 8, 3]）。
+    """
     table = RequestTable(2, compiled.kv_pool_slots)
     slot = table.add_request("r", prompt)
     token = None
-    for pos in range(0, len(prompt), chunk):
-        part = prompt[pos:pos + chunk]
+    if isinstance(chunk, int):
+        spans = [(pos, min(pos + chunk, len(prompt)))
+                 for pos in range(0, len(prompt), chunk)]
+    else:
+        spans = []
+        start = 0
+        for size in chunk:
+            spans.append((start, start + size))
+            start += size
+    for pos, end in spans:
+        part = prompt[pos:end]
         logits = prefill_chunk(
             compiled, backend, slot, part, pos, causal_mask_of)
         token = int(np.argmax(logits[0, len(part) - 1]))
@@ -103,6 +123,57 @@ def test_chunked_prefill_matches_whole(prompt_len: int, chunk: int,
     prompt = [1 + index for index in range(prompt_len)]
     assert _chunked(compiled, backend, prompt, chunk) == _whole(
         compiled, backend, prompt)
+
+
+@pytest.mark.parametrize("chunk", [12, [5, 7], [1, 8, 3], 8])
+def test_dynamic_chunked_prefill_matches_static(
+        chunk, monkeypatch, compiled_and_backend,
+        dynamic_compiled_and_backend) -> None:
+    """动态编译 × 分块 prefill：任意分段与静态整段逐 token 一致。
+
+    分段形态覆盖整段锚点、首段 1 token（[1, 8, 3]）与尾段非整桶（[5, 7]、
+    8+4）两种评审点名形态；用例自带 PIM_DYN_SHAPE 开运行期绑定。
+    """
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    static_compiled, static_backend = compiled_and_backend
+    dyn_compiled, dyn_backend = dynamic_compiled_and_backend
+    prompt = [1 + index for index in range(12)]
+    assert _chunked(dyn_compiled, dyn_backend, prompt, chunk) == _whole(
+        static_compiled, static_backend, prompt)
+
+
+def test_dynamic_chunk_binds_each_segment_length(
+        monkeypatch, compiled_and_backend,
+        dynamic_compiled_and_backend) -> None:
+    """动态分块的返回契约：logits 保持包络行数，本段 token 占前若干行。
+
+    d2h 输出条目按设计保持包络（静态同段会选 8 桶返回 8 行）；本段 token
+    占前 length 行，末行取段内偏移 end-pos-1。绑定失效（内核按包络读未
+    填充输入）会让 token 对拍翻红，由上一条用例守护。
+    """
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    static_compiled, static_backend = compiled_and_backend
+    dyn_compiled, dyn_backend = dynamic_compiled_and_backend
+    prompt = [1 + index for index in range(12)]
+
+    table = RequestTable(2, dyn_compiled.kv_pool_slots)
+    slot = table.add_request("r", prompt)
+    shapes = []
+    for pos, end in ((0, 5), (5, 12)):
+        logits = prefill_chunk(
+            dyn_compiled, dyn_backend, slot, prompt[pos:end], pos,
+            causal_mask_of)
+        shapes.append(np.asarray(logits).shape)
+        token = int(np.argmax(np.asarray(logits)[0, end - pos - 1]))
+    assert shapes == [(1, MAX_SEQ, 128)] * 2
+    assert slot.valid_len == 12, "两段应按绝对位置把 KV 推进到 12"
+    slot.is_prefill_done = True
+    slot.generated.append(token)
+    tokens = [token] + [
+        step_request(dyn_compiled, dyn_backend, slot, causal_mask_of)
+        for _ in range(NEW_TOKENS - 1)]
+
+    assert tokens == _whole(static_compiled, static_backend, prompt)
 
 
 def test_chunked_matches_whole_on_host_path(monkeypatch, compiled_and_backend) -> None:

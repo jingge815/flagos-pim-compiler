@@ -740,6 +740,65 @@ def test_cat_joins_only_the_segments_of_its_own_row() -> None:
     assert np.allclose(result.astype(np.float32), reference.detach().numpy(), atol=1e-2)
 
 
+def test_arg_shape_exprs_align_with_arg_positions_when_literals_mix_in() -> None:
+    """字面量实参与 cat 拼接实参混排时 `arg_shape_exprs` 仍与 `arg_shapes` 逐位对齐。
+
+    两组列表若按不同过滤规则分别构建（表达式按 Node 实参压缩、形状按
+    payload 实参顺序含 None 占位、cat 未持有段被 pop），表达式会错配到
+    相邻实参的形状上；对齐必须是构造出来的不变式，不能靠实参排列巧合。
+    """
+    from graph.opt_passes import tile_graph
+    from contracts.runtime_graph import ShapeExpr
+    from contracts.unified_ir import SHAPE_EXPR_META_KEY
+
+    torch.manual_seed(0)
+    weight = torch.randn(8, 8)
+    graph = Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("down_proj_weight")
+    lin = graph.call_function(torch.ops.aten.linear.default, (x, w))
+    graph.output(lin)
+    mod = torch.nn.Module()
+    mod.register_buffer("down_proj_weight", weight.clone().to(torch.float16))
+    gm = GraphModule(mod, graph)
+    x.meta["val"] = torch.empty(1, 8, dtype=torch.float16)
+    w.meta["val"] = torch.empty(8, 8, dtype=torch.float16)
+    lin.meta["val"] = torch.empty(1, 8, dtype=torch.float16)
+    partition_graph(gm)
+    strategy = ShardStrategy(
+        name="tp2", num_dpus=2, dpu_ids=(0, 1),
+        weight_rules=(("down_proj_weight", "row"),))
+    # K 向分块：slice（张量后跟 3 个字面量）与 cat（4 段张量 + dim 字面量）混排。
+    assert tile_graph(gm, wram_bytes=144, tp_width=2) == 1
+    partition_graph(gm)
+    edges = propagate_specs(gm, strategy)
+    # 手工标注符号维（模拟动态导出）：行维记 dim(T)，其余维 None。
+    for node in gm.graph.nodes:
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            node.meta[SHAPE_EXPR_META_KEY] = tuple(
+                ShapeExpr.dim("T") if i == 1 else None
+                for i in range(val.ndim))
+    compiled, _ = _plan_and_compile(gm, edges)
+
+    seen = {"literal_tail": 0, "cat": 0}
+    for cmd in compiled.plan.commands:
+        exprs = cmd.payload.get("arg_shape_exprs")
+        if exprs is None:
+            continue
+        kinds = cmd.payload["arg_kinds"]
+        shapes = cmd.payload["arg_shapes"]
+        assert len(exprs) == len(shapes) == len(kinds), cmd.payload["node"]
+        for kind, entries in zip(kinds, exprs):
+            assert kind == "tensor" or entries is None, cmd.payload["node"]
+        if any(kind != "tensor" for kind in kinds):
+            seen["literal_tail"] += 1
+        if cmd.payload["node"].startswith("cat"):
+            seen["cat"] += 1
+    assert seen["literal_tail"] > 0, "应覆盖张量后跟字面量的命令"
+    assert seen["cat"] > 0, "应覆盖 cat 拼接命令"
+
+
 def test_weight_slice_on_a_non_shard_axis_keeps_global_indices() -> None:
     """切片轴不是权重的切分轴时，下标不能按其它轴的分片起点平移。
 

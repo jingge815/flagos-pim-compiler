@@ -9,9 +9,14 @@ from contracts.exec_plan import Command
 from contracts.runtime_graph import ShapeExpr
 
 
+def runtime_static_mode() -> bool:
+    """PIM_RUNTIME_MODE=static：动态编译产物运行期整体回退静态包络执行。"""
+    return os.environ.get("PIM_RUNTIME_MODE", "") == "static"
+
+
 def dynamic_shape_enabled() -> bool:
-    """PIM_DYN_SHAPE=1 时，动态执行按实际 T 绑定内核形状。"""
-    return os.environ.get("PIM_DYN_SHAPE", "") == "1"
+    """PIM_DYN_SHAPE=1 且运行期未回退静态时，动态执行按实际 T 绑定内核形状。"""
+    return os.environ.get("PIM_DYN_SHAPE", "") == "1" and not runtime_static_mode()
 
 
 def _bind_dims(entries, envelope, env) -> list | None:

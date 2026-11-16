@@ -24,7 +24,12 @@ from contracts.unified_ir import (
     ABSORBED_META_KEY, ARG_EXPR_META_KEY, RMS_NORM_META_KEY,
     SHAPE_EXPR_META_KEY)
 from graph.spec_prop import _layer_of_node
-from runtime.dependency import deps_of as _deps_of, overlap, war_waits as _war_waits
+from runtime.dependency import (
+    deps_of as _deps_of,
+    fold_waits,
+    overlap,
+    war_waits as _war_waits,
+)
 from runtime.shape_bind import dynamic_shape_enabled
 
 # MoE 执行语义。图编译器与 GeneSim 共用这两个取值；默认跟随 PIM_MOE_DISPATCH。
@@ -445,16 +450,11 @@ class _PlanBuilder:
                num_tasklets: int = 1) -> Command:
         # 写后写：等所有写过同一区间的旧命令，否则旧写者晚跑会覆盖新值。
         waits = waits + _deps_of(writes, self.writers)
-        # 同一 DPU 的命令由执行后端按提交序串行，等该 DPU 上最后一条前驱即可；
-        # host 命令之间没有这种串行关系，逐条保留。
-        last: dict[tuple, int] = {}
-        for cid in waits:
-            lane = self.lane_of[cid]
-            key = ("dpu", lane) if lane is not None else ("host", cid)
-            if cid > last.get(key, -1):
-                last[key] = cid
+        # 折叠规则与运行期 shadow 校验共用 dependency.fold_waits 单实现，
+        # 两处语义必须逐字一致，禁止在此另写副本。
         cmd = Command(id=self._next_id, op=op, dpu_id=dpu_id, payload=payload,
-                       reads=reads, writes=writes, waits=sorted(last.values()),
+                       reads=reads, writes=writes,
+                       waits=fold_waits(waits, self.lane_of),
                        num_tasklets=num_tasklets)
         self._next_id += 1
         self.commands.append(cmd)
@@ -741,6 +741,9 @@ def build_execution_plan(
                 arg_kinds = []
                 arg_shapes = []
                 arg_dtypes = []
+                # 逐实参形状表达式与 arg_shapes 同点位构建（None 占位、cat
+                # 未持有段同步跳过），两组列表逐位对齐是运行期绑定的前提。
+                arg_shape_exprs: list = []
                 arg_elem_exprs: list = []
                 arg_decisions: list[tuple] = []
                 # 字面量形状实参（view/reshape 的第二实参等）在折叠时留下了
@@ -763,6 +766,7 @@ def build_execution_plan(
                         arg_kinds.append(arg)
                         arg_shapes.append(None)
                         arg_dtypes.append(None)
+                        arg_shape_exprs.append(None)
                         arg_elem_exprs.append(
                             literal_exprs.pop(0) if literal_exprs else None)
                         continue
@@ -773,6 +777,7 @@ def build_execution_plan(
                         arg_kinds.append(0.0)
                         arg_shapes.append(None)
                         arg_dtypes.append(None)
+                        arg_shape_exprs.append(None)
                         arg_elem_exprs.append(None)
                         continue
                     arg_kinds.append("tensor")
@@ -791,6 +796,8 @@ def build_execution_plan(
                         continue
                     arg_detail = arg_spec_here.shard_map[dpu_id]
                     arg_shapes.append(arg_detail.local_shape)
+                    arg_shape_exprs.append(
+                        _expr_dicts(arg.meta.get(SHAPE_EXPR_META_KEY)))
                     arg_dtypes.append(arg.meta[SPEC_META_KEY].dtype)
                     # 形状与切分决策取同一个 spec：发射侧按「同形状 ⇒ 同切分」
                     # 把编码一起贴上去，这里留下逐实参的决策供出口断言核对。
@@ -835,10 +842,7 @@ def build_execution_plan(
                 if out_expr is not None or any(
                         arg.meta.get(SHAPE_EXPR_META_KEY) is not None
                         for arg in flat_args if isinstance(arg, Node)):
-                    arg_exprs = [
-                        _expr_dicts(arg.meta.get(SHAPE_EXPR_META_KEY))
-                        for arg in flat_args if isinstance(arg, Node)]
-                    payload["arg_shape_exprs"] = arg_exprs
+                    payload["arg_shape_exprs"] = arg_shape_exprs
                     payload["out_shape_expr"] = _expr_dicts(out_expr)
                 encoded = [_encode_arg_expr(expr) for expr in arg_elem_exprs]
                 if any(entry is not None for entry in encoded):

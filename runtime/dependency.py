@@ -39,7 +39,11 @@ def war_waits(
 
 
 def fold_waits(waits: Iterable[int], lane_of: dict[int, int | None]) -> list[int]:
-    """同 DPU 只保留最后一条前驱；host 命令逐条保留（与静态计划同一折叠规则）。"""
+    """同 DPU 只保留最后一条前驱；host 命令逐条保留。
+
+    静态计划生成（`_PlanBuilder.append`）与运行期 shadow 校验
+    （`address_waits`）共用本实现，折叠规则是唯一真源，不得另写副本。
+    """
     last: dict[tuple, int] = {}
     for cid in waits:
         lane = lane_of.get(cid)

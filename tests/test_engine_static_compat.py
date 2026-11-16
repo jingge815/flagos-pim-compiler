@@ -31,9 +31,6 @@ def test_dynamic_entry_points_default_to_static() -> None:
 
     fields = {item.name: item for item in dataclasses.fields(CompiledModel)}
     assert fields["compile_mode"].default == "static"
-    assert fields["runtime_graph"].default is None
-    assert fields["dynamic_axes"].default_factory is dict
-    assert fields["kernel_classes"].default == ()
 
 
 def test_unknown_execute_mode_is_rejected() -> None:

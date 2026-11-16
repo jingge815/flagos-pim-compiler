@@ -12,7 +12,7 @@ import torch
 from backend.hal_numpy import ExecutionContext
 from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import write_block_table
-from runtime.shape_bind import dynamic_shape_enabled
+from runtime.shape_bind import dynamic_shape_enabled, runtime_static_mode
 
 
 class KVSlotPool:
@@ -274,20 +274,20 @@ def prefill_chunk(
 def prefill_bucket(compiled, n_tokens: int) -> int:
     """选能放下 n_tokens 行的 prefill 桶；动态图开绑定时只有一张 T_max 图，按原长。
 
-    静态路径没有桶表时也按原长（手搓蓝图）。
+    两种模式共用入口防线：token 数超过最长桶（动态即 T_max 包络）直接抛错，
+    不让越界形状进内核。静态路径没有桶表时也按原长（手搓蓝图）。
     """
+    lengths = getattr(compiled, "prefill_seq_lens", ()) or ()
+    if lengths and n_tokens > lengths[-1]:
+        raise ValueError(
+            f"token 数 {n_tokens} 超过最长 prefill 桶 {lengths[-1]}；"
+            f"建议调大 PIM_PREFILL_SEQ_LEN 或调小 --max-num-batched-tokens")
     if getattr(compiled, "compile_mode", "static") == "dynamic" \
             and dynamic_shape_enabled():
         return n_tokens
-    lengths = getattr(compiled, "prefill_seq_lens", ()) or ()
     if not lengths:
         return n_tokens
-    for length in lengths:
-        if n_tokens <= length:
-            return length
-    raise ValueError(
-        f"token 数 {n_tokens} 超过最长 prefill 桶 {lengths[-1]}；"
-        f"建议调大 PIM_PREFILL_SEQ_LEN 或调小 --max-num-batched-tokens")
+    return next(length for length in lengths if n_tokens <= length)
 
 
 def _prefill_plan(compiled, seq_len: int, slot_index: int):
@@ -368,8 +368,7 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
                  pos: int | None = None,
                  num_tokens: int | None = None,
                  causal_mask_standard: bool = False,
-                 mode: str = "static",
-                 drain: bool = True) -> dict[int, object]:
+                 mode: str = "static") -> dict[int, object]:
     """执行计划并返回按命令编号索引的事件。
 
     命令按计划顺序全部提交即可：`hal.submit` 内部会让每个 worker 先等
@@ -378,14 +377,14 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
     为空时沿用全局事件表，保持旧的单请求语义。
     `causal_mask_standard` 声明本次传入的掩码就是标准因果掩码，注意力内核
     据此走融合路径；自定义掩码（滑动窗口、bias）不要置位。
-    `mode` 是静态/动态执行路径的显式入口；dynamic 走事件驱动调度，`drain=False`
-    时只启动调度并返回事件表，由调用方按输出命令等待。
+    `mode` 是静态/动态执行路径的显式入口；dynamic 走事件驱动调度，
+    `PIM_RUNTIME_MODE=static` 时整体回退静态全量提交与包络执行。
     """
     if mode not in ("static", "dynamic"):
         raise ValueError(f"未知执行模式：{mode!r}")
     if causal_mask_standard:
         values = {**(values or {}), "causal_mask_standard": True}
-    if mode == "dynamic":
+    if mode == "dynamic" and not runtime_static_mode():
         if ctx is None:
             hal.reset_events()
             hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)
@@ -395,7 +394,7 @@ def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
             ctx.pos = pos
             ctx.num_tokens = num_tokens
         from runtime.scheduler import EventScheduler
-        return EventScheduler(plan, hal, ctx).run(drain=drain)
+        return EventScheduler(plan, hal, ctx).run()
     if ctx is None:
         hal.reset_events()
         hal.bind_inputs(values or {}, pos=pos, num_tokens=num_tokens)

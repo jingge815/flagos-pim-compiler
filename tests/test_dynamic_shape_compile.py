@@ -95,7 +95,6 @@ def dynamic(small_model):
 def test_dynamic_compile_records_mode_and_single_bucket(dynamic) -> None:
     compiled, _ = dynamic
     assert compiled.compile_mode == "dynamic"
-    assert compiled.dynamic_axes == {"T": (1, MAX_SEQ)}
     assert compiled.prefill_seq_lens == (MAX_SEQ,)
 
 
@@ -165,6 +164,28 @@ def test_static_plan_has_no_shape_expr_payload(baseline) -> None:
             assert "arg_shape_exprs" not in cmd.payload
 
 
+def test_arg_shape_exprs_align_with_payload_positions(dynamic) -> None:
+    """携带表达式的命令：表达式长度等于实参数，非张量位为 None。
+
+    运行期绑定按下标把 arg_shape_exprs 配到 arg_shapes；两组列表若在
+    构建期错位，绑定会把错误表达式的结果写进相邻实参的形状。
+    """
+    compiled, _ = dynamic
+    checked = 0
+    for plan in compiled.prefill_plans[MAX_SEQ]:
+        for cmd in plan.commands:
+            exprs = cmd.payload.get("arg_shape_exprs")
+            if exprs is None:
+                continue
+            checked += 1
+            kinds = cmd.payload["arg_kinds"]
+            shapes = cmd.payload["arg_shapes"]
+            assert len(exprs) == len(shapes) == len(kinds)
+            for kind, entries in zip(kinds, exprs):
+                assert kind == "tensor" or entries is None
+    assert checked > 0, "动态计划应至少有一条携带实参表达式的命令"
+
+
 @pytest.mark.parametrize("prompt_len", [1, 2, 3, 5, 8, 12, MAX_SEQ - MAX_NEW_TOKENS])
 def test_dynamic_tokens_match_static_baseline(prompt_len, baseline, dynamic,
                                               monkeypatch) -> None:
@@ -175,6 +196,81 @@ def test_dynamic_tokens_match_static_baseline(prompt_len, baseline, dynamic,
     prompt = [1 + i for i in range(prompt_len)]
     assert _run(dyn_compiled, dyn_backend, prompt) == _run(
         base_compiled, base_backend, prompt)
+
+
+def test_runtime_mode_static_routes_dynamic_to_static_path(dynamic,
+                                                           monkeypatch) -> None:
+    """PIM_RUNTIME_MODE=static：动态产物改走静态全量提交路径，token 不变。"""
+    import runtime.scheduler as scheduler_mod
+
+    dyn_compiled, dyn_backend = dynamic
+    prompt = [1 + i for i in range(5)]
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    expected = _run(dyn_compiled, dyn_backend, prompt)
+
+    monkeypatch.setenv("PIM_RUNTIME_MODE", "static")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("PIM_RUNTIME_MODE=static 不应实例化事件调度器")
+
+    monkeypatch.setattr(scheduler_mod, "EventScheduler", _forbidden)
+    assert _run(dyn_compiled, dyn_backend, prompt) == expected
+
+
+def test_dynamic_default_keeps_scheduler_without_override(dynamic,
+                                                          monkeypatch) -> None:
+    """不设 PIM_RUNTIME_MODE 时动态行为不变：仍经事件调度器执行。"""
+    import runtime.scheduler as scheduler_mod
+
+    dyn_compiled, dyn_backend = dynamic
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    monkeypatch.delenv("PIM_RUNTIME_MODE", raising=False)
+    real = scheduler_mod.EventScheduler
+    used = []
+
+    def _record(*args, **kwargs):
+        used.append(args[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_mod, "EventScheduler", _record)
+    tokens = _run(dyn_compiled, dyn_backend, [1 + i for i in range(5)])
+    assert tokens, "动态执行应有 token 产出"
+    assert used, "默认动态路径应经事件调度器"
+
+
+def test_capture_shape_exprs_propagates_conversion_errors(monkeypatch) -> None:
+    """符号转换异常必须直接抛出，不得静默退化成包络常量掩盖绑定失效。"""
+    import runtime.compile as compile_mod
+    from torch.export import Dim
+
+    class Cat(torch.nn.Module):
+        def forward(self, x, y):
+            return torch.cat([x, y], dim=1)
+
+    prog = torch.export.export(
+        Cat().eval(), (torch.empty(8, 16), torch.empty(8, 8)), strict=True,
+        dynamic_shapes=({"x": {1: Dim("T", min=1, max=32)},
+                         "y": {1: Dim("T2", min=1, max=32)}}),
+    )
+
+    def _boom(raw, hint, dyn_symbol):
+        raise RuntimeError("conversion sentinel")
+
+    monkeypatch.setattr(compile_mod, "_sympy_to_shape_expr", _boom)
+    with pytest.raises(RuntimeError, match="conversion sentinel"):
+        compile_mod.capture_shape_exprs(prog.module())
+
+
+def test_dynamic_prompt_over_envelope_raises(dynamic, monkeypatch) -> None:
+    """开绑定时 prompt 超过 T_max 包络与静态同防线：带处置建议的 ValueError。"""
+    from runtime.executor import prefill_bucket
+
+    dyn_compiled, dyn_backend = dynamic
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    with pytest.raises(ValueError, match="超过最长 prefill 桶"):
+        prefill_bucket(dyn_compiled, MAX_SEQ + 1)
+    with pytest.raises(ValueError, match="超过最长 prefill 桶"):
+        _run(dyn_compiled, dyn_backend, [1 + i for i in range(MAX_SEQ + 1)])
 
 
 def test_dynamic_without_binding_falls_back_envelope(baseline, dynamic,

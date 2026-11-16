@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -62,9 +62,6 @@ class CompiledModel:
     moe_execution: str = ""
     # 动态图路径：static 走现有静态蓝图；dynamic 由 RuntimeGraph 绑定执行。
     compile_mode: str = "static"
-    runtime_graph: object | None = None
-    dynamic_axes: dict[str, tuple[int, int]] = field(default_factory=dict)
-    kernel_classes: tuple[tuple[int, ...], ...] = ()
 
 
 class PositionalLlama(torch.nn.Module):
@@ -157,10 +154,7 @@ def capture_shape_exprs(gm: GraphModule, dyn_symbol: str = "T") -> None:
             if raw is None:
                 exprs.append(None)
                 continue
-            try:
-                exprs.append(_sympy_to_shape_expr(raw, int(dim), dyn_symbol))
-            except Exception:
-                exprs.append(ShapeExpr.const(int(dim)))
+            exprs.append(_sympy_to_shape_expr(raw, int(dim), dyn_symbol))
         node.meta[SHAPE_EXPR_META_KEY] = tuple(exprs)
         node.meta[VAL_META_KEY] = val.new_empty(tuple(int(d) for d in dims))
     nodes = {node.name: node for node in gm.graph.nodes}
@@ -678,7 +672,6 @@ def compile_llama2(
         decode_plans=_windows(decode.plan),
         moe_execution=moe_execution,
         compile_mode="dynamic" if dynamic else "static",
-        dynamic_axes=( {"T": (1, prefill_seq_len)} if dynamic else {}),
     )
 
 

@@ -69,12 +69,14 @@ def _backend_with_weights(compiled, hardware) -> NumpyBackend:
     return backend
 
 
-def _compile(model, hw, hardware, num_request_slots, kv_slot_tokens=MAX_SEQ):
+def _compile(model, hw, hardware, num_request_slots, kv_slot_tokens=MAX_SEQ,
+             dynamic=False):
     strategy = llama_strategies(NUM_DPUS, **STRATEGY_KWARGS)[0]
     return compile_llama2(
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN,
         max_seq=MAX_SEQ, hw=hw, hardware=hardware,
         num_request_slots=num_request_slots, kv_slot_tokens=kv_slot_tokens,
+        dynamic=dynamic,
     )
 
 
@@ -106,6 +108,34 @@ def test_two_requests_match_individual_runs(small_model, hw_and_hardware) -> Non
         )
         assert generated[request_id] == ref, (
             f"请求 {request_id} 多路生成 {generated[request_id]} 与单独运行 {ref} 不一致")
+
+
+def test_two_requests_wave_match_individual_runs_dynamic(
+        small_model, hw_and_hardware, monkeypatch) -> None:
+    """动态编译 × 多请求 wave：两路并发绑定各自 T，仍与单独运行逐 token 一致。"""
+    monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, NUM_SLOTS, dynamic=True)
+    backend = _backend_with_weights(compiled, hardware)
+    # 两个 prompt 长度不同，同一 wave 的两条泳道并发绑定不同 T。
+    prompts = {"a": PROMPT_A, "b": PROMPT_B[:-1]}
+    table = RequestTable(NUM_SLOTS, compiled.kv_pool_slots)
+    for request_id, prompt in prompts.items():
+        table.add_request(request_id, prompt)
+
+    for _ in range(MAX_NEW_TOKENS):
+        run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+
+    generated = {s.request_id: list(s.generated) for s in table.active_slots()}
+    for request_id, prompt in prompts.items():
+        ref = run_decode_loop(
+            compiled, backend,
+            prompt_ids=torch.tensor(prompt), max_new_tokens=MAX_NEW_TOKENS,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
+        )
+        assert generated[request_id] == ref, (
+            f"请求 {request_id} 动态 wave 生成 {generated[request_id]} "
+            f"与单独运行 {ref} 不一致")
 
 
 def test_freed_slot_can_be_reused(small_model, hw_and_hardware) -> None:

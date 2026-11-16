@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import threading
+import weakref
 
 from contracts.exec_plan import ExecutionPlan
 from runtime.shape_bind import bind_command_shapes, dynamic_shape_enabled
 
-# waits 引用校验按计划身份只做一次；计划常驻 CompiledModel，id 不会复用。
-_VALIDATED: set[int] = set()
+# waits 引用校验按计划身份只做一次。条目以弱引用持有计划：计划被回收后
+# 自动清除，之后同地址的新计划不会被误判为「已校验」而跳过防线。
+_VALIDATED: "weakref.WeakValueDictionary[int, ExecutionPlan]" = (
+    weakref.WeakValueDictionary())
 
 
 def _validate_plan(plan: ExecutionPlan) -> None:
@@ -17,7 +20,7 @@ def _validate_plan(plan: ExecutionPlan) -> None:
                if dep not in ids}
     if unknown:
         raise ValueError(f"计划依赖了不存在的命令：{sorted(unknown)}")
-    _VALIDATED.add(id(plan))
+    _VALIDATED[id(plan)] = plan
 
 
 class EventScheduler:
@@ -37,13 +40,12 @@ class EventScheduler:
         self._thread: threading.Thread | None = None
         _validate_plan(plan)
 
-    def run(self, drain: bool = True) -> dict[int, object]:
-        """启动提交线程；`drain=True` 时等全部命令完成再返回。"""
+    def run(self) -> dict[int, object]:
+        """启动提交线程并等全部命令完成。"""
         self._thread = threading.Thread(
             target=self._loop, name="event-scheduler", daemon=True)
         self._thread.start()
-        if drain:
-            self.wait()
+        self.wait()
         return self.events
 
     def wait(self) -> dict[int, object]:

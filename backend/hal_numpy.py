@@ -177,16 +177,6 @@ class NumpyBackend:
         """返回本次执行使用的事件表：无上下文时用全局表，否则用请求上下文。"""
         return self._events_by_id if ctx is None else ctx.events
 
-    def make_skipped_event(
-        self,
-        cmd: Command,
-        lane_key: int,
-        events: dict[int, Event],
-        ctx: ExecutionContext | None = None,
-    ) -> Event:
-        """给调度器用的跳过事件；语义与 submit 内的同步 gate 分支一致。"""
-        return self._skipped_event(cmd, lane_key, events, ctx)
-
     @property
     def dpu_set(self) -> DpuSet:
         """底层 SDK 集合：通信库（comm/lowering.py）经此与 HAL 共享同一伪硬件。"""
