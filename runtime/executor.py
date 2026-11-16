@@ -12,6 +12,7 @@ import torch
 from backend.hal_numpy import ExecutionContext
 from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import write_block_table
+from runtime.materialize import materialize
 from runtime.shape_bind import dynamic_shape_enabled, runtime_static_mode
 
 
@@ -293,8 +294,12 @@ def prefill_bucket(compiled, n_tokens: int) -> int:
 def _prefill_plan(compiled, seq_len: int, slot_index: int):
     """取第 `seq_len` 桶第 `slot_index` 号窗口的计划。
 
-    动态图只有一张 T_max 图，实际长度不是桶键，落到唯一的计划上。
+    动态图只有一张 T_max 图，实际长度不是桶键，落到唯一的计划上；窗口计划
+    运行期按模板物化（runtime/materialize.py）。
     """
+    template = getattr(compiled, "prefill_window_template", None)
+    if template is not None:
+        return materialize(template, slot_index)
     plans = getattr(compiled, "prefill_plans", None) or {}
     windows = plans.get(seq_len)
     if windows and slot_index < len(windows):
@@ -312,7 +317,13 @@ def _prefill_output_cmd(compiled, seq_len: int) -> int:
 
 
 def _window_plan(compiled, phase: str, slot_index: int):
-    """取某阶段第 `slot_index` 号窗口的计划；手搓蓝图没有窗口表时退回原计划。"""
+    """取某阶段第 `slot_index` 号窗口的计划；手搓蓝图没有窗口表时退回原计划。
+
+    动态路径先查窗口模板：编译产物只有窗口 0，其余窗口运行期物化。
+    """
+    template = getattr(compiled, f"{phase}_window_template", None)
+    if template is not None:
+        return materialize(template, slot_index)
     plans = getattr(compiled, f"{phase}_plans", None)
     if plans:
         return plans[slot_index]

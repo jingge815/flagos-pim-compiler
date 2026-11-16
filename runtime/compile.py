@@ -29,6 +29,7 @@ from runtime.binding import bind_plan
 from runtime.exec_plan_gen import (
     CompiledPlan, build_execution_plan, is_moe_config,
     resolve_moe_execution)
+from runtime.materialize import WindowTemplate, build_window_template
 
 
 @dataclass
@@ -60,8 +61,12 @@ class CompiledModel:
     # MoE 执行语义：dense_sim / dynamic_dispatch；非 MoE 模型为空串。
     # 执行后端未显式配置时按它决定是否执行动态分派。
     moe_execution: str = ""
-    # 动态图路径：static 走现有静态蓝图；dynamic 由 RuntimeGraph 绑定执行。
+    # 动态图路径：static 走现有静态蓝图；dynamic 编译单张符号 T 图，窗口
+    # 计划运行期按模板物化（runtime/materialize.py）。
     compile_mode: str = "static"
+    # 动态路径的窗口 0 模板：静态路径为 None，执行器退回上面的窗口表。
+    prefill_window_template: WindowTemplate | None = None
+    decode_window_template: WindowTemplate | None = None
 
 
 class PositionalLlama(torch.nn.Module):
@@ -402,6 +407,7 @@ def compile_llama2(
     graph_tiling: bool | None = None,
     moe_execution: str | None = None,
     dynamic: bool = False,
+    act_pool_slots: int | None = None,
 ) -> CompiledModel:
     """编译 Llama 的 decode 图与一组按长度分桶的 prefill 图。
 
@@ -421,8 +427,11 @@ def compile_llama2(
     缺省跟随 `PIM_MOE_DISPATCH`。这一份值随 CompiledModel 交给放置导出与
     仿真配置，主链各入口不再各自读环境变量或写死。
 
-    `dynamic=True` 预留给动态图路径；D0 只提供接口，真正的调度/形状绑定在
-    D1/D2 实现，未实现前显式报错，避免静默退回静态行为。
+    `dynamic=True` 编译单张符号 T 的 prefill 图，运行期把实际长度绑进形状
+    （runtime/shape_bind.py）。激活区与块表按窗口池深规划（`act_pool_slots`，
+    默认 8，`PIM_ACT_POOL_SLOTS` 可覆盖，MRAM 放不下自动收缩），编译产物只留
+    窗口 0 模板，其余窗口运行期物化（runtime/materialize.py）；并发宽度默认
+    min(4, 池深, num_request_slots)。静态路径不受这些参数影响，行为不变。
     """
     if dynamic and prefill_seq_lens:
         raise ValueError(
@@ -518,11 +527,28 @@ def compile_llama2(
     parallel_slots = min(num_parallel_slots or 2, num_request_slots)
     auto_parallel = num_parallel_slots is None
     auto_block_table = block_table_slots is None
+    # 动态路径多一层窗口池：激活区/块表按池深规划地址，运行期并发宽度另行
+    # 取值；静态路径两者同一个数，行为不变。
+    window_pool = parallel_slots
+    auto_pool = False
+    if act_pool_slots is not None and not dynamic:
+        raise ValueError("act_pool_slots 只在 dynamic=True 的动态路径生效")
+    if dynamic:
+        if act_pool_slots is not None:
+            if act_pool_slots < 1:
+                raise ValueError(f"act_pool_slots={act_pool_slots} 必须为正")
+            window_pool = act_pool_slots
+        else:
+            env_pool = os.environ.get("PIM_ACT_POOL_SLOTS")
+            window_pool = int(env_pool) if env_pool else 8
+            auto_pool = True
+        parallel_slots = min(num_parallel_slots or 4, window_pool, num_request_slots)
     if auto_block_table:
-        block_table_slots = parallel_slots
-    if block_table_slots < parallel_slots:
+        block_table_slots = window_pool if dynamic else parallel_slots
+    if block_table_slots < (window_pool if dynamic else parallel_slots):
         raise ValueError(
-            f"block_table_slots={block_table_slots} 小于并行窗口数 {parallel_slots}")
+            f"block_table_slots={block_table_slots} 小于并行窗口数 "
+            f"{window_pool if dynamic else parallel_slots}")
 
     def _plan(nodes, pool_slots, bt_slots):
         return {
@@ -537,16 +563,25 @@ def compile_llama2(
     def _max_slots(plans):
         return fit_pool_slots(
             plans, kv_specs, hw, kernel_mram_bytes=kernel_mram,
-            act_slots=parallel_slots, block_table_slots=block_table_slots)
+            act_slots=window_pool, block_table_slots=block_table_slots)
 
     # 自动定容：先用最小槽池探一次几何，再按剩余 MRAM 收窗口数、定槽数。
     # 槽池与窗口都不改变权重占用，所以探测得到的蓝图就能反推容量。
-    if kv_pool_slots is None or auto_parallel:
+    # 动态路径容量由窗口池深决定（宽度不占额外激活区），只收池深。
+    if kv_pool_slots is None or auto_parallel or auto_pool:
         probe = _plan(prefill_nodes_of[prefill_seq_len],
                       blocks_per_request, block_table_slots)
-        if auto_parallel:
-            while parallel_slots > 1 and _max_slots(probe) < blocks_per_request:
-                parallel_slots -= 1
+        if auto_pool:
+            while window_pool > 1 and _max_slots(probe) < blocks_per_request:
+                window_pool -= 1
+                if auto_block_table:
+                    block_table_slots = window_pool
+            parallel_slots = min(parallel_slots, window_pool)
+        if auto_parallel and not dynamic:
+            # 静态路径窗口数=池深，收缩时两者同步减。
+            while window_pool > 1 and _max_slots(probe) < blocks_per_request:
+                window_pool -= 1
+                parallel_slots = window_pool
                 if auto_block_table:
                     block_table_slots = parallel_slots
         if kv_pool_slots is None:
@@ -557,7 +592,7 @@ def compile_llama2(
                 raise ValueError(
                     f"MRAM 装不下一个满长请求：需要 {blocks_per_request} 个 KV 槽"
                     f"再加一块空位，按当前权重、块表 ×{block_table_slots}、激活窗口 "
-                    f"×{parallel_slots} 只能放 {kv_pool_slots} 个；"
+                    f"×{window_pool} 只能放 {kv_pool_slots} 个；"
                     f"调小 max_model_len、num_request_slots 或 PIM_MRAM_BYTES 不够"
                     f"时调大 PIM_MRAM_BYTES")
 
@@ -572,7 +607,7 @@ def compile_llama2(
             if plan.weight != base.weight or plan.kv_base != base.kv_base:
                 raise ValueError(
                     f"prefill 桶 {seq_len} 的权重/KV 布局与最长桶不一致（dpu{dpu_id}）")
-    act_stride = fit_activation_windows(mem_plans, parallel_slots, hw, kernel_mram)
+    act_stride = fit_activation_windows(mem_plans, window_pool, hw, kernel_mram)
 
     bt_bytes = {spec.block_table_bytes for spec in kv_specs.values()}
     if len(bt_bytes) != 1:
@@ -609,9 +644,12 @@ def compile_llama2(
 
     # 每个窗口一份计划：0 号就是原计划（零拷贝），其余把激活地址和块表基址平移到
     # 自己的窗口。所有图共用同一份激活布局，所以窗口步长完全一致。
+    # 动态路径例外：编译期只留窗口 0 模板，其余窗口运行期物化。
     act_base_by_dpu = {dpu_id: plan.act_base for dpu_id, plan in mem_plans.items()}
 
     def _windows(plan):
+        if dynamic:
+            return [plan]
         return [
             bind_plan(plan, act_base_by_dpu=act_base_by_dpu,
                       act_shift=k * act_stride, block_slot=k,
@@ -647,6 +685,20 @@ def compile_llama2(
         hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
     )
 
+    # 动态路径：把窗口 0 计划连同激活区访问的 RegionRef 符号表存成模板，
+    # 其余窗口由执行器按窗口号现算（runtime/materialize.py）。
+    prefill_window_template = None
+    decode_window_template = None
+    if dynamic:
+        prefill_window_template = build_window_template(
+            prefill_plans[prefill_seq_len][0],
+            act_base_by_dpu=act_base_by_dpu, act_stride=act_stride,
+            bt_stride=block_table_bytes, pool=window_pool)
+        decode_window_template = build_window_template(
+            decode.plan, act_base_by_dpu=act_base_by_dpu,
+            act_stride=act_stride, bt_stride=block_table_bytes,
+            pool=window_pool)
+
     return CompiledModel(
         strategy=strategy,
         prefill_gm=prefill_gms[prefill_seq_len],
@@ -672,6 +724,8 @@ def compile_llama2(
         decode_plans=_windows(decode.plan),
         moe_execution=moe_execution,
         compile_mode="dynamic" if dynamic else "static",
+        prefill_window_template=prefill_window_template,
+        decode_window_template=decode_window_template,
     )
 
 

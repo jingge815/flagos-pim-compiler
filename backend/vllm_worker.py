@@ -156,6 +156,11 @@ class PIMWorker(WorkerBase):
         # 默认取 2 个窗口，放不下就减到 1。
         raw_parallel = os.environ.get("PIM_PARALLEL_SLOTS")
         self.num_parallel_slots: int | None = int(raw_parallel) if raw_parallel else None
+        # 动态图编译：PIM_DYN_SHAPE=1 走单张符号 T 图 + 运行期窗口物化；
+        # PIM_ACT_POOL_SLOTS 覆盖激活窗口池深（默认 8）。
+        self.dynamic_compile = bool(os.environ.get("PIM_DYN_SHAPE"))
+        raw_pool = os.environ.get("PIM_ACT_POOL_SLOTS")
+        self.act_pool_slots = int(raw_pool) if raw_pool else None
         self.kv_slot_tokens = int(self.cache_config.block_size)
         self.max_seq = int(self.model_config.max_model_len)
         # prefill 图按长度分桶：prompt 右侧补齐到最小的能放下它的桶。
@@ -249,7 +254,9 @@ class PIMWorker(WorkerBase):
             kv_slot_tokens=self.kv_slot_tokens,
             kv_pool_slots=self.kv_pool_slots,
             num_parallel_slots=self.num_parallel_slots,
-            prefill_seq_lens=self.prefill_seq_lens,
+            prefill_seq_lens=() if self.dynamic_compile else self.prefill_seq_lens,
+            dynamic=self.dynamic_compile,
+            act_pool_slots=self.act_pool_slots,
         )
         # 自动定容的结果以编译产物为准：vLLM 的块数与窗口数都由它决定。
         self.kv_pool_slots = self.compiled.kv_pool_slots
