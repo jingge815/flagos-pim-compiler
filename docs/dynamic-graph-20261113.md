@@ -127,3 +127,5 @@
 - 测试：scheduler/dynamic/binding/parallel 25 项 + exec_plan/moe_dispatch/prefill_buckets/comm/compat 113 项全绿；全量回归见下。
 
 decode 两路本就执行同一份 decode 计划（`_window_plan` 不分 mode），动态路径的 decode 开销即调度器本身；本轮修完后 dynamic decode ≈ static decode + 线程切换（毫秒级）。prefill 侧动态图一张 T_max 图 + 去填充，不劣于静态桶。剩余 ~2% 差值主要在 prefill 的形状绑定与未绑定命令的包络执行，属 numpy 镜像本底，不再单列工作项。
+
+多请求并发验收（Go/No-Go 最后一条，4L 双请求 × 2 并行窗口，同轮独占）：static run 144.64s / dynamic_bind 135.10s = **93.4%**，动态更快——静态路两请求 prefill 都补 pad 到桶 8，动态按实际长度建输入；两请求 tokens 两臂逐位一致（r0 与单请求参考串前缀吻合）。至此首期（D0–D2-full）验收全部达成：单请求 102.3%、多请求 93.4%、token 单/双请求逐位一致、全量回归 2308 passed。全量回归本轮耗时 2:08:18（上轮 1423s），机器有其他负载，只取正确性结论。
