@@ -516,6 +516,16 @@ def compile_llama2(
     prefill_nodes_of = {
         seq_len: list(gm.graph.nodes) for seq_len, gm in prefill_gms.items()}
     decode_nodes = list(decode_gm.graph.nodes)
+    # exact_dispatch：每张导出图各分析一次 MoE 拓扑（节点名随桶不同），
+    # 内存规划按它预留路由/紧凑/累加缓冲。
+    moe_topo_prefill: dict = {}
+    moe_topo_decode: dict = {}
+    if moe_execution == "exact_dispatch":
+        from graph.moe_exact import moe_exact_topology
+        moe_topo_prefill = {
+            seq_len: moe_exact_topology(nodes)
+            for seq_len, nodes in prefill_nodes_of.items()}
+        moe_topo_decode = moe_exact_topology(decode_nodes)
     # 内核 tile 占的是与三区同一块 MRAM，所以容量判据要把两者相加。那份占用只有
     # 算子编译器知道（它定分块），这里问它回传；工具链不在位时退回 0，判据只看
     # 三区，与改动前逐字节等价。多桶取峰值，不是求和。
@@ -550,13 +560,15 @@ def compile_llama2(
             f"block_table_slots={block_table_slots} 小于并行窗口数 "
             f"{window_pool if dynamic else parallel_slots}")
 
-    def _plan(nodes, pool_slots, bt_slots):
+    def _plan(nodes, pool_slots, bt_slots, moe_topo_p=None):
         return {
             dpu_id: plan_dpu(dpu_id, nodes, decode_nodes, kv_specs, hw,
                              kernel_mram_bytes=kernel_mram,
                              kv_pool_slots=pool_slots,
                              act_slots=1,
-                             block_table_slots=bt_slots)
+                             block_table_slots=bt_slots,
+                             moe_prefill_topology=moe_topo_p,
+                             moe_decode_topology=moe_topo_decode)
             for dpu_id in strategy.dpu_ids
         }
 
@@ -570,7 +582,8 @@ def compile_llama2(
     # 动态路径容量由窗口池深决定（宽度不占额外激活区），只收池深。
     if kv_pool_slots is None or auto_parallel or auto_pool:
         probe = _plan(prefill_nodes_of[prefill_seq_len],
-                      blocks_per_request, block_table_slots)
+                      blocks_per_request, block_table_slots,
+                      moe_topo_prefill.get(prefill_seq_len))
         if auto_pool:
             while window_pool > 1 and _max_slots(probe) < blocks_per_request:
                 window_pool -= 1
@@ -597,7 +610,8 @@ def compile_llama2(
                     f"时调大 PIM_MRAM_BYTES")
 
     mem_plans_of = {
-        seq_len: _plan(nodes, kv_pool_slots, block_table_slots)
+        seq_len: _plan(nodes, kv_pool_slots, block_table_slots,
+                       moe_topo_prefill.get(seq_len))
         for seq_len, nodes in prefill_nodes_of.items()}
     mem_plans = mem_plans_of[prefill_seq_len]
     # 权重区和 KV 区只按一遍算，短桶必须落在同一组地址上，否则窗口平移失效。
@@ -669,6 +683,10 @@ def compile_llama2(
         compiled_plan = build_execution_plan(
             prefill_nodes_of[seq_len], prefill_gms[seq_len], entries, pending,
             hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gms[seq_len]),
+            moe_execution=moe_execution,
+            moe_buffers=({d: p.moe_prefill
+                          for d, p in mem_plans_of[seq_len].items()}
+                         if moe_execution == "exact_dispatch" else None),
         )
         prefill_plans[seq_len] = _windows(compiled_plan.plan)
         prefill_cmd_ids[seq_len] = compiled_plan.output_cmd_id
@@ -683,6 +701,9 @@ def compile_llama2(
     decode = build_execution_plan(
         decode_nodes, decode_gm, decode_entries, pending_decode,
         hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
+        moe_execution=moe_execution,
+        moe_buffers=({d: p.moe_decode for d, p in mem_plans.items()}
+                     if moe_execution == "exact_dispatch" else None),
     )
 
     # 动态路径：把窗口 0 计划连同激活区访问的 RegionRef 符号表存成模板，

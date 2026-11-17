@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from math import prod
 from typing import Callable
 
 import numpy as np
@@ -12,17 +13,19 @@ from torch.fx import Node
 from torch.fx.node import map_aggregate, map_arg
 
 from comm.lowering import DmaEngine, all_gather, all_reduce, all_to_all, scatter
-from comm.plan import CommPlanEntry
+from comm.plan import CommPlanEntry, CommSegment
 from contracts.dtypes import dtype_bytes
 from contracts.exec_plan import Access, Command, ExecutionPlan
 from contracts.graph_meta import (
     DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, FUSED_TAIL_META_KEY,
     REDISTRIBUTE_META_KEY, SPEC_META_KEY)
 from contracts.op_contract import DpuShard, PIMHardwareConfig
-from contracts.op_semantics import RMS_NORM_KERNEL
+from contracts.op_semantics import (
+    GATHER_ROWS_KERNEL, RMS_NORM_KERNEL, SCATTER_ADD_KERNEL)
 from contracts.unified_ir import (
     ABSORBED_META_KEY, ARG_EXPR_META_KEY, RMS_NORM_META_KEY,
     SHAPE_EXPR_META_KEY)
+from graph.moe_exact import MoELayerTopology, moe_exact_topology
 from graph.spec_prop import _layer_of_node
 from runtime.dependency import (
     deps_of as _deps_of,
@@ -32,14 +35,16 @@ from runtime.dependency import (
 )
 from runtime.shape_bind import dynamic_shape_enabled
 
-# MoE 执行语义。图编译器与 GeneSim 共用这两个取值；默认跟随 PIM_MOE_DISPATCH。
-MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch")
+# MoE 执行语义。图编译器与 GeneSim 共用这些取值；默认跟随 PIM_MOE_DISPATCH。
+MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch", "exact_dispatch")
 
 
 def moe_execution_default() -> str:
-    """编译配置的默认执行语义：PIM_MOE_DISPATCH=0 退回稠密模拟。"""
-    return "dense_sim" if os.environ.get("PIM_MOE_DISPATCH", "1") == "0" \
-        else "dynamic_dispatch"
+    """编译配置的默认执行语义：PIM_MOE_DISPATCH=0 稠密模拟、2|exact 精确行数。"""
+    raw = os.environ.get("PIM_MOE_DISPATCH", "1")
+    if raw in ("2", "exact"):
+        return "exact_dispatch"
+    return "dense_sim" if raw == "0" else "dynamic_dispatch"
 
 
 def is_moe_config(cfg) -> bool:
@@ -194,6 +199,197 @@ def _emit_moe_dispatch(builder, layer: int, route_cmd_id: int) -> int:
     return builder.append(
         "host_op", None, {"node": f"moe_dispatch_{layer}", "fn": fn},
         [], [], [route_cmd_id]).id
+
+
+# exact_dispatch 的合成边号：负数与真实通信边永不冲突，只进 payload 备查。
+_SYNTH_EDGE = iter(range(-1, -10**6, -1))
+
+
+def _emit_moe_exact_dispatch(
+    builder: _PlanBuilder, topo: MoELayerTopology,
+    mask_cmd_id: int, routing_cmd_id: int,
+    buffers_by_dpu: dict, xs_access_of: dict,
+    num_tasklets: int = 4,
+) -> int:
+    """exact_dispatch 的 dispatch v2：算每专家 k_e/idx/w 写设备路由表。
+
+    主机读两个 scatter 的结果（选中掩码 + 路由权重），每专家按 token 升序
+    收集行号与 fp16 权重列，写进各 DPU 预规划的路由表段；同一命令顺带清零
+    acc——三者的写 Access 都烘在 cmd.writes 里，窗口平移由 bind_plan 统一
+    处理。行数进 `hal.moe_rows`，零命中专家进 `gate_skips`。之后按专家发
+    gather_rows。行级命令带 (gate, expert) 标签：零命中专家整支不提交，与
+    dense 的门控跳过同一套机制。
+    """
+    dpus = sorted(buffers_by_dpu)
+    experts = sorted(int(e) for e in topo.down_outs)
+    writes: list[Access] = []
+    for dpu_id in dpus:
+        bufs = buffers_by_dpu[dpu_id]
+        writes.append(Access(("dpu", dpu_id),
+                             bufs[f"moe:idx:{topo.layer}"].offset,
+                             bufs[f"moe:idx:{topo.layer}"].nbytes))
+        writes.append(Access(("dpu", dpu_id),
+                             bufs[f"moe:w:{topo.layer}"].offset,
+                             bufs[f"moe:w:{topo.layer}"].nbytes))
+    for dpu_id in dpus:
+        acc = buffers_by_dpu[dpu_id][f"moe:acc:{topo.layer}"]
+        writes.append(Access(("dpu", dpu_id), acc.offset, acc.nbytes))
+    t_rows = buffers_by_dpu[dpus[0]][f"moe:idx:{topo.layer}"].shape[1]
+    acc_shape = buffers_by_dpu[dpus[0]][f"moe:acc:{topo.layer}"].shape
+
+    def fn(hal, cmd):
+        mask = hal.result_of(mask_cmd_id)
+        routing = hal.result_of(routing_cmd_id)
+        lane = hal.current_lane_key()
+        skips: set[int] = set()
+        idx_bytes = t_rows * dtype_bytes("int64")
+        w_bytes = t_rows * dtype_bytes("float16")
+        for expert in experts:
+            rows = mask[:, expert].nonzero(as_tuple=True)[0]
+            k_e = int(rows.numel())
+            if k_e:
+                # 写该专家的表段：写 Access 是整张表，段内偏移在这里加。
+                w_col = routing[rows, expert].to(torch.float16).numpy()
+                for dpu_index, dpu_id in enumerate(dpus):
+                    hal.write_local(
+                        dpu_id,
+                        cmd.writes[2 * dpu_index].offset + expert * idx_bytes,
+                        rows.numpy())
+                    hal.write_local(
+                        dpu_id,
+                        cmd.writes[2 * dpu_index + 1].offset + expert * w_bytes,
+                        w_col)
+            hal.moe_rows[(lane, cmd.id, expert)] = k_e
+            if k_e == 0:
+                skips.add(expert)
+        hal.gate_skips[(lane, cmd.id)] = skips
+        # 累加器每步清零：scatter_add 是读改写，起点必须是零。写 Access
+        # 已烘进 cmd.writes，窗口平移由 bind_plan 统一处理。
+        zero = np.zeros(prod(acc_shape), np.float16)
+        for dpu_index, dpu_id in enumerate(dpus):
+            hal.write_local(dpu_id, cmd.writes[2 * len(dpus) + dpu_index].offset,
+                            zero)
+
+    waits = [mask_cmd_id, routing_cmd_id]
+    for access in writes:
+        waits += _war_waits(access.loc, access.offset,
+                            builder.pending_readers, builder.reader_cmds)
+    dispatch = builder.append(
+        "host_op", None, {"node": f"moe_dispatch_{topo.layer}", "fn": fn},
+        [], writes, waits).id
+    for dpu_id in dpus:
+        bufs = buffers_by_dpu[dpu_id]
+        for expert in experts:
+            compact = bufs[f"moe:compact:{topo.layer}:{expert}"]
+            idx = bufs[f"moe:idx:{topo.layer}"]
+            reads = [
+                xs_access_of[dpu_id],
+                Access(("dpu", dpu_id),
+                       idx.offset + expert * t_rows * dtype_bytes("int64"),
+                       t_rows * dtype_bytes("int64")),
+            ]
+            write = Access(("dpu", dpu_id), compact.offset, compact.nbytes)
+            cmd = builder.append(
+                "launch", dpu_id,
+                {"kernel": GATHER_ROWS_KERNEL,
+                 "node": f"moe:gather:{topo.layer}:{expert}",
+                 "arg_kinds": ["tensor", "tensor"],
+                 "arg_shapes": [tuple(compact.shape), (t_rows,)],
+                 "arg_dtypes": ["float16", "int64"],
+                 "dtype": "float16", "out_shape": tuple(compact.shape),
+                 "gate": dispatch, "expert": expert},
+                reads, [write],
+                _deps_of(reads, builder.writers)
+                + _war_waits(write.loc, write.offset,
+                             builder.pending_readers, builder.reader_cmds)
+                + [dispatch],
+                num_tasklets=num_tasklets)
+            builder.register_reader(f"moe:gather:{topo.layer}:{expert}",
+                                    dpu_id, cmd.id)
+    return dispatch
+
+
+def _emit_moe_scatter_add(
+    builder: _PlanBuilder, topo: MoELayerTopology, expert: int, dpu_id: int,
+    buffers: dict, out_access: Access, out_shape: tuple, dispatch_id: int,
+    num_tasklets: int = 4,
+) -> None:
+    """专家输出的加权散写：`acc[idx[i]] += w[i]*out[i]`，i < k_e。
+
+    读 acc + down_proj 本台分片 + 该专家的权重/索引段，写回 acc。同一 DPU
+    的多条 scatter 按 `_deps_of` 生成的 WAW waits 链串行（发射序 = 专家号
+    升序），每 token 的加法序与 dense where 路径的升序累加一致。
+    """
+    acc = buffers[f"moe:acc:{topo.layer}"]
+    w = buffers[f"moe:w:{topo.layer}"]
+    idx = buffers[f"moe:idx:{topo.layer}"]
+    t_rows = acc.shape[0]
+    reads = [
+        Access(("dpu", dpu_id), acc.offset, acc.nbytes),
+        out_access,
+        Access(("dpu", dpu_id), w.offset + expert * t_rows * dtype_bytes("float16"),
+               t_rows * dtype_bytes("float16")),
+        Access(("dpu", dpu_id), idx.offset + expert * t_rows * dtype_bytes("int64"),
+               t_rows * dtype_bytes("int64")),
+    ]
+    write = Access(("dpu", dpu_id), acc.offset, acc.nbytes)
+    cmd = builder.append(
+        "launch", dpu_id,
+        {"kernel": SCATTER_ADD_KERNEL,
+         "node": f"moe:scatter:{topo.layer}:{expert}",
+         "arg_kinds": ["tensor"] * 4,
+         "arg_shapes": [tuple(acc.shape), tuple(out_shape), (t_rows,), (t_rows,)],
+         "arg_dtypes": ["float16", "float16", "float16", "int64"],
+         "dtype": "float16", "out_shape": tuple(acc.shape),
+         "gate": dispatch_id, "expert": expert},
+        reads, [write],
+        _deps_of(reads, builder.writers)
+        + _war_waits(write.loc, write.offset,
+                     builder.pending_readers, builder.reader_cmds)
+        + [dispatch_id],
+        num_tasklets=num_tasklets)
+    builder.register_reader(f"moe:scatter:{topo.layer}:{expert}", dpu_id, cmd.id)
+
+
+def _emit_moe_acc_reduce(
+    builder: _PlanBuilder, topo: MoELayerTopology, buffers_by_dpu: dict,
+) -> None:
+    """专家升序散写完成后，把 acc 的各 DPU 部分和归约写回落地缓冲。
+
+    复用 dense 专家分片同一条 all_reduce 原语（fp16 累加），数值口径一致；
+    出口投影节点（如 acc 的 view）改读落地缓冲，下游图照常。
+    """
+    dpus = sorted(buffers_by_dpu)
+    acc0 = buffers_by_dpu[dpus[0]][f"moe:acc:{topo.layer}"]
+    numel = prod(acc0.shape)
+    edge_id = next(_SYNTH_EDGE)
+    entry = CommPlanEntry(
+        edge_id=edge_id, type="all_reduce", reduce="sum",
+        shape=tuple(acc0.shape), dtype=np.dtype("float16"),
+        dst_loc={"device": DEVICE_DPU, "dpus": dpus},
+        wait_for=(),
+        segments=[
+            CommSegment(
+                edge_id=edge_id, type="all_reduce", src_dpu=dpu_id,
+                src_local_range=(0, numel), global_range=(0, numel),
+                dst_dpu=dpu_id, dst_local_offset=0, nbytes=acc0.nbytes,
+                reduce="sum",
+                src_addr=buffers_by_dpu[dpu_id][f"moe:acc:{topo.layer}"].offset,
+                dst_addr=buffers_by_dpu[dpu_id][f"moe:acc_land:{topo.layer}"].offset)
+            for dpu_id in dpus])
+    reads = [Access(("dpu", d), entry.segments[i].src_addr, acc0.nbytes)
+             for i, d in enumerate(dpus)]
+    writes = [Access(("dpu", d), entry.segments[i].dst_addr, acc0.nbytes)
+              for i, d in enumerate(dpus)]
+    cmd = builder.append(
+        "host_reduce", None,
+        {"node": f"moe:reduce:{topo.layer}", "fn": lambda hal, c:
+         all_reduce(entry, _dma_engine(hal, c)), "edge_id": edge_id},
+        reads, writes, _deps_of(reads, builder.writers))
+    builder.register_reader(f"moe:reduce:{topo.layer}", None, cmd.id)
+    for access in reads + writes:
+        builder.register_reader(f"moe:reduce:{topo.layer}",
+                                access.loc[1], cmd.id)
 
 def _skip_zero_nodes(nodes: list[Node], provenance: dict[str, object]) -> set[str]:
     """哪些专家节点的输出会被专家子图之外、不会一起跳过的命令读到。
@@ -642,8 +838,15 @@ def build_execution_plan(
     sdpa_info_of: "Callable[[Node], dict | None] | None" = None,
     num_tasklets: int = 4,
     placed_elem_bytes=None,
+    moe_execution: str = "dense_sim",
+    moe_buffers: dict | None = None,
 ) -> CompiledPlan:
-    """从图、通信计划和内存依赖构建按拓扑顺序执行的命令计划。"""
+    """从图、通信计划和内存依赖构建按拓扑顺序执行的命令计划。
+
+    `moe_execution="exact_dispatch"` 时走精确行数发射：按 `moe_exact_topology`
+    抑制 dense 尾链，专家链改读紧凑缓冲，行级命令按 `moe_buffers`（plan_dpu
+    预规划的 MoE 路由缓冲）定地址；dense/dynamic 两模式不碰这些参数。
+    """
     if hardware.num_tasklets != num_tasklets:
         raise ValueError(
             f"hardware.num_tasklets ({hardware.num_tasklets}) must match num_tasklets ({num_tasklets})"
@@ -656,6 +859,38 @@ def build_execution_plan(
     dispatch_by_layer: dict[int, int] = {}
     # 每个节点的唯一专家归属，供整条专家子图（含分块/通信）统一打标。
     provenance = _expert_provenance(nodes)
+    # exact_dispatch：拓扑分析产物——抑制集、链上 xs 读者重定向、出口落地
+    # 重定向、down_proj 输出定位、路由 scatter 定位。
+    exact = moe_execution == "exact_dispatch"
+    exact_topo: dict[int, MoELayerTopology] = {}
+    exact_suppress: set[str] = set()
+    chain_redirect: dict[str, tuple[int, int]] = {}
+    acc_land_of: dict[str, int] = {}
+    down_out_of: dict[str, tuple[int, int]] = {}
+    routing_layers: dict[str, int] = {}
+    xs_access_by_layer: dict[int, dict] = {}
+    if exact:
+        if moe_buffers is None:
+            raise ValueError(
+                "exact_dispatch 需要 moe_buffers（plan_dpu 预规划的 MoE 路由缓冲）")
+        exact_topo = moe_exact_topology(nodes)
+        for topo in exact_topo.values():
+            exact_suppress |= topo.tail
+            routing_layers[topo.routing_scatter] = topo.layer
+            for expert, readers in topo.xs_readers.items():
+                for name in readers:
+                    chain_redirect[name] = (topo.layer, expert)
+            for expert, name in topo.down_outs.items():
+                down_out_of[name] = (topo.layer, expert)
+            for exit_name in topo.exits:
+                for arg in _flatten_node_args(by_name[exit_name].args):
+                    if isinstance(arg, Node) and arg.name in topo.tail:
+                        acc_land_of[arg.name] = topo.layer
+            xs_node = by_name[topo.xs]
+            width = _placed_width(xs_node, placed_elem_bytes)
+            xs_access_by_layer[topo.layer] = {
+                dpu_id: _node_access(xs_node, dpu_id, width)
+                for dpu_id in xs_node.meta[SPEC_META_KEY].shard_map}
     # 只有输出会跨出专家子图的命令才需要在跳过时写零；子图内部的读者会
     # 一起被跳过，给每条命令都清零只是把省下的调度成本又花了回去。
     skip_zero_nodes = _skip_zero_nodes(nodes, provenance)
@@ -665,6 +900,10 @@ def build_execution_plan(
         if node.op != "output" and node.meta.get("val") is None:
             # 无张量输出的节点不生成命令。
             continue
+        # exact：尾链节点（where 闭包、融合累加）整支退役——数值由行级
+        # scatter + acc 归约替代，消费者和它们的 redistribute 边一起作废。
+        if node.name in exact_suppress:
+            continue
 
         # 处理节点输入的重分布。同一条边挂在每个消费者上（spec_prop 去重），
         # 命令只发一次：重复发会在后面的消费者处重读源分片，而源缓冲彼时
@@ -673,6 +912,8 @@ def build_execution_plan(
             if edge.edge_id in emitted_edges:
                 continue
             emitted_edges.add(edge.edge_id)
+            if edge.src in exact_suppress:
+                continue
             _emit_redistribute(
                 builder, edge, comm_entries[edge.edge_id], by_name[edge.src],
                 dispatch_by_layer, provenance)
@@ -713,8 +954,26 @@ def build_execution_plan(
                 flat_args = ([fusion.eaten[0].args[0], fusion.weight_node]
                              if fusion is not None else _flatten_node_args(node.args))
                 reads: list[Access] = []
+                # exact：本节点在专家链上时，xs 实参改读该专家的紧凑缓冲
+                # （gather 写的，行数 = k_e）；形状与 xs 相同，payload 不变。
+                redirect = chain_redirect.get(node.name) if exact else None
                 for arg in flat_args:
                     if not isinstance(arg, Node):
+                        continue
+                    if (redirect is not None
+                            and arg.name == exact_topo[redirect[0]].xs):
+                        compact = moe_buffers[dpu_id][
+                            f"moe:compact:{redirect[0]}:{redirect[1]}"]
+                        reads.append(Access(
+                            ("dpu", dpu_id), compact.offset, compact.nbytes))
+                        continue
+                    if exact and arg.name in acc_land_of:
+                        # 出口投影读尾链主机节点的，改读 acc 落地缓冲
+                        # （归约写回的完整 (T, h)）。
+                        land = moe_buffers[dpu_id][
+                            f"moe:acc_land:{acc_land_of[arg.name]}"]
+                        reads.append(Access(
+                            ("dpu", dpu_id), land.offset, land.nbytes))
                         continue
                     if arg.name in landing_by_src and dpu_id in landing_by_src[arg.name].dst_loc.get("dpus", []):
                         # 有落地边时读落地规格，`cat` 也一样：部分和归约后的值在
@@ -870,6 +1129,19 @@ def build_execution_plan(
                 )
                 # 登记本节点为输入地址读者。
                 builder.register_reader(node.name, dpu_id, cmd.id)
+                # exact：down_proj 输出落地即加权散写进 acc；本层最后一个
+                # 专家收尾时发 acc 跨 DPU 归约，写回落地缓冲供出口投影读。
+                down = down_out_of.get(node.name)
+                if down is not None:
+                    _emit_moe_scatter_add(
+                        builder, exact_topo[down[0]], down[1], dpu_id,
+                        moe_buffers[dpu_id], write,
+                        tuple(spec.shard_map[dpu_id].local_shape),
+                        dispatch_by_layer[down[0]], num_tasklets=num_tasklets)
+            if node.name in down_out_of:
+                layer, expert = down_out_of[node.name]
+                if expert == max(exact_topo[layer].down_outs):
+                    _emit_moe_acc_reduce(builder, exact_topo[layer], moe_buffers)
             continue
 
         # 生成主机计算命令。
@@ -880,12 +1152,22 @@ def build_execution_plan(
         # 再发一个 dispatch 覆盖同一层的门控。
         # dtype 从统一 IR 的 spec 读（`meta["val"]` 的 dtype 只允许在
         # spec_prop 里进入 IR）；掩码 scatter 是唯一的布尔 scatter。
+        # exact：布尔 scatter 不再触发 dense dispatch，改由下面的路由
+        # 权重 scatter 触发 dispatch v2。
         spec = node.meta.get(SPEC_META_KEY)
         if (node.target in (torch.ops.aten.scatter.src,
                             torch.ops.aten.scatter.value)
                 and spec is not None and spec.dtype == "bool"):
             layer = _moe_layer_of(node, "mlp.gate.weight")
-            if layer is not None:
+            if layer is not None and not exact:
                 dispatch_by_layer[layer] = _emit_moe_dispatch(builder, layer, cmd.id)
+        elif exact and node.name in routing_layers:
+            topo = exact_topo[routing_layers[node.name]]
+            dispatch_by_layer[topo.layer] = _emit_moe_exact_dispatch(
+                builder, topo,
+                mask_cmd_id=builder.host_value_of[topo.mask_scatter],
+                routing_cmd_id=cmd.id, buffers_by_dpu=moe_buffers,
+                xs_access_of=xs_access_by_layer[topo.layer],
+                num_tasklets=num_tasklets)
 
     return CompiledPlan(plan=ExecutionPlan(commands=builder.commands), output_cmd_id=output_cmd_id)

@@ -84,6 +84,23 @@ class DPUPlan:
     pending_readers_decode: dict[tuple, list[str]]
     act_extent: int = 0                  # 单个请求窗口实际用到的激活字节数
     act_stride: int = 0                  # 相邻请求窗口的步长（对齐后）
+    # exact_dispatch 的 MoE 路由缓冲（idx/w 表、紧凑专家输入、acc 及其落地）。
+    # 只在 exact 模式非空；地址在激活窗口内，随窗口平移。
+    moe_prefill: dict = field(default_factory=dict)   # 名 -> MoEBuffer
+    moe_decode: dict = field(default_factory=dict)    # 名 -> MoEBuffer
+
+
+@dataclass(frozen=True)
+class MoEBuffer:
+    """exact_dispatch 单块 MoE 路由缓冲的地址与形状（fp16 激活区一段）。"""
+
+    offset: int
+    shape: tuple[int, ...]
+    dtype: str
+
+    @property
+    def nbytes(self) -> int:
+        return prod(self.shape) * dtype_bytes(self.dtype)
 
 
 @dataclass
@@ -262,6 +279,50 @@ def transient_tensors(dpu_nodes: list[Node], dpu_id: int) -> list[TransientTenso
     return tensors
 
 
+def _moe_exact_tensors(
+    dpu_nodes: list[Node], dpu_id: int, topology: dict
+) -> tuple[list[TransientTensor], dict[str, tuple[tuple[int, ...], str]]]:
+    """exact_dispatch 的 MoE 路由/紧凑/累加缓冲：激活区瞬态与形状。
+
+    生命周期对齐 `graph.moe_exact` 的拓扑：routing scatter 处产生（dispatch
+    v2 写表、清零 acc、gather 写紧凑），exit_consumer 处读毕。读者名与
+    exec_plan_gen 的行级命令登记名一一对应，WAR 链靠它们闭合。
+    """
+    if not topology:
+        return [], {}
+    node_step, _ = _build_step_index(dpu_nodes)
+    by_name = {n.name: n for n in dpu_nodes}
+    tensors: list[TransientTensor] = []
+    shapes: dict[str, tuple[tuple[int, ...], str]] = {}
+
+    def add(name, shape, dtype, produced, last_read, readers):
+        tensors.append(TransientTensor(
+            name=name, size=prod(shape) * dtype_bytes(dtype),
+            produced_at=produced, last_read_at=last_read, readers=readers))
+        shapes[name] = (tuple(shape), dtype)
+
+    for layer, topo in sorted(topology.items()):
+        xs_detail = by_name[topo.xs].meta[SPEC_META_KEY].shard_map[dpu_id]
+        t, h = xs_detail.local_shape    # MoE 公共输入：本台持整份 (T, h)
+        experts = len(topo.down_outs)
+        produced = node_step[by_name[topo.routing_scatter]]
+        last_read = node_step[by_name[topo.exit_consumer]]
+        gathers = [f"moe:gather:{layer}:{e}" for e in topo.down_outs]
+        scatters = [f"moe:scatter:{layer}:{e}" for e in topo.down_outs]
+        add(f"moe:idx:{layer}", (experts, t), "int64", produced, last_read,
+            gathers + scatters)
+        add(f"moe:w:{layer}", (experts, t), "float16", produced, last_read,
+            scatters)
+        for e in topo.down_outs:
+            add(f"moe:compact:{layer}:{e}", (t, h), "float16", produced,
+                last_read, list(topo.xs_readers[e]))
+        add(f"moe:acc:{layer}", (t, h), "float16", produced, last_read,
+            scatters + [f"moe:reduce:{layer}"])
+        add(f"moe:acc_land:{layer}", (t, h), "float16", produced, last_read,
+            sorted(topo.exits))
+    return tensors, shapes
+
+
 def greedy_reuse(tensors: list[TransientTensor], base: int, align: int) -> tuple[dict[str, int], int]:
     """按生命周期和读者关系为临时张量复用激活区地址。
 
@@ -329,6 +390,8 @@ def plan_dpu(
     act_slots: int = 1,
     act_stride: int | None = None,
     block_table_slots: int = 1,
+    moe_prefill_topology: dict | None = None,
+    moe_decode_topology: dict | None = None,
 ) -> DPUPlan:
     """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
 
@@ -339,6 +402,8 @@ def plan_dpu(
     `kv_pool_slots` 是全局物理槽池大小；为空时取满长单请求的块数。
     `act_slots` 是激活区复制的窗口数，`act_stride` 为空时按单请求占用对齐后取。
     `block_table_slots` 是并发的块表窗口份数。
+    `moe_*_topology` 是 `graph.moe_exact` 的层拓扑；非空时把 exact_dispatch 的
+    路由/紧凑/累加缓冲按生命周期并进激活区复用，偏移写回 `DPUPlan.moe_*`。
     """
     weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
 
@@ -352,19 +417,31 @@ def plan_dpu(
     act_base = off
     prefill_tensors = transient_tensors(prefill_nodes, dpu_id)
     decode_tensors = transient_tensors(decode_nodes, dpu_id)
+    moe_prefill_tensors, moe_prefill_shapes = _moe_exact_tensors(
+        prefill_nodes, dpu_id, moe_prefill_topology or {})
+    moe_decode_tensors, moe_decode_shapes = _moe_exact_tensors(
+        decode_nodes, dpu_id, moe_decode_topology or {})
+    prefill_tensors = prefill_tensors + moe_prefill_tensors
+    decode_tensors = decode_tensors + moe_decode_tensors
     act_prefill, end_prefill = greedy_reuse(prefill_tensors, act_base, hw.align)
     act_decode, end_decode = greedy_reuse(decode_tensors, act_base, hw.align)
     act_extent = max(end_prefill, end_decode) - act_base
     if act_stride is None:
         act_stride = align_up(act_extent, hw.align)
     total = act_base + act_slots * act_stride
+    moe_prefill_bufs = {
+        name: MoEBuffer(act_prefill[name], shape, dtype)
+        for name, (shape, dtype) in moe_prefill_shapes.items()}
+    moe_decode_bufs = {
+        name: MoEBuffer(act_decode[name], shape, dtype)
+        for name, (shape, dtype) in moe_decode_shapes.items()}
 
     # 写回激活节点的 MRAM 偏移。
     for nodes, offsets in ((prefill_nodes, act_prefill), (decode_nodes, act_decode)):
         by_name = {n.name: n for n in nodes}
         for name, node_off in offsets.items():
-            if name.startswith("redist_dst:"):
-                continue  # 落地缓冲在后续循环写回。
+            if name.startswith("redist_dst:") or name.startswith("moe:"):
+                continue  # 落地缓冲在后续循环写回；MoE 缓冲走 DPUPlan.moe_*。
             node = by_name[name]
             spec = node.meta[SPEC_META_KEY]
             spec.shard_map[dpu_id] = replace(spec.shard_map[dpu_id],
@@ -407,6 +484,8 @@ def plan_dpu(
         pending_readers_decode=pending_readers_of_reused_addresses(decode_tensors, act_decode, dpu_id),
         act_extent=act_extent,
         act_stride=act_stride,
+        moe_prefill=moe_prefill_bufs,
+        moe_decode=moe_decode_bufs,
     )
 
 
