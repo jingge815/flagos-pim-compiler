@@ -39,6 +39,12 @@ class OpSemantics:
 # RMSNorm 链融合后的命令名。它不是 aten 目标，设备侧内核入口仍是 `normalize`。
 RMS_NORM_KERNEL = "pim.normalize"
 
+# exact_dispatch 的行级路由命令名。同 paged_attn：运行时按 MoE 节点下发，
+# aten 图里没有对应节点。gather_rows 复用 `gather` 的编译内核（按包络形状，
+# 行数不进缓存键），scatter_add 只有 numpy 镜像。
+GATHER_ROWS_KERNEL = "pim.gather_rows"
+SCATTER_ADD_KERNEL = "pim.scatter_add"
+
 
 # 声明序即 `mnemonics()` 的顺序 —— 与改动前的字面量一致，便于人读错误信息。
 OP_SEMANTICS: tuple[OpSemantics, ...] = (
@@ -75,6 +81,12 @@ OP_SEMANTICS: tuple[OpSemantics, ...] = (
     # scaled_dot_product_attention，没有独立的图节点。
     OpSemantics("paged_attn", None, has_kernel=True, is_mnemonic=False,
                 note="运行时按 SDPA 节点调用；GML 侧折进 MatMul/Softmax 链"),
+    # exact_dispatch 的行级路由：dispatch 写好路由表后按专家下发，行数是
+    # 运行期值。同 paged_attn 的口径——运行时下发，图上无节点，GML 无对应。
+    OpSemantics("gather_rows", None, has_kernel=False, is_mnemonic=False,
+                note="运行时按 MoE 节点调用；编译侧复用 gather 入口（包络形状）"),
+    OpSemantics("scatter_add", None, has_kernel=False, is_mnemonic=False,
+                note="运行时按 MoE 节点调用；fp16 加权累加，专家升序由 waits 链保证"),
     OpSemantics("gather", "Gather", has_kernel=True, is_mnemonic=True,
                 aten_targets=("embedding.default",)),
     OpSemantics("transpose", "Transpose", has_kernel=True, is_mnemonic=True,
