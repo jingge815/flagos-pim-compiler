@@ -12,7 +12,8 @@ from typing import Callable
 import numpy as np
 import torch
 
-from contracts.op_semantics import RMS_NORM_KERNEL
+from contracts.op_semantics import (
+    GATHER_ROWS_KERNEL, RMS_NORM_KERNEL, SCATTER_ADD_KERNEL)
 from memory.kv_layout import prefill_mask
 from runtime import kernels_pim
 
@@ -933,6 +934,95 @@ def gather_kernel(hal, dpu_id: int, cmd) -> None:
     _write_result(hal, dpu_id, cmd, out)
 
 
+def _moe_rows_of(hal, cmd) -> int:
+    """命令的运行期专家行数：dispatch 写进 `hal.moe_rows`，行级内核按需读取。
+
+    exact 模式下行数只有 dispatch 知道；缺了说明它没跑或泳道对不上。回退
+    包络等于悄悄丢正确性，直接抛。
+    """
+    key = (hal.current_lane_key(), int(cmd.payload["gate"]),
+           int(cmd.payload["expert"]))
+    rows = hal.moe_rows.get(key)
+    if rows is None:
+        raise ValueError(f"命令 {cmd.id} 拿不到运行期行数：moe_rows 里没有 {key}")
+    return int(rows)
+
+
+def _compiled_gather_rows(table_shape, ids_shape, *, ctx: _OpContext | None = None,
+                          dtype: str = "float16", index_dtype: str = "int64"):
+    """按包络形状编一个行级 gather（复用 `gather` 入口）；工具链不在位返回 None。
+
+    缓存键只有包络形状与索引类型：行数是运行期值，进键每步都要重编。
+    """
+    key = (ctx, "gather_rows", table_shape, ids_shape, index_dtype)
+    if key in _COMPILED_KERNEL_CACHE:
+        return _COMPILED_KERNEL_CACHE[key]
+
+    from contracts.op_contract import DEFAULT_HARDWARE_CONFIG, OpCompileRequest
+    from opcompiler_bridge.driver import (
+        ToolchainUnavailable, compile_op, load_kernel)
+
+    try:
+        result = compile_op(OpCompileRequest(
+            op="gather", arg_shapes=[table_shape, ids_shape],
+            hardware=(ctx or DEFAULT_OPS_CONTEXT).hardware, dtype=dtype,
+            out_dtype=index_dtype,
+            shard=(ctx or DEFAULT_OPS_CONTEXT).shard,
+            elem_strides=(ctx or DEFAULT_OPS_CONTEXT).elem_strides,
+            mram_offset=(ctx or DEFAULT_OPS_CONTEXT).mram_offset,
+            align_bytes=(ctx or DEFAULT_OPS_CONTEXT).align_bytes,
+        ))
+    except ToolchainUnavailable:
+        _COMPILED_KERNEL_CACHE[key] = None
+        return None
+    fn = load_kernel(result)
+    _COMPILED_KERNEL_CACHE[key] = fn
+    return fn
+
+
+def gather_rows_kernel(hal, dpu_id: int, cmd) -> None:
+    """exact_dispatch 的行级路由 gather：命中 token 的行抄进紧凑输入区。
+
+    查表就是 `pim.gather`，复用它的编译入口与镜像；行数之外的索引在本内核
+    钳到 0 行——编译内核按包络整块处理时尾部是行 0 的复制，下游 scatter 的
+    零权重把它挡在累加之外，dispatch 不必预钳位。两条路由产出逐字节相同
+    的包络输出。
+    """
+    table, indices = _read_tensor_args(hal, dpu_id, cmd)[:2]
+    rows = _moe_rows_of(hal, cmd)
+    declared = cmd.payload.get("arg_dtypes")
+    index_dtype = (np.dtype(declared[1]) if declared and declared[1]
+                   else np.dtype(indices.dtype))
+    ids = np.ascontiguousarray(
+        np.where(np.arange(indices.shape[0]) < rows, indices, 0),
+        dtype=index_dtype)
+    fn = _compiled_gather_rows(
+        tuple(table.shape), ids.shape, ctx=_ctx_of(cmd),
+        dtype=table.dtype.name, index_dtype=index_dtype.name)
+    if fn is None:
+        record_route("gather_rows", "fallback")
+        out = kernels_pim.gather(table, ids)
+    else:
+        record_route("gather_rows", "hit")
+        out = np.zeros(table.shape, dtype=table.dtype)
+        fn(ctypes.c_void_p(np.ascontiguousarray(table, out.dtype).ctypes.data),
+           ctypes.c_void_p(ids.ctypes.data), ctypes.c_void_p(out.ctypes.data))
+    _write_result(hal, dpu_id, cmd, out)
+
+
+def scatter_add_kernel(hal, dpu_id: int, cmd) -> None:
+    """exact_dispatch 的加权散写累加：专家输出按命中行加回累加器。
+
+    设备侧没有「按索引累加」的编译入口（散写只有 kv_cache 的不加重），先走
+    镜像。累加器是读改写，多专家的写序靠同 DPU 的 WAW waits 链（发射序 =
+    专家号升序）串行化。
+    """
+    acc, expert_out, weights, indices = _read_tensor_args(hal, dpu_id, cmd)
+    rows = _moe_rows_of(hal, cmd)
+    _write_result(hal, dpu_id, cmd,
+                  kernels_pim.scatter_add(acc, expert_out, weights, indices, rows))
+
+
 def dynamic_quant_kernel(hal, dpu_id: int, cmd) -> None:
     """`aten.alias` 的内核：恒等传递。
 
@@ -1747,8 +1837,12 @@ _KERNELS = {
     str(torch.ops.aten.to.dtype_layout): KernelEntry(convert_kernel),
     # 分块把低精度提升到 float32 用的是这个，与 to.dtype 一样只换元素类型。
     str(torch.ops.aten._to_copy.default): KernelEntry(convert_kernel),
-    # 融合命令只有这一个非 aten 名字：执行计划把 RMSNorm 链接成一条命令。
+    # 融合命令是非 aten 名字：执行计划把 RMSNorm 链接成一条命令。
     RMS_NORM_KERNEL: KernelEntry(rmsnorm_kernel),
+    # exact_dispatch 的行级路由也是非 aten 名字：运行时按 MoE 节点下发，
+    # 语义登记在 op_semantics（同 paged_attn 口径）。
+    GATHER_ROWS_KERNEL: KernelEntry(gather_rows_kernel),
+    SCATTER_ADD_KERNEL: KernelEntry(scatter_add_kernel),
 }
 # 下面这些 aten 目标 **故意不在表里**：它们仍在主机侧口径里，放进这张表
 # 就是按构造永不执行的死代码。反向闭合测试

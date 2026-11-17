@@ -144,6 +144,10 @@ class NumpyBackend:
         # MoE 动态分派：键 (lane_key, dispatch_cmd_id)，值是本步无 token 命中的
         # 专家集合。空字典 = 不跳过任何命令，行为与引入前一致。
         self.gate_skips: dict[tuple[int, int], set[int]] = {}
+        # MoE 精确行数分派：键 (lane_key, dispatch_cmd_id, expert)，值是该专家
+        # 本步命中的行数 k_e，由 dispatch 写入、行级内核读取。空字典 = 没有
+        # exact 命令在跑，行为与引入前一致。
+        self.moe_rows: dict[tuple[int, int, int], int] = {}
         # 每个 (泳道, dispatch) 实际放行/拦下的命令数。跳过比例与总时延都
         # 看不出「某一层根本没挂上 gate」，计数落在提交侧才能逐层核对。
         self.gate_stats: dict[tuple[int, int], dict[str, int]] = {}

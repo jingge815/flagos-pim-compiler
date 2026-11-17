@@ -49,6 +49,26 @@ def gather(table: np.ndarray, indices: np.ndarray) -> np.ndarray:
     return np.asarray(table)[np.asarray(indices)]
 
 
+def scatter_add(acc: np.ndarray, out: np.ndarray, weights: np.ndarray,
+                indices: np.ndarray, rows: int) -> np.ndarray:
+    """exact_dispatch 的加权散写累加：`acc[indices[i]] += weights[i]*out[i]`，i < rows。
+
+    fp16 乘加与稠密 where 路径同宽（routing 先落 fp16 再乘）；一个专家的
+    rows 个目标行互不相同（topk 每 token 每专家至多一次），向量化写没有
+    次序问题。行数超出索引表是上游的错，直接抛——回退包络等于悄悄丢正确性。
+    """
+    indices = np.asarray(indices)
+    if not 0 <= rows <= len(indices):
+        raise ValueError(f"行数 {rows} 超出索引表长度 {len(indices)}")
+    result = np.array(acc, copy=True)
+    # 权重按行缩放（同 dense 的 routing[:, e:e+1]），(rows,) 对 (rows,h) 直接乘
+    # 会按末轴广播出错误形状。
+    updates = (np.asarray(weights)[:rows].reshape(-1, 1)
+               * np.asarray(out)[:rows])
+    result[indices[:rows]] += updates
+    return result
+
+
 def rope(source: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
     """`pim.rope`：`x*cos + rotate_half(x)*sin`，按三相各自落 fp16。
 
