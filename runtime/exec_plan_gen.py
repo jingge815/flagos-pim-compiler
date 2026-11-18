@@ -220,7 +220,7 @@ def _emit_moe_exact_dispatch(
     gather_rows。行级命令带 (gate, expert) 标签：零命中专家整支不提交，与
     dense 的门控跳过同一套机制。
     """
-    dpus = sorted(buffers_by_dpu)
+    dpus = sorted(xs_access_of)    # 宿主集 = xs 的 placement（PP 下只有本段 DPU）
     experts = sorted(int(e) for e in topo.down_outs)
     writes: list[Access] = []
     for dpu_id in dpus:
@@ -353,13 +353,13 @@ def _emit_moe_scatter_add(
 
 def _emit_moe_acc_reduce(
     builder: _PlanBuilder, topo: MoELayerTopology, buffers_by_dpu: dict,
+    dpus: list[int],
 ) -> None:
     """专家升序散写完成后，把 acc 的各 DPU 部分和归约写回落地缓冲。
 
     复用 dense 专家分片同一条 all_reduce 原语（fp16 累加），数值口径一致；
     出口投影节点（如 acc 的 view）改读落地缓冲，下游图照常。
     """
-    dpus = sorted(buffers_by_dpu)
     acc0 = buffers_by_dpu[dpus[0]][f"moe:acc:{topo.layer}"]
     numel = prod(acc0.shape)
     edge_id = next(_SYNTH_EDGE)
@@ -1141,7 +1141,9 @@ def build_execution_plan(
             if node.name in down_out_of:
                 layer, expert = down_out_of[node.name]
                 if expert == max(exact_topo[layer].down_outs):
-                    _emit_moe_acc_reduce(builder, exact_topo[layer], moe_buffers)
+                    _emit_moe_acc_reduce(
+                        builder, exact_topo[layer], moe_buffers,
+                        dpus=sorted(xs_access_by_layer[layer]))
             continue
 
         # 生成主机计算命令。

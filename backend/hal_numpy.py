@@ -355,8 +355,18 @@ class NumpyBackend:
                     writes_by_dpu.setdefault(int(access.loc[1]), []).append(access)
         if not writes_by_dpu:
             future: Future[object] = Future()
-            future.set_result(zero_value())
-            return Event("host" if cmd.dpu_id is None else "dpu", future)
+            # 设备命令的跳过事件挂到本泳道 DPU 流队尾：读者（如 exact 的
+            # acc 归约）等的是折叠后的末位写者事件，事件提前兑现会放过仍在
+            # 执行的同流命令；挂队尾等价 FIFO 到位，且不占执行队列。
+            if cmd.dpu_id is None:
+                future.set_result(zero_value())
+                return Event("host", future)
+            tail = self._stream_tail.get((lane_key, int(cmd.dpu_id)))
+            if tail is None:
+                future.set_result(zero_value())
+            else:
+                tail.add_done_callback(lambda _: future.set_result(zero_value()))
+            return Event("dpu", future)
 
         deps = self._dependency_futures(cmd.waits, events)
         zeroing = [

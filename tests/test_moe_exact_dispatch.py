@@ -45,7 +45,7 @@ def _dispatch_cmds_of(compiled):
             and str(c.payload.get("node", "")).startswith("moe_dispatch_")]
 
 
-def _compile(model, *, moe_execution):
+def _compile(model, *, moe_execution, num_dpus=2, num_stages=1, num_windows=1):
     from contracts.op_contract import PIMHardwareConfig
     from graph.strategy import llama_strategy
     from memory.mem_planner import HwBudget
@@ -57,17 +57,18 @@ def _compile(model, *, moe_execution):
     model.save_pretrained(path)
     from backend.architectures import ARCHITECTURES
     loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
-    strategy = llama_strategy(2, num_stages=1, num_heads=4, num_kv_heads=2,
-                              intermediate_size=32, vocab_size=128,
+    strategy = llama_strategy(num_dpus, num_stages=num_stages, num_heads=4,
+                              num_kv_heads=2, intermediate_size=32,
+                              vocab_size=128,
                               num_layers=model.config.num_hidden_layers)
     hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
     hardware = PIMHardwareConfig(
-        num_dpus=2, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+        num_dpus=num_dpus, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
         wram_bytes_per_dpu=65536, dma_align=64)
     return compile_llama2(
         loaded, strategy, prefill_seq_len=4, max_seq=16,
         hw=hw, hardware=hardware,
-        num_request_slots=1, num_parallel_slots=1,
+        num_request_slots=num_windows, num_parallel_slots=num_windows,
         moe_execution=moe_execution)
 
 
@@ -217,7 +218,7 @@ def test_exact_dispatch_writes_rows_and_tables(exact_dense_pair) -> None:
 # ---------- 数值对拍 ----------
 
 
-def _decode_tokens(compiled, prompt, steps):
+def _decode_tokens(compiled, prompt, steps, num_dpus=2):
     import torch
 
     from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
@@ -226,7 +227,7 @@ def _decode_tokens(compiled, prompt, steps):
     from runtime.kernels import register_all
 
     backend = NumpyBackend(NumpyBackendConfig(
-        num_dpus=2, mram_bytes_per_dpu=1 << 28))
+        num_dpus=num_dpus, mram_bytes_per_dpu=1 << 28))
     register_all(backend)
     load_weights(compiled, backend)
     got = run_decode_loop(
@@ -589,3 +590,26 @@ def test_exact_norm_topk_prob_false() -> None:
     compiled = _compile(model, moe_execution="exact_dispatch")
     got, _backend = _decode_tokens(compiled, [1, 2, 3, 4], 3)
     assert got == expect, f"exact={got} hf={expect}"
+
+
+def test_exact_pp_hosting_subset_matches_hf() -> None:
+    """PP 放置（tp2×pp2）：层宿主在 DPU 子集，exact 仍与 HF 逐位一致。
+
+    曾因路由缓冲按「每层 xs 全复制」规划，在真实 8-DPU（tp4×pp2）编译期
+    KeyError；tiny 全复制（pp=1）测不出，此处锁住宿主子集路径。
+    """
+    model = _moe_model(num_layers=4, num_experts=4)
+    compiled = _compile(model, moe_execution="exact_dispatch",
+                        num_dpus=4, num_stages=2)
+    # 结构断言：4 层各宿主在两个 DPU 上，前后段宿主集不相交——否则本
+    # 测试退化成全复制，锁不住 PP 路径。
+    hosts: dict[int, set] = {}
+    for c in compiled.decode_plans[0].commands:
+        node = str(c.payload.get("node", ""))
+        if node.startswith("moe:gather:"):
+            hosts.setdefault(int(node.split(":")[2]), set()).add(c.dpu_id)
+    assert sorted(hosts) == [0, 1, 2, 3], f"4 层都该有行级命令：{sorted(hosts)}"
+    assert all(len(d) == 2 for d in hosts.values()), f"宿主集应为 2 台：{hosts}"
+    assert hosts[0].isdisjoint(hosts[2]), f"两段宿主集应不相交：{hosts}"
+    got, _backend = _decode_tokens(compiled, [1, 2, 3, 4], 3, num_dpus=4)
+    assert got == _hf_reference(model, steps=3), f"exact={got}"

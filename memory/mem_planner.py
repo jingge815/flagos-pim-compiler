@@ -302,7 +302,11 @@ def _moe_exact_tensors(
         shapes[name] = (tuple(shape), dtype)
 
     for layer, topo in sorted(topology.items()):
-        xs_detail = by_name[topo.xs].meta[SPEC_META_KEY].shard_map[dpu_id]
+        # PP：层宿主在本段的 DPU 子集上，不宿主的台不规划该层路由缓冲。
+        xs_spec = by_name[topo.xs].meta[SPEC_META_KEY]
+        if dpu_id not in xs_spec.shard_map:
+            continue
+        xs_detail = xs_spec.shard_map[dpu_id]
         t, h = xs_detail.local_shape    # MoE 公共输入：本台持整份 (T, h)
         experts = len(topo.down_outs)
         produced = node_step[by_name[topo.routing_scatter]]

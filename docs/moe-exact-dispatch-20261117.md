@@ -84,6 +84,86 @@ slice/to 等只搬值不改值的节点）下行，碰到算术节点（term mul
   vllm_executor/genesim_simulation（245）。
 - 探针：静态多窗口（parallel=2）、dynamic 编译（窗口模板）+ exact 均与 HF 逐位一致。
 
+## 4L 真实权重探针揪出的两个真 bug（M2⑥ 收尾）
+
+tiny 测试全是 TP×PP=1（全复制），4L Qwen3-30B 的合法策略是 **TP=4×PP=2**
+（num_kv_heads=4 不能被 8 整除，纯 TP=8 非法）——层 0-1 与层 2-3 宿主在不同
+DPU 子集。三臂探针一跑就暴露了两个 tiny 覆盖不到的真 bug：
+
+### 修复 1：PP 下 MoE 只在宿主子集规划与归约
+
+**症状**：exact 臂编译即崩 `KeyError: 0`（`mem_planner.py` 的
+`_moe_exact_tensors` 对每层按全部 8 台查 `shard_map[dpu_id]`，层 2-3 不宿主
+在 dpu0-3）。
+
+**修复**（三处对齐，宿主集 = xs 节点 `shard_map` 的键集）：
+
+| 文件 | 改动 |
+| --- | --- |
+| `memory/mem_planner.py` | `_moe_exact_tensors` 按层跳过不宿主 DPU——不宿主的台不规划该层路由缓冲 |
+| `runtime/exec_plan_gen.py` | `_emit_moe_exact_dispatch` 的 `dpus` 改从 xs placement 取（原 `buffers_by_dpu` 在 PP 下混入非宿主台）；`_emit_moe_acc_reduce` 签名加 `dpus`，归约只在宿主集内收集段 |
+
+锁定测试 `test_exact_pp_hosting_subset_matches_hf`：4 DPU × 2 段，断言 4 层
+gather 各宿主 2 台、层 0/2 宿主集不相交、token == HF。
+
+### 修复 2：跳过事件竞态（归约读到未完成的 scatter）
+
+**症状**：exact 臂 token 从中途开始发散且不可复现（同命令同数据，重跑结果
+不同）；tiny 多窗口探针稳定复现 exact 7/8 失败（dense 8/8 正确）。
+
+**根因**：`_skipped_event` 对零命中专家的命令即时返回预完成 Future。exact 的
+acc 归约只等 `deps_of` 给出的每 DPU **末位 scatter**（`fold_waits` 折叠同 DPU
+等待，依赖 per-lane FIFO）；当末位 scatter 恰是零命中（跳过）专家时事件瞬时
+兑现，而同 DPU 流上更早的**命中** scatter 还在执行 → 归约读到旧累加值。
+dense 免疫：where 主机闭包按值读专家输出，不吃内存等待的折叠。
+
+**修复**（`backend/hal_numpy.py`）：设备命令（dpu_id 非 None）的跳过事件改挂
+`_stream_tail[(lane, dpu)]` 队尾（`add_done_callback`），等价 FIFO 到位且不占
+执行队列——跳过优化完整保留；主机命令（dpu_id None）仍即时兑现，dense 行为
+逐字节不变。
+
+### 验证
+
+- tiny 多窗口（2 窗口 × 2 请求 × 5 步 × 8 次）：修复前 exact 7/8，修复后
+  exact 8/8、dense 8/8。
+- `test_moe_exact_dispatch.py` 13/13（12 + 新增 PP 测试）；受影响回归
+  102 + 301 = 403 条全绿。
+- 4L 三臂探针（8 DPU、4 提示、7 步，同轮独占）**通过**：三臂 token 逐位一致
+  （r0=[6722,4849,35579,1197,5434,5434,5434]、r1=[12824,102642,124264,93418,
+  1940,5434,103511]、r2=[108535,13447,86740,105139,135220,9794,48316]、
+  r3=[1632,21309,15245,22270,22270,22270,22270]）；墙钟 exact 93.44s vs
+  static 235.08s / dynamic 243.72s（39.7%，≤105% 达标，exact 反而快 2.5×——
+  零命中专家整支跳过 + 每专家只算命中行的双重收益）；`moe_rows_sum=128`
+  （=4 泳道 × 4 层 × Σk_e=8，行数守恒），零命中专家 16 个全部跳过。
+
+## 契约对齐（全量回归揪出，M2 遗留）
+
+全量回归两条契约测试失败，均指向 `graph/moe_exact.py`：`device` 键裸字符串
+读取（:34/:68）与两步式 `val.dtype` 取法（:73）——定向回归批次的关键字没
+覆盖这两个契约测试文件，漏网。修复对齐仓内先例（`exec_plan_gen.py` 同一批
+scatter 节点的写法）：device 走 `DEVICE_META_KEY`/`DEVICE_DPU`/`DEVICE_HOST`
+常量，dtype 走 `SPEC_META_KEY` 的 `spec.dtype == "bool"`（统一 IR 字符串，
+spec_prop 是 dtype 进入 IR 的唯一入口）。契约测试 23 passed、exact 测试
+13 passed，行为等价。
+
+## 已立项：紧凑缓冲共享化（下一个优化项，2026-11-18 用户拍板）
+
+定位依据（4L 实测账本，T_max=512，dense stride 59MiB / exact 319MiB）：增量
+260MiB 中 **98% 来自「每专家一份全宽紧凑缓冲」**——`_moe_exact_tensors` 给
+每个专家规划独立 `moe:compact:{layer}:{e}` (T×h 整份全宽，E=128 份共
+256MiB)，且生命周期统一取块级（routing_scatter 产生 → exit_consumer 读毕），
+128 份互不能叠地址。idx/w 路由表（0.6MiB）与 acc/acc_land（4MiB）是零头。
+
+优化方案：专家链在 DPU 流上本就按计划序串行执行，**共享一份 T×h 紧凑缓冲**
+即可（256MiB → 2MiB，exact 的激活代价反而低于 dense）。改动面集中在
+`_moe_exact_tensors` 的生命周期建模从块级细化到行级命令（gather:e 写、
+该专家链读毕即释放），`greedy_reuse` 本体不动；行级命令的 WAR 链靠既有
+读者名登记闭合。语义与逐位一致性不受影响（只改地址复用，不改执行序）。
+
+待另行拍板：共享落地、48L 全模型复测后，是否把 exact 设为默认模式
+（用户判断：exact 语义更贴近 transformer MoE 的真实计算方式——只算被路由
+到的 token，dense 的 16 倍包络计算终归是模拟开销）。
+
 ## 当前不足 / 已知边界
 
 - **段偏移、写表偏移是手工算术**：`expert * t_rows * dtype_bytes(...)` 在 dispatch v2 /
@@ -95,5 +175,6 @@ slice/to 等只搬值不改值的节点）下行，碰到算术节点（term mul
   独跑/双探针并行/人工 CPU 负载均不复现）。跑对拍类测试时避免与其他编译任务并发。
 - GeneSim/CEVA 接线是 M4a/b：sidecar 枚举、按 Σk_e 行计费、设备路径落地或降级登记。
 
-净增删：+397 / -15（三个已跟踪文件），新文件 graph/moe_exact.py 221 行、
-tests/test_moe_exact_dispatch.py 591 行、本文档 99 行。未提交，等用户下令。
+净增删：M2③④⑤⑥ 主体 cafdb35 已提交；本收尾批次（PP 托管 + 竞态修复 +
+契约对齐）已随三笔提交落库，改动 +66 / -15（hal_numpy +12/-2、mem_planner
++5/-1、exec_plan_gen +5/-3、moe_exact +8/-4、test +31/-7）另文档增量。
