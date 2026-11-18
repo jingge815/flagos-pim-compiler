@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 import torch
 from torch.fx import Node
 
+from contracts.graph_meta import (
+    DEVICE_DPU, DEVICE_HOST, DEVICE_META_KEY, SPEC_META_KEY,
+)
+
 
 @dataclass(frozen=True)
 class MoELayerTopology:
@@ -31,7 +35,7 @@ class MoELayerTopology:
 
 def _device_node(node: Node) -> bool:
     """节点是否落在设备侧；主机脚手架（getitem 等）没有 device meta。"""
-    return node.meta.get("device") == "dpu"
+    return node.meta.get(DEVICE_META_KEY) == DEVICE_DPU
 
 
 # 出口投影允许下行的值透传节点：它们只搬值不改值，发射后改读 acc 落地即可。
@@ -64,13 +68,13 @@ def _scatter_layers(nodes: list[Node]) -> dict[str, tuple[int, str]]:
         if node.target not in (torch.ops.aten.scatter.src,
                                torch.ops.aten.scatter.value):
             continue
-        val = node.meta.get("val")
-        if val is None or node.meta.get("device") != "host":
+        spec = node.meta.get(SPEC_META_KEY)
+        if spec is None or node.meta.get(DEVICE_META_KEY) != DEVICE_HOST:
             continue
         layer = _layer_of_weight_walk(node)
         if layer is None:
             continue
-        kind = "mask" if val.dtype == torch.bool else "routing"
+        kind = "mask" if spec.dtype == "bool" else "routing"
         out[node.name] = (layer, kind)
     return out
 
