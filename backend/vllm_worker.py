@@ -42,7 +42,7 @@ from backend.sampling import RequestSampler, SampleResult, SamplingConfig
 from contracts.op_contract import DPU_MRAM_BYTES, DPU_SYS_RESERVE_BYTES
 from memory.mem_planner import default_site_capacity
 from runtime.compile import causal_mask_of, compile_llama2, default_prefill_buckets, load_weights
-from runtime.executor import RequestTable, prefill_chunk, step_request
+from runtime.executor import RequestTable, plan_wave, prefill_chunk, step_request
 from runtime.kernels import register_all
 
 logger = init_logger(__name__)
@@ -352,29 +352,28 @@ class PIMWorker(WorkerBase):
 
         # logprobs 的宽度按整批取最大值，与 vLLM 的 Sampler 一致。
         logprobs_width = self._max_logprobs_width(req_ids)
-        # 按并行窗口数分 wave，wave 内每个请求用自己的窗口同时执行。
-        sampled: list[list[int]] = [[] for _ in req_ids]
-        results: list[SampleResult | None] = [None] * len(req_ids)
+        # 按并行窗口数用 plan_wave 分 wave，wave 内每个请求用自己的窗口同时执行。
+        sampled: list[list[int]] = []
+        results: list[SampleResult | None] = []
         width = min(self.num_parallel_slots, len(req_ids)) if req_ids else 1
         if width <= 1:
-            for index, req_id in enumerate(req_ids):
+            for req_id in req_ids:
                 token, result = self._step(req_id, 0, logprobs_width, scheduled[req_id])
-                sampled[index] = [] if token is None else [token]
-                results[index] = result
+                sampled.append([] if token is None else [token])
+                results.append(result)
         else:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(max_workers=self.num_parallel_slots)
-            for start in range(0, len(req_ids), width):
-                wave = req_ids[start:start + width]
+            for wave in plan_wave(req_ids, width=width):
                 futures = [
                     self._executor.submit(
                         self._step, req_id, index, logprobs_width, scheduled[req_id])
                     for index, req_id in enumerate(wave)
                 ]
-                for offset, future in enumerate(futures):
+                for future in futures:
                     token, result = future.result()
-                    sampled[start + offset] = [] if token is None else [token]
-                    results[start + offset] = result
+                    sampled.append([] if token is None else [token])
+                    results.append(result)
 
         self._record_stats(scheduled, width)
         return ModelRunnerOutput(

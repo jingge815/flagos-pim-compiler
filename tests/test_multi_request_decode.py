@@ -17,7 +17,9 @@ from contracts.op_contract import PIMHardwareConfig
 from graph.strategy import llama_strategies
 from memory.mem_planner import HwBudget
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
-from runtime.executor import RequestTable, run_decode_loop, run_one_step
+from runtime.executor import (
+    RequestTable, available_windows, plan_wave, run_decode_loop, run_one_step,
+)
 from runtime.kernels import register_all
 
 NUM_DPUS = 4
@@ -70,14 +72,47 @@ def _backend_with_weights(compiled, hardware) -> NumpyBackend:
 
 
 def _compile(model, hw, hardware, num_request_slots, kv_slot_tokens=MAX_SEQ,
-             dynamic=False):
+             dynamic=False, num_parallel_slots=None, act_pool_slots=None):
     strategy = llama_strategies(NUM_DPUS, **STRATEGY_KWARGS)[0]
     return compile_llama2(
         model, strategy, prefill_seq_len=PREFILL_SEQ_LEN,
         max_seq=MAX_SEQ, hw=hw, hardware=hardware,
         num_request_slots=num_request_slots, kv_slot_tokens=kv_slot_tokens,
-        dynamic=dynamic,
+        dynamic=dynamic, num_parallel_slots=num_parallel_slots,
+        act_pool_slots=act_pool_slots,
     )
+
+
+def _mixed_table(compiled, backend, prompts: dict) -> RequestTable:
+    """建一张 4 请求表：前两个先跑一步进入 decode，后两个保持未 prefill。"""
+    table = RequestTable(4, compiled.kv_pool_slots)
+    for request_id in ("a", "b"):
+        table.add_request(request_id, prompts[request_id], eos_id=-1)
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    for request_id in ("c", "d"):
+        table.add_request(request_id, prompts[request_id], eos_id=-1)
+    return table
+
+
+def _run_steps(compiled, backend, table, **kwargs) -> None:
+    """反复执行整步，直到每个请求都生成满 MAX_NEW_TOKENS 个 token。"""
+    while any(len(s.generated) < MAX_NEW_TOKENS for s in table.active_slots()):
+        run_one_step(compiled, backend, table, causal_mask_of,
+                     sample_fn=_greedy, **kwargs)
+
+
+def _assert_match_individual(compiled, backend, table, prompts: dict) -> None:
+    """逐请求对照单独运行（贪心）的结果，前 MAX_NEW_TOKENS 个 token 须一致。"""
+    for slot in table.active_slots():
+        ref = run_decode_loop(
+            compiled, backend,
+            prompt_ids=torch.tensor(prompts[slot.request_id]),
+            max_new_tokens=MAX_NEW_TOKENS, eos_id=-1, sample_fn=_greedy,
+            causal_mask_of=causal_mask_of,
+        )
+        assert list(slot.generated)[:MAX_NEW_TOKENS] == ref, (
+            f"请求 {slot.request_id} 混批生成 {list(slot.generated)} "
+            f"与单独运行 {ref} 不一致")
 
 
 def test_two_requests_match_individual_runs(small_model, hw_and_hardware) -> None:
@@ -186,3 +221,109 @@ def test_request_table_rejects_overflow() -> None:
     table.add_request("a", PROMPT_A)
     with pytest.raises(RuntimeError, match="请求槽"):
         table.add_request("b", PROMPT_B)
+
+
+def test_plan_wave_fcfs() -> None:
+    """plan_wave 纯函数：保序连续切分、组宽不超上限、末组可短、非法宽度报错。"""
+    items = ["a", "b", "c", "d", "e"]
+    assert plan_wave(items, width=2) == [["a", "b"], ["c", "d"], ["e"]]
+    assert plan_wave(items, width=5) == [items]
+    assert plan_wave(items, width=99) == [items]
+    assert plan_wave([], width=2) == []
+    with pytest.raises(ValueError, match="宽度"):
+        plan_wave(items, width=0)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_mixed_prefill_decode_wave_matches_individual(
+        small_model, hw_and_hardware, monkeypatch, dynamic) -> None:
+    """一个 wave 混排 prefill 与 decode 请求，各路结果仍与单独运行一致。"""
+    if dynamic:
+        monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, 4, dynamic=dynamic,
+                        num_parallel_slots=4)
+    backend = _backend_with_weights(compiled, hardware)
+    # 两个新请求长度不同（3 与 4），prefill 桶按各自长度选。
+    prompts = {"a": PROMPT_A, "b": PROMPT_B, "c": [1, 2, 3], "d": [9, 10, 11, 12]}
+    table = _mixed_table(compiled, backend, prompts)
+    _run_steps(compiled, backend, table, parallel_slots=4)
+    _assert_match_individual(compiled, backend, table, prompts)
+
+
+def test_run_one_step_external_waves(small_model, hw_and_hardware) -> None:
+    """外部给定 waves（乱序、不等宽）原样执行，结果与 FCFS 一致。"""
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, 4, num_parallel_slots=4)
+    backend = _backend_with_weights(compiled, hardware)
+    prompts = {"a": PROMPT_A, "b": PROMPT_B, "c": [1, 2, 3], "d": [9, 10, 11, 12]}
+    table = _mixed_table(compiled, backend, prompts)
+    slots = table.active_slots()
+    waves = [slots[3:], slots[:3]]
+    _run_steps(compiled, backend, table, waves=waves)
+    _assert_match_individual(compiled, backend, table, prompts)
+
+    # 空 waves 合法：整步空转，不产生 token。
+    before = {s.request_id: list(s.generated) for s in table.active_slots()}
+    run_one_step(compiled, backend, table, causal_mask_of,
+                 sample_fn=_greedy, waves=[])
+    assert {s.request_id: list(s.generated) for s in table.active_slots()} == before
+
+    # wave 比并行窗口数宽直接报错，且报错发生在执行之前。
+    with pytest.raises(ValueError, match="并行窗口"):
+        run_one_step(compiled, backend, table, causal_mask_of,
+                     sample_fn=_greedy, waves=[slots + slots])
+    assert {s.request_id: list(s.generated) for s in table.active_slots()} == before
+
+
+def test_available_windows_backpressure(small_model, hw_and_hardware) -> None:
+    """接入前问容量：available_windows 归零就不再加请求，不会触发 RuntimeError。"""
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, 2, kv_slot_tokens=2)
+    backend = _backend_with_weights(compiled, hardware)
+    table = RequestTable(2, compiled.kv_pool_slots)
+    assert available_windows(compiled, table) == 2
+
+    admitted = []
+    for request_id in ("a", "b", "c"):
+        if available_windows(compiled, table) > 0:
+            admitted.append(
+                table.add_request(request_id, PROMPT_A, eos_id=-1).request_id)
+    assert admitted == ["a", "b"]
+    assert available_windows(compiled, table) == 0
+
+    free_initial = table.kv_slots_free()
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    free_after_prefill = table.kv_slots_free()
+    assert isinstance(free_after_prefill, int)
+    assert free_after_prefill < free_initial
+    for _ in range(2):
+        run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    assert table.kv_slots_free() < free_after_prefill  # decode 跨块边界继续长块
+
+    # 块号外部托管的表没有池，剩余数返回 None。
+    assert RequestTable(2).kv_slots_free() is None
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_batch8_full_pool_no_conflict(
+        small_model, hw_and_hardware, monkeypatch, dynamic) -> None:
+    """8 请求全部驻留占满槽池，wave 并发互不串扰，结果与单独运行一致。"""
+    if dynamic:
+        monkeypatch.setenv("PIM_DYN_SHAPE", "1")
+    hw, hardware = hw_and_hardware
+    compiled = _compile(
+        small_model, hw, hardware, 8, dynamic=dynamic,
+        num_parallel_slots=None if dynamic else 8,
+        act_pool_slots=8 if dynamic else None)
+    backend = _backend_with_weights(compiled, hardware)
+    prompts = [PROMPT_A, PROMPT_B] * 4
+    table = RequestTable(8, compiled.kv_pool_slots)
+    for index, prompt in enumerate(prompts):
+        table.add_request(f"r{index}", prompt, eos_id=-1)
+    assert available_windows(compiled, table) == 0
+
+    _run_steps(compiled, backend, table)
+    _assert_match_individual(
+        compiled, backend, table,
+        {f"r{index}": prompt for index, prompt in enumerate(prompts)})

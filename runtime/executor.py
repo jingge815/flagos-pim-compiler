@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 import numpy as np
 import torch
@@ -14,6 +15,8 @@ from contracts.exec_plan import ExecutionPlan
 from memory.kv_layout import write_block_table
 from runtime.materialize import materialize
 from runtime.shape_bind import dynamic_shape_enabled, runtime_static_mode
+
+T = TypeVar("T")
 
 
 class KVSlotPool:
@@ -38,6 +41,12 @@ class KVSlotPool:
         with self._lock:
             self._free.append(slot)
             self._free.sort()
+
+    @property
+    def num_free(self) -> int:
+        """当前空闲物理槽数，供接入前查询反压。"""
+        with self._lock:
+            return len(self._free)
 
 
 class KVBlockTable:
@@ -155,6 +164,10 @@ class RequestTable:
     @property
     def num_free(self) -> int:
         return len(self._free)
+
+    def kv_slots_free(self) -> int | None:
+        """KV 物理槽剩余数；块号由外部托管（无池）时返回 None。"""
+        return None if self._pool is None else self._pool.num_free
 
 
 def _apply_moe_execution(compiled, hal) -> None:
@@ -330,6 +343,13 @@ def _window_plan(compiled, phase: str, slot_index: int):
     return getattr(compiled, phase).plan
 
 
+def plan_wave(slots: list[T], *, width: int) -> list[list[T]]:
+    """默认 FCFS 组 wave 策略：按顺序把 slots 连续切成每组至多 width 个。"""
+    if width < 1:
+        raise ValueError(f"wave 宽度必须 >= 1，got {width}")
+    return [slots[start:start + width] for start in range(0, len(slots), width)]
+
+
 def run_one_step(
     compiled,
     hal,
@@ -338,11 +358,13 @@ def run_one_step(
     *,
     sample_fn=None,
     parallel_slots: int | None = None,
+    waves: list[list[RequestSlot]] | None = None,
 ) -> list[tuple[str, list[int]]]:
     """对表中每个活跃请求各执行一步，返回刚生成完毕的 (request_id, tokens)。
 
-    活跃请求按 `parallel_slots` 分 wave，wave 内并发执行，每个请求用 wave 内
-    自己的窗口（激活区与块表都不相交）。wave 之间串行，结果语义与逐个执行一致。
+    wave 默认按 FCFS 组成（`plan_wave`）；外部批处理器（如 vLLM）可用 `waves`
+    直接给定，此时原样执行。wave 内并发，每个请求用 wave 内自己的窗口（激活区
+    与块表都不相交）；wave 之间串行，结果语义与逐个执行一致。
     """
     slots = table.active_slots()
     results: list[tuple[str, list[int]]] = []
@@ -354,15 +376,18 @@ def run_one_step(
             pending.append(slot)
 
     max_windows = getattr(compiled, "num_parallel_slots", 1)
-    width = parallel_slots if parallel_slots is not None else max_windows
-    width = max(1, min(width, max_windows, len(pending))) if pending else 1
-    if width == 1:
-        for slot in pending:
-            step_request(compiled, hal, slot, causal_mask_of, sample_fn=sample_fn)
-    else:
+    if waves is None:
+        width = parallel_slots if parallel_slots is not None else max_windows
+        width = max(1, min(width, max_windows, len(pending))) if pending else 1
+        waves = plan_wave(pending, width=width)
+    for wave in waves:
+        if len(wave) > max_windows:
+            raise ValueError(
+                f"wave 长度 {len(wave)} 超过并行窗口数 {max_windows}，"
+                "外部给定的 wave 太宽")
+    if any(len(wave) > 1 for wave in waves):
         executor = table.step_executor(max_windows)
-        for start in range(0, len(pending), width):
-            wave = pending[start:start + width]
+        for wave in waves:
             futures = [
                 executor.submit(
                     step_request, compiled, hal, slot, causal_mask_of,
@@ -371,7 +396,16 @@ def run_one_step(
             ]
             for future in futures:
                 future.result()
+    else:
+        for wave in waves:
+            for slot in wave:
+                step_request(compiled, hal, slot, causal_mask_of, sample_fn=sample_fn)
     return results
+
+
+def available_windows(compiled, table: RequestTable) -> int:
+    """当前还能并发接入的窗口数：并行窗口上限与空闲请求槽取小。"""
+    return min(getattr(compiled, "num_parallel_slots", 1), table.num_free)
 
 
 def execute_plan(plan: ExecutionPlan, hal, *, ctx=None,
