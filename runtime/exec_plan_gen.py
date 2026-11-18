@@ -209,16 +209,14 @@ def _emit_moe_exact_dispatch(
     builder: _PlanBuilder, topo: MoELayerTopology,
     mask_cmd_id: int, routing_cmd_id: int,
     buffers_by_dpu: dict, xs_access_of: dict,
-    num_tasklets: int = 4,
 ) -> int:
     """exact_dispatch 的 dispatch v2：算每专家 k_e/idx/w 写设备路由表。
 
     主机读两个 scatter 的结果（选中掩码 + 路由权重），每专家按 token 升序
     收集行号与 fp16 权重列，写进各 DPU 预规划的路由表段；同一命令顺带清零
     acc——三者的写 Access 都烘在 cmd.writes 里，窗口平移由 bind_plan 统一
-    处理。行数进 `hal.moe_rows`，零命中专家进 `gate_skips`。之后按专家发
-    gather_rows。行级命令带 (gate, expert) 标签：零命中专家整支不提交，与
-    dense 的门控跳过同一套机制。
+    处理。行数进 `hal.moe_rows`，零命中专家进 `gate_skips`。gather 不在此
+    发——紧凑缓冲全专家共享，gather 随链首惰性发射（`_emit_moe_gather`）。
     """
     dpus = sorted(xs_access_of)    # 宿主集 = xs 的 placement（PP 下只有本段 DPU）
     experts = sorted(int(e) for e in topo.down_outs)
@@ -274,39 +272,49 @@ def _emit_moe_exact_dispatch(
     for access in writes:
         waits += _war_waits(access.loc, access.offset,
                             builder.pending_readers, builder.reader_cmds)
-    dispatch = builder.append(
+    return builder.append(
         "host_op", None, {"node": f"moe_dispatch_{topo.layer}", "fn": fn},
         [], writes, waits).id
-    for dpu_id in dpus:
-        bufs = buffers_by_dpu[dpu_id]
-        for expert in experts:
-            compact = bufs[f"moe:compact:{topo.layer}:{expert}"]
-            idx = bufs[f"moe:idx:{topo.layer}"]
-            reads = [
-                xs_access_of[dpu_id],
-                Access(("dpu", dpu_id),
-                       idx.offset + expert * t_rows * dtype_bytes("int64"),
-                       t_rows * dtype_bytes("int64")),
-            ]
-            write = Access(("dpu", dpu_id), compact.offset, compact.nbytes)
-            cmd = builder.append(
-                "launch", dpu_id,
-                {"kernel": GATHER_ROWS_KERNEL,
-                 "node": f"moe:gather:{topo.layer}:{expert}",
-                 "arg_kinds": ["tensor", "tensor"],
-                 "arg_shapes": [tuple(compact.shape), (t_rows,)],
-                 "arg_dtypes": ["float16", "int64"],
-                 "dtype": "float16", "out_shape": tuple(compact.shape),
-                 "gate": dispatch, "expert": expert},
-                reads, [write],
-                _deps_of(reads, builder.writers)
-                + _war_waits(write.loc, write.offset,
-                             builder.pending_readers, builder.reader_cmds)
-                + [dispatch],
-                num_tasklets=num_tasklets)
-            builder.register_reader(f"moe:gather:{topo.layer}:{expert}",
-                                    dpu_id, cmd.id)
-    return dispatch
+
+
+def _emit_moe_gather(
+    builder: _PlanBuilder, topo: MoELayerTopology, expert: int, dpu_id: int,
+    buffers: dict, xs_access_of: dict, dispatch_id: int,
+    num_tasklets: int = 4,
+) -> None:
+    """该专家的行级 gather：按路由表把命中行抽进紧凑缓冲。
+
+    紧凑缓冲全专家共享一份地址（专家链按序执行），gather 随链首个节点
+    惰性发射而不是 dispatch 后整批预发——WAR 边（同地址上前一链的读者）
+    与计划序同向，单工作流不会等到更晚提交的同流命令。行级命令带
+    (gate, expert) 标签：零命中专家整支不提交，与 dense 的门控跳过同机制。
+    """
+    compact = buffers[f"moe:compact:{topo.layer}:{expert}"]
+    idx = buffers[f"moe:idx:{topo.layer}"]
+    t_rows = idx.shape[1]
+    reads = [
+        xs_access_of[dpu_id],
+        Access(("dpu", dpu_id),
+               idx.offset + expert * t_rows * dtype_bytes("int64"),
+               t_rows * dtype_bytes("int64")),
+    ]
+    write = Access(("dpu", dpu_id), compact.offset, compact.nbytes)
+    cmd = builder.append(
+        "launch", dpu_id,
+        {"kernel": GATHER_ROWS_KERNEL,
+         "node": f"moe:gather:{topo.layer}:{expert}",
+         "arg_kinds": ["tensor", "tensor"],
+         "arg_shapes": [tuple(compact.shape), (t_rows,)],
+         "arg_dtypes": ["float16", "int64"],
+         "dtype": "float16", "out_shape": tuple(compact.shape),
+         "gate": dispatch_id, "expert": expert},
+        reads, [write],
+        _deps_of(reads, builder.writers)
+        + _war_waits(write.loc, write.offset,
+                     builder.pending_readers, builder.reader_cmds)
+        + [dispatch_id],
+        num_tasklets=num_tasklets)
+    builder.register_reader(f"moe:gather:{topo.layer}:{expert}", dpu_id, cmd.id)
 
 
 def _emit_moe_scatter_add(
@@ -865,6 +873,9 @@ def build_execution_plan(
     exact_topo: dict[int, MoELayerTopology] = {}
     exact_suppress: set[str] = set()
     chain_redirect: dict[str, tuple[int, int]] = {}
+    # 紧凑缓冲共享的发射簿记：已发 gather 的 (层, 专家, dpu) 与已发射的链读者名。
+    gathers_done: set[tuple[int, int, int]] = set()
+    chain_readers_done: set[str] = set()
     acc_land_of: dict[str, int] = {}
     down_out_of: dict[str, tuple[int, int]] = {}
     routing_layers: dict[str, int] = {}
@@ -957,6 +968,28 @@ def build_execution_plan(
                 # exact：本节点在专家链上时，xs 实参改读该专家的紧凑缓冲
                 # （gather 写的，行数 = k_e）；形状与 xs 相同，payload 不变。
                 redirect = chain_redirect.get(node.name) if exact else None
+                if redirect is not None:
+                    layer_r, expert_r = redirect
+                    key = (layer_r, expert_r, dpu_id)
+                    if key not in gathers_done:
+                        # 共享紧凑缓冲的硬前提：前序专家的链读者已全部发射，
+                        # 否则 WAR 边会静默缺失（war_waits 对未发射读者跳过）、
+                        # gather 提前覆写还在读的紧凑缓冲——建模序破坏直接抛。
+                        pending_prev = [
+                            n for p, names in exact_topo[layer_r].xs_readers.items()
+                            if p < expert_r for n in names
+                            if n not in chain_readers_done]
+                        if pending_prev:
+                            raise ValueError(
+                                f"专家链节点序交错（层 {layer_r}）："
+                                f"{node.name} 先于前序专家读者 {pending_prev}，"
+                                "紧凑缓冲共享不成立")
+                        gathers_done.add(key)
+                        _emit_moe_gather(
+                            builder, exact_topo[layer_r], expert_r, dpu_id,
+                            moe_buffers[dpu_id], xs_access_by_layer[layer_r],
+                            dispatch_by_layer[layer_r],
+                            num_tasklets=num_tasklets)
                 for arg in flat_args:
                     if not isinstance(arg, Node):
                         continue
@@ -1127,8 +1160,10 @@ def build_execution_plan(
                     reads, [write], waits,
                     num_tasklets=num_tasklets,
                 )
-                # 登记本节点为输入地址读者。
+                # 登记本节点为输入地址读者；链读者名另记，供 gather 的交错防护。
                 builder.register_reader(node.name, dpu_id, cmd.id)
+                if redirect is not None:
+                    chain_readers_done.add(node.name)
                 # exact：down_proj 输出落地即加权散写进 acc；本层最后一个
                 # 专家收尾时发 acc 跨 DPU 归约，写回落地缓冲供出口投影读。
                 down = down_out_of.get(node.name)
@@ -1169,7 +1204,6 @@ def build_execution_plan(
                 builder, topo,
                 mask_cmd_id=builder.host_value_of[topo.mask_scatter],
                 routing_cmd_id=cmd.id, buffers_by_dpu=moe_buffers,
-                xs_access_of=xs_access_by_layer[topo.layer],
-                num_tasklets=num_tasklets)
+                xs_access_of=xs_access_by_layer[topo.layer])
 
     return CompiledPlan(plan=ExecutionPlan(commands=builder.commands), output_cmd_id=output_cmd_id)

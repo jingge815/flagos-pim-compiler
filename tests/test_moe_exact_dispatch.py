@@ -180,8 +180,13 @@ def test_exact_expert_chain_reads_compact(exact_dense_pair) -> None:
             assert not (offsets & xs_off), (
                 f"{layer_gate.name} 仍直接读 xs 原缓冲")
         all_input_offsets |= offsets
-    # 各专家的紧凑缓冲互不重叠：4 个 gate_proj（2 层 × 2 DPU 段）偏移两两不同。
-    assert len(all_input_offsets) == 2 * len(gate_linears) // 2
+    # 紧凑缓冲全专家共享一份地址（共享化后）：4 个 gate_proj（2 层）× 2 台
+    # DPU，每台一个偏移，层间因生命周期相邻可与别层叠址。
+    per_dpu = {}
+    for loc, offset in all_input_offsets:
+        per_dpu.setdefault(loc[1], set()).add(offset)
+    assert all(len(s) <= 2 for s in per_dpu.values()), (
+        f"每台 DPU 至多 2 个紧凑缓冲地址（2 层），实际 {per_dpu}")
 
 
 def test_exact_dispatch_writes_rows_and_tables(exact_dense_pair) -> None:
@@ -433,8 +438,28 @@ def test_exact_routing_tables_bitwise(exact_dense_pair) -> None:
         return v
 
     backend.result_of = spy
+    # 表段生命周期到块尾为止——紧凑缓冲共享后 greedy_reuse 允许块后缓冲
+    # 复用 idx/w 地址，终态读回会读到复用者。包装 scatter 内核在执行时
+    # （表存活期内，它同时读 w 段与 idx 段）快照两表逐位核对。
+    snap: dict[tuple, tuple] = {}
+    from contracts.op_semantics import SCATTER_ADD_KERNEL
+    orig_scatter = backend._kernels.lookup(SCATTER_ADD_KERNEL)
+
+    def scatter_wrap(hal, dpu_id, cmd, _orig=orig_scatter):
+        seg_w, seg_idx = cmd.reads[2], cmd.reads[3]
+        n = seg_idx.length // dtype_bytes("int64")
+        parts = str(cmd.payload["node"]).split(":")
+        snap[(int(parts[2]), int(parts[3]), dpu_id)] = (
+            np.asarray(hal.copy_from_dpu(dpu_id, seg_idx.offset,
+                                          (n,), np.int64)).copy(),
+            np.asarray(hal.copy_from_dpu(dpu_id, seg_w.offset,
+                                          (n,), np.float16)).copy())
+        return _orig(hal, dpu_id, cmd)
+    backend._kernels.register(SCATTER_ADD_KERNEL, scatter_wrap)
+
     # 跑 2 步：第 0 步是 prefill 计划（T=4，地址偏移与 decode 计划不同），
-    # 末步是 decode 计划——正是 _dispatch_cmds_of 读的这份，末步终态可核。
+    # 末步是 decode 计划——正是 _dispatch_cmds_of 读的这份；快照与掩码都
+    # 取末次执行。
     run_decode_loop(compiled, backend, prompt_ids=torch.tensor([1, 2, 3, 4]),
                     max_new_tokens=2, eos_id=-1,
                     sample_fn=lambda logits: int(np.argmax(logits)),
@@ -442,7 +467,6 @@ def test_exact_routing_tables_bitwise(exact_dense_pair) -> None:
 
     num_dpus, num_experts = 2, 4
     idx_b = dtype_bytes("int64")
-    w_b = dtype_bytes("float16")
     for cmd in dispatch:
         mask_id, routing_id = closure_ids[cmd.id]
         mask, routing = seen.get(mask_id), seen.get(routing_id)
@@ -451,28 +475,61 @@ def test_exact_routing_tables_bitwise(exact_dense_pair) -> None:
         assert mask.dtype == torch.bool, (
             f"闭包首 int 应是布尔掩码命令号，实得 dtype={mask.dtype}")
         t_rows = cmd.writes[0].length // (num_experts * idx_b)
-        seg_idx = t_rows * idx_b   # 每专家段步长（dispatch 写表用同一算术）
-        seg_w = t_rows * w_b
+        layer = int(str(cmd.payload["node"]).rsplit("_", 1)[1])
         lane = {k[0] for k in backend.moe_rows if k[1] == cmd.id}.pop()
         for expert in range(num_experts):
             rows = mask[:, expert].nonzero(as_tuple=True)[0]
             k_e = backend.moe_rows[(lane, cmd.id, expert)]
             assert int(rows.numel()) == k_e, "moe_rows 与掩码重算不一致"
             if k_e == 0:
-                continue
+                continue    # 零命中专家整支跳过，scatter 不执行、无快照
             expect_w = routing[rows, expert].to(torch.float16).numpy()
             for dpu in range(num_dpus):
-                got_idx = backend.copy_from_dpu(
-                    dpu, cmd.writes[2 * dpu].offset + expert * seg_idx,
-                    (t_rows,), np.int64)
-                got_w = backend.copy_from_dpu(
-                    dpu, cmd.writes[2 * dpu + 1].offset + expert * seg_w,
-                    (t_rows,), np.float16)
+                got_idx, got_w = snap[(layer, expert, dpu)]
                 assert np.array_equal(got_idx[:k_e], rows.numpy()), (
                     f"{cmd.payload['node']} 专家 {expert} DPU{dpu} idx 表不符")
                 assert np.all(np.diff(got_idx[:k_e]) > 0), "行号应按 token 升序"
                 assert np.array_equal(got_w[:k_e], expect_w), (
                     f"{cmd.payload['node']} 专家 {expert} DPU{dpu} w 表不符")
+
+
+def test_exact_compact_buffers_shared(exact_dense_pair) -> None:
+    """紧凑缓冲共享：同层各专家 compact 规划到同一地址；gather 随链惰性
+    发射（前序专家命令之后、waits 含前序专家命令），不再 dispatch 后整批预发。"""
+    from collections import defaultdict
+
+    compiled = exact_dense_pair[0]
+    for plan_field in ("moe_prefill", "moe_decode"):
+        for plan in compiled.mem_plans.values():
+            by_layer = defaultdict(set)
+            for name, buf in (getattr(plan, plan_field) or {}).items():
+                if name.startswith("moe:compact:"):
+                    by_layer[name.split(":")[2]].add(buf.offset)
+            assert by_layer, f"{plan_field} 未规划紧凑缓冲"
+            for layer, offsets in by_layer.items():
+                assert len(offsets) == 1, (
+                    f"{plan_field} 层 {layer} 紧凑缓冲未共享: {sorted(offsets)}")
+
+    cmds = compiled.decode_plans[0].commands
+    pos = {c.id: i for i, c in enumerate(cmds)}
+    by_id = {c.id: c for c in cmds}
+    gathers = sorted(
+        (c for c in cmds
+         if str(c.payload.get("node", "")).startswith("moe:gather:")),
+        key=lambda c: pos[c.id])
+    assert len(gathers) >= 4, "两层 × 两台 × 四专家应有不少于 4 条 gather"
+    # 惰性发射：相邻 gather 之间隔着链命令，不是 dispatch 后连续整批。
+    assert pos[gathers[-1].id] - pos[gathers[0].id] > len(gathers), (
+        "gather 仍集中发射，未随链惰性化")
+    # WAR 边：每条 gather 的 waits 至少含一条前序专家的命令（共享地址的
+    # 写前等待），专家 0 只等 dispatch。
+    for g in gathers:
+        expert = int(str(g.payload["node"]).split(":")[3])
+        if expert == 0:
+            continue
+        prev_waits = {w for w in g.waits
+                      if by_id[w].payload.get("expert") == expert - 1}
+        assert prev_waits, f"{g.payload['node']} 缺前序专家的 WAR 等待"
 
 
 def test_exact_scatter_waw_chain(exact_dense_pair) -> None:

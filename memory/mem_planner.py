@@ -318,8 +318,11 @@ def _moe_exact_tensors(
         add(f"moe:w:{layer}", (experts, t), "float16", produced, last_read,
             scatters)
         for e in topo.down_outs:
-            add(f"moe:compact:{layer}:{e}", (t, h), "float16", produced,
-                last_read, list(topo.xs_readers[e]))
+            # 紧凑缓冲全专家共享一份地址：专家链按序执行，生命周期取本专家
+            # 链 xs 读者的节点区间（gather 随链首惰性发射，见 exec_plan_gen）。
+            e_steps = [node_step[by_name[n]] for n in topo.xs_readers[e]]
+            add(f"moe:compact:{layer}:{e}", (t, h), "float16",
+                min(e_steps), max(e_steps), list(topo.xs_readers[e]))
         add(f"moe:acc:{layer}", (t, h), "float16", produced, last_read,
             scatters + [f"moe:reduce:{layer}"])
         add(f"moe:acc_land:{layer}", (t, h), "float16", produced, last_read,

@@ -146,23 +146,52 @@ scatter 节点的写法）：device 走 `DEVICE_META_KEY`/`DEVICE_DPU`/`DEVICE_H
 spec_prop 是 dtype 进入 IR 的唯一入口）。契约测试 23 passed、exact 测试
 13 passed，行为等价。
 
-## 已立项：紧凑缓冲共享化（下一个优化项，2026-11-18 用户拍板）
+## 已落地：紧凑缓冲共享化（2026-11-18）
 
-定位依据（4L 实测账本，T_max=512，dense stride 59MiB / exact 319MiB）：增量
-260MiB 中 **98% 来自「每专家一份全宽紧凑缓冲」**——`_moe_exact_tensors` 给
-每个专家规划独立 `moe:compact:{layer}:{e}` (T×h 整份全宽，E=128 份共
-256MiB)，且生命周期统一取块级（routing_scatter 产生 → exit_consumer 读毕），
-128 份互不能叠地址。idx/w 路由表（0.6MiB）与 acc/acc_land（4MiB）是零头。
+立项时的定位（4L 实测账本，T_max=512）：exact 比 dense 多出的 260MiB 激活
+中 **98% 来自「每专家一份全宽紧凑缓冲」**——E=128 份 `moe:compact` 共
+256MiB，块级生命周期（routing_scatter→exit_consumer）致 128 份互不能叠址。
 
-优化方案：专家链在 DPU 流上本就按计划序串行执行，**共享一份 T×h 紧凑缓冲**
-即可（256MiB → 2MiB，exact 的激活代价反而低于 dense）。改动面集中在
-`_moe_exact_tensors` 的生命周期建模从块级细化到行级命令（gather:e 写、
-该专家链读毕即释放），`greedy_reuse` 本体不动；行级命令的 WAR 链靠既有
-读者名登记闭合。语义与逐位一致性不受影响（只改地址复用，不改执行序）。
+**实现**（改动 +147/-53，三文件）：
 
-待另行拍板：共享落地、48L 全模型复测后，是否把 exact 设为默认模式
-（用户判断：exact 语义更贴近 transformer MoE 的真实计算方式——只算被路由
-到的 token，dense 的 16 倍包络计算终归是模拟开销）。
+| 文件 | 改动 |
+| --- | --- |
+| `memory/mem_planner.py` | `_moe_exact_tensors` 的 compact 生命周期从块级改为**本专家链 xs 读者的节点区间**——专家链按序执行，区间互不重叠，`greedy_reuse` 自动把全部专家叠到同一地址（本体未动） |
+| `runtime/exec_plan_gen.py` | gather 从「dispatch 后整批预发」改为**随链首惰性发射**（`_emit_moe_gather`，挂在主循环首个链节点处）——整批预发 + 共享地址会让 WAR 边指向更晚提交的同流命令，单工作流下死锁；惰性化后 WAR 边与计划序同向、被 fold_waits 折叠零开销。附带编译期交错防护：前序专家读者未发射即抛（`war_waits` 对未发射读者静默跳过，不能靠它兜） |
+| `tests/test_moe_exact_dispatch.py` | 新增 `test_exact_compact_buffers_shared`（同层 compact 单地址、gather 惰性分布、WAR 边含前序专家命令）；`chain_reads_compact` 断言改共享语义；`routing_tables_bitwise` 改为 scatter 执行时快照表段（表生命周期到块尾，块后缓冲合法复用其地址，终态读回会读到复用者） |
+
+**实测**（4L 真实权重，8×8GiB，池 8）：
+
+| 每台激活总占用 | 共享前 | 共享后 |
+| --- | --- | --- |
+| exact T_max=128 | 637 MiB | **126 MiB** |
+| exact T_max=512 | 2552 MiB | **505 MiB** |
+| exact / dense 比 | 5.4× | **1.07×**（差额 4.2MiB = idx/w/acc） |
+
+exact 臂 token 与三臂基线**逐位一致**、行数守恒；单测 14/14、受影响回归
+223 绿。执行序与逐位一致性不受影响（同一 DPU 流内命令集合与时序不变，
+只改地址复用与发射位置）。
+
+**48L 全模型账本**（plan-only 探针 `/tmp/probe_48l_exact_plan.py`：真代码
+路径跑到内存规划、发射三件打桩，79 分钟 vs 全编译 5h21m；4L 冒烟与全编译
+账本逐字节一致验证桩不扰动数字）：
+
+| Qwen3-30B-A3B 48L @ T_max=512，每台 8GiB | 值 |
+| --- | --- |
+| 权重 | 7724.7 MiB（94.9%） |
+| stride | 63.16 MiB（与 4L 相同——层间串行复用，峰值不随层数涨） |
+| 自动收缩 | 池 8→**2**，并发宽度 2 |
+| 激活合计 / KV | 126.3 MiB / 52.3 MiB（279 槽 = 4464 token） |
+| 余量 | 224.7 MiB |
+
+推断（未实测旧代码）：共享化前 exact stride ~319MiB > 全部可用余量，
+48L exact 编译会直接失败——共享化把 48L exact 从「装不下」救成「池 2 宽 2」。
+
+dense 对照臂（同探针 PROBE_MODE=dense）：stride 59.09MiB、池/宽同为 2/2
+——**48L 上 exact 零并发代价**；代价转移到 KV：322→279 槽（−13%，约少
+0.8 个满长请求），换来 MoE 计算 ~16× 缩减。exact 转默认的拍板数据至此
+齐备（4L：激活比 1.07、墙钟快 2.5×、token 逐位一致；48L：同池深、
+−13% KV、~16× 计算）。
 
 ## 当前不足 / 已知边界
 
@@ -175,6 +204,6 @@ spec_prop 是 dtype 进入 IR 的唯一入口）。契约测试 23 passed、exac
   独跑/双探针并行/人工 CPU 负载均不复现）。跑对拍类测试时避免与其他编译任务并发。
 - GeneSim/CEVA 接线是 M4a/b：sidecar 枚举、按 Σk_e 行计费、设备路径落地或降级登记。
 
-净增删：M2③④⑤⑥ 主体 cafdb35 已提交；本收尾批次（PP 托管 + 竞态修复 +
-契约对齐）已随三笔提交落库，改动 +66 / -15（hal_numpy +12/-2、mem_planner
-+5/-1、exec_plan_gen +5/-3、moe_exact +8/-4、test +31/-7）另文档增量。
+净增删：M2 主体与收尾已全部落库（cafdb35 + 3321efb/3afc0d3/2138cf4）；
+紧凑缓冲共享化批次 +147/-53（mem_planner +5/-2、exec_plan_gen +72/-38、
+test +70/-13）另文档增量，等用户下令提交。
