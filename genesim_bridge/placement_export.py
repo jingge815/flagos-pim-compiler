@@ -962,7 +962,8 @@ def export_placement_to_genesim(
             if not ir_execution:
                 raise ValueError(
                     "MoE IR 没有 moe_execution，调用方也没有传编译配置："
-                    "无法确定仿真应按 dense_sim 还是 dynamic_dispatch 计费。")
+                    "无法确定仿真按 dense_sim / dynamic_dispatch / "
+                    "exact_dispatch 哪种语义计费。")
             moe_execution = ir_execution
         elif ir_execution and ir_execution != moe_execution:
             raise ValueError(

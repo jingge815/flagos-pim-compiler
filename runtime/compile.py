@@ -423,9 +423,10 @@ def compile_llama2(
     `graph_tiling` 控制图级分块：缺省按架构定（MoE 关闭，其余打开），
     显式 True/False 可覆盖；`PIM_DISABLE_TILE=1` 也走关闭。
 
-    `moe_execution` 是 MoE 的执行语义（`dense_sim` / `dynamic_dispatch`），
-    缺省跟随 `PIM_MOE_DISPATCH`。这一份值随 CompiledModel 交给放置导出与
-    仿真配置，主链各入口不再各自读环境变量或写死。
+    `moe_execution` 是 MoE 的执行语义（`dense_sim` / `dynamic_dispatch` /
+    `exact_dispatch`），缺省跟随 `PIM_MOE_DISPATCH`。这一份值随
+    CompiledModel 交给放置导出与仿真配置，主链各入口不再各自读环境变量或
+    写死。
 
     `dynamic=True` 编译单张符号 T 的 prefill 图，运行期把实际长度绑进形状
     （runtime/shape_bind.py）。激活区与块表按窗口池深规划（`act_pool_slots`，

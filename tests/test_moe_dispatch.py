@@ -105,9 +105,8 @@ def test_skipped_launch_is_never_submitted() -> None:
     assert submitted == [0]
 
 
-@pytest.fixture(scope="module")
-def moe_compiled(tmp_path_factory):
-    """小 MoE（4 层 × 8 专家）编译出带 dispatch 的 decode 计划。"""
+def _compile_plan_fixture(tmp_path_factory, moe_execution=None, tag="plan"):
+    """小 MoE（4 层 × 8 专家）编译出 decode/prefill 计划；语义可指定。"""
     import torch
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
@@ -122,7 +121,7 @@ def moe_compiled(tmp_path_factory):
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
         head_dim=32, vocab_size=128, num_experts=8, num_experts_per_tok=2,
         norm_topk_prob=True)).eval().to(torch.float16)
-    path = tmp_path_factory.mktemp("qwen3_moe_plan")
+    path = tmp_path_factory.mktemp(f"qwen3_moe_{tag}")
     model.save_pretrained(path)
     loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
     strategy = ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config)
@@ -132,8 +131,22 @@ def moe_compiled(tmp_path_factory):
         wram_bytes_per_dpu=65536, dma_align=64)
     compiled = compile_llama2(
         loaded, strategy, prefill_seq_len=4, max_seq=16,
-        hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1)
+        hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1,
+        moe_execution=moe_execution)
     return compiled, loaded
+
+
+@pytest.fixture(scope="module")
+def moe_compiled(tmp_path_factory):
+    """缺省语义（dynamic_dispatch 系）的计划。"""
+    return _compile_plan_fixture(tmp_path_factory)
+
+
+@pytest.fixture(scope="module")
+def moe_exact_compiled(tmp_path_factory):
+    """exact_dispatch 的计划：行级命令 + 每层一条 acc 归约。"""
+    return _compile_plan_fixture(
+        tmp_path_factory, moe_execution="exact_dispatch", tag="exact")
 
 
 def test_decode_plan_carries_dispatch_and_expert_tags(moe_compiled) -> None:
@@ -836,17 +849,24 @@ def test_backend_records_per_dispatch_execution(moe_compiled) -> None:
             f"dispatch {dispatch_id} 没有拦下任何命令：gate 没有生效")
 
 
-def test_plan_and_genesim_ir_agree_on_moe_roles(moe_compiled, tmp_path) -> None:
+@pytest.mark.parametrize(
+    "moe_execution", ["dense_sim", "dynamic_dispatch", "exact_dispatch"])
+def test_plan_and_genesim_ir_agree_on_moe_roles(
+        moe_compiled, moe_exact_compiled, tmp_path, moe_execution) -> None:
     """跨仓对拍：FX 计划的落点/门控与 GeneSim IR 的成本角色逐项一致。
 
     IR 声明为 `expert_work` 的 (层, 专家) 组合必须整条带 gate；IR 声明为
-    host `shared_reduce` 的选择/加权累加必须落在主机命令上。只对总时延或
+    host `shared_reduce` 的选择/加权累加必须落在主机侧。dense_sim 与
+    dynamic_dispatch 编译出同一份带 gate 的计划（跳过是运行期行为），共用
+    一份计划对拍；exact_dispatch 的专家工作对应行级 gather/scatter 命令，
+    where 主机闭包退役、每层只剩一条 acc 归约在主机收口。只对总时延或
     「trace 全是 pimir」下结论看不出这类落点错配。
     """
     import sys
 
     import torch
 
+    from contracts.op_semantics import GATHER_ROWS_KERNEL, SCATTER_ADD_KERNEL
     from genesim_bridge.paths import genesim_root
     from runtime.exec_plan_gen import _expert_provenance, _expert_tag_of
 
@@ -857,12 +877,13 @@ def test_plan_and_genesim_ir_agree_on_moe_roles(moe_compiled, tmp_path) -> None:
         sys.path.append(str(src))
     from ir.model_ir import build_from_hf_config
 
-    compiled, loaded = moe_compiled
+    compiled, loaded = (moe_exact_compiled if moe_execution == "exact_dispatch"
+                        else moe_compiled)
     config_path = tmp_path / "config.json"
     loaded.config.to_json_file(str(config_path))
     ir = build_from_hf_config(
         str(config_path), execution_dtype="float16",
-        moe_execution="dynamic_dispatch")
+        moe_execution=moe_execution)
 
     ir_work = {
         (layer, int(op.expert_id))
@@ -880,21 +901,49 @@ def test_plan_and_genesim_ir_agree_on_moe_roles(moe_compiled, tmp_path) -> None:
     nodes = {node.name: node for node in compiled.decode_gm.graph.nodes}
     provenance = _expert_provenance(list(nodes.values()))
     commands = compiled.decode_plans[0].commands
-    plan_gated = {
-        _expert_tag_of(provenance, nodes[cmd.payload["node"]])
-        for cmd in commands
-        if cmd.op == "launch" and "gate" in cmd.payload
-    }
+    # 行级命令（moe:gather/moe:scatter）不在 FX 图里，(层, 专家) 直接取
+    # payload；图内命令仍走 provenance。两种来源汇成同一个门控集合。
+    _, gated = _gate_assignments(commands)
+    plan_gated = set()
+    for cmd, layer in gated:
+        node = nodes.get(str(cmd.payload.get("node")))
+        if node is not None:
+            plan_gated.add(_expert_tag_of(provenance, node))
+        else:
+            plan_gated.add((layer, cmd.payload["expert"]))
     plan_gated.discard(None)
     assert plan_gated == ir_work, (
         "计划门控的 (层, 专家) 与 IR 的 expert_work 不一致："
         f"计划多 {sorted(plan_gated - ir_work)[:5]}，"
         f"IR 多 {sorted(ir_work - plan_gated)[:5]}")
 
-    selects = [node for node in nodes.values()
-               if node.target in (torch.ops.aten.ne.Scalar,
-                                  torch.ops.aten.where.ScalarOther)]
-    host_nodes = {cmd.payload.get("node") for cmd in commands
-                  if cmd.op == "host_op"}
-    assert selects and {node.name for node in selects} <= host_nodes, (
-        "IR 把选择/加权累加记为 host，计划里这些节点却不是主机命令")
+    if moe_execution == "exact_dispatch":
+        # 尾链退役：where 主机闭包不再发射；每层一条 acc 归约落在主机。
+        host_nodes = {cmd.payload.get("node") for cmd in commands
+                      if cmd.op == "host_op"}
+        wheres = {n.name for n in nodes.values()
+                  if n.target == torch.ops.aten.where.ScalarOther}
+        assert wheres and not (wheres & host_nodes), (
+            "exact 计划不应发射 where 主机闭包")
+        reduces = [cmd for cmd in commands
+                   if str(cmd.payload.get("node", "")).startswith("moe:reduce:")]
+        assert len(reduces) == int(ir.num_layers), (
+            "exact 计划应每层一条 acc 归约")
+        assert all(cmd.op == "host_reduce" and cmd.dpu_id is None
+                   for cmd in reduces), "acc 归约必须是主机命令"
+        # 专家工作逐 (层, 专家) 落到行级 gather/scatter 命令上。
+        for kernel in (GATHER_ROWS_KERNEL, SCATTER_ADD_KERNEL):
+            rows = {(layer, cmd.payload["expert"]) for cmd, layer in gated
+                    if cmd.payload.get("kernel") == kernel}
+            assert rows == ir_work, (
+                f"{kernel} 的 (层, 专家) 与 IR 的 expert_work 不一致："
+                f"命令多 {sorted(rows - ir_work)[:5]}，"
+                f"IR 多 {sorted(ir_work - rows)[:5]}")
+    else:
+        selects = [node for node in nodes.values()
+                   if node.target in (torch.ops.aten.ne.Scalar,
+                                      torch.ops.aten.where.ScalarOther)]
+        host_nodes = {cmd.payload.get("node") for cmd in commands
+                      if cmd.op == "host_op"}
+        assert selects and {node.name for node in selects} <= host_nodes, (
+            "IR 把选择/加权累加记为 host，计划里这些节点却不是主机命令")

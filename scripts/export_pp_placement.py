@@ -49,6 +49,7 @@ from graph.strategy import (
 from graph.fuse_pim import fuse_for_pim
 from memory.mem_planner import default_site_capacity
 from runtime.compile import compile_llama2
+from runtime.exec_plan_gen import MOE_EXECUTION_MODES
 
 NUM_DPUS = 8
 NUM_TASKLETS = 4
@@ -113,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--moe-execution", default=None,
-        choices=("dense_sim", "dynamic_dispatch"),
+        choices=MOE_EXECUTION_MODES,
         help=(
             "MoE 执行语义；缺省跟随 PIM_MOE_DISPATCH。这份值随 sidecar 的 "
             "moe_config.execution 下发给 GeneSim，必须与图骨架 IR 一致。"

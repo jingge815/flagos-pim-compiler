@@ -71,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.architectures import Architecture, architecture_of
 from genesim_bridge.cost_extractor import SIDECAR_VERSION
+from runtime.exec_plan_gen import MOE_EXECUTION_MODES
 from genesim_bridge.ir_fingerprint import (
     assert_ir_fingerprint, fingerprint_ir, fusion_signature)
 from genesim_bridge.paths import (ceva_reference_dir, ceva_workspace, genesim_models_dir,
@@ -2820,7 +2821,7 @@ def parse_args() -> argparse.Namespace:
                         help="模型目录；架构、产物名与仿真配置从注册表派生。"
                              "默认取 paths 里的 llama2_7b_model_dir")
     parser.add_argument("--moe-execution", default=None,
-                        choices=("dense_sim", "dynamic_dispatch"),
+                        choices=MOE_EXECUTION_MODES,
                         help="MoE 执行语义；缺省跟随 PIM_MOE_DISPATCH。"
                              "同一次运行里图骨架、放置 sidecar 与仿真都按它。")
     parser.add_argument("--max-requests", type=int, default=None,
