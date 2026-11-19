@@ -26,6 +26,8 @@ import torch
 
 from contracts.ceva import CevaGraphSpec, CevaIoBinding
 from contracts.compile_slots import CompileSlots
+from contracts.dtypes import dtype_bytes
+from contracts.mem_layout import align_up
 from genesim_bridge.paths import ceva_embedding, flagtree_source
 
 RUNTIME_DIR = Path("parser_output") / "tvmgen_default_nprm_main_0" / "runtime_files"
@@ -1017,6 +1019,80 @@ def opcompiler_revision() -> str:
     return digest.hexdigest()[:12]
 
 
+# ---- MoE 语义边界与窗口变体（M4b 首片，docs/m0-ceva-probe-20261118.md） ----
+
+M0_CEVA_PROBE_DOC = "docs/m0-ceva-probe-20261118.md"
+
+
+def require_supported_moe_execution(moe_execution: str | None) -> None:
+    """exact_dispatch 在导出边界直接拒绝：厂商不支持运行期行级 gather（M0-①）。"""
+    if moe_execution == "exact_dispatch":
+        raise ValueError(
+            "CEVA 链路不支持 moe_execution='exact_dispatch'：厂商不支持运行期"
+            "行级 gather，MoE 只允许 dense_sim / dynamic_dispatch"
+            f"（{M0_CEVA_PROBE_DOC}）。exact 的交付口径 = numpy 数值真源 + "
+            "GeneSim 计费，CEVA 边界登记为降级项。")
+
+
+@dataclass(frozen=True)
+class CevaWindowGeometry:
+    """窗口池几何，平移语义与主链 WindowSpec（runtime/materialize.py）一致。"""
+
+    pool: int        # 变体份数 = 池深
+    act_stride: int  # 相邻窗口边界激活（hidden 进/出对）的统一步长
+    bt_stride: int   # CEVA 无块表（KV 行索引是内容级），恒 0；占位对齐 M1 几何
+
+
+def window_geometry(spec: CevaGraphSpec, *, pool: int,
+                    align: int = 4096) -> CevaWindowGeometry:
+    """按 I/O 契约推窗口几何：单请求占用 = hidden 进 + 出两块边界激活。
+
+    GML/bin 不携带 DDR 地址（缓冲只按文件名引用，边界地址由 runner 在
+    executeSubgraph 的 io_map 按名字绑），窗口步长只覆盖边界激活；中间缓冲由
+    厂商 SDK 摆进 p_memory，子图执行是阻塞原子的，全窗口共用。4K 对齐与
+    DDR 布局（ddr_manager 的 align_to_x）一致。
+    """
+    if pool < 1:
+        raise ValueError(f"窗口池深 pool={pool} 必须为正")
+    pair = 0
+    for binding in (spec.io_for("nprm_0_i0"), spec.io_for("output")):
+        size = dtype_bytes(binding.dtype)
+        for extent in binding.shape:
+            size *= int(extent)
+        pair += size
+    return CevaWindowGeometry(pool=pool, act_stride=align_up(pair, align),
+                              bt_stride=0)
+
+
+def derive_window_variants(out_dir: Path, directory: Path,
+                           geometry: CevaWindowGeometry) -> list[dict]:
+    """按池深派生窗口变体目录，返回 bundle.json 的 windows.variants 记录。
+
+    窗口 0 用原图；1..pool-1 复制成 `<图根>_w<N>`（与 TP2 分片的 `_attn/_mlp`
+    同一后缀约定）。M0-② 实测内核不随摆放变化，所以派生只复制文件、逐字节
+    共享，不重导；act_shift/bt_shift 是相对窗口 0 的地址摘要（绝对基址由 DDR
+    布局定），gml_sha256 供 runner 核对变体与窗口 0 同源。runner 侧目前仍是
+    单请求 DDR 布局（KV/暂存没有按窗口份数），池深 >1 只完成导出侧派生，
+    运行侧接线在下一片。
+    """
+    graph_root = directory.parent.parent.parent
+    records = []
+    for window in range(geometry.pool):
+        variant_root = graph_root if window == 0 else \
+            graph_root.with_name(f"{graph_root.name}_w{window}")
+        if window:
+            target = out_dir / variant_root
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(out_dir / graph_root, target)
+        variant = variant_root / directory.relative_to(graph_root)
+        records.append({"window": window, "directory": str(variant),
+                        "act_shift": window * geometry.act_stride,
+                        "bt_shift": window * geometry.bt_stride,
+                        "gml_sha256": _sha256(out_dir / variant / GML_NAME)})
+    return records
+
+
 def generation_digest(model, calibration, *, revision: str, opcompiler: str,
                       use_opcompiler: bool) -> str:
     """影响生成结果的输入摘要：checkpoint、整模型标定、两端编译器版本与是否接算子编译器。
@@ -1033,12 +1109,16 @@ def generation_digest(model, calibration, *, revision: str, opcompiler: str,
 
 def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
                        targets, *, use_opcompiler: bool = True, log=print,
-                       calibration=None) -> Path:
+                       calibration=None, moe_execution: str | None = None,
+                       window_pool: int = 1) -> Path:
     """逐图导出并写 `bundle.json`。已完成的图在清单里登记，中断后重跑会覆盖。
 
     `calibration`（`quant.calibration.LlamaCalibration`）是整模型标定结果：每张层子图取
     本层的 KV scale，输出头取 final norm 的输入作标定样本。不给则在本模型上现标定。
+    `moe_execution` 在此边界校验（exact_dispatch 直接拒绝）；`window_pool` 是
+    窗口变体份数（池深），每张图按它派生变体并记进清单的 windows 字段。
     """
+    require_supported_moe_execution(moe_execution)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "bundle.json"
@@ -1067,7 +1147,7 @@ def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
                          f"不能只重导部分图；未覆盖的有 "
                          f"{sorted((g['stage'], g['layer_id']) for g in kept_graphs)[:3]}")
     manifest.update(compiler_revision=revision, opcompiler_revision=opcompiler,
-                    generation_digest=digest,
+                    generation_digest=digest, moe_execution=moe_execution or "",
                     calibration={"kv": [list(pair) for pair in calibration.kv]})
     for stage, layer_id in targets:
         spec = load_ceva_spec(reference_root, stage, layer_id, slots)
@@ -1077,6 +1157,12 @@ def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
             scales=calibration.scales_for(layer_id),
             calibration_inputs=calibration.head_inputs if stage == "lm_head" else None)
         entry["directory"] = str(directory)
+        geometry = window_geometry(spec, pool=window_pool)
+        entry["windows"] = {"pool": geometry.pool,
+                            "act_stride": geometry.act_stride,
+                            "bt_stride": geometry.bt_stride,
+                            "variants": derive_window_variants(
+                                out_dir, directory, geometry)}
         entry["generation_digest"] = digest
         manifest["graphs"] = [g for g in manifest["graphs"]
                               if (g["stage"], g["layer_id"]) != (stage, layer_id)]

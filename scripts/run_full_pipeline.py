@@ -2786,9 +2786,13 @@ def run_ceva(args: argparse.Namespace, log_dir: Path) -> Path:
     bundle = workspace / "bundles" / args.run_name
     verdict_path = workspace / "runs" / args.run_name / "results" / "verdict.txt"
     print("\n[1] 图编译器导出 65 张 CEVA 子图（厂商反量化权重作 checkpoint，bin 全部我方生成）")
-    _run([sys.executable, "scripts/export_gml.py", "--ceva-reference", str(ceva_reference_dir()),
-          "--use-opcompiler", "--out-dir", str(bundle)],
-         cwd=_REPO_ROOT, log_path=log_dir / "ceva_export.log")
+    export_cmd = [sys.executable, "scripts/export_gml.py",
+                  "--ceva-reference", str(ceva_reference_dir()),
+                  "--use-opcompiler", "--out-dir", str(bundle)]
+    if args.moe_execution:
+        # exact_dispatch 在导出边界被拒（M0-①），不会静默落成另一种语义。
+        export_cmd += ["--moe-execution", args.moe_execution]
+    _run(export_cmd, cwd=_REPO_ROOT, log_path=log_dir / "ceva_export.log")
     print("\n[2] 清单校验（全部文件由我方生成，尺寸与摘要一致）")
     _run([sys.executable, "scripts/verify_gml_artifact.py", str(bundle),
           "--ceva-manifest", str(bundle / "bundle.json")],

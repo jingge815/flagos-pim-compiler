@@ -1359,6 +1359,21 @@ def test_generated_files_manifest_and_io_sf(tmp_path) -> None:
     assert [b.sf for b in fixed] == [0.05, 1.0, 0.003]
 
 
+def _spec_stub(stage, layer):
+    """最小 CevaGraphSpec：整包导出的假图给窗口几何读 hidden 进/出两个绑定。"""
+    from contracts.ceva import CevaGraphSpec, CevaIoBinding
+    from contracts.compile_slots import CompileSlots
+
+    io = (CevaIoBinding(direction="input", index=0, name="nprm_0_i0", label=None,
+                        shape=(1, 1, 64), dtype="float16", sf=1.0),
+          CevaIoBinding(direction="output", index=0,
+                        name="tvmgen_default_nprm_main_0_output_0", label="output",
+                        shape=(1, 1, 64), dtype="float16", sf=1.0))
+    return CevaGraphSpec(stage=stage, layer_id=layer, query_tokens=1,
+                         slots=CompileSlots(), version="26.10.1", io=io,
+                         runtime_dir=Path("."))
+
+
 def test_bundle_passes_layer_scales_and_head_inputs(tmp_path, monkeypatch) -> None:
     """整包导出：每张图拿到本层 KV 标定；输出头拿到 final norm 输入作为标定样本。"""
     import json
@@ -1368,12 +1383,14 @@ def test_bundle_passes_layer_scales_and_head_inputs(tmp_path, monkeypatch) -> No
 
     calls = []
     monkeypatch.setattr(ceva, "load_ceva_spec",
-                        lambda root, stage, layer, slots: (stage, layer))
+                        lambda root, stage, layer, slots: _spec_stub(stage, layer))
     monkeypatch.setattr(ceva, "bundle_complete", lambda root, graphs, digest: False)
 
     def fake_export(model, spec, out_dir, *, use_opcompiler, scales, calibration_inputs):
         calls.append((spec, scales, calibration_inputs))
-        return {"stage": spec[0], "layer_id": spec[1], "files": []}
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / ceva.GML_NAME).write_text("graph [ ]")
+        return {"stage": spec.stage, "layer_id": spec.layer_id, "files": []}
 
     monkeypatch.setattr(ceva, "export_ceva_graph", fake_export)
     import torch
@@ -1527,7 +1544,7 @@ def _fake_bundle_export(monkeypatch):
     from gml_bridge import ceva
 
     monkeypatch.setattr(ceva, "load_ceva_spec",
-                        lambda root, stage, layer, slots: (stage, layer))
+                        lambda root, stage, layer, slots: _spec_stub(stage, layer))
     monkeypatch.setattr(ceva, "bundle_complete",
                         lambda root, graphs, digest: {(g["stage"], g["layer_id"]) for g in graphs}
                         >= {("prefill", 0), ("decode", 0)})
@@ -1535,7 +1552,8 @@ def _fake_bundle_export(monkeypatch):
     def fake_export(model, spec, out_dir, *, use_opcompiler, scales, calibration_inputs):
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "kv.txt").write_text(f"{scales.key},{scales.value}")
-        return {"stage": spec[0], "layer_id": spec[1], "files": []}
+        (out_dir / ceva.GML_NAME).write_text("graph [ ]")
+        return {"stage": spec.stage, "layer_id": spec.layer_id, "files": []}
 
     monkeypatch.setattr(ceva, "export_ceva_graph", fake_export)
 
@@ -1613,7 +1631,8 @@ def test_interrupted_full_reexport_never_marks_mixed_bundle_complete(tmp_path, m
             raise RuntimeError("第二张图失败")
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "kv.txt").write_text(f"{scales.key},{scales.value}")
-        return {"stage": spec[0], "layer_id": spec[1], "files": []}
+        (out_dir / ceva.GML_NAME).write_text("graph [ ]")
+        return {"stage": spec.stage, "layer_id": spec.layer_id, "files": []}
 
     monkeypatch.setattr(ceva, "export_ceva_graph", flaky_export)
     with pytest.raises(RuntimeError, match="第二张图失败"):

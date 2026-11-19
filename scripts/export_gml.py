@@ -37,6 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from genesim_bridge.paths import gml_llama2_reference_dir, llama2_7b_model_dir
+from runtime.exec_plan_gen import MOE_EXECUTION_MODES
 from gml_bridge.export import (
     format_summary,
     fuse_for_gml,
@@ -387,6 +388,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default="all", help="CEVA 模式只导某一阶段，调试用")
     parser.add_argument("--layer-index", type=int, default=None,
                         help="CEVA 模式只导某一层，调试用")
+    parser.add_argument("--moe-execution", default=None,
+                        choices=MOE_EXECUTION_MODES,
+                        help="CEVA 模式的 MoE 执行语义；exact_dispatch 会在导出"
+                        "边界直接拒绝（厂商无运行期行级 gather，"
+                        "docs/m0-ceva-probe-20261118.md）")
+    parser.add_argument("--window-pool", type=int, default=1,
+                        help="CEVA 窗口变体份数（池深）；默认 1 只导窗口 0")
     # 旧的自研 prepare_out 支线已删除，net.ini 由厂商 GC/L2A 生成。
     parser.add_argument("--orchestrate", action="store_true",
                         help=argparse.SUPPRESS)
@@ -405,6 +413,9 @@ def main() -> int:
     if args.orchestrate:
         parser.error("--orchestrate 已删除：prepare_out 由厂商 GC 生成，"
                      "CEVA 链路用 --ceva-reference")
+    if args.ceva_reference is None and (args.moe_execution or args.window_pool != 1):
+        parser.error("--moe-execution/--window-pool 只用于 CEVA 模式"
+                     "（需 --ceva-reference）")
 
     if args.ceva_reference is not None:
         if not args.use_opcompiler:
@@ -506,13 +517,17 @@ def _main_ceva(args) -> int:
     from gml_bridge import ceva
     from gml_bridge.ceva import bundle_targets
 
+    # 加载模型前先拦：exact_dispatch 落不了 CEVA，别白载一份权重。
+    ceva.require_supported_moe_execution(args.moe_execution)
     model = _load_model(args.layers)
     ceva.load_vendor_checkpoint(model, args.ceva_reference, include_head=True)
     targets = bundle_targets(args.stage, args.layer_index,
                              model.config.num_hidden_layers)
     print(f"CEVA 导出 {len(targets)} 张子图 -> {args.out_dir}")
     manifest = ceva.export_ceva_bundle(model, args.ceva_reference, args.out_dir, targets,
-                                       use_opcompiler=args.use_opcompiler)
+                                       use_opcompiler=args.use_opcompiler,
+                                       moe_execution=args.moe_execution,
+                                       window_pool=args.window_pool)
     print(f"清单: {manifest}")
     return 0
 
