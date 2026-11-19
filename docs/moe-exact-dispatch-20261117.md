@@ -1,5 +1,11 @@
 # MoE exact_dispatch 第三模式落地（M2③④⑤，2026-11-17）
 
+> **2026-11-19 更新：exact_dispatch 已转默认**（用户拍板）。两仓缺省规则同步
+> 翻转：`PIM_MOE_DISPATCH` 缺省值 "1"→"2"，即不带环境时 MoE 走精确行数；
+> `=1` 显式回 dynamic_dispatch、`=0` 回 dense_sim。CEVA 链路不受影响
+> （当前产物非 MoE；MoE 走 CEVA 未指定时 fail-fast 提示选 dense/dynamic，
+> 不静默切换）。守护测试反向：缺省即 exact 是被锁定的行为。
+
 ## 做了什么
 
 `exact_dispatch` 成为 MoE 第三种执行语义（与 `dense_sim`、`dynamic_dispatch` 并列，

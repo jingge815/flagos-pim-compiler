@@ -111,7 +111,8 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
         hw=hw, hardware=PIMHardwareConfig(
             num_dpus=16, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
             wram_bytes_per_dpu=65536, dma_align=64),
-        num_request_slots=1, num_parallel_slots=1)
+        num_request_slots=1, num_parallel_slots=1,
+        moe_execution="dynamic_dispatch")  # EP 测的是动态分派；exact×EP 是 stretch
     backend = NumpyBackend(NumpyBackendConfig(
         num_dpus=16, mram_bytes_per_dpu=1 << 28))
     register_all(backend)
@@ -184,7 +185,8 @@ def test_dpu_to_host_reads_are_war_protected(ep_model_dir) -> None:
         hw=hw, hardware=PIMHardwareConfig(
             num_dpus=8, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
             wram_bytes_per_dpu=65536, dma_align=64),
-        num_request_slots=1, num_parallel_slots=1)
+        num_request_slots=1, num_parallel_slots=1,
+        moe_execution="dynamic_dispatch")  # EP 测的是动态分派；exact×EP 是 stretch
 
     for plan_obj in compiled.prefill_plans[4]:
         cmds = plan_obj if isinstance(plan_obj, Iterable) and hasattr(plan_obj, "__iter__") and not hasattr(plan_obj, "commands") else plan_obj.commands

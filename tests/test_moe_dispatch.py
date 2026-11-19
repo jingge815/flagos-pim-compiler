@@ -138,8 +138,10 @@ def _compile_plan_fixture(tmp_path_factory, moe_execution=None, tag="plan"):
 
 @pytest.fixture(scope="module")
 def moe_compiled(tmp_path_factory):
-    """缺省语义（dynamic_dispatch 系）的计划。"""
-    return _compile_plan_fixture(tmp_path_factory)
+    """dynamic_dispatch 的计划（这族测试写的就是动态分派语义；
+    全局默认已转 exact_dispatch，语义必须显式钉住）。"""
+    return _compile_plan_fixture(
+        tmp_path_factory, moe_execution="dynamic_dispatch")
 
 
 @pytest.fixture(scope="module")
@@ -391,7 +393,8 @@ def _compile_tiled(loaded, wram=128):
         hardware=PIMHardwareConfig(
             num_dpus=2, num_tasklets=4, mram_bytes_per_dpu=1 << 24,
             wram_bytes_per_dpu=wram, dma_align=64),
-        num_request_slots=1, num_parallel_slots=1, graph_tiling=True)
+        num_request_slots=1, num_parallel_slots=1, graph_tiling=True,
+        moe_execution="dynamic_dispatch")  # 分块×exact 不支持，本族测 dynamic
 
 
 def ARCHITECTURES_loaded_strategy(loaded):
@@ -798,7 +801,8 @@ def moe_pp_compiled(tmp_path_factory):
         wram_bytes_per_dpu=65536, dma_align=64)
     compiled = compile_llama2(
         loaded, strategy, prefill_seq_len=4, max_seq=16,
-        hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1)
+        hw=hw, hardware=hardware, num_request_slots=1, num_parallel_slots=1,
+        moe_execution="dynamic_dispatch")
     return compiled, strategy
 
 

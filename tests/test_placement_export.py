@@ -1846,14 +1846,14 @@ def test_export_step_rejects_a_fresh_sidecar_without_hashes(
 
 
 def test_pipeline_resolves_one_moe_execution_for_all_stages(tmp_path) -> None:
-    """主链只解析一次执行语义：MoE 缺省动态分派，非 MoE 必须为空。"""
+    """主链只解析一次执行语义：MoE 缺省精确行数（2026-11-19 转默认），非 MoE 为空。"""
     import scripts.run_full_pipeline as pipeline
 
     config = tmp_path / "config.json"
     config.write_text(json.dumps({
         "model_type": "qwen3_moe", "num_experts": 128,
         "num_experts_per_tok": 8}))
-    assert pipeline._resolve_moe_execution(tmp_path, None) == "dynamic_dispatch"
+    assert pipeline._resolve_moe_execution(tmp_path, None) == "exact_dispatch"
     assert pipeline._resolve_moe_execution(tmp_path, "dense_sim") == "dense_sim"
 
     config.write_text(json.dumps({"model_type": "llama"}))

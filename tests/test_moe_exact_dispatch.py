@@ -80,9 +80,8 @@ def exact_dense_pair():
     cfg = type("C", (), {"model_type": "qwen3_moe",
                          "num_experts": 4, "num_experts_per_tok": 2})()
 
-    # 默认语义不变：不带环境时仍是 dense_sim / dynamic_dispatch 系。
-    assert moe_execution_default() != "exact_dispatch", (
-        "exact_dispatch 不能是默认模式")
+    # 2026-11-19 拍板：默认语义已转 exact_dispatch（本夹具显式钉两种模式）。
+    assert moe_execution_default() == "exact_dispatch"
     assert resolve_moe_execution(cfg, "dense_sim") == "dense_sim"
 
     model = _moe_model()
@@ -94,7 +93,7 @@ def exact_dense_pair():
 
 
 def test_exact_dispatch_mode_accepted(monkeypatch) -> None:
-    """exact_dispatch 进模式表；PIM_MOE_DISPATCH=2|exact 启用，默认不变。"""
+    """exact_dispatch 进模式表且为默认（2026-11-19 拍板）；1/0 可显式回退。"""
     from runtime.exec_plan_gen import (
         MOE_EXECUTION_MODES, moe_execution_default, resolve_moe_execution)
 
@@ -104,14 +103,16 @@ def test_exact_dispatch_mode_accepted(monkeypatch) -> None:
 
     assert "exact_dispatch" in MOE_EXECUTION_MODES
     assert resolve_moe_execution(cfg, "exact_dispatch") == "exact_dispatch"
+    monkeypatch.delenv("PIM_MOE_DISPATCH", raising=False)
+    assert moe_execution_default() == "exact_dispatch"
     monkeypatch.setenv("PIM_MOE_DISPATCH", "2")
     assert moe_execution_default() == "exact_dispatch"
     monkeypatch.setenv("PIM_MOE_DISPATCH", "exact")
     assert moe_execution_default() == "exact_dispatch"
+    monkeypatch.setenv("PIM_MOE_DISPATCH", "1")
+    assert moe_execution_default() == "dynamic_dispatch"
     monkeypatch.setenv("PIM_MOE_DISPATCH", "0")
-    assert moe_execution_default() != "exact_dispatch"
-    monkeypatch.delenv("PIM_MOE_DISPATCH")
-    assert moe_execution_default() != "exact_dispatch"
+    assert moe_execution_default() == "dense_sim"
 
 
 # ---------- 计划结构 ----------

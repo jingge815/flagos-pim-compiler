@@ -40,8 +40,9 @@ MOE_EXECUTION_MODES = ("dense_sim", "dynamic_dispatch", "exact_dispatch")
 
 
 def moe_execution_default() -> str:
-    """编译配置的默认执行语义：PIM_MOE_DISPATCH=0 稠密模拟、2|exact 精确行数。"""
-    raw = os.environ.get("PIM_MOE_DISPATCH", "1")
+    """编译配置的默认执行语义：默认 exact 精确行数（2026-11-19 用户拍板），
+    PIM_MOE_DISPATCH=1 动态分派、0 稠密模拟可显式回退。"""
+    raw = os.environ.get("PIM_MOE_DISPATCH", "2")
     if raw in ("2", "exact"):
         return "exact_dispatch"
     return "dense_sim" if raw == "0" else "dynamic_dispatch"
