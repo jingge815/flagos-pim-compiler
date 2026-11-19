@@ -139,3 +139,25 @@ def test_ceva_embedding_is_configurable(monkeypatch, tmp_path) -> None:
     assert paths.ceva_embedding() == Path("/c/embed_torch.pth")
     monkeypatch.setenv("CEVA_EMBEDDING", "/o/e.pth")
     assert paths.ceva_embedding() == Path("/o/e.pth")
+
+
+def test_ceva_workspace_write_guard_fires() -> None:
+    """conftest 工作区写守卫的生效性检查（round02 问题5）。
+
+    探针路径取 runs/ 下两层（git 忽略区）：守卫生效时 mkdir 被拦截、
+    目录不落盘；守卫失效时本用例失败并留下可见现场。"""
+    probe = Path(paths.ceva_workspace()) / "runs" / "_guard_probe"
+    with pytest.raises(AssertionError, match="测试不得写真实工作区"):
+        probe.mkdir(parents=True)
+    assert not probe.exists()
+
+
+def test_repo_runs_write_guard_fires() -> None:
+    """conftest 守卫同样覆盖本仓 runs/ 归档树（round03 问题1）。
+
+    级联分支的 fake_run 曾以 cwd=仓库根把伪 PASS verdict 写进
+    runs/multi/results；工作区前缀守卫管不到仓内侧，本用例锁定补齐后的范围。"""
+    probe = Path(__file__).resolve().parent.parent / "runs" / "_guard_probe"
+    with pytest.raises(AssertionError, match="测试不得写仓内真实归档树"):
+        probe.mkdir(parents=True)
+    assert not probe.exists()

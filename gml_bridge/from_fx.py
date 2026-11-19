@@ -2622,9 +2622,16 @@ def _semantic_gml_name(op_type, fx_node, node_id, weight_param, role) -> str | N
     我们没有 Relay，qidx 用 FX 出现序（同一张图稳定），params 用 node_id。
     逐头节点已经叫 `mha_*_headN`，保持不动（layer_expand 靠这个认头）。
     """
+    qidx = _fx_qidx(fx_node)
+    # 逐头节点也要 vendor 风格后缀：单核路径由 publish_vendor_labels 覆盖同名，
+    # 不改最终产物；TP 分片路径跳过 vendor 对齐，缺后缀会让 GC 的 test_app
+    # 认不出 params 绑定（实测 attn 分片 GC 失败、补后缀口径与厂商一致）。
+    import re as _re
+    if _re.fullmatch(r"mha_(batch_matmul1|batch_matmul2|mask|softmax)_head\d+",
+                     fx_node.name):
+        return f"{fx_node.name}_qidx{qidx}_params_{node_id}"
     if role in _ROLE_OP_TYPES:
         return None
-    qidx = _fx_qidx(fx_node)
     if op_type == "RMSNorm_vpu":
         return f"RMSNorm_params_{node_id}"
     if op_type == "Gemm" and weight_param:

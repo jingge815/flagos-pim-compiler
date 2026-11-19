@@ -1,0 +1,13 @@
+{
+ "prompt_per_layer_ratio": 0.6804,
+ "decode_per_layer_ratio": 0.9361,
+ "source": "measured:llama2-7b/pp2/single_ours(32层单核) vs pp2_v3(16层分核), 2026-11-18",
+ "source_runs": ["runs/single_ours", "runs/pp2_v3"],
+ "in_sample_note": "对 pp2_v3 评估属同源验证（in_sample），偏差不能单独作为验收依据；验收需第二次独立 PP2 运行",
+ "detail": {
+  "prompt_single_per_layer": 28346864,
+  "prompt_per_core_per_layer": 19288436,
+  "decode_single_mean": 18145144,
+  "decode_per_core_mean": 8495400
+ }
+}

@@ -387,6 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default="all", help="CEVA 模式只导某一阶段，调试用")
     parser.add_argument("--layer-index", type=int, default=None,
                         help="CEVA 模式只导某一层，调试用")
+    parser.add_argument("--num-ceva", type=int, default=1,
+                        help="级联核数，默认 1（单核行为不变）")
+    parser.add_argument("--strategy", choices=("single", "pp2", "tp2"),
+                        default="single", help="级联切分策略")
     # 旧的自研 prepare_out 支线已删除，net.ini 由厂商 GC/L2A 生成。
     parser.add_argument("--orchestrate", action="store_true",
                         help=argparse.SUPPRESS)
@@ -410,6 +414,9 @@ def main() -> int:
         if not args.use_opcompiler:
             # 设计 3.2：CEVA 链路的相位必须来自 FlagTree，并校验跨相依赖。
             parser.error("--ceva-reference 必须同时给 --use-opcompiler")
+        if (args.num_ceva == 1) != (args.strategy == "single"):
+            parser.error("--num-ceva 与 --strategy 不匹配：单核用 single，"
+                         "多核用 pp2/tp2")
         return _main_ceva(args)
 
     from contracts.compile_slots import CompileSlots
@@ -508,11 +515,19 @@ def _main_ceva(args) -> int:
 
     model = _load_model(args.layers)
     ceva.load_vendor_checkpoint(model, args.ceva_reference, include_head=True)
-    targets = bundle_targets(args.stage, args.layer_index,
-                             model.config.num_hidden_layers)
+    if args.strategy == "tp2":
+        # tp2 每层拆 attn/mlp 两段，目标是 (stage, layer, shard_kind) 三元组。
+        targets = ceva.tp2_targets(model.config.num_hidden_layers)
+        if args.layer_index is not None:
+            targets = [t for t in targets if t[1] in (args.layer_index, None)]
+    else:
+        targets = bundle_targets(args.stage, args.layer_index,
+                                 model.config.num_hidden_layers)
     print(f"CEVA 导出 {len(targets)} 张子图 -> {args.out_dir}")
     manifest = ceva.export_ceva_bundle(model, args.ceva_reference, args.out_dir, targets,
-                                       use_opcompiler=args.use_opcompiler)
+                                       use_opcompiler=args.use_opcompiler,
+                                       strategy=None if args.strategy == "single"
+                                       else args.strategy)
     print(f"清单: {manifest}")
     return 0
 

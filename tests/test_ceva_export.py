@@ -1959,3 +1959,663 @@ def test_partial_reexport_refuses_changed_opcompiler(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(ceva, "opcompiler_revision", lambda: ceva.OPCOMPILER_UNKNOWN)
     with pytest.raises(ValueError, match="算子编译器版本"):
         ceva.export_ceva_bundle(model, tmp_path, out, [("decode", 0)], calibration=cal)
+
+
+def test_bundle_pp2_adds_cascade_node(tmp_path, monkeypatch) -> None:
+    """pp2 策略在 bundle.json 追加 cascade 节：层段均分、lm_head 归末核（设计 4.4）。"""
+    import json
+
+    from gml_bridge import ceva
+    from quant.calibration import LlamaCalibration
+
+    _fake_bundle_export(monkeypatch)
+    path = ceva.export_ceva_bundle(_small_llama(), tmp_path, tmp_path / "b",
+                                   ceva.bundle_targets("all", None, 2),
+                                   calibration=LlamaCalibration(kv=[(0.1, 0.2), (0.3, 0.4)]),
+                                   strategy="pp2")
+    node = json.loads(path.read_text())["cascade"]
+    assert node == {"strategy": "pp2", "num_cores": 2,
+                    "core_layers": [[0, 1], [1, 2]], "lm_head_core": 1}
+
+
+def test_bundle_single_strategy_no_cascade_node(tmp_path, monkeypatch) -> None:
+    """strategy 缺省（单核）时清单不出现 cascade 节，导出行为与旧路径一致。"""
+    import json
+
+    from gml_bridge import ceva
+    from quant.calibration import LlamaCalibration
+
+    _fake_bundle_export(monkeypatch)
+    path = ceva.export_ceva_bundle(_small_llama(), tmp_path, tmp_path / "b",
+                                   [("prefill", 0), ("decode", 0)],
+                                   calibration=LlamaCalibration(kv=[(0.1, 0.2)]))
+    manifest = json.loads(path.read_text())
+    assert "cascade" not in manifest
+
+
+def test_bundle_pp2_rejects_indivisible_layers(tmp_path, monkeypatch) -> None:
+    """层数不能被核数整除时拒绝导出，避免半截层段。"""
+    import pytest
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from gml_bridge import ceva
+    from quant.calibration import LlamaCalibration
+
+    _fake_bundle_export(monkeypatch)
+    odd = LlamaForCausalLM(LlamaConfig(vocab_size=128, hidden_size=64,
+                                       intermediate_size=176, num_hidden_layers=3,
+                                       num_attention_heads=4, num_key_value_heads=4,
+                                       max_position_embeddings=64)).eval()
+    with pytest.raises(ValueError, match="整除"):
+        ceva.export_ceva_bundle(odd, tmp_path, tmp_path / "b",
+                                ceva.bundle_targets("all", None, 3),
+                                calibration=LlamaCalibration(kv=[(0.1, 0.2)]),
+                                strategy="pp2")
+
+
+def test_cli_ceva_cascade_flags() -> None:
+    """--num-ceva/--strategy 可解析，默认 1/single（单核行为不变，设计 4.8）。"""
+    from scripts.export_gml import build_parser
+
+    args = build_parser().parse_args(["--ceva-reference", "/r", "--use-opcompiler",
+                                      "--num-ceva", "2", "--strategy", "pp2"])
+    assert (args.num_ceva, args.strategy) == (2, "pp2")
+    defaults = build_parser().parse_args([])
+    assert (defaults.num_ceva, defaults.strategy) == (1, "single")
+
+
+def test_cli_ceva_strategy_must_match_cores(monkeypatch, capsys) -> None:
+    """核数与策略不一致（单核给 pp2、多核给 single）直接报参数错误。"""
+    import sys
+
+    import pytest
+
+    from scripts import export_gml
+
+    for extra in (["--strategy", "pp2"], ["--num-ceva", "2"]):
+        monkeypatch.setattr(sys, "argv", ["export_gml.py", "--ceva-reference", "/r",
+                                          "--use-opcompiler", *extra])
+        with pytest.raises(SystemExit) as exc:
+            export_gml.main()
+        assert exc.value.code == 2
+
+
+def test_cli_ceva_passes_strategy_to_bundle(monkeypatch, tmp_path) -> None:
+    """_main_ceva 把 strategy 透传给 export_ceva_bundle。"""
+    from types import SimpleNamespace
+
+    from scripts import export_gml
+
+    calls = {}
+
+    def fake_bundle(model, ref, out, targets, *, use_opcompiler, strategy=None, **k):
+        calls["strategy"] = strategy
+        return tmp_path / "bundle.json"
+
+    monkeypatch.setattr("gml_bridge.ceva.export_ceva_bundle", fake_bundle)
+    monkeypatch.setattr("gml_bridge.ceva.load_vendor_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(export_gml, "_load_model", lambda layers=None: _small_llama())
+    args = export_gml.build_parser().parse_args(
+        ["--ceva-reference", "/r", "--use-opcompiler", "--num-ceva", "2",
+         "--strategy", "pp2", "--out-dir", str(tmp_path / "b")])
+    assert export_gml._main_ceva(args) == 0 and calls["strategy"] == "pp2"
+    # 默认单核透传 None（设计 5.3：strategy=None 等价旧行为）
+    args = export_gml.build_parser().parse_args(
+        ["--ceva-reference", "/r", "--use-opcompiler", "--out-dir", str(tmp_path / "b")])
+    assert export_gml._main_ceva(args) == 0 and calls["strategy"] is None
+
+
+# ---- TP2 分片导出（设计 4.5）----
+
+def _sharded(core_id: int):
+    """返回 (未切分参考模型, 已按 core_id 切片的模型副本)。"""
+    import copy
+
+    from gml_bridge.ceva import shard_model
+
+    model = _small_llama()
+    sharded = copy.deepcopy(model)
+    shard_model(sharded, tp_width=2, core_id=core_id)
+    return model, sharded
+
+
+def test_shard_model_slice_shapes() -> None:
+    """tp2 切片形状等于 local_shapes：q/k/v 出维减半、o 入维减半、lm_head 出维减半。"""
+    from graph.strategy import llama_strategy
+    from gml_bridge.sharding import local_shapes
+
+    _, s0 = _sharded(0)
+    attn = s0.model.layers[0].self_attn
+    mlp = s0.model.layers[0].mlp
+    cfg = s0.config
+    shapes = local_shapes(
+        llama_strategy(num_dpus=2, num_stages=1, num_heads=cfg.num_attention_heads,
+                       num_kv_heads=cfg.num_key_value_heads,
+                       intermediate_size=cfg.intermediate_size,
+                       vocab_size=cfg.vocab_size, num_layers=cfg.num_hidden_layers),
+        hidden_size=cfg.hidden_size, num_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads,
+        intermediate_size=cfg.intermediate_size, dpu_id=0)
+    assert attn.q_proj.weight.shape == (shapes.q_out, cfg.hidden_size)
+    assert attn.k_proj.weight.shape == (shapes.k_out, cfg.hidden_size)
+    assert attn.o_proj.weight.shape == (cfg.hidden_size, shapes.o_in)
+    assert mlp.gate_proj.weight.shape == (shapes.gate_out, cfg.hidden_size)
+    assert mlp.down_proj.weight.shape == (cfg.hidden_size, shapes.down_in)
+    assert s0.lm_head.weight.shape == (cfg.vocab_size // 2, cfg.hidden_size)
+
+
+def test_shard_model_concat_restores_full() -> None:
+    """两核切片拼回等于原权重：列切按 dim0、行切按 dim1。"""
+    import torch
+
+    full, s0 = _sharded(0)
+    _, s1 = _sharded(1)
+    for name in ("q_proj", "k_proj", "v_proj"):
+        joined = torch.cat([getattr(s0.model.layers[0].self_attn, name).weight,
+                            getattr(s1.model.layers[0].self_attn, name).weight], 0)
+        torch.testing.assert_close(
+            joined, getattr(full.model.layers[0].self_attn, name).weight)
+    for name in ("gate_proj", "up_proj"):
+        joined = torch.cat([getattr(s0.model.layers[0].mlp, name).weight,
+                            getattr(s1.model.layers[0].mlp, name).weight], 0)
+        torch.testing.assert_close(
+            joined, getattr(full.model.layers[0].mlp, name).weight)
+    for name, mod in (("o_proj", "self_attn"), ("down_proj", "mlp")):
+        joined = torch.cat([getattr(getattr(s0.model.layers[0], mod), name).weight,
+                            getattr(getattr(s1.model.layers[0], mod), name).weight], 1)
+        torch.testing.assert_close(joined, getattr(getattr(full.model.layers[0], mod), name).weight)
+    torch.testing.assert_close(
+        torch.cat([s0.lm_head.weight, s1.lm_head.weight], 0), full.lm_head.weight)
+
+
+def test_tp2_attn_mlp_shard_numerics() -> None:
+    """两核 attn/mlp 分片的部分和相加（host 归约）等于整层参考输出。"""
+    import torch
+
+    from gml_bridge.ceva import AttnShardPrefill, MlpShardLayer, causal_mask
+
+    full, s0 = _sharded(0)
+    _, s1 = _sharded(1)
+    layer = full.model.layers[0]
+    T, nh, hd = 6, 4, 16
+    torch.manual_seed(2)
+    hidden = torch.randn(1, T, 64)
+    mask = causal_mask(T, T)
+
+    # 参考：整层 attention 输出（不含残差）
+    x = layer.input_layernorm(hidden)
+    pos = torch.arange(T).unsqueeze(0)
+    emb = full.model.rotary_emb(hidden, pos)
+    attn_out = layer.self_attn(x, attention_mask=mask, position_embeddings=emb)[0]
+
+    cos, sin = _vendor_rope(full, list(range(T)))
+    parts = []
+    for core, model in ((0, s0), (1, s1)):
+        shard = AttnShardPrefill(model.model.layers[0], cos, sin)
+        parts.append(shard(hidden, mask)[0])
+    torch.testing.assert_close(parts[0] + parts[1], attn_out, rtol=1e-4, atol=1e-5)
+
+    # 参考：整层 mlp 输出（不含残差）
+    mlp_ref = layer.mlp(layer.post_attention_layernorm(hidden))
+    mlp_parts = [MlpShardLayer(m.model.layers[0])(hidden) for m in (s0, s1)]
+    torch.testing.assert_close(mlp_parts[0] + mlp_parts[1], mlp_ref,
+                               rtol=1e-4, atol=1e-5)
+
+
+def test_tp2_head_shard_concat() -> None:
+    """两核 head 分片 logits 拼接等于整头输出。"""
+    import torch
+
+    from gml_bridge.ceva import HeadShardLayer
+
+    full, s0 = _sharded(0)
+    _, s1 = _sharded(1)
+    hidden = torch.randn(1, 1, 64)
+    ref = full.lm_head(full.model.norm(hidden))
+    got = torch.cat([HeadShardLayer(s0)(hidden), HeadShardLayer(s1)(hidden)], -1)
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+def _local_slots(model):
+    import dataclasses
+
+    from contracts.compile_slots import CompileSlots
+
+    return dataclasses.replace(
+        CompileSlots.from_config(model.config, max_seq=16),
+        heads=model.config.num_attention_heads // 2)
+
+
+def test_shard_ceva_spec_io() -> None:
+    """分片 spec 的 IO 契约：attn 沿用厂商 decode 名（KV 槽本地头数），mlp/head 只有 hidden。"""
+    from gml_bridge.ceva import shard_ceva_spec
+
+    slots = _local_slots(_small_llama())
+    attn = shard_ceva_spec("decode", 0, "attn", core_id=0, slots=slots)
+    names = {b.name: b for b in attn.io if b.direction == "input"}
+    assert set(names) == {"nprm_0_i0", "nprm_0_i1", "nprm_0_i3", "nprm_0_i4",
+                          "nprm_0_i9", "nprm_0_i10", "nprm_0_i15"}
+    assert names["nprm_0_i3"].shape == (1, slots.heads, slots.seq, slots.head_dim)
+    outs = {b.label: b for b in attn.io if b.direction == "output"}
+    assert outs["output"].shape == (1, 1, slots.hidden)
+    mlp = shard_ceva_spec("decode", 0, "mlp", core_id=0, slots=slots)
+    assert [b.name for b in mlp.io if b.direction == "input"] == ["nprm_0_i0"]
+    head = shard_ceva_spec("lm_head", None, "head", core_id=0, slots=slots,
+                           local_vocab=64)
+    assert [b.shape for b in head.io if b.direction == "output"] == [(1, 1, 64)]
+
+
+def test_stage_module_shard_geometry() -> None:
+    """attn 分片能导出：q 的 view 是本地头数 [1,1,2,16]，o_proj 输入是本地宽度。"""
+    import torch
+
+    from gml_bridge.ceva import _stage_module, shard_ceva_spec
+
+    _, s0 = _sharded(0)
+    slots = _local_slots(s0)
+    spec = shard_ceva_spec("decode", 0, "attn", core_id=0, slots=slots)
+    module, args = _stage_module(s0, spec)
+    gm, _ = _fused(module, args)
+    expected = module(*args)
+    outs = gm(*args)
+    assert outs[0].shape == (1, 1, 64)          # 部分和仍是全宽 hidden
+    torch.testing.assert_close(outs[0], expected[0], rtol=1e-4, atol=1e-5)
+    views = [tuple(n.meta["val"].shape) for n in gm.graph.nodes
+             if n.op == "call_function" and "view" in str(n.target)
+             and n.meta.get("val") is not None]
+    assert (1, 1, 2, 16) in views               # 本地头数的 q/k view
+    reshapes = [tuple(n.meta["val"].shape) for n in gm.graph.nodes
+                if n.op == "call_function" and "reshape" in str(n.target)
+                and n.meta.get("val") is not None]
+    assert (1, 1, 32) in reshapes               # o_proj 输入本地宽度
+
+
+def test_stage_module_mlp_head_shard_export() -> None:
+    """mlp/head 分片能导出且数值等于 wrapper。"""
+    import torch
+
+    from gml_bridge.ceva import HeadShardLayer, MlpShardLayer, _stage_module, shard_ceva_spec
+
+    _, s0 = _sharded(0)
+    slots = _local_slots(s0)
+    for stage, kind in (("decode", "mlp"), ("lm_head", "head")):
+        kwargs = {"local_vocab": 64} if kind == "head" else {}
+        spec = shard_ceva_spec(stage, None if kind == "head" else 0, kind,
+                               core_id=0, slots=slots, **kwargs)
+        module, args = _stage_module(s0, spec)
+        gm, _ = _fused(module, args)
+        torch.testing.assert_close(gm(*args), module(*args), rtol=1e-4, atol=1e-5)
+    assert isinstance(_stage_module(s0, shard_ceva_spec(
+        "decode", 0, "mlp", core_id=0, slots=slots))[0], MlpShardLayer)
+    assert isinstance(_stage_module(s0, shard_ceva_spec(
+        "lm_head", None, "head", core_id=0, slots=slots, local_vocab=64))[0],
+        HeadShardLayer)
+
+
+def _quant_llama():
+    """hidden=128 的小模型：宽度能被 128 组宽整除，可走完整 W4A8 量化落盘链。
+
+    `_small_llama`（hidden=64）的激活进不了 128 组的动态量化，Gemm 的 int8
+    输入找不到 DQ 生产者、写盘即抛——整层图同样如此，属模型尺寸限制。
+    """
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    return LlamaForCausalLM(LlamaConfig(
+        vocab_size=256, hidden_size=128, intermediate_size=256,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=4,
+        max_position_embeddings=64)).eval()
+
+
+def test_export_ceva_graph_shard_no_vendor(tmp_path) -> None:
+    """分片图 vendor_align=False 完整导出：无厂商对齐也能落盘且引用集闭合。"""
+    import copy
+    import dataclasses
+    import torch
+
+    from contracts.compile_slots import CompileSlots
+    from gml_bridge.ceva import bundle_subdir, export_ceva_graph, shard_ceva_spec, shard_model
+    from quant.calibration import ActivationScales
+
+    model = _quant_llama()
+    s0 = copy.deepcopy(model)
+    shard_model(s0, tp_width=2, core_id=0)
+    slots = dataclasses.replace(CompileSlots.from_config(s0.config, max_seq=16), heads=2)
+    spec = shard_ceva_spec("decode", 0, "mlp", core_id=0, slots=slots)
+    out = tmp_path / bundle_subdir("decode", 0, "mlp")
+    entry = export_ceva_graph(s0, spec, out, use_opcompiler=False,
+                              scales=ActivationScales(), vendor_align=False)
+    assert entry["shard_kind"] == "mlp"
+    written = {p.name for p in out.glob("*")}
+    assert "relay2gml_graph.gml" in written and "IO_info.txt" in written
+    assert {f["path"] for f in entry["files"]} == written
+
+    head = shard_ceva_spec("lm_head", None, "head", core_id=0, slots=slots,
+                           local_vocab=s0.config.vocab_size // 2)
+    entry = export_ceva_graph(s0, head, tmp_path / bundle_subdir("lm_head", None, "head"),
+                              use_opcompiler=False, scales=ActivationScales(),
+                              calibration_inputs=[torch.randn(1, 1, 128)],
+                              vendor_align=False)
+    assert entry["shard_kind"] == "head"
+
+
+def test_bundle_subdir_shard_suffix() -> None:
+    """分片子目录带 _attn/_mlp 后缀，整层图不变。"""
+    from gml_bridge.ceva import bundle_subdir
+
+    assert bundle_subdir("decode", 3, "attn").parts[1] == "model_layers_3_decode_v2_attn"
+    assert bundle_subdir("prefill", 0, "mlp").parts[1] == "model_layers_0_prompt_v2_mlp"
+    assert bundle_subdir("decode", 0).parts[1] == "model_layers_0_decode_v2"
+
+
+def test_tp2_bundle_flow(tmp_path, monkeypatch) -> None:
+    """tp2 导出按核出 core0/core1 两个子包，清单键含 shard_kind、按 129 键核对完整性。"""
+    import json
+
+    from gml_bridge import ceva
+    from quant.calibration import LlamaCalibration
+
+    sharded_models = []
+
+    def fake_shard(model, *, tp_width, core_id):
+        sharded_models.append(core_id)
+
+    monkeypatch.setattr(ceva, "shard_model", fake_shard)
+
+    def fake_export(model, spec, out_dir, *, use_opcompiler, scales,
+                    calibration_inputs=None, vendor_align=True, **k):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return {"stage": spec.stage, "layer_id": spec.layer_id,
+                "shard_kind": spec.shard_kind, "files": []}
+
+    monkeypatch.setattr(ceva, "export_ceva_graph", fake_export)
+    targets = ceva.tp2_targets(2)
+    assert len(targets) == 2 * 2 * 2 + 1     # 每层 attn+mlp × 两阶段，加 head
+    ceva.export_ceva_bundle(_small_llama(), tmp_path / "ref", tmp_path / "b", targets,
+                            calibration=LlamaCalibration(kv=[(0.1, 0.2), (0.3, 0.4)]),
+                            strategy="tp2")
+    assert sharded_models == [0, 1]
+    for core in (0, 1):
+        manifest = json.loads((tmp_path / "b" / f"core{core}" / "bundle.json").read_text())
+        keys = {(g["stage"], g["layer_id"], g["shard_kind"]) for g in manifest["graphs"]}
+        assert len(manifest["graphs"]) == 9 and len(keys) == 9
+        assert ("lm_head", None, "head") in keys
+        assert manifest["complete"] is True
+        assert manifest["cascade"]["strategy"] == "tp2"
+        # 分片区间随核号互补（round03 问题5）：校验层据此核对宽度之和等于全宽
+        for g in manifest["graphs"]:
+            r = g["shard_range"]
+            local = r["full"] // 2
+            assert r["hi"] - r["lo"] == local
+            assert r["lo"] == (0 if core == 0 else local)
+
+
+def test_shard_bundle_complete() -> None:
+    """分片包完整性按每核全部 (stage, layer, kind) 键核对。"""
+    from gml_bridge.ceva import shard_bundle_complete, tp2_targets
+
+    keys = tp2_targets(1)
+    graphs = [{"stage": s, "layer_id": i, "shard_kind": k, "generation_digest": "d"}
+              for s, i, k in keys]
+    assert shard_bundle_complete(1, graphs, "d")
+    assert not shard_bundle_complete(1, graphs[:-1], "d")
+    assert not shard_bundle_complete(1, [dict(g, generation_digest="x")
+                                         for g in graphs], "d")
+
+
+def _tp2_core_dir(root, core, *, mlp_bytes=10, head_bytes=8, extra_graphs=True,
+                  same_half=False, with_shard_range=True):
+    """搭一个 tp2 核子包：1 层小模型的 attn+mlp+head 三张图（假文件）。
+
+    shard_range 记录分片区间（与导出侧同构）；same_half=True 时 core1 也声明
+    前半区间，模拟 core_id 传错两核切到同一半。"""
+    import hashlib
+    import json
+
+    # 分片维全宽：attn=头数、mlp=中间维、head=词表（llama2 7B 的口径）
+    split_dims = {"attn": ("heads", 32), "mlp": ("intermediate", 11008),
+                  "head": ("vocab", 32000)}
+    d = root / f"core{core}"
+    graphs = []
+    for stage, layer, kind in (("prefill", 0, "attn"), ("prefill", 0, "mlp"),
+                                ("decode", 0, "attn"), ("decode", 0, "mlp"),
+                                ("lm_head", None, "head")):
+        sub = {"attn": f"model_layers_0_{stage}_v2_attn", "mlp": f"model_layers_0_{stage}_v2_mlp",
+               "head": "llama_lm_head"}[kind]
+        stage_dir = {"prefill": "prompt", "decode": "decode"}.get(stage, "decode")
+        directory = f"{stage_dir}/{sub}/parser_output/tvmgen_default_nprm_main_0/runtime_files" \
+            if kind != "head" else f"llama_lm_head/parser_output/tvmgen_default_nprm_main_0/runtime_files"
+        gdir = d / directory
+        gdir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for name, blob in (("relay2gml_graph.gml", b"graph [ ]"),
+                           ("IO_info.txt", b"{}"),
+                           ("weight_buffer_3.bin", bytes([mlp_bytes] * (mlp_bytes if kind != "head" else head_bytes)))):
+            (gdir / name).write_bytes(blob)
+            files.append({"path": name, "size_bytes": len(blob),
+                          "sha256": hashlib.sha256(blob).hexdigest(),
+                          "role": "generated", "source": None})
+        entry = {"stage": stage, "layer_id": layer, "shard_kind": kind,
+                 "directory": directory, "generation_digest": "d1", "files": files}
+        if with_shard_range:
+            dim, full = split_dims[kind]
+            local = full // 2
+            lo = 0 if core == 0 or same_half else local
+            entry["shard_range"] = {"dim": dim, "lo": lo, "hi": lo + local,
+                                    "full": full}
+        graphs.append(entry)
+    (d / "bundle.json").write_text(json.dumps({
+        "schema_version": 1, "complete": True, "generation_digest": "d1",
+        "reference_root": str(root / "ref"), "graphs": graphs,
+        "cascade": {"strategy": "tp2", "num_cores": 2, "tp_width": 2,
+                    "core_layers": [[0, 1], [0, 1]], "lm_head_core": None}}))
+    return d
+
+
+def test_verify_tp2_bundle(tmp_path) -> None:
+    """tp2 子包校验：完整性按 shard 键核对、跳过厂商尺寸比对、跨核文件对称。"""
+    from scripts.verify_gml_artifact import Report, check_ceva_manifest
+
+    _tp2_core_dir(tmp_path, 0)
+    _tp2_core_dir(tmp_path, 1)
+    report = Report()
+    check_ceva_manifest(tmp_path / "core0" / "bundle.json", report)
+    assert not report.failed, report.failed[:3]
+
+
+def test_verify_tp2_core_asymmetry_fails(tmp_path) -> None:
+    """两核同名 bin 尺寸不对称（切宽不等）判失败；缺图判失败。"""
+    from scripts.verify_gml_artifact import Report, check_ceva_manifest
+
+    _tp2_core_dir(tmp_path, 0, mlp_bytes=10)
+    _tp2_core_dir(tmp_path, 1, mlp_bytes=12)
+    report = Report()
+    check_ceva_manifest(tmp_path / "core0" / "bundle.json", report)
+    assert any("对称" in p for p in report.failed)
+
+    _tp2_core_dir(tmp_path / "two", 0)
+    _tp2_core_dir(tmp_path / "two", 1)
+    (tmp_path / "two" / "core1" / "bundle.json").unlink()
+    report2 = Report()
+    check_ceva_manifest(tmp_path / "two" / "core0" / "bundle.json", report2)
+    assert report2.failed
+
+
+def test_verify_tp2_core_width_complementarity(tmp_path) -> None:
+    """核间一致性含宽度互补（round03 问题5）：对称但不互补（两核同切一半）判失败。"""
+    from scripts.verify_gml_artifact import Report, check_ceva_manifest
+
+    # 两核完全对称、尺寸一致，但 core1 的区间与前半重叠——拼接宽度只有一半
+    _tp2_core_dir(tmp_path, 0)
+    _tp2_core_dir(tmp_path, 1, same_half=True)
+    report = Report()
+    check_ceva_manifest(tmp_path / "core0" / "bundle.json", report)
+    assert any("互补" in p for p in report.failed), report.failed[:3]
+
+    # 清单缺分片区间（旧口径导出）：宽度互补无从核对，判失败
+    _tp2_core_dir(tmp_path / "old", 0, with_shard_range=False)
+    _tp2_core_dir(tmp_path / "old", 1, with_shard_range=False)
+    report2 = Report()
+    check_ceva_manifest(tmp_path / "old" / "core0" / "bundle.json", report2)
+    assert any("shard_range" in p for p in report2.failed)
+
+
+def test_run_ceva_dispatches_cascade(monkeypatch, tmp_path) -> None:
+    """num-ceva>=2 走工作区 run_cascade.sh；单核仍走 run_all.sh（设计 4.8）。
+
+    工作区必须打到 tmp_path：fake 产物落进真实 runs/ 会制造不可溯源的
+    伪 PASS 判定（round02 问题5；conftest 的工作区写保护会拦截）。"""
+    import argparse
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from scripts import run_full_pipeline
+
+    commands = []
+    # 工作区/参考目录指向 tmp：fake_run 的产物（verdict 等）只允许落临时目录
+    monkeypatch.setattr(run_full_pipeline, "ceva_workspace", lambda: tmp_path)
+    monkeypatch.setattr(run_full_pipeline, "ceva_reference_dir",
+                        lambda: tmp_path / "reference")
+
+    def fake_run(cmd, *, cwd, log_path, env=None):
+        commands.append([str(c) for c in cmd])
+        # 只有 run_cascade.sh 那步会产 verdict：导出/清单校验步的 cwd 是仓库根，
+        # 无条件落盘会把伪 PASS 写进本仓 runs/（round03 问题1，conftest 守卫拦截）。
+        if not any("run_cascade.sh" in str(c) for c in cmd):
+            return
+        verdict = Path(cwd) / "runs" / "multi" / "results" / "verdict.txt"
+        verdict.parent.mkdir(parents=True, exist_ok=True)
+        verdict.write_text("token 与 baseline 一致\n  结论: PASS\n")
+
+    monkeypatch.setattr(run_full_pipeline, "_run", fake_run)
+    monkeypatch.setattr(run_full_pipeline, "ceva_verdict", lambda p: ["[PASS] token"])
+    args = SimpleNamespace(run_name="multi", decode_steps=5, token_check="warn",
+                           num_ceva=2, strategy="pp2", dry_run=False)
+    run_full_pipeline.run_ceva(args, tmp_path)
+    assert any(any("run_cascade.sh" in part for part in c) for c in commands)
+    cascade = next(c for c in commands if any("run_cascade.sh" in p for p in c))
+    assert "--cores" in cascade and "2" in cascade and "pp2" in cascade
+    assert (tmp_path / "runs" / "multi" / "results" / "verdict.txt").is_file()
+    # 单核：仍是 run_all.sh 路径
+    commands.clear()
+    verdict = tmp_path / "runs" / "single" / "results" / "verdict.txt"
+    verdict.parent.mkdir(parents=True)
+    args = SimpleNamespace(run_name="single", decode_steps=5, token_check="warn",
+                           num_ceva=1, strategy="single", dry_run=False)
+    run_full_pipeline.run_ceva(args, tmp_path)
+    assert any(any("run_all.sh" in part for part in c) for c in commands)
+    assert not any(any("run_cascade.sh" in p for p in c) for c in commands)
+
+
+def test_run_ceva_pipeline_sh_passthrough() -> None:
+    """启动脚本 exec 透传 "$@"：新参数无需改脚本本体。"""
+    text = Path("scripts/run_ceva_pipeline.sh").read_text()
+    assert '"$@"' in text
+
+
+def _dispatch_sh(tmp_path, *cli: str) -> tuple[int, list[str]]:
+    """把外壳的 exec 换成 echo 后实跑，只校验参数分派（不起 python）。"""
+    import subprocess
+
+    src = Path("scripts/run_ceva_pipeline.sh").read_text()
+    repo = Path(__file__).resolve().parent.parent
+    old = ('exec python "$REPO_ROOT/scripts/run_full_pipeline.py" '
+           '--backend ceva "$@"')
+    assert old in src, "exec 行变了，测试要跟着改"
+    patched = src.replace(old, 'printf "%s\\n" --backend ceva "$@"')
+    # stub 落在 tmp，REPO_ROOT 要钉回本仓才能找到 paths.json
+    patched = patched.replace(
+        'REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)',
+        f'REPO_ROOT={repo}')
+    stub = tmp_path / "pipeline_stub.sh"
+    stub.write_text(patched)
+    proc = subprocess.run(["bash", str(stub), *cli], capture_output=True, text=True,
+                          cwd=Path(__file__).resolve().parent.parent)
+    return proc.returncode, [l for l in proc.stdout.splitlines() if l.strip()]
+
+
+def test_run_ceva_pipeline_sh_defaults_to_single(tmp_path) -> None:
+    """无 --num-ceva 时与旧版命令行逐参数等价：不注入多核默认值。"""
+    code, args = _dispatch_sh(tmp_path, "--run-name", "x1", "--decode-steps", "10")
+    assert code == 0
+    assert args == ["--backend", "ceva", "--run-name", "x1",
+                    "--decode-steps", "10"]
+
+
+def test_run_ceva_pipeline_sh_single_core_allows_baseline_names(tmp_path) -> None:
+    """单核调用可用基线 run 名重跑（需求引用的标准命令）；多核分支才拦保护名单。"""
+    code, _ = _dispatch_sh(tmp_path, "--run-name", "ours_e2e", "--decode-steps", "10")
+    assert code == 0
+    code, _ = _dispatch_sh(tmp_path, "--run-name", "ours_e2e", "--num-ceva", "2")
+    assert code == 2
+    code, _ = _dispatch_sh(tmp_path, "--run-name", "pp2_v3", "--num-ceva=2")
+    assert code == 2
+
+
+def test_cli_ceva_tp2_uses_shard_targets(monkeypatch, tmp_path) -> None:
+    """tp2 的 CLI 目标是 (stage, layer, shard_kind) 三元组（每层 attn+mlp+head）。"""
+    from scripts import export_gml
+
+    seen = {}
+
+    def fake_bundle(model, ref, out, targets, *, use_opcompiler, strategy=None, **k):
+        seen["targets"] = list(targets)
+        seen["strategy"] = strategy
+        return tmp_path / "bundle.json"
+
+    monkeypatch.setattr("gml_bridge.ceva.export_ceva_bundle", fake_bundle)
+    monkeypatch.setattr("gml_bridge.ceva.load_vendor_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(export_gml, "_load_model", lambda layers=None: _small_llama())
+    args = export_gml.build_parser().parse_args(
+        ["--ceva-reference", "/r", "--use-opcompiler", "--num-ceva", "2",
+         "--strategy", "tp2", "--out-dir", str(tmp_path / "b")])
+    assert export_gml._main_ceva(args) == 0
+    assert seen["strategy"] == "tp2"
+    assert len(seen["targets"]) == 2 * 2 * 2 + 1
+    assert ("lm_head", None, "head") in seen["targets"]
+    assert all(len(t) == 3 for t in seen["targets"])
+
+
+def test_tp2_attn_shard_decode_matches_full() -> None:
+    """decode attn 分片（更新 cache 后做注意力）：两核部分和相加等于整层注意力输出。"""
+    import torch
+
+    from gml_bridge.ceva import AttnShardDecode, causal_mask
+
+    full, s0 = _sharded(0)
+    _, s1 = _sharded(1)
+    layer = full.model.layers[0]
+    S, T, nh, hd = 16, 1, 4, 16
+    torch.manual_seed(3)
+    hidden = torch.randn(1, T, 64)
+    cos, sin = _vendor_rope(full, [T - 1])
+    key = torch.randn(1, nh, S, hd)
+    value = torch.randn(1, nh, S, hd)
+    position = torch.full((3, 1, nh, 1), T - 1, dtype=torch.int16)
+    mask = torch.full((1, 1, 1, S), torch.finfo(torch.float32).min)
+    mask[..., :T] = 0
+
+    from gml_bridge.ceva import DecodeLayer
+    full_out, ref_k = DecodeLayer(layer)(hidden, cos, sin, key, position, mask, value)[:2]
+    # 纯注意力参考（去掉残差与 MLP）：手推 DecodeLayer 内部同构流程。
+    q, k_new, v_new = DecodeLayer(layer).project(hidden, cos, sin)
+    pos = torch.tensor([T - 1])
+    key_upd = torch.index_copy(key, 2, pos, k_new.transpose(1, 2))
+    value_upd = torch.index_copy(value, 2, pos, v_new)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), key_upd, value_upd, attn_mask=mask, scale=hd ** -0.5)
+    attn_ref = layer.self_attn.o_proj(out.transpose(1, 2).reshape(1, T, 64))
+
+    partials, k_outs = [], []
+    for core, model in ((0, s0), (1, s1)):
+        local_key = key[:, core * 2:(core + 1) * 2]     # 每核自己的头组 cache
+        local_value = value[:, core * 2:(core + 1) * 2]
+        partial, k_out, v_out = AttnShardDecode(model.model.layers[0])(
+            hidden, cos, sin, local_key, position, mask, local_value)
+        partials.append(partial)
+        k_outs.append(k_out)
+    torch.testing.assert_close(partials[0] + partials[1], attn_ref, rtol=1e-4, atol=1e-5)
+    # 两核各写自己头组的 cache 行，拼接等于整层 decode 的 cache 更新
+    torch.testing.assert_close(torch.cat(k_outs, dim=1), ref_k, rtol=1e-4, atol=1e-5)
+    del full_out

@@ -972,10 +972,17 @@ def check_ceva_manifest(manifest_path: Path, report: Report) -> None:
     graphs = manifest.get("graphs", [])
     report.check("包里至少有一张图", bool(graphs))
     reference = Path(manifest.get("reference_root", ""))
+    is_tp2 = any(g.get("shard_kind") for g in graphs)
     if manifest.get("complete"):
-        report.check("complete=true 的包覆盖参考目录全部子图且生成口径一致",
-                     ceva.bundle_complete(reference, graphs,
-                                          manifest.get("generation_digest")))
+        if is_tp2:
+            num_layers = manifest["cascade"]["core_layers"][0][1]
+            report.check("complete=true 的 tp2 包覆盖每核全部 (stage,layer,shard) 键",
+                         ceva.shard_bundle_complete(num_layers, graphs,
+                                                    manifest.get("generation_digest")))
+        else:
+            report.check("complete=true 的包覆盖参考目录全部子图且生成口径一致",
+                         ceva.bundle_complete(reference, graphs,
+                                              manifest.get("generation_digest")))
     for graph in graphs:
         directory = root / graph["directory"]
         label = graph["directory"]
@@ -996,7 +1003,53 @@ def check_ceva_manifest(manifest_path: Path, report: Report) -> None:
                      f"{len(foreign)} 个不是 generated，如 {foreign[:2]}" if foreign
                      else f"{checked} 个文件")
         report.check(f"{label} 文件尺寸与摘要与清单一致", not bad, "; ".join(bad[:2]))
+        if graph.get("shard_kind"):
+            continue    # 分片图没有厂商同名子图，走跨核一致性检查
         _check_ceva_graph_files(graph, directory, reference, report)
+    if is_tp2:
+        _check_tp2_core_consistency(root, report)
+
+
+def _check_tp2_core_consistency(root: Path, report: Report) -> None:
+    """tp2 两核核间一致性（设计 4.5）：键集合相等、同位置图尺寸对称、分片区间互补。
+
+    只查对称挡不住「两核因切分 bug 拿到同一半」——对称但不互补时拼接宽度
+    只有全宽一半，故清单必须带 shard_range 并核对两核区间互斥且覆盖全宽。"""
+    import json
+
+    def graph_map(core_dir: Path) -> dict:
+        manifest = json.loads((core_dir / "bundle.json").read_text())
+        return {(g["stage"], g["layer_id"], g["shard_kind"]):
+                {"files": {f["path"]: f["size_bytes"] for f in g["files"]},
+                 "shard_range": g.get("shard_range")}
+                for g in manifest["graphs"]}
+
+    other = root.parent / ("core1" if root.name == "core0" else "core0")
+    if not (other / "bundle.json").is_file():
+        report.check("tp2 双核子包齐全", False, f"缺 {other}/bundle.json")
+        return
+    ours, theirs = graph_map(root), graph_map(other)
+    report.check("tp2 双核子包齐全", set(ours) == set(theirs),
+                 f"键差 {sorted(set(ours) ^ set(theirs))[:3]}")
+    asymmetric = [f"{key}:{name}"
+                  for key in set(ours) & set(theirs)
+                  for name in sorted(set(ours[key]["files"]) | set(theirs[key]["files"]))
+                  if ours[key]["files"].get(name) != theirs[key]["files"].get(name)]
+    report.check("tp2 两核同位置图同名文件尺寸对称（切宽各半）", not asymmetric,
+                 f"{len(asymmetric)} 处不对称，如 {asymmetric[:3]}")
+    bad_cover = []
+    for key in sorted(set(ours) & set(theirs)):
+        pair = [ours[key]["shard_range"], theirs[key]["shard_range"]]
+        if any(r is None for r in pair):
+            bad_cover.append(f"{key}:清单缺 shard_range（分片包需按含区间的口径重导）")
+            continue
+        first, second = sorted(pair, key=lambda r: r["lo"])
+        if not (first["lo"] == 0 and first["hi"] == second["lo"]
+                and second["hi"] == first["full"] == second["full"]):
+            bad_cover.append(f"{key}:{first['dim']} 区间 {first['lo']}-{first['hi']} 与 "
+                             f"{second['lo']}-{second['hi']} 不互补（全宽 {first['full']}）")
+    report.check("tp2 两核同位置图分片区间互补（宽度之和等于全宽）",
+                 not bad_cover, f"{len(bad_cover)} 处不互补，如 {bad_cover[:2]}")
 
 
 def _check_ceva_graph_files(graph: dict, directory: Path, reference: Path,

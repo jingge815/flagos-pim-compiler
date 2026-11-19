@@ -1,12 +1,53 @@
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import json
+import os
+import sys
 import time
 
 import pytest
 
 
 _REPORT_STATE = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _forbid_test_writes_to_real_ceva_workspace():
+    """测试不得写真实归档树：CEVA 工作区与本仓 runs/（round02 问题5、round03 问题1）。
+
+    runs/ 归档树是验收证据，单测往里落文件会制造不可溯源的伪证据
+    （如伪造的 PASS verdict）。要写工作区的测试必须 monkeypatch
+    ceva_workspace 到 tmp_path；本守卫经系统审计钩子拦截一切对两处
+    归档树的写/建/改名/删除/替换并让该测试立刻失败。
+    工作区取本仓库 paths.json 的 ceva_workspace；hermetic 子环境
+    （test_pytest_report 把 conftest 拷进临时目录）没有该配置，
+    无真实工作区可保护，不装钩子。"""
+    config = Path(__file__).resolve().parent.parent / "paths.json"
+    if not config.is_file():
+        yield
+        return
+    # (前缀, 报错文案)：工作区 + 本仓 runs/，两处都是真实归档树
+    prefixes = [(json.loads(config.read_text())["ceva_workspace"], "测试不得写真实工作区"),
+                (str(config.parent / "runs"), "测试不得写仓内真实归档树")]
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC
+
+    def _hook(event, args):
+        candidates = [str(a) for a in args[:2]
+                      if isinstance(a, (str, bytes, os.PathLike))]
+        hits = [(p, msg) for p in candidates for prefix, msg in prefixes
+                if p == prefix or p.startswith(prefix + os.sep)]
+        if not hits:
+            return
+        if event == "open":
+            if args[2] & write_flags:
+                raise AssertionError(f"{hits[0][1]}: {hits[0][0]}")
+        elif event in ("os.mkdir", "os.remove", "os.rmdir", "os.rename",
+                       "os.replace", "os.symlink", "os.link", "os.truncate"):
+            raise AssertionError(f"{hits[0][1]}: {hits[0][0]}")
+
+    sys.addaudithook(_hook)
+    yield
 
 
 @pytest.fixture(scope="module", autouse=True)

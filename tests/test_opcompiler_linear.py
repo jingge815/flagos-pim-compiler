@@ -720,26 +720,39 @@ def test_compiler_fingerprint_covers_the_loaded_libtriton() -> None:
         "指纹没有覆盖 libtriton.so")
 
 
-def test_cache_key_lock_serializes_processes(tmp_path, monkeypatch) -> None:
-    """同一缓存 key 的两个进程不能同时进入编译区。"""
+def _cache_lock_worker(queue, cache_dir, key):
+    """spawn 子进程入口：注入缓存目录后取锁并上报起止时刻。
+
+    必须放模块级（spawn 按 qualified name pickle target，闭包不行）；
+    monkeypatch 不跨进程传播，缓存目录经参数传入。"""
     from opcompiler_bridge import driver
 
-    monkeypatch.setattr(driver, "_CACHE_DIR", tmp_path)
-    context = mp.get_context("fork")
+    driver._CACHE_DIR = Path(cache_dir)
+    with driver._cache_key_lock(key):
+        queue.put(("start", time.monotonic()))
+        time.sleep(0.12)
+        queue.put(("end", time.monotonic()))
+
+
+def test_cache_key_lock_serializes_processes(tmp_path) -> None:
+    """同一缓存 key 的两个进程不能同时进入编译区。
+
+    用 spawn 不用 fork：同 session 先跑的导出用例留下 torch/dynamo 后台
+    线程，fork 多线程解释器时子进程会继承被持有的锁（worker 里的 import
+    拿不到导入锁）而死锁，高负载下已两次在全量回归触发（2026-11-18/19）。
+    spawn 子进程是全新解释器，无继承锁。"""
+    context = mp.get_context("spawn")
     events = context.Queue()
-
-    def worker(queue):
-        with driver._cache_key_lock("same-key"):
-            queue.put(("start", time.monotonic()))
-            time.sleep(0.12)
-            queue.put(("end", time.monotonic()))
-
-    processes = [context.Process(target=worker, args=(events,)) for _ in range(2)]
+    processes = [
+        context.Process(target=_cache_lock_worker,
+                        args=(events, str(tmp_path), "same-key"))
+        for _ in range(2)
+    ]
     for process in processes:
         process.start()
-    records = [events.get(timeout=5) for _ in range(4)]
+    records = [events.get(timeout=30) for _ in range(4)]
     for process in processes:
-        process.join(timeout=5)
+        process.join(timeout=30)
         assert process.exitcode == 0
 
     starts = sorted(t for kind, t in records if kind == "start")

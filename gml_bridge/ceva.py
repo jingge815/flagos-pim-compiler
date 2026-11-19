@@ -326,6 +326,66 @@ def load_ceva_spec(reference_root: Path, stage: str, layer_id: int | None,
                          runtime_dir=runtime_dir)
 
 
+def shard_ceva_spec(stage: str, layer_id: int | None, shard_kind: str, *,
+                    core_id: int, slots: CompileSlots, version: str = "26.8.0",
+                    local_vocab: int | None = None) -> CevaGraphSpec:
+    """构造 TP 分片图的契约（设计 4.5）：attn 沿用厂商 decode 的 I/O 名，KV 槽是本地头数。
+
+    `slots.heads` 必须已是本地头数（`heads // tp_width`）。分片图没有厂商同名
+    子图，`runtime_dir` 指向包内自身目录、vendor 对齐链路整体跳过。
+    """
+    if stage not in ("prefill", "decode", "lm_head"):
+        raise ValueError(f"未知阶段 {stage!r}")
+    hd, S = slots.head_dim, slots.seq
+    T = slots.seq if stage == "prefill" else 1
+    f16 = "float16"
+
+    def bind(direction, index, name, shape, dtype=f16, label=None):
+        return CevaIoBinding(direction=direction, index=index, name=name,
+                             label=label, shape=shape, dtype=dtype, sf=1.0)
+
+    def out(index, label, shape):
+        # 出口用厂商 tvmgen 名，label 是 runner/蓝图的语义名（与 65 图口径一致）。
+        return bind("output", index, f"tvmgen_default_nprm_main_0_output_{index}",
+                    shape, label=label)
+
+    io = []
+    if shard_kind == "attn":
+        kv = (1, slots.heads, S, hd)
+        if stage == "decode":
+            io = [bind("input", 0, "nprm_0_i0", (1, 1, slots.hidden)),
+                  bind("input", 1, "nprm_0_i1", kv), bind("input", 3, "nprm_0_i3", kv),
+                  bind("input", 4, "nprm_0_i4", (3, 1, slots.heads, 1), "int16"),
+                  bind("input", 9, "nprm_0_i9", (1, 1, 1, hd)),
+                  bind("input", 10, "nprm_0_i10", (1, 1, 1, hd)),
+                  bind("input", 15, "nprm_0_i15", (1, 1, 1, S)),
+                  out(0, "output", (1, T, slots.hidden)),
+                  out(1, "key_cache_out", kv),
+                  out(2, "value_cache_out", kv)]
+        else:
+            io = [bind("input", 0, "nprm_0_i0", (1, T, slots.hidden)),
+                  bind("input", 164, "nprm_0_i164", (1, 1, T, T)),
+                  out(0, "output", (1, T, slots.hidden)),
+                  out(1, "key_cache_out", (1, slots.heads, T, hd)),
+                  out(2, "value_cache_out", (1, slots.heads, T, hd))]
+    elif shard_kind == "mlp":
+        io = [bind("input", 0, "nprm_0_i0", (1, T, slots.hidden)),
+              out(0, "output", (1, T, slots.hidden))]
+    elif shard_kind == "head":
+        if local_vocab is None:
+            raise ValueError("head 分片需要 local_vocab")
+        io = [bind("input", 0, "nprm_0_i0", (1, 1, slots.hidden)),
+              out(0, "output", (1, 1, local_vocab))]
+    else:
+        raise ValueError(f"未知分片类型 {shard_kind!r}")
+
+    slots = dataclasses.replace(slots, tokens=T)
+    return CevaGraphSpec(stage=stage, layer_id=layer_id, query_tokens=T,
+                         slots=slots, version=version, io=tuple(io),
+                         runtime_dir=Path(f"core{core_id}"),
+                         shard_kind=shard_kind)
+
+
 # ---- 三类包装器 ----
 #
 # 包装真实的 HF 层，张量签名与厂商 runner 的绑定一致。cos/sin 用厂商编码：
@@ -424,6 +484,147 @@ class HeadLayer(torch.nn.Module):
 
     def forward(self, hidden):
         return self.lm_head(self.norm(hidden))
+
+
+# ---- TP2 分片 wrapper（设计 4.5）：本地头数/宽度显式取自分片后的权重 ----
+
+class _AttnShardBody(torch.nn.Module):
+    """attn 分片公共体：RMSNorm1 + q/k/v + SDPA + 行切 o_proj，输出部分和、无残差。"""
+
+    def __init__(self, layer: torch.nn.Module) -> None:
+        super().__init__()
+        self.layer = layer
+        attn = layer.self_attn
+        self.head_dim = int(attn.head_dim)
+        self.local_heads = attn.q_proj.weight.shape[0] // self.head_dim
+        self.local_kv = attn.k_proj.weight.shape[0] // self.head_dim
+        self.local_o_in = attn.o_proj.weight.shape[1]
+        self.register_buffer("sign_half", _sign_half(self.head_dim), persistent=False)
+
+    def qkv(self, hidden, cos, sin):
+        """本地头数的 q/k/v：q/k 过 RoPE，v 转置为 [1,kv,T,hd]。"""
+        attn = self.layer.self_attn
+        T = hidden.shape[1]
+        x = self.layer.input_layernorm(hidden)
+        sin_hf = sin * self.sign_half
+        q = _rope(attn.q_proj(x).view(1, T, self.local_heads, self.head_dim),
+                  cos, sin_hf)
+        k = _rope(attn.k_proj(x).view(1, T, self.local_kv, self.head_dim),
+                  cos, sin_hf)
+        v = attn.v_proj(x).view(1, T, self.local_kv, self.head_dim).transpose(1, 2)
+        return q, k.transpose(1, 2), v
+
+    def o_partial(self, out):
+        """SDPA 结果过行切 o_proj，输出部分和。"""
+        attn = self.layer.self_attn
+        T = out.shape[2]
+        return attn.o_proj(out.transpose(1, 2).reshape(1, T, self.local_o_in))
+
+
+class AttnShardPrefill(_AttnShardBody):
+    """attn 分片 prefill：`(hidden, mask) -> (partial, key, value)`，cos/sin 编译期常量。"""
+
+    def __init__(self, layer, cos: torch.Tensor, sin: torch.Tensor) -> None:
+        super().__init__(layer)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, hidden, mask):
+        q, key, value = self.qkv(hidden, self.cos, self.sin)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), key, value, attn_mask=mask,
+            scale=self.head_dim ** -0.5)
+        return self.o_partial(out), key, value
+
+
+class AttnShardDecode(_AttnShardBody):
+    """attn 分片 decode：`(hidden, cos, sin, key, position, mask, value) -> (partial, k_out, v_out)`。
+
+    与整层 DecodeLayer 同构：先 index_copy 更新 cache，注意力读更新后的 cache
+    （当前 token 的 K/V 必须参与），KV 入口才会走 KV_Cache_DMA、边界角色可识别。
+    """
+
+    def forward(self, hidden, cos, sin, key, position, mask, value):
+        q, k_new, v_new = self.qkv(hidden, cos, sin)
+        pos = position[2, 0, 0, 0].to(torch.long).reshape(1)
+        key_out = torch.index_copy(key, 2, pos, k_new)
+        value_out = torch.index_copy(value, 2, pos, v_new)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), key_out, value_out, attn_mask=mask,
+            scale=self.head_dim ** -0.5)
+        return self.o_partial(out), key_out, value_out
+
+
+class MlpShardLayer(torch.nn.Module):
+    """mlp 分片：RMSNorm2 + gate/up + silu·mul + 行切 down，输出部分和、无残差。"""
+
+    def __init__(self, layer: torch.nn.Module) -> None:
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, hidden):
+        h = self.layer.post_attention_layernorm(hidden)
+        mlp = self.layer.mlp
+        return mlp.down_proj(torch.nn.functional.silu(mlp.gate_proj(h)) * mlp.up_proj(h))
+
+
+class HeadShardLayer(HeadLayer):
+    """lm_head 列切分片：权重已按 vocab 维切片，拼接后等于整头。"""
+
+
+def shard_model(model, *, tp_width: int, core_id: int) -> None:
+    """按 TP 规则原地切片七个投影（设计 4.5）：q/k/v/gate/up/lm_head 列切，o/down 行切。
+
+    在 `load_vendor_checkpoint` 之后调用；后续 `_weight_tensor`/量化链按切片后
+    参数张量自动出本地形状。
+    """
+    from graph.strategy import llama_strategy
+    from gml_bridge.sharding import local_shapes
+
+    cfg = model.config
+    strategy = llama_strategy(
+        num_dpus=tp_width, num_stages=1, num_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads,
+        intermediate_size=cfg.intermediate_size, vocab_size=cfg.vocab_size,
+        num_layers=cfg.num_hidden_layers)
+    shapes = local_shapes(
+        strategy, hidden_size=cfg.hidden_size, num_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads,
+        intermediate_size=cfg.intermediate_size, dpu_id=core_id)
+
+    def col(tensor, local_out):
+        tensor.data = tensor.data[core_id * local_out:(core_id + 1) * local_out, :]
+
+    def row(tensor, local_in):
+        tensor.data = tensor.data[:, core_id * local_in:(core_id + 1) * local_in]
+
+    for layer in model.model.layers:
+        attn, mlp = layer.self_attn, layer.mlp
+        col(attn.q_proj.weight, shapes.q_out)
+        col(attn.k_proj.weight, shapes.k_out)
+        col(attn.v_proj.weight, shapes.v_out)
+        row(attn.o_proj.weight, shapes.o_in)
+        col(mlp.gate_proj.weight, shapes.gate_out)
+        col(mlp.up_proj.weight, shapes.up_out)
+        row(mlp.down_proj.weight, shapes.down_in)
+    col(model.lm_head.weight, cfg.vocab_size // tp_width)
+
+
+# 分片图清单 shard_range 字段的分片维：attn 按头数、mlp 按中间维、head 按词表。
+_SHARD_SPLIT_DIMS = {"attn": "heads", "mlp": "intermediate", "head": "vocab"}
+
+
+def shard_range(cfg, kind: str, core_id: int, tp_width: int = 2) -> dict:
+    """本核在分片维上的区间（与 shard_model 的切片同口径）。
+
+    清单校验据此核对两核区间互补（宽度之和等于全宽）——只查对称挡不住
+    「core_id 传错两核同切一半」。"""
+    dim = _SHARD_SPLIT_DIMS[kind]
+    full = {"heads": cfg.num_attention_heads, "intermediate": cfg.intermediate_size,
+            "vocab": cfg.vocab_size}[dim]
+    local = full // tp_width
+    return {"dim": dim, "lo": core_id * local, "hi": (core_id + 1) * local,
+            "full": full}
 
 
 # ---- 编号与逐节点对齐 ----
@@ -702,6 +903,26 @@ def _stage_module(model, spec: CevaGraphSpec):
     """按阶段包好模型并给出导出用的样例输入（形状取自契约）。"""
     slots = spec.slots
     nh, hd, S = slots.heads, slots.head_dim, slots.seq
+    kind = getattr(spec, "shard_kind", None)
+    if kind:
+        layer = model.model.layers[spec.layer_id] if spec.layer_id is not None else None
+        if kind == "attn":
+            if spec.stage == "decode":
+                args = (torch.zeros(1, 1, slots.hidden), torch.zeros(1, 1, 1, hd),
+                        torch.zeros(1, 1, 1, hd), torch.zeros(1, nh, S, hd),
+                        torch.zeros(3, 1, nh, 1, dtype=torch.int16),
+                        torch.zeros(1, 1, 1, S), torch.zeros(1, nh, S, hd))
+                return AttnShardDecode(layer), args
+            T = spec.query_tokens
+            cos, sin = _prefill_rope(model, T)
+            return AttnShardPrefill(layer, cos, sin), (torch.zeros(1, T, slots.hidden),
+                                                       torch.zeros(1, 1, T, T))
+        if kind == "mlp":
+            T = spec.query_tokens
+            return MlpShardLayer(layer), (torch.zeros(1, T, slots.hidden),)
+        if kind == "head":
+            return HeadShardLayer(model), (torch.zeros(1, 1, slots.hidden),)
+        raise ValueError(f"未知分片类型 {kind!r}")
     if spec.stage == "lm_head":
         return HeadLayer(model), (torch.zeros(1, 1, slots.hidden),)
     layer = model.model.layers[spec.layer_id]
@@ -758,18 +979,19 @@ def mark_static_quant(gm) -> None:
 def export_ceva_graph(model, spec: CevaGraphSpec, out_dir: Path, *,
                       vendor: VendorGraph | None = None,
                       use_opcompiler: bool = True, scales=None,
-                      calibration_inputs=None) -> dict:
+                      calibration_inputs=None, vendor_align: bool = True) -> dict:
     """导出一张子图到 `out_dir`（含 GML、IO_info 与 bin），返回清单条目。
 
     GML、字段与全部 bin 由我方生成；厂商同名子图只用于逐节点核对结构与 runner 契约。
     `scales` 给 KV cache 的标定 scale；静态 int8 入口（输出头）的 scale 在本子图上
-    跑 `calibration_inputs` 现场标定。
+    跑 `calibration_inputs` 现场标定。`vendor_align=False` 用于 TP 分片图：没有
+    厂商同名子图，跳过解析与逐节点对齐，只保留编号与设备约定。
     """
     from gml_bridge.export import _referenced_buffers, serialize_gml
     from gml_bridge.writer import write_gml
     from quant.calibration import ActivationScales, graph_static_scales
 
-    if vendor is None:
+    if vendor_align and vendor is None:
         vendor = parse_vendor_graph(graph_dir_of(spec))
     gm, report = export_ceva_subgraph(model, spec)
     phase_source = None
@@ -787,12 +1009,13 @@ def export_ceva_graph(model, spec: CevaGraphSpec, out_dir: Path, *,
         artifact.nodes, artifact.edges, sources=sources, sinks=sinks,
         weight_params=artifact.weight_params, dq_specs=artifact.dq_specs)
     # 要在重编号之后：入口的「第一个读者」按厂商编号定。
-    apply_vendor_conventions(nodes, edges, stage=spec.stage)
-    keys = align_to_vendor(nodes, edges, vendor)
-    publish_vendor_labels(nodes, keys, vendor)
-    problems = check_fields(nodes, keys, vendor)
-    if problems:
-        raise ValueError(f"{len(problems)} 处字段与厂商不一致，首条：{problems[0]}")
+    apply_vendor_conventions(nodes, edges, stage=spec.stage, heads=spec.slots.heads)
+    if vendor_align:
+        keys = align_to_vendor(nodes, edges, vendor)
+        publish_vendor_labels(nodes, keys, vendor)
+        problems = check_fields(nodes, keys, vendor)
+        if problems:
+            raise ValueError(f"{len(problems)} 处字段与厂商不一致，首条：{problems[0]}")
 
     static = sorted({n.fields["pim_static_quant_input"] for n in nodes
                      if n.fields.get("pim_static_quant_input")})
@@ -824,10 +1047,12 @@ def export_ceva_graph(model, spec: CevaGraphSpec, out_dir: Path, *,
         files.append({"path": name, "size_bytes": (out_dir / name).stat().st_size,
                       "sha256": _sha256(out_dir / name), "role": "generated",
                       "source": None})
-    return {"stage": spec.stage, "layer_id": spec.layer_id, "files": files}
+    return {"stage": spec.stage, "layer_id": spec.layer_id,
+            "shard_kind": spec.shard_kind, "files": files}
 
 
-def apply_vendor_conventions(nodes, edges, *, stage: str = "decode") -> None:
+def apply_vendor_conventions(nodes, edges, *, stage: str = "decode",
+                             heads: int | None = None) -> None:
     """补齐厂商子图的几处边界口径（逐图实测：decode/prompt/head 一致）。
 
     - 入口缓冲带 `original_name`；喂残差的入口带旁路槽的定标文件名。
@@ -875,9 +1100,12 @@ def apply_vendor_conventions(nodes, edges, *, stage: str = "decode") -> None:
             fields.setdefault("weight_sf_dtype", "float16")
         elif op == "EltwiseAdd":
             fields.pop("input_sf_dtype", None)
-        for key in ("group_attention_data_num", "group_attention_weight_num"):
-            if isinstance(fields.get(key), int):
-                fields[key] = str(fields[key])
+        if op == "MatMul":
+            # 逐头节点记录本图总头数：TP 分片图是本地头数（16），沿用 32 会与
+            # KV 维度对不上，GC 的 test_app 直接失败（实测）。
+            count = heads if heads is not None else fields.get("group_attention_data_num")
+            fields["group_attention_data_num"] = str(count)
+            fields["group_attention_weight_num"] = str(count)
         if stage == "prefill":
             # 厂商 prefill：Q 拆头的 Split 把 RoPE-DQ 输出按 fp16 记、不带
             # input_sf；EltwiseMul 不带 transpose（与 decode 不同，逐层实测）。
@@ -916,12 +1144,32 @@ def bundle_targets(stage: str, layer_index: int | None, num_layers: int):
     return targets
 
 
-def bundle_subdir(stage: str, layer_id: int | None) -> Path:
-    """包内子图目录，与厂商 65 图同构，GC 可直接使用。"""
+def bundle_subdir(stage: str, layer_id: int | None,
+                  shard_kind: str | None = None) -> Path:
+    """包内子图目录，与厂商 65 图同构，GC 可直接使用。分片图加 _attn/_mlp 后缀。"""
     if stage == "lm_head":
         return Path("llama_lm_head") / RUNTIME_DIR
     sub = {"prefill": "prompt", "decode": "decode"}[stage]
-    return Path(sub) / f"model_layers_{layer_id}_{sub}_v2" / RUNTIME_DIR
+    suffix = f"_{shard_kind}" if shard_kind else ""
+    return Path(sub) / f"model_layers_{layer_id}_{sub}_v2{suffix}" / RUNTIME_DIR
+
+
+def tp2_targets(num_layers: int) -> list:
+    """tp2 导出目标：每层 attn+mlp 两段 × prefill/decode 两阶段，加 head（设计 4.5）。"""
+    targets = []
+    for stage in ("prefill", "decode"):
+        for layer in range(num_layers):
+            targets += [(stage, layer, "attn"), (stage, layer, "mlp")]
+    targets.append(("lm_head", None, "head"))
+    return targets
+
+
+def shard_bundle_complete(num_layers: int, graphs: list[dict], digest: str) -> bool:
+    """分片包完整性：每核的全部 (stage, layer, shard_kind) 键都齐且摘要一致。"""
+    expected = {(s, i, k) for s, i, k in tp2_targets(num_layers)}
+    keys = {(g["stage"], g["layer_id"], g["shard_kind"]) for g in graphs}
+    return bool(digest) and expected <= keys \
+        and all(g.get("generation_digest") == digest for g in graphs)
 
 
 def bundle_complete(reference_root: Path, graphs: list[dict], digest: str) -> bool:
@@ -1033,14 +1281,20 @@ def generation_digest(model, calibration, *, revision: str, opcompiler: str,
 
 def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
                        targets, *, use_opcompiler: bool = True, log=print,
-                       calibration=None) -> Path:
+                       calibration=None, strategy: str | None = None) -> Path:
     """逐图导出并写 `bundle.json`。已完成的图在清单里登记，中断后重跑会覆盖。
 
     `calibration`（`quant.calibration.LlamaCalibration`）是整模型标定结果：每张层子图取
     本层的 KV scale，输出头取 final norm 的输入作标定样本。不给则在本模型上现标定。
+    `strategy` 是级联策略：None/single 走单核旧行为；pp2 追加 cascade 节（层段均分、
+    lm_head 归末核），65 图本身不变。
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if strategy == "tp2":
+        return _export_tp2_bundle(model, out_dir, targets,
+                                  use_opcompiler=use_opcompiler, log=log,
+                                  calibration=calibration)
     manifest_path = out_dir / "bundle.json"
     manifest = (json.loads(manifest_path.read_text()) if manifest_path.is_file()
                 else {"graphs": []})
@@ -1069,6 +1323,16 @@ def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
     manifest.update(compiler_revision=revision, opcompiler_revision=opcompiler,
                     generation_digest=digest,
                     calibration={"kv": [list(pair) for pair in calibration.kv]})
+    if strategy in ("pp2",):
+        num_layers = int(model.config.num_hidden_layers)
+        if num_layers % 2:
+            raise ValueError(f"pp2 要求层数能被 2 整除，实际 {num_layers}")
+        per = num_layers // 2
+        manifest["cascade"] = {"strategy": "pp2", "num_cores": 2,
+                               "core_layers": [[0, per], [per, num_layers]],
+                               "lm_head_core": 1}
+    elif strategy not in (None, "single"):
+        raise ValueError(f"未知导出策略 {strategy!r}")
     for stage, layer_id in targets:
         spec = load_ceva_spec(reference_root, stage, layer_id, slots)
         directory = bundle_subdir(stage, layer_id)
@@ -1086,3 +1350,66 @@ def export_ceva_bundle(model, reference_root: Path, out_dir: Path,
     manifest["complete"] = bundle_complete(reference_root, manifest["graphs"], digest)
     _write_manifest(manifest_path, manifest)
     return manifest_path
+
+
+def _export_tp2_bundle(model, out_dir: Path, targets, *, use_opcompiler: bool,
+                       log=print, calibration=None) -> Path:
+    """tp2 整包导出（设计 4.5）：每核一个子包 `core{N}/`，各自切片、各自清单。
+
+    分片图没有厂商同名子图，走 `vendor_align=False`；清单键是
+    `(stage, layer_id, shard_kind)` 三元组，完整性按 `shard_bundle_complete` 核对。
+    """
+    import copy
+
+    if calibration is None:
+        calibration = calibrate_model(model)
+    revision = compiler_revision(Path(__file__).resolve().parent.parent)
+    opcompiler = opcompiler_revision() if use_opcompiler else "not-used"
+    cfg = model.config
+    local_vocab = cfg.vocab_size // 2
+    for core in (0, 1):
+        sharded = copy.deepcopy(model)
+        shard_model(sharded, tp_width=2, core_id=core)
+        slots = dataclasses.replace(
+            CompileSlots.from_config(cfg, max_seq=1024),
+            heads=cfg.num_attention_heads // 2)
+        core_dir = out_dir / f"core{core}"
+        core_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = core_dir / "bundle.json"
+        manifest = (json.loads(manifest_path.read_text()) if manifest_path.is_file()
+                    else {"graphs": []})
+        manifest.update(schema_version=1, complete=False)
+        _write_manifest(manifest_path, manifest)
+        digest = generation_digest(sharded, calibration, revision=revision,
+                                   opcompiler=opcompiler,
+                                   use_opcompiler=use_opcompiler)
+        if any(g.get("generation_digest") != digest for g in manifest["graphs"]):
+            raise ValueError(f"{core_dir} 已有图的生成口径与本次不同，不能部分重导")
+        manifest.update(compiler_revision=revision, opcompiler_revision=opcompiler,
+                        generation_digest=digest,
+                        calibration={"kv": [list(pair) for pair in calibration.kv]},
+                        cascade={"strategy": "tp2", "num_cores": 2, "tp_width": 2,
+                                 "core_layers": [[0, cfg.num_hidden_layers]] * 2,
+                                 "lm_head_core": None})
+        for stage, layer_id, kind in targets:
+            spec = shard_ceva_spec(stage, layer_id, kind, core_id=core, slots=slots,
+                                   local_vocab=local_vocab if kind == "head" else None)
+            directory = bundle_subdir(stage, layer_id, kind)
+            entry = export_ceva_graph(
+                sharded, spec, core_dir / directory,
+                use_opcompiler=use_opcompiler, vendor_align=False,
+                scales=calibration.scales_for(layer_id) if layer_id is not None else None,
+                calibration_inputs=calibration.head_inputs if kind == "head" else None)
+            entry["directory"] = str(directory)
+            entry["generation_digest"] = digest
+            entry["shard_range"] = shard_range(cfg, kind, core)
+            manifest["graphs"] = [g for g in manifest["graphs"]
+                                  if (g["stage"], g["layer_id"], g["shard_kind"])
+                                  != (stage, layer_id, kind)]
+            manifest["graphs"].append(entry)
+            _write_manifest(manifest_path, manifest)
+            log(f"  已导出 core{core}/{directory}（{len(entry['files'])} 个文件）")
+        manifest["complete"] = shard_bundle_complete(cfg.num_hidden_layers,
+                                                     manifest["graphs"], digest)
+        _write_manifest(manifest_path, manifest)
+    return out_dir

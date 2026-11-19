@@ -728,10 +728,47 @@ def ceva_verdict(verdict_path: Path) -> list[str]:
 
 
 def run_ceva(args: argparse.Namespace, log_dir: Path) -> Path:
-    """CEVA 后端：我方导出 65 图，交给工作区 run_all.sh 编译、仿真并判定。"""
+    """CEVA 后端：我方导出 65 图，交给工作区 run_all.sh 编译、仿真并判定。
+
+    `--num-ceva >= 2` 时改走工作区 run_cascade.sh（设计 4.8）：导出带策略、
+    按核 GC 与 DDR 布局、级联仿真与判定，全在工作区脚本里编排。
+    """
     workspace = ceva_workspace()
+    if getattr(args, "skip_simulation", False):
+        # 该开关只在 genesim 分支生效；CEVA 分支曾静默忽略，容易让人误以为没有仿真。
+        raise StepFailed("CEVA 后端不支持 --skip-simulation；要只到蓝图请用 --dry-run")
     bundle = workspace / "bundles" / args.run_name
     verdict_path = workspace / "runs" / args.run_name / "results" / "verdict.txt"
+    num_ceva = getattr(args, "num_ceva", 1)
+    strategy = getattr(args, "strategy", "single")
+    dry_run = getattr(args, "dry_run", False)
+    if num_ceva >= 2:
+        print(f"\n[级联 1/3] 图编译器按策略导出 {strategy} bundle（{num_ceva} 核）")
+        _run([sys.executable, "scripts/export_gml.py",
+              "--ceva-reference", str(ceva_reference_dir()), "--use-opcompiler",
+              "--out-dir", str(bundle), "--num-ceva", str(num_ceva),
+              "--strategy", strategy],
+             cwd=_REPO_ROOT, log_path=log_dir / "ceva_cascade_export.log")
+        print("\n[级联 2/3] 清单校验")
+        manifest = bundle / "core0" / "bundle.json" if strategy == "tp2" \
+            else bundle / "bundle.json"
+        _run([sys.executable, "scripts/verify_gml_artifact.py", str(manifest.parent),
+              "--ceva-manifest", str(manifest)],
+             cwd=_REPO_ROOT, log_path=log_dir / "ceva_cascade_manifest.log")
+        print(f"\n[级联 3/3] {num_ceva} CEVA、策略 {strategy}：run_cascade.sh 编排全流程")
+        cmd = ["bash", "run_cascade.sh", "-n", args.run_name,
+               "--cores", str(num_ceva), "--strategy", strategy,
+               "--steps", str(args.decode_steps),
+               "--token-check", args.token_check]
+        if dry_run:
+            cmd.append("--dry-run")
+        if getattr(args, "fresh", False):
+            cmd.append("--fresh")
+        _run(cmd, cwd=workspace, log_path=log_dir / "ceva_cascade.log")
+        if not dry_run:                      # 干跑到蓝图为止，没有判定报告
+            for line in ceva_verdict(verdict_path):
+                print(f"    {line.strip()}")
+        return verdict_path
     print("\n[1] 图编译器导出 65 张 CEVA 子图（厂商反量化权重作 checkpoint，bin 全部我方生成）")
     _run([sys.executable, "scripts/export_gml.py", "--ceva-reference", str(ceva_reference_dir()),
           "--use-opcompiler", "--out-dir", str(bundle)],
@@ -760,6 +797,14 @@ def parse_args() -> argparse.Namespace:
                         help="CEVA：strict 要求 token 与厂商基线一致；warn 不一致只告警（默认）")
     parser.add_argument("--decode-steps", type=int, default=10,
                         help="CEVA 后端的 decode 步数，至少 1（厂商基线为 10）")
+    parser.add_argument("--num-ceva", type=int, default=1,
+                        help="CEVA 级联核数，默认 1（单核路径不变）")
+    parser.add_argument("--strategy", choices=("single", "pp2", "tp2"),
+                        default="single", help="CEVA 级联切分策略")
+    parser.add_argument("--fresh", action="store_true",
+                        help="级联仿真忽略断点状态重跑（保留已编译 GML）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="CEVA 级联干跑：到蓝图与布局为止，不启动仿真")
     parser.add_argument("--num-stages", type=int, default=4,
                         help="流水段数：1=纯张量并行，num_dpus=纯流水")
     parser.add_argument("--num-dpus", type=int, default=8)

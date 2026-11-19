@@ -36,6 +36,8 @@ class CevaGraphSpec:
     version: str                    # 26.8.0 或 19.2.0，取自厂商同名 GML
     io: tuple[CevaIoBinding, ...]
     runtime_dir: Path               # 厂商同名子图目录，只用于核对结构与 runner 契约
+    # TP 分片类型（attn/mlp/head）；None 表示单核/PP2 的整层图。
+    shard_kind: str | None = None
 
     def io_for(self, name: str) -> CevaIoBinding:
         for binding in self.io:
