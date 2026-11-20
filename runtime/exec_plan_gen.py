@@ -226,6 +226,7 @@ def _emit_moe_exact_dispatch(
     """
     dpus = sorted(xs_access_of)    # 宿主集 = xs 的 placement（PP 下只有本段 DPU）
     experts = sorted(int(e) for e in topo.down_outs)
+    hosts = topo.hosts             # 专家 → 宿主台集合（EP 下互不相交）
     writes: list[Access] = []
     for dpu_id in dpus:
         bufs = buffers_by_dpu[dpu_id]
@@ -250,9 +251,12 @@ def _emit_moe_exact_dispatch(
             rows = mask[:, expert].nonzero(as_tuple=True)[0]
             k_e = int(rows.numel())
             if k_e:
-                # 写该专家的表段：写 Access 是整张表，段内偏移在这里加。
+                # 写该专家的表段：EP 下只写宿主该专家的台（表段随专家分区，
+                # 写入量反而更小）。写 Access 是整张表，段内偏移在这里加。
                 w_col = routing[rows, expert].to(torch.float16).numpy()
                 for dpu_index, dpu_id in enumerate(dpus):
+                    if dpu_id not in hosts[expert]:
+                        continue
                     hal.write_local(
                         dpu_id,
                         cmd.writes[2 * dpu_index].offset

@@ -248,9 +248,9 @@ def _consumers_through_slices(node: Node) -> list[Node]:
     return seen
 
 
-def _experts_ancestor_layers(node: Node) -> set[int]:
-    """沿上游收集所有 experts 权重所在的层号。"""
-    layers: set[int] = set()
+def _expert_origins(node: Node) -> set[tuple[int, int]]:
+    """沿上游收集 experts 权重的 (层号, 专家号) 集合。"""
+    origins: set[tuple[int, int]] = set()
     seen, stack = set(), [node]
     while stack:
         cur = stack.pop()
@@ -259,18 +259,21 @@ def _experts_ancestor_layers(node: Node) -> set[int]:
         seen.add(cur)
         if cur.op == "get_attr" and ".mlp.experts." in str(cur.target):
             part = str(cur.target).split(".")
-            layers.add(int(part[part.index("layers") + 1]))
+            origins.add((int(part[part.index("layers") + 1]),
+                         int(part[part.index("experts") + 1])))
         stack.extend(a for a in cur.args if hasattr(a, "op"))
-    return layers
+    return origins
 
 
 def remark_moe_aggregation_for_ep(gm: GraphModule) -> int:
-    """PP×EP：把 MoE 累加链（mul/add）改标 host，返回改标数。
+    """PP×EP：把 MoE 跨专家累加链（mul/add）改标 host，返回改标数。
 
-    专家输出落在互不相交的 DPU 上，跨 DPU 加权求和在主机做——REPLICATE
-    词表覆盖不了「子集复制」，硬走 DPU 会拼错。只标记「experts 祖先层 ==
-    节点归属层」的 mul/add：MoE 块下游（下一层 RMSNorm/残差）虽然也带
-    experts 祖先，但归属下一层，留在设备上走 fused 路径（host 的 fp16
+    专家输出落在互不相交的 DPU 上，跨 DPU 求和只能在主机做。只标记真正
+    跨专家的 mul/add：某实参来自路由权重（无 experts 祖先）或两个实参来自
+    不同专家。单专家内部的乘法（如 silu·up，两实参同一专家）留在设备侧
+    随专家链执行——改标 host 会把链打断在主机，exact_dispatch 的链分析
+    （xs 读者闭包）无从展开。MoE 块下游（下一层 RMSNorm/残差）虽然也带
+    experts 祖先，但归属下一层，同样留在设备上走 fused 路径（host 的 fp16
     mean 精度低于内核的 fp32 累加，会把近平局的门控 argmax 翻掉）。
     """
     count = 0
@@ -278,13 +281,21 @@ def remark_moe_aggregation_for_ep(gm: GraphModule) -> int:
         if node.op != "call_function" or node.target not in (
                 torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor):
             continue
-        expert_layers = _experts_ancestor_layers(node)
+        expert_layers = {layer for layer, _expert in _expert_origins(node)}
         if not expert_layers:
             continue
         home = _layer_of_node(node)
-        if home in expert_layers:
-            node.meta[DEVICE_META_KEY] = DEVICE_HOST
-            count += 1
+        if home not in expert_layers:
+            continue
+        # 实参的专家祖先按本层过滤：残差流会把上一层全部专家带进祖先集，
+        # 不过滤会把本层专家内部的乘法误判成跨专家。
+        per_arg = [{e for l, e in _expert_origins(arg) if l == home}
+                   for arg in node.args if hasattr(arg, "op")]
+        if per_arg and all(len(origins) == 1 for origins in per_arg) \
+                and len(set().union(*per_arg)) == 1:
+            continue  # 全部实参出自本层同一专家：专家内部计算，留设备侧。
+        node.meta[DEVICE_META_KEY] = DEVICE_HOST
+        count += 1
     return count
 
 

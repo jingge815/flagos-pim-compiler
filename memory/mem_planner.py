@@ -318,8 +318,11 @@ def _moe_exact_tensors(
         add(f"moe:w:{layer}", (experts, t), "float16", produced, last_read,
             scatters)
         for e in topo.down_outs:
-            # 紧凑缓冲全专家共享一份地址：专家链按序执行，生命周期取本专家
-            # 链 xs 读者的节点区间（gather 随链首惰性发射，见 exec_plan_gen）。
+            # 紧凑缓冲只规划在宿主该专家的台上（EP 下专家链落单 DPU）；
+            # 全专家共享一份地址：专家链按序执行，生命周期取本专家链 xs
+            # 读者的节点区间（gather 随链首惰性发射，见 exec_plan_gen）。
+            if dpu_id not in topo.hosts[e]:
+                continue
             e_steps = [node_step[by_name[n]] for n in topo.xs_readers[e]]
             add(f"moe:compact:{layer}:{e}", (t, h), "float16",
                 min(e_steps), max(e_steps), list(topo.xs_readers[e]))

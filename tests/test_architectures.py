@@ -400,7 +400,8 @@ def test_single_expert_moe_keeps_moe_execution_semantics() -> None:
     from runtime.exec_plan_gen import resolve_moe_execution
 
     cfg = _single_expert_config()
-    assert resolve_moe_execution(cfg) == "dynamic_dispatch"
+    # 默认语义随 2026-11-19 拍板转 exact_dispatch（1 专家同样是合法 exact 配置）。
+    assert resolve_moe_execution(cfg) == "exact_dispatch"
     assert resolve_moe_execution(cfg, "dense_sim") == "dense_sim"
     assert graph_tiling_enabled(cfg, None) is False
     # 真正的 dense 配置不携带 MoE 字段，行为必须不变。
@@ -420,7 +421,7 @@ def test_single_expert_moe_generate_matches_hf(tmp_path_factory) -> None:
     loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
     strategy = ARCHITECTURES["qwen3_moe"].strategy(NUM_DPUS, loaded.config)
     compiled, backend = _compile_and_load(loaded, strategy)
-    assert compiled.moe_execution == "dynamic_dispatch"
+    assert compiled.moe_execution == "exact_dispatch"
     prompt = torch.tensor(PROMPTS[0])
     got = run_decode_loop(
         compiled, backend, prompt_ids=prompt, max_new_tokens=MAX_NEW_TOKENS,

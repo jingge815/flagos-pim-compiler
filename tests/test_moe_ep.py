@@ -87,8 +87,61 @@ def test_ep_weight_specs_and_host_aggregation(ep_model_dir) -> None:
     assert host_agg, "累加链应改标 host"
 
 
-def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
-    """16 DPU pp4×ep4：贪心生成与 HF 逐 token 一致，专家映射均衡。"""
+def test_ep_exact_compact_buffers_on_hosts(ep_model_dir) -> None:
+    """EP×exact：每专家紧凑缓冲只规划在宿主台；idx/w/acc 在段内每台。"""
+    from contracts.op_contract import PIMHardwareConfig
+    from graph.strategy import ShardStrategy
+    from memory.mem_planner import HwBudget
+    from runtime.compile import compile_llama2
+
+    model, path = ep_model_dir
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ShardStrategy(
+        name="pp2ep2", num_dpus=4, num_stages=2, ep_width=2,
+        weight_rules=ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config).weight_rules,
+    )
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
+    compiled = compile_llama2(
+        loaded, strategy, prefill_seq_len=4, max_seq=16,
+        hw=hw, hardware=PIMHardwareConfig(
+            num_dpus=4, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+            wram_bytes_per_dpu=65536, dma_align=64),
+        num_request_slots=1, num_parallel_slots=1,
+        moe_execution="exact_dispatch")
+
+    num_layers = loaded.config.num_hidden_layers
+    for plan_field in ("moe_prefill", "moe_decode"):
+        for dpu_id, plan in compiled.mem_plans.items():
+            bufs = set(getattr(plan, plan_field) or {})
+            for layer in range(num_layers):
+                stage = set(strategy.dpus_of_layer(layer, num_layers))
+                if dpu_id not in stage:
+                    # 别段的层整层不规划（PP 宿主子集，与 ep=1 同口径）。
+                    foreign = [n for n in bufs
+                               if n.startswith("moe:")
+                               and int(n.split(":")[2]) == layer]
+                    assert not foreign, f"dpu{dpu_id} 不该有层 {layer} 缓冲：{foreign}"
+                    continue
+                # 段内每台都有路由表与累加器（acc 归约跨全段）。
+                for shared in (f"moe:idx:{layer}", f"moe:w:{layer}",
+                               f"moe:acc:{layer}", f"moe:acc_land:{layer}"):
+                    assert shared in bufs, f"dpu{dpu_id} 缺 {shared}"
+                # 紧凑缓冲只在本台宿主的专家上规划。
+                for expert in range(NUM_EXPERTS):
+                    host = strategy.ep_dpu_of_expert(layer, expert, num_layers)
+                    has = f"moe:compact:{layer}:{expert}" in bufs
+                    assert has == (dpu_id == host), (
+                        f"{plan_field} dpu{dpu_id} 专家 {layer}.{expert} "
+                        f"compact 应只规划在宿主 dpu{host}")
+
+
+@pytest.mark.parametrize("moe_execution", ["dynamic_dispatch", "exact_dispatch"])
+def test_ep_16_dpu_generate_matches_hf(ep_model_dir, moe_execution) -> None:
+    """16 DPU pp4×ep4：贪心生成与 HF 逐 token 一致，专家映射均衡。
+
+    两种分派语义都过：exact×EP 下 dispatch 表段按专家宿主分段写，行数
+    守恒与零命中跳过另有终态断言。
+    """
     from collections import Counter
 
     from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
@@ -112,7 +165,7 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
             num_dpus=16, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
             wram_bytes_per_dpu=65536, dma_align=64),
         num_request_slots=1, num_parallel_slots=1,
-        moe_execution="dynamic_dispatch")  # EP 测的是动态分派；exact×EP 是 stretch
+        moe_execution=moe_execution)
     backend = NumpyBackend(NumpyBackendConfig(
         num_dpus=16, mram_bytes_per_dpu=1 << 28))
     register_all(backend)
@@ -147,6 +200,8 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
     for cmd in commands:
         if cmd.op != "launch" or "gate" not in cmd.payload:
             continue
+        if cmd.payload["node"] not in nodes:
+            continue  # exact 的行级命令（gather/scatter）无图节点可查层号
         layer = int(dispatch[cmd.payload["gate"]].rsplit("_", 1)[1])
         tag = _expert_tag_of(provenance, nodes[cmd.payload["node"]])
         assert tag is not None and tag[0] == layer
@@ -160,6 +215,63 @@ def test_ep_16_dpu_generate_matches_hf(ep_model_dir) -> None:
             strategy.ep_dpu_of_expert(layer, e, NUM_LAYERS)
             for e in range(NUM_EXPERTS))
         assert max(counts.values()) - min(counts.values()) <= 1
+
+    if moe_execution != "exact_dispatch":
+        return
+    # exact 终态断言（末步 = T=1 decode）：行数守恒 topk×T，跳过集恰为零
+    # 命中专家，被跳过专家的行级命令一台都没跑。
+    dispatch_ids = set(dispatch)
+    by_dispatch: dict[tuple, dict[int, int]] = {}
+    for (lane, cmd_id, expert), rows in backend.moe_rows.items():
+        if cmd_id in dispatch_ids:
+            by_dispatch.setdefault((lane, cmd_id), {})[expert] = rows
+    assert by_dispatch, "exact dispatch 应登记 moe_rows"
+    for (lane, cmd_id), rows in by_dispatch.items():
+        assert sum(rows.values()) == 2, f"行数守恒（topk=2×T=1）失败：{rows}"
+        skips = backend.gate_skips.get((lane, cmd_id), set())
+        assert skips == {e for e, k in rows.items() if k == 0}, (
+            f"跳过集与零行专家不符：{skips} vs {rows}")
+        assert len(skips) == NUM_EXPERTS - 2, f"T=1 应跳过 E-topk=2 个专家：{skips}"
+
+
+def test_ep_pp2ep4_exact_matches_hf(ep_model_dir) -> None:
+    """8 DPU pp2×ep4 × exact：第二策略面生成对拍 HF。"""
+    from backend.hal_numpy import NumpyBackend, NumpyBackendConfig
+    from contracts.op_contract import PIMHardwareConfig
+    from graph.strategy import ShardStrategy
+    from memory.mem_planner import HwBudget
+    from runtime.compile import causal_mask_of, compile_llama2, load_weights
+    from runtime.executor import run_decode_loop
+    from runtime.kernels import register_all
+
+    model, path = ep_model_dir
+    loaded = ARCHITECTURES["qwen3_moe"].load(str(path))
+    strategy = ShardStrategy(
+        name="pp2ep4", num_dpus=8, num_stages=2, ep_width=4,
+        weight_rules=ARCHITECTURES["qwen3_moe"].strategy(4, loaded.config).weight_rules,
+    )
+    hw = HwBudget(mram_bytes=1 << 28, align=64, sys_reserve_bytes=1 << 20)
+    compiled = compile_llama2(
+        loaded, strategy, prefill_seq_len=4, max_seq=16,
+        hw=hw, hardware=PIMHardwareConfig(
+            num_dpus=8, num_tasklets=4, mram_bytes_per_dpu=hw.mram_bytes,
+            wram_bytes_per_dpu=65536, dma_align=64),
+        num_request_slots=1, num_parallel_slots=1,
+        moe_execution="exact_dispatch")
+    backend = NumpyBackend(NumpyBackendConfig(
+        num_dpus=8, mram_bytes_per_dpu=1 << 28))
+    register_all(backend)
+    load_weights(compiled, backend)
+    got = run_decode_loop(
+        compiled, backend, prompt_ids=torch.tensor([1, 2, 3, 4]),
+        max_new_tokens=3, eos_id=-1,
+        sample_fn=lambda logits: int(np.argmax(logits)),
+        causal_mask_of=causal_mask_of)
+    torch.manual_seed(6)
+    ref_model = Qwen3MoeForCausalLM(Qwen3MoeConfig(**MODEL_KWARGS)).eval().to(torch.float16)
+    ref = ref_model.generate(torch.tensor([[1, 2, 3, 4]]),
+                             max_new_tokens=3, do_sample=False)
+    assert got == ref[0][4:].tolist()
 
 
 def test_dpu_to_host_reads_are_war_protected(ep_model_dir) -> None:

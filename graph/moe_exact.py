@@ -25,6 +25,9 @@ class MoELayerTopology:
     mask_scatter: str             # 布尔选中掩码 scatter（命中来源）
     routing_scatter: str          # 浮点路由权重 scatter（dispatch v2 读它）
     down_outs: dict[int, str]     # 专家号 → down_proj 输出节点名
+    # 专家号 → 宿主 DPU 集合（down_proj 分片键集）。EP 下各专家互不相交；
+    # TP/PP（ep=1）下与 xs 的键集相同。
+    hosts: dict[int, tuple[int, ...]] = field(default_factory=dict)
     chains: set[str] = field(default_factory=set)   # 专家链成员（含 down_proj）
     xs_readers: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # 每专家链上直接读 xs 的节点（exact 改读该专家的紧凑缓冲）
@@ -154,6 +157,10 @@ def moe_exact_topology(nodes: list[Node]) -> dict[int, MoELayerTopology]:
                 down_outs[expert] = node
         if not down_outs:
             raise ValueError(f"层 {layer} 找不到任何专家 down_proj linear")
+        # 专家宿主集 = down_proj 分片键集：EP 下专家整块落单 DPU，TP/PP 下
+        # 等于 xs 的键集（段内全复制/切分）。
+        hosts = {expert: tuple(sorted(node.meta[SPEC_META_KEY].shard_map))
+                 for expert, node in down_outs.items()}
 
         chains: set[str] = set()
         xs_readers: dict[int, tuple[str, ...]] = {}
@@ -216,6 +223,7 @@ def moe_exact_topology(nodes: list[Node]) -> dict[int, MoELayerTopology]:
             mask_scatter=next(iter(layer_mask)),
             routing_scatter=next(iter(layer_routing)),
             down_outs={e: n.name for e, n in sorted(down_outs.items())},
+            hosts=hosts,
             chains=chains,
             xs_readers=xs_readers,
             tail=tail,
