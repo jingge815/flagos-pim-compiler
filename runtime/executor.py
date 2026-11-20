@@ -350,6 +350,21 @@ def plan_wave(slots: list[T], *, width: int) -> list[list[T]]:
     return [slots[start:start + width] for start in range(0, len(slots), width)]
 
 
+def kv_blocks_needed(slots: list[RequestSlot], kv_slot_tokens: int) -> int:
+    """这批 slot 本步要新申请的 KV 块数：decode 一步至多长一块（跨块边界才算），
+    未 prefill 的按整段 prompt 长块，口径与 ensure 一致并扣除已持有块数。"""
+    needed = 0
+    for slot in slots:
+        if slot.is_prefill_done:
+            if slot.valid_len % kv_slot_tokens == 0:
+                needed += 1
+        else:
+            needed += max(
+                0, _blocks_for(len(slot.prompt_ids), kv_slot_tokens)
+                - len(slot.blocks.slots))
+    return needed
+
+
 def run_one_step(
     compiled,
     hal,
@@ -380,6 +395,14 @@ def run_one_step(
         width = parallel_slots if parallel_slots is not None else max_windows
         width = max(1, min(width, max_windows, len(pending))) if pending else 1
         waves = plan_wave(pending, width=width)
+        # 自管池将耗尽时从尾部收窄 wave，装不下的请求本步不执行、下一步再试；
+        # 单请求仍装不下属于容量配置错误，照旧在 ensure 处报错。
+        if table.kv_slots_free() is not None:
+            for wave in waves:
+                while (len(wave) > 1
+                       and kv_blocks_needed(wave, compiled.kv_slot_tokens)
+                       > table.kv_slots_free()):
+                    wave.pop()
     for wave in waves:
         if len(wave) > max_windows:
             raise ValueError(

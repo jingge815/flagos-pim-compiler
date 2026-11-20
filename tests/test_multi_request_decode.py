@@ -18,7 +18,8 @@ from graph.strategy import llama_strategies
 from memory.mem_planner import HwBudget
 from runtime.compile import causal_mask_of, compile_llama2, load_weights
 from runtime.executor import (
-    RequestTable, available_windows, plan_wave, run_decode_loop, run_one_step,
+    KVBlockTable, RequestSlot, RequestTable, available_windows,
+    kv_blocks_needed, plan_wave, run_decode_loop, run_one_step,
 )
 from runtime.kernels import register_all
 
@@ -327,3 +328,112 @@ def test_batch8_full_pool_no_conflict(
     _assert_match_individual(
         compiled, backend, table,
         {f"r{index}": prompt for index, prompt in enumerate(prompts)})
+
+
+def _pure_slot(request_id, *, valid_len=0, prompt=(), held_blocks=0,
+               prefill_done=False) -> RequestSlot:
+    """直接拼一个 RequestSlot，供 kv_blocks_needed 纯函数测试用。"""
+    slot = RequestSlot(
+        request_id=request_id, request_slot=0, blocks=KVBlockTable())
+    slot.blocks.adopt(list(range(held_blocks)))
+    slot.prompt_ids = list(prompt)
+    slot.valid_len = valid_len
+    slot.is_prefill_done = prefill_done
+    return slot
+
+
+def test_kv_blocks_needed_pure() -> None:
+    """kv_blocks_needed：decode 跨界才算一块，未 prefill 按整段长块扣已持有。"""
+    decode_cross = _pure_slot("x", valid_len=4, prompt=[1] * 4, prefill_done=True)
+    decode_cross_next = _pure_slot("x", valid_len=8, prompt=[1] * 8, prefill_done=True)
+    decode_within = _pure_slot("x", valid_len=6, prompt=[1] * 6, prefill_done=True)
+    prefill_fresh = _pure_slot("x", prompt=[1] * 5)
+    prefill_partial = _pure_slot("x", prompt=[1] * 8, held_blocks=1)
+    prefill_covered = _pure_slot("x", prompt=[1] * 4, held_blocks=1)
+
+    assert kv_blocks_needed([decode_cross], 4) == 1
+    assert kv_blocks_needed([decode_cross_next], 4) == 1
+    assert kv_blocks_needed([decode_within], 4) == 0
+    assert kv_blocks_needed([prefill_fresh], 4) == 2
+    assert kv_blocks_needed([prefill_partial], 4) == 1
+    assert kv_blocks_needed([prefill_covered], 4) == 0
+    # 混排 wave 求和：跨界 decode + 不跨界 decode + 新 prefill（3 token 一块）。
+    assert kv_blocks_needed(
+        [decode_cross, decode_within, _pure_slot("x", prompt=[1] * 3)], 4) == 2
+
+
+def test_kv_pool_exhaustion_narrows_wave(small_model, hw_and_hardware) -> None:
+    """池将耗尽时收窄 wave：装不下的请求晚一步，最终 token 仍与单独运行一致。"""
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, 3, kv_slot_tokens=4,
+                        num_parallel_slots=3)
+    backend = _backend_with_weights(compiled, hardware)
+    prompts = {"a": PROMPT_A, "b": PROMPT_B, "c": [9, 10, 11, 12]}
+    # 5 块池：3 路 prefill 各占 1 块后剩 2 块，恰够 2 路跨界 decode。
+    table = RequestTable(3, 5)
+    for request_id, prompt in prompts.items():
+        table.add_request(request_id, prompt, eos_id=-1)
+
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    assert table.kv_slots_free() == 2
+
+    # 三路同一步都跨块边界但只剩 2 块：收窄为 2 路，不抛 RuntimeError。
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    lengths = {s.request_id: len(s.generated) for s in table.active_slots()}
+    assert lengths == {"a": 2, "b": 2, "c": 1}
+    assert table.kv_slots_free() == 0
+
+    # c 仍装不下（跨界要 1 块、空闲 0），继续被移出；a/b 不需新块照常跑满。
+    run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    finished = {
+        s.request_id: list(s.generated) for s in table.active_slots()}
+    assert len(finished["a"]) == 3
+    assert len(finished["b"]) == 3 and len(finished["c"]) == 1
+
+    # 释放 a/b 的块后 c 追上，三路 token 都与单独运行一致。
+    for request_id in ("a", "b"):
+        table.free_slot(request_id)
+    for _ in range(2):
+        run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+    finished["c"] = list(table.get("c").generated)
+    assert len(finished["c"]) == 3
+    for request_id, prompt in prompts.items():
+        ref = run_decode_loop(
+            compiled, backend,
+            prompt_ids=torch.tensor(prompt), max_new_tokens=MAX_NEW_TOKENS,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
+        )
+        assert finished[request_id] == ref, (
+            f"请求 {request_id} 收窄后生成 {finished[request_id]} "
+            f"与单独运行 {ref} 不一致")
+
+
+def test_external_blocks_skip_narrowing(small_model, hw_and_hardware) -> None:
+    """块号外部托管（无池）时不收窄：跨界步也全员执行，结果与单独运行一致。"""
+    hw, hardware = hw_and_hardware
+    compiled = _compile(small_model, hw, hardware, 2, kv_slot_tokens=4,
+                        num_parallel_slots=2)
+    backend = _backend_with_weights(compiled, hardware)
+    prompts = {"a": PROMPT_A, "b": PROMPT_B}
+    table = RequestTable(2)
+    table.add_request("a", prompts["a"], eos_id=-1, block_ids=[0, 1])
+    table.add_request("b", prompts["b"], eos_id=-1, block_ids=[2, 3])
+
+    generated = {}
+    for step in range(1, MAX_NEW_TOKENS + 1):
+        run_one_step(compiled, backend, table, causal_mask_of, sample_fn=_greedy)
+        # 每步两路都各前进一步，没有被移出的请求。
+        lengths = {s.request_id: len(s.generated) for s in table.active_slots()}
+        assert lengths == {"a": step, "b": step}
+        generated = {s.request_id: list(s.generated)
+                     for s in table.active_slots()}
+
+    for request_id, prompt in prompts.items():
+        ref = run_decode_loop(
+            compiled, backend,
+            prompt_ids=torch.tensor(prompt), max_new_tokens=MAX_NEW_TOKENS,
+            eos_id=-1, sample_fn=_greedy, causal_mask_of=causal_mask_of,
+        )
+        assert generated[request_id] == ref, (
+            f"请求 {request_id} 外部块号生成 {generated[request_id]} "
+            f"与单独运行 {ref} 不一致")
