@@ -189,6 +189,10 @@ def moe_exact_topology(nodes: list[Node]) -> dict[int, MoELayerTopology]:
                 break
             if foreign or not args:
                 continue
+            if not any(arg.name in closure for arg in args):
+                # 只吃权重/常量的节点不在 MoE 种子下游（如 no_grad 图首的
+                # RoPE 频率链），吸收它会把出口消费者误判成它的首个消费者。
+                continue
             closure.add(node.name)
 
         if exit_consumer is None:

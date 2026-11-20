@@ -671,3 +671,47 @@ def test_exact_pp_hosting_subset_matches_hf() -> None:
     assert hosts[0].isdisjoint(hosts[2]), f"两段宿主集应不相交：{hosts}"
     got, _backend = _decode_tokens(compiled, [1, 2, 3, 4], 3, num_dpus=4)
     assert got == _hf_reference(model, steps=3), f"exact={got}"
+
+
+def test_exact_pp_no_grad_export_acc_land_on_consumers() -> None:
+    """生产导出路径（no_grad，export_pp_placement 同款）下 exact×PP 编译。
+
+    曾因 no_grad 图把图首只吃权重的 RoPE 频率链误吸进 MoE 闭包，出口消费
+    者误判成 wrap_with_autocast（stage0 的 to_1），出口读 acc_land 跨段，
+    编译期 KeyError 'moe:acc_land:3'（grad 开着的单测路径测不出）。断言：
+    每层出口投影所在 shard_map 的每台 DPU 都规划了该层 acc_land；no_grad
+    与 grad 两种导出图的 token 都与 HF 参考逐位一致。
+    """
+    import torch
+
+    from contracts.graph_meta import DEVICE_DPU, DEVICE_META_KEY, SPEC_META_KEY
+    from graph.moe_exact import moe_exact_topology
+
+    model = _moe_model(num_layers=4, num_experts=4)
+    expect = _hf_reference(model, steps=3)
+    with torch.set_grad_enabled(False):
+        exact = _compile(model, moe_execution="exact_dispatch",
+                         num_dpus=4, num_stages=2)
+    exact_grad = _compile(model, moe_execution="exact_dispatch",
+                          num_dpus=4, num_stages=2)
+
+    for gm, plan_field in ((exact.prefill_gm, "moe_prefill"),
+                           (exact.decode_gm, "moe_decode")):
+        nodes = list(gm.graph.nodes)
+        by_name = {n.name: n for n in nodes}
+        for layer, topo in moe_exact_topology(nodes).items():
+            for name in topo.exits:
+                node = by_name[name]
+                if node.meta.get(DEVICE_META_KEY) != DEVICE_DPU:
+                    continue
+                shard = node.meta[SPEC_META_KEY].shard_map
+                for dpu_id in shard:
+                    bufs = getattr(exact.mem_plans[dpu_id], plan_field)
+                    assert f"moe:acc_land:{layer}" in bufs, (
+                        f"{plan_field} 出口 {name}（层 {layer}）读 dpu{dpu_id}，"
+                        f"但该台未规划 acc_land（shard={sorted(shard)}）")
+
+    got, _ = _decode_tokens(exact, [1, 2, 3, 4], 3, num_dpus=4)
+    got_grad, _ = _decode_tokens(exact_grad, [1, 2, 3, 4], 3, num_dpus=4)
+    assert got == expect, f"no_grad exact={got} hf={expect}"
+    assert got_grad == expect, f"grad exact={got_grad} hf={expect}"
