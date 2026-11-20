@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
              "是因为形状口径与融合与否互不相干：全局形状的那份精化 IR 同样需要"
              "知道图编译器折了哪些激活，否则被吸收的节点会被多计一遍。",
     )
+    parser.add_argument(
+        "--profile", default=None,
+        help="硬件画像 JSON（contracts/profiles）。给了就按同一份预算与 DMA "
+             "对齐测量，并核对放置 sidecar 的画像摘要；不给则沿用全局默认。",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +92,14 @@ def main() -> int:
                 "export_pp_placement.py 重新导出。"
             )
 
+    # 画像与放置的契约核对要在测量之前：矛盾的 DPU/tasklet 预算直接拒绝。
+    from genesim_bridge.refine_profile import resolve_hardware
+
+    try:
+        hardware, _profile = resolve_hardware(args.profile, args.placement)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     sidecar = export_costs_to_genesim(
         ir_path=Path(args.ir),
         out_ir_path=Path(args.out_ir),
@@ -99,6 +112,7 @@ def main() -> int:
         placement_sidecar=(
             Path(args.fusion_from) if args.fusion_from else None
         ),
+        hardware=hardware,
     )
 
     bridged = len(sidecar["coverage"]["bridged"])

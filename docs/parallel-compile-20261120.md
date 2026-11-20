@@ -1,11 +1,25 @@
 # 算子编译并行化与冗余清理（2026-11-20）
 
-> 追记（同日，genesim 侧三处缓存优化）：仿真完整轮 30 分 37 秒 → **14 分 31
-> 秒（2.11×）**，`Total time: 5551.468564 s` 与改前逐位一致、吞吐不变。
-> 三处：`config_loader.get` 记忆化（+~9%）、`_json_identity` 按对象身份
-> 记忆化（py-spy 原生采样的第一热点 ~15%，cProfile 看不见——走 C 编码器）、
-> `_SHARED_PHASE_METRICS` FIFO 淘汰。单请求对照链：77.7 → 70.4 → 57.7 s，
-> `Total time` 三次均为 518.383745 s。改动在 genesim 工作区未提交。
+> 追记一（同日，genesim 侧三处缓存优化）：仿真完整轮（tp2_pp4，10 请求）
+> 30 分 37 秒 → **14 分 31 秒（2.11×）**，`Total time: 5551.468564 s` 与改前
+> 逐位一致。三处：`config_loader.get` 记忆化、`_json_identity` 内容指纹、
+> `_SHARED_PHASE_METRICS` FIFO 淘汰。教训：估热点占比一律 py-spy 原生采样，
+> cProfile 对百万级调用计数既放大（config.get）又漏报（C 编码器里的 JSON）。
+>
+> 追记二（同日下午，测试修复轮）：genesim `./run.sh --test` 四个文件挂：
+> ① `config.get` 记忆化只在 `__init__` 建属性，单测 `__new__` 直造实例炸
+> → 改惰性 `_reader_cache()`；② `_json_identity` 按对象身份的缓存丢掉了
+> 周期表原地改值契约（`test_vpu` 有测试钉着）→ 改精确分流指纹（平坦标量
+> 表 `tuple(sorted(items))`、嵌套退 `json.dumps`），比 id 缓存慢 ~7%，契约
+> 保住；③ `_SHARED_PHASE_METRICS` 跨用例泄漏 → 测试 setUp 清空；④
+> `_resolve_pimir_path` 同样吃 `__new__` 绕过 → 惰性初始化；⑤
+> `test_collective_edges` 配置与"用满校验"冲突 → 改非正式核数（2 核）。
+> 修复后 `tests/sim` 49 个文件全绿；tp16_pp4 单请求 `Total time` 123.670581 s
+> 逐位一致。
+>
+> 追记三：genesim 已切标准形态 **tp16_pp4（64 DPU 用满 64 核）**，加了
+> 用满校验（tp2_pp4 会被拒）；本仓 `run_full_pipeline.py` 的 `--num-dpus`
+> 缺省同步改为从 CEVA 画像取 64。
 
 ## 背景与动机
 

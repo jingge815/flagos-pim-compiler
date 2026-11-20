@@ -1052,12 +1052,6 @@ def _write_cache_text(path: Path, text: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _invalidate_cache(so_path: Path, meta_path: Path, pimir_path: Path) -> None:
-    """删除不完整或被 force 替换的旧三件套，避免新旧文件混用。"""
-    for path in (so_path, meta_path, pimir_path):
-        path.unlink(missing_ok=True)
-
-
 def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileResult:
     """编译算子请求并返回共享库描述，结果按请求参数缓存。"""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1069,12 +1063,13 @@ def compile_op(request: OpCompileRequest, *, force: bool = False) -> OpCompileRe
     # 锁住整个「检查→编译→发布」事务。不同 key 可以并行；同一 key 的第二个
     # 进程拿锁后再次检查，直接复用第一份完整产物，不会把旧 meta/pimir 与新 .so
     # 拼在一起。force 仍表示即使已有缓存也要重编，但重编过程同样不可交错。
+    # 发布一律用原子替换覆盖旧文件：先删再编会让并发读者（已拿到 so_path 正在
+    # dlopen 的进程）短暂看到文件缺失。
     with _cache_key_lock(key):
         if not force:
             cached = _read_cached_result(so_path, meta_path, pimir_path)
             if cached is not None:
                 return cached
-        _invalidate_cache(so_path, meta_path, pimir_path)
         return _compile_op_uncached(
             request, key, so_path, meta_path, pimir_path)
 

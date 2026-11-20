@@ -67,6 +67,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 CEVA_MRAM_BYTES = 8_000_000_000
 CEVA_SYS_RESERVE_BYTES = 0
 CEVA_SIM_CONFIG = "ceva_64core_4e.yaml"
+# DPU 数缺省也从这份画像推导（64）；与 export_pp_placement.py 同源。
+DEFAULT_PROFILE = _REPO_ROOT / "contracts" / "profiles" / "ceva_64core_4e.json"
 # 七个投影，缺一个都说明 IR 或匹配退化了。
 _EXPECTED_ROLES = {
     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -807,7 +809,8 @@ def parse_args() -> argparse.Namespace:
                         help="CEVA 级联干跑：到蓝图与布局为止，不启动仿真")
     parser.add_argument("--num-stages", type=int, default=4,
                         help="流水段数：1=纯张量并行，num_dpus=纯流水")
-    parser.add_argument("--num-dpus", type=int, default=8)
+    parser.add_argument("--num-dpus", type=int, default=None,
+                        help="逻辑 DPU 数；缺省取 CEVA 画像的核数（64）")
     parser.add_argument("--max-requests", type=int, default=None,
                         help="仿真的请求数上限。默认跟随配置；"
                              "慢速测试传 1，只要 prefill 与 decode 各一次")
@@ -837,6 +840,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.num_dpus is None:
+        from contracts.hardware_profile import load_profile
+        args.num_dpus = load_profile(DEFAULT_PROFILE).total_clusters
     if args.jobs < 1:
         print("错误: --jobs 至少为 1", file=sys.stderr)
         return 2

@@ -10,6 +10,10 @@
 
     python scripts/export_pp_placement.py --num-stages 8
 
+硬件参数（DPU 数、MRAM 预算、系统预留）缺省从 CEVA 画像推导，不再各自
+内置默认值——曾因脚本写死 NUM_DPUS=8 而画像是 64 核，导出的放置只钉住
+8 个核，仿真静默少用核。显式传参仍可覆盖。
+
 产物默认写到 GeneSim 的 models/ 目录，文件名带策略名，便于并存多种策略：
 
     models/llama2_7b_<策略名>_placed.ir
@@ -31,6 +35,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from contracts.hardware_profile import HardwareProfile, load_profile
 from contracts.op_contract import PIMHardwareConfig
 from contracts.partition_plan import PartitionPlan
 from genesim_bridge.paths import genesim_models_dir, llama2_7b_model_dir
@@ -45,13 +50,23 @@ from graph.strategy import (
 )
 from memory.mem_planner import HwBudget
 
-NUM_DPUS = 8
+# 缺省画像：CEVA 64 核 4e，与 GeneSim 的 conf/ceva_64core_4e.yaml 成对。
+DEFAULT_PROFILE = Path(__file__).resolve().parent.parent / "contracts" / "profiles" / "ceva_64core_4e.json"
 NUM_TASKLETS = 4
 PREFILL_SEQ_LEN = 16
 MAX_SEQ = 64
-# 默认按 GeneSim 的 CEVA 64 核 4e 画像：每核 8,000,000,000 B，无系统预留。
-DEFAULT_MRAM_BYTES = 8_000_000_000
-DEFAULT_SYS_RESERVE_BYTES = 0
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> HardwareProfile:
+    """num-dpus/mram-bytes/sys-reserve-bytes 未显式给出时从画像推导。"""
+    profile = load_profile(Path(args.profile))
+    if args.num_dpus is None:
+        args.num_dpus = profile.total_clusters
+    if args.mram_bytes is None:
+        args.mram_bytes = profile.cluster_memory_bytes
+    if args.sys_reserve_bytes is None:
+        args.sys_reserve_bytes = profile.sys_reserve_bytes
+    return profile
 
 
 def build_hw_budget(mram_bytes: int, sys_reserve_bytes: int) -> HwBudget:
@@ -90,7 +105,14 @@ def parse_args() -> argparse.Namespace:
             "给了它就由方案决定段数和 DPU 数，不再看 --num-stages/--num-dpus。"
         ),
     )
-    parser.add_argument("--num-dpus", type=int, default=NUM_DPUS)
+    parser.add_argument(
+        "--num-dpus", type=int, default=None,
+        help="逻辑 DPU 数；缺省取画像的设备数 × 每设备簇数（CEVA 64 核 = 64）。",
+    )
+    parser.add_argument(
+        "--profile", default=str(DEFAULT_PROFILE),
+        help="硬件画像 JSON；num-dpus/mram-bytes/sys-reserve-bytes 缺省从它推导。",
+    )
     parser.add_argument(
         "--ir", default=None,
         help="输入 GeneSim 图骨架，默认取 <genesim>/models/llama2_7b.ir",
@@ -100,15 +122,12 @@ def parse_args() -> argparse.Namespace:
         help="产物目录，默认取 <genesim>/models",
     )
     parser.add_argument(
-        "--mram-bytes", type=int, default=DEFAULT_MRAM_BYTES,
-        help=(
-            "单台 DPU 的 MRAM 字节预算；缺省 8,000,000,000 B（CEVA 64 核 4e 画像），"
-            "其他场景按 GeneSim 配置显式覆盖。"
-        ),
+        "--mram-bytes", type=int, default=None,
+        help="单台 DPU 的 MRAM 字节预算；缺省取画像的 cluster_memory_bytes。",
     )
     parser.add_argument(
-        "--sys-reserve-bytes", type=int, default=DEFAULT_SYS_RESERVE_BYTES,
-        help="系统预留字节数（内核、栈、workspace）；缺省 0。",
+        "--sys-reserve-bytes", type=int, default=None,
+        help="系统预留字节数（内核、栈、workspace）；缺省取画像的 sys_reserve_bytes。",
     )
     parser.add_argument(
         "--measure-kernel-tiles", action="store_true",
@@ -126,6 +145,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    profile = apply_profile_defaults(args)
+    print(
+        f"硬件画像: {profile.name}（{profile.num_pim_devices} 设备 × "
+        f"{profile.clusters_per_device} 核，MRAM {profile.cluster_memory_bytes} B）"
+    )
     models_dir = genesim_models_dir()
     ir_path = Path(args.ir) if args.ir else models_dir / "llama2_7b.ir"
     out_dir = Path(args.out_dir) if args.out_dir else models_dir
@@ -169,10 +193,13 @@ def main() -> None:
     print(format_strategy(strategy, cfg.num_hidden_layers))
 
     hw = build_hw_budget(args.mram_bytes, args.sys_reserve_bytes)
+    # 字节预算允许命令行覆盖；WRAM/DMA 对齐/编译目标一律与画像同源。
     hardware = PIMHardwareConfig(
         num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
-        mram_bytes_per_dpu=hw.mram_bytes, wram_bytes_per_dpu=65536,
-        dma_align=64,
+        mram_bytes_per_dpu=hw.mram_bytes,
+        wram_bytes_per_dpu=profile.wram_bytes_per_dpu,
+        dma_align=profile.dma_align,
+        compiler_target=profile.compiler_target,
     )
     print(
         f"MRAM 预算: 物理 {hw.mram_bytes} B，"
@@ -182,6 +209,7 @@ def main() -> None:
     result = export_placement_for_strategy(
         model, ir_path, out_dir,
         strategy=strategy, plan=plan, hw=hw, hardware=hardware,
+        profile=profile,
         prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
         force_compile=False,
         measure_kernel_tiles=args.measure_kernel_tiles,

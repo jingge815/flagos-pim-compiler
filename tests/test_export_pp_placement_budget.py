@@ -1,7 +1,7 @@
-"""放置导出脚本的 MRAM 预算入口。
+"""放置导出脚本的硬件参数入口。
 
-默认与 GeneSim 的 CEVA 64 核 4e 画像一致：每核 8,000,000,000 B、无系统预留；
-其他场景可用命令行显式覆盖。
+num-dpus / mram-bytes / sys-reserve-bytes 缺省从 CEVA 画像推导（64 核、
+每核 8,000,000,000 B、无系统预留）；其他场景可用命令行显式覆盖。
 """
 
 import importlib.util
@@ -23,22 +23,40 @@ def _parse(monkeypatch, *args):
     return _module.parse_args()
 
 
-def test_defaults_use_the_ceva_budget(monkeypatch):
+def test_defaults_come_from_the_ceva_profile(monkeypatch):
+    """未显式给出时，核数与字节预算都从 CEVA 64 核画像推导。"""
     args = _parse(monkeypatch, "--num-stages", "4")
+    assert args.num_dpus is None
+    assert args.mram_bytes is None
+    assert args.sys_reserve_bytes is None
+    profile = _module.apply_profile_defaults(args)
+    assert profile.total_clusters == 64
+    assert args.num_dpus == 64
     assert args.mram_bytes == 8_000_000_000
     assert args.sys_reserve_bytes == 0
 
 
+def test_explicit_num_dpus_beats_the_profile(monkeypatch):
+    args = _parse(monkeypatch, "--num-stages", "4", "--num-dpus", "32")
+    _module.apply_profile_defaults(args)
+    assert args.num_dpus == 32
+    # 未覆盖的项仍从画像取。
+    assert args.mram_bytes == 8_000_000_000
+
+
 def test_mram_bytes_override(monkeypatch):
     args = _parse(
-        monkeypatch, "--num-stages", "4", "--mram-bytes", "8000000000")
-    assert args.mram_bytes == 8000000000
+        monkeypatch, "--num-stages", "4", "--mram-bytes", "7000000000")
+    _module.apply_profile_defaults(args)
+    assert args.mram_bytes == 7000000000
+    assert args.num_dpus == 64
 
 
 def test_sys_reserve_override(monkeypatch):
     args = _parse(
-        monkeypatch, "--num-stages", "4", "--sys-reserve-bytes", "0")
-    assert args.sys_reserve_bytes == 0
+        monkeypatch, "--num-stages", "4", "--sys-reserve-bytes", str(64 * 2**20))
+    _module.apply_profile_defaults(args)
+    assert args.sys_reserve_bytes == 64 * 2**20
 
 
 def test_budget_uses_the_requested_bytes():

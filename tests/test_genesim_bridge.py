@@ -520,7 +520,12 @@ def test_pimir_sidecar_agrees_with_ttir_on_flops():
     pimir = json.loads(pimir_path.read_text())
     assert ttir["ir_level"] == "ttir" and pimir["ir_level"] == "pimir"
     assert pimir["coverage"] == ttir["coverage"]
-    assert pimir["pim_options"]["pim_target"]
+    if "pim_options" in pimir:
+        # 旧单次链路的产物：记录全局 pass 参数。
+        assert pimir["pim_options"]["pim_target"]
+    else:
+        # 带画像精化的产物：硬件五元组替代全局 pass 参数。
+        assert pimir["hardware"]["compiler_target"]
 
     # 融合算子的折激活记账挂在 pimir 的写回上，ttir 侧 A 路 kernel 没有
     # dma_store，两条路径的运算数本来就不是同一口径。

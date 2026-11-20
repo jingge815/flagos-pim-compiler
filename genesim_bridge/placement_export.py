@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
@@ -383,7 +384,10 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes,
     out = _CACHE_DIR / f"bpath-{key}.pimir.mlir"
     if force_compile or not out.is_file():
         expanded, _ = _run_oplevel_triton_opt(text, hw)
-        tmp = out.with_suffix(".tmp")
+        # 不同的形状 key 可能编出相同 text（builder 只取部分维度），落到
+        # 同一个内容寻址缓存文件；tmp 名带线程标识，避免并发写同一 out
+        # 时一个线程 rename 走 tmp、另一个线程的 tmp 就此消失。
+        tmp = out.with_suffix(f".{os.getpid()}-{threading.get_ident()}.tmp")
         tmp.write_text(expanded)
         os.replace(tmp, out)
     return str(out)
