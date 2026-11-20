@@ -53,6 +53,15 @@ def _representative_strategies():
     return [strategy for strategy in _strategies() if strategy.name in keep]
 
 
+def _strategy_params():
+    """按策略生成参数：同名策略的用例分到同一 xdist 组，并行跑不同切分。"""
+    return [
+        pytest.param(strategy, id=strategy.name,
+                     marks=pytest.mark.xdist_group(f"llama2-strategy-{strategy.name}"))
+        for strategy in _representative_strategies()
+    ]
+
+
 def test_real_7b_suite_keeps_three_representative_strategies() -> None:
     assert [strategy.name for strategy in _representative_strategies()] == [
         "tp8_pp1", "tp2_pp4", "tp1_pp8"]
@@ -126,7 +135,7 @@ def _run_strategy(model, strategy):
     return generated, backend, compiled
 
 
-@pytest.mark.parametrize("strategy", _representative_strategies(), ids=lambda s: s.name)
+@pytest.mark.parametrize("strategy", _strategy_params())
 def test_real_llama2_7b_inference_matches_hf_under_every_strategy(
     strategy, llama2_model, hf_reference, run_cache
 ) -> None:
@@ -140,7 +149,7 @@ def test_real_llama2_7b_inference_matches_hf_under_every_strategy(
     )
 
 
-@pytest.mark.parametrize("strategy", _representative_strategies(), ids=lambda s: s.name)
+@pytest.mark.parametrize("strategy", _strategy_params())
 def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
     strategy, llama2_model, hf_reference, run_cache
 ) -> None:
@@ -177,7 +186,7 @@ def test_real_llama2_7b_kv_region_matches_hf_cache_under_every_strategy(
                 )
 
 
-@pytest.mark.parametrize("strategy", _representative_strategies(), ids=lambda s: s.name)
+@pytest.mark.parametrize("strategy", _strategy_params())
 def test_real_llama2_7b_memory_footprint_fits_and_scales(strategy, llama2_model) -> None:
     """验证各策略的内存布局不超过单 DPU 容量。"""
     hw = HwBudget(mram_bytes=4 * 2**30, align=64, sys_reserve_bytes=64 * 2**20)

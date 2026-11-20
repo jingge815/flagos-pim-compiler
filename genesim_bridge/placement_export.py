@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
@@ -203,8 +204,13 @@ def _fused_activations(gm: GraphModule) -> list[dict]:
     return found
 
 
-def _get_attr_node(gm: GraphModule, pattern: str):
-    matches = [n for n in gm.graph.nodes if n.op == "get_attr" and pattern in n.target]
+def _get_attr_node(attr_nodes: list, pattern: str):
+    """在预先收集的 get_attr 节点里按后缀找权重节点。
+
+    `attr_nodes` 由调用方一次遍历图收集：每个 (层, 投影) 组合都调一次这里，
+    现扫全图是 224 次全图遍历，先收一遍 get_attr 只扫几百个节点。
+    """
+    matches = [n for n in attr_nodes if pattern in n.target]
     if len(matches) != 1:
         raise ValueError(f"pattern={pattern!r} 应恰好匹配 1 个 get_attr 节点，实际 {len(matches)} 个")
     return matches[0]
@@ -311,7 +317,8 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes,
     只按文本哈希会让第二个候选捡到第一个候选的产物。
     """
     from opcompiler_bridge.driver import (
-        _CACHE_DIR, _compiler_fingerprint, _run_oplevel_triton_opt)
+        _CACHE_DIR, _compiler_fingerprint, _module_text,
+        _run_oplevel_triton_opt)
     from opcompiler_bridge.oplevel_kernel import (
         concat_kernel, dynamic_quant_kernel, eltwise_kernel, gather_kernel, kv_cache_kernel,
         lut_kernel, mask_kernel, matmul_kernel, normalize_kernel,
@@ -363,9 +370,6 @@ def _bpath_pimir(mnemonic: str, input_shapes, output_shapes,
         raise RuntimeError(
             f"{mnemonic} 的 B 路 IR 缺 stationarity 标记，KV 缓存会被当成模型权值"
         )
-    from opcompiler_bridge.driver import (
-        _CACHE_DIR, _module_text, _run_oplevel_triton_opt)
-    import hashlib, os
     hw = DEFAULT_HARDWARE_CONFIG if hardware is None else hardware
     # B 路算子按复制档进入每个 DPU；模块头要写 DPU/tasklet，仿真才能证明
     # 这批 B 路产物吃的是本候选的编译参数，而不是另一套默认值。
@@ -421,36 +425,60 @@ def _attach_bpath_pimir(operators_by_id, sidecar, hardware=None,
                         *, force_compile: bool = False) -> None:
     """给每个算子级节点编一份 B 路 pimir 并写进 sidecar。
 
-    同一 (mnemonic, 形状, 硬件) 只编一次。编不出来直接抛：静默跳过的那条条目
-    会缺 `pimir_path`，仿真侧退回手写模板，而现场只看到「缺路径」这个结果，
+    同一 (mnemonic, 形状, 硬件) 只编一次，唯一键并行编译（各自走独立的
+    内容寻址缓存文件，互不影响）。编不出来直接抛：静默跳过的那条条目会缺
+    `pimir_path`，仿真侧退回手写模板，而现场只看到「缺路径」这个结果，
     看不到是谁、为什么编不出。契约不满足就让原因立刻暴露。
     """
-    cache: dict = {}
+    # 第一遍收集唯一键，并记下首次出现的算子用于报错定位。
+    keys: list = []
+    first_of: dict = {}
+    key_of_op: dict = {}
     for op_id, op in operators_by_id.items():
         mnemonic = _BPATH_MNEMONIC.get(op["op_type"])
         if mnemonic is None:
             continue
         key = (mnemonic, json.dumps(op["input_shapes"]),
                json.dumps(op["output_shapes"]))
-        if key not in cache:
-            try:
-                cache[key] = _bpath_pimir(
-                    mnemonic, op["input_shapes"], op["output_shapes"],
-                    hardware, force_compile=force_compile)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"op{op_id}（{op['op_type']} -> {mnemonic}，形状 "
-                    f"{op['input_shapes']} -> {op['output_shapes']}）没编出 "
-                    f"pim mlir：{exc}。缺了它 GeneSim 会静默退回手写模板，"
-                    "这个算子的原语等于没进仿真。"
-                ) from exc
+        key_of_op[op_id] = key
+        if key not in first_of:
+            first_of[key] = (op_id, op)
+            keys.append(key)
+
+    def compile_key(key):
+        mnemonic = key[0]
+        op_id, op = first_of[key]
+        try:
+            return _bpath_pimir(
+                mnemonic, op["input_shapes"], op["output_shapes"],
+                hardware, force_compile=force_compile)
+        except Exception as exc:
+            raise RuntimeError(
+                f"op{op_id}（{op['op_type']} -> {mnemonic}，形状 "
+                f"{op['input_shapes']} -> {op['output_shapes']}）没编出 "
+                f"pim mlir：{exc}。缺了它 GeneSim 会静默退回手写模板，"
+                "这个算子的原语等于没进仿真。"
+            ) from exc
+
+    from opcompiler_bridge.parallel import run_jobs
+
+    paths = run_jobs(compile_key, keys)
+    cache = dict(zip(keys, paths))
+    # sha256 按路径去重：同一条 pimir 被上千个算子引用，逐个重读是纯浪费。
+    sha_of: dict = {}
+    for op_id, op in operators_by_id.items():
+        if op_id not in key_of_op:
+            continue
+        path = cache[key_of_op[op_id]]
+        if path not in sha_of:
+            sha_of[path] = _file_sha256(path)
         # `shards` 必须在：消费方逐条取 `entry["shards"]` 统计分片数，缺了就抛。
         # B 路节点不切分，所以是空列表，而不是不写这个键。
         entry = sidecar["operators"].setdefault(str(op_id), {
             "op_type": op["op_type"], "device_hint": "pim", "shards": [],
         })
-        entry["pimir_path"] = cache[key]
-        entry["pimir_sha256"] = _file_sha256(cache[key])
+        entry["pimir_path"] = path
+        entry["pimir_sha256"] = sha_of[path]
         # 算子级节点走 B 路：只出现 MRAM/WRAM/DMA/目标，DPU/tasklet 编码
         # 不在这条路径上；消费侧按路由决定哪些属性必须存在。
         entry["pimir_route"] = "b"
@@ -707,6 +735,10 @@ def export_placement_to_genesim(
     # {(local_in, local_out): tile_n}。同一形状只编一次——llama2 的 224 个 GEMM
     # 只有 7 种本地形状，逐个编会白跑 217 次。
     tile_cache: Dict[tuple[int, int, str | None], tuple[int, str, int | None]] = {}
+    # 测量延后到循环外并行做：这里只收集 (entry, 本地形状, 激活)。
+    gemm_measurements: list[tuple[Dict[str, Any], int, int, str | None]] = []
+    # 权重节点先收一遍：每个 (层, 投影) 找一次节点，现扫全图是 224 次全图遍历。
+    attr_nodes = [n for n in gm.graph.nodes if n.op == "get_attr"]
 
     for layer in range(num_layers):
         gemm_op_ids = [
@@ -717,7 +749,7 @@ def export_placement_to_genesim(
         for op_id in gemm_op_ids:
             role = operators_by_id[op_id]["semantic_role"]
             pattern = _ROLE_TO_WEIGHT_PATTERN[role]
-            weight_node = _get_attr_node(gm, f"layers.{layer}.{pattern}")
+            weight_node = _get_attr_node(attr_nodes, f"layers.{layer}.{pattern}")
             spec = weight_node.meta[SPEC_META_KEY]
             if spec.device != DEVICE_DPU:
                 continue  # host 权重不写入 DPU 设备提示。
@@ -777,32 +809,48 @@ def export_placement_to_genesim(
             sidecar["operators"][str(op_id)] = entry
 
             if measure_kernel_tiles:
-                tile_n, pimir_path, placed = _measure_kernel_tile_n(
-                    int(rep_in), int(rep_out), dtype, hardware, tile_cache,
-                    activation=_activation_of(weight_node),
-                    force_compile=force_compile,
+                gemm_measurements.append(
+                    (entry, int(rep_in), int(rep_out),
+                     _activation_of(weight_node))
                 )
-                entry["kernel_tile_n"] = tile_n
-                # 算子编译器回传的单台 MRAM 占用。GeneSim 用它核对常驻容量，
-                # 没回传就不写，免得 sidecar 里多一个恒为 null 的键。
-                if placed is not None:
-                    entry["placed_mram_bytes"] = placed
-                # GeneSim 照这份 pim mlir 生成 PIM trace，而不是用手写模板。
-                #
-                # 这是导出这台机器上的绝对路径（算子编译缓存在仓库里）。换机器、
-                # 换 checkout 目录、或缓存被清掉之后就失效，GeneSim 侧会按文件名
-                # 在 `scheduler.pimir_search_dirs` 里再找一遍——文件名是算子编译
-                # 缓存的内容哈希，同名即同一份产物。
-                entry["pimir_path"] = pimir_path
-                # GEMM 走 A 路整图编译：PIM MLIR 必须写全 DPU/tasklet 等六项
-                # 预算属性，消费侧按路由逐项核对。
-                entry["pimir_route"] = "a"
-                # 内容哈希一并记下：GeneSim 侧把它放进 trace 缓存签名，这样
-                # 「同形状、同分块、但 pim mlir 换了」不会复用旧 trace。缓存里
-                # 真实存在这样的碰撞（同为 out=2048 in=4096 tile_n=512，但
-                # num-dpus/num-tasklets/dma-align 不同）。也便于换机器后核对
-                # 找回来的文件是不是同一份。
-                entry["pimir_sha256"] = _file_sha256(pimir_path)
+
+    # 唯一 (本地形状, 激活) 键并行编译：各键走 compile_op 的独立缓存文件，
+    # 互不影响；主循环里逐个编是纯串行的子进程等待。激活可 None 可 str，
+    # 不能排序去重，按首次出现顺序保持确定性。
+    if gemm_measurements:
+        unique_keys = list(dict.fromkeys(
+            (in_f, out_f, act) for _, in_f, out_f, act in gemm_measurements))
+        from opcompiler_bridge.parallel import run_jobs
+
+        run_jobs(
+            lambda key: _measure_kernel_tile_n(
+                key[0], key[1], dtype, hardware, tile_cache,
+                activation=key[2], force_compile=force_compile),
+            unique_keys,
+        )
+        for entry, rep_in, rep_out, activation in gemm_measurements:
+            tile_n, pimir_path, placed = tile_cache[(rep_in, rep_out, activation)]
+            entry["kernel_tile_n"] = tile_n
+            # 算子编译器回传的单台 MRAM 占用。GeneSim 用它核对常驻容量，
+            # 没回传就不写，免得 sidecar 里多一个恒为 null 的键。
+            if placed is not None:
+                entry["placed_mram_bytes"] = placed
+            # GeneSim 照这份 pim mlir 生成 PIM trace，而不是用手写模板。
+            #
+            # 这是导出这台机器上的绝对路径（算子编译缓存在仓库里）。换机器、
+            # 换 checkout 目录、或缓存被清掉之后就失效，GeneSim 侧会按文件名
+            # 在 `scheduler.pimir_search_dirs` 里再找一遍——文件名是算子编译
+            # 缓存的内容哈希，同名即同一份产物。
+            entry["pimir_path"] = pimir_path
+            # GEMM 走 A 路整图编译：PIM MLIR 必须写全 DPU/tasklet 等六项
+            # 预算属性，消费侧按路由逐项核对。
+            entry["pimir_route"] = "a"
+            # 内容哈希一并记下：GeneSim 侧把它放进 trace 缓存签名，这样
+            # 「同形状、同分块、但 pim mlir 换了」不会复用旧 trace。缓存里
+            # 真实存在这样的碰撞（同为 out=2048 in=4096 tile_n=512，但
+            # num-dpus/num-tasklets/dma-align 不同）。也便于换机器后核对
+            # 找回来的文件是不是同一份。
+            entry["pimir_sha256"] = _file_sha256(pimir_path)
 
     # 非 GEMM 的算子级节点也写 pimir_path：相位链与视图类的真实 IR 才能进
     # GeneSim 的 trace 编译。之前只有 GEMM 写，相位链那一支在生产里没人喂。

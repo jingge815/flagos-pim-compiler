@@ -72,6 +72,19 @@ def _strategies():
     ]
 
 
+def _strategy_params():
+    """按策略生成参数：同名策略的用例分到同一 xdist 组，并行跑不同切分。"""
+    params = []
+    for strategy in _strategies():
+        # tp1_pp8 纯流水单条要 48 分钟，是并行化后唯一的墙，默认回归不跑，
+        # 用 -m slow 显式选中再验证。
+        marks = [pytest.mark.xdist_group(f"llama2-opcompiler-{strategy.name}")]
+        if strategy.name == "tp1_pp8":
+            marks.append(pytest.mark.slow)
+        params.append(pytest.param(strategy, id=strategy.name, marks=marks))
+    return params
+
+
 def test_strategy_set_covers_tensor_hybrid_and_pipeline() -> None:
     """判据 0：三种策略分别落在张量、混合、流水三类上。"""
     kinds = {s.name: s.kind for s in _strategies()}
@@ -143,7 +156,7 @@ def _wrap_with_numpy_cross_check(orig_compiled_linear_kernel):
     return wrapped, stats
 
 
-@pytest.mark.parametrize("strategy", _strategies(), ids=lambda s: s.name)
+@pytest.mark.parametrize("strategy", _strategy_params())
 def test_compiled_linear_end_to_end_matches_hf_generate(
     monkeypatch, strategy, tokenizer, llama2_model, hf_reference
 ) -> None:

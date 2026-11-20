@@ -131,11 +131,13 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
     from contracts.ir_payloads import placement_of_module
     from contracts.op_contract import OpCompileRequest
     from opcompiler_bridge.driver import compile_op
+    from opcompiler_bridge.parallel import run_jobs
     from runtime.exec_plan_gen import _fused_activation_of, _shard_decision_of
     from runtime.kernels import _compiled_linear_supports
 
-    peak = 0
+    # 1. 串行收集唯一编译任务：探测的跳过与去重逻辑保持串行语义不变。
     seen: set[tuple] = set()
+    jobs: list[tuple] = []
     for node in nodes:
         if "linear" not in str(getattr(node, "target", "")):
             continue
@@ -168,32 +170,44 @@ def peak_kernel_mram_bytes(nodes, *, hardware: PIMHardwareConfig,
             if not _compiled_linear_supports([x_shape, w_shape], dtype):
                 continue
             raw = _shard_decision_of(spec, spec.shard_map[dpu_id])
-            try:
-                result = compile_op(OpCompileRequest(
-                    op="linear", arg_shapes=[x_shape, w_shape],
-                    hardware=hardware, dtype=dtype,
-                    num_tasklets=hardware.num_tasklets,
-                    shard=None if raw is None else DpuShard.from_payload(raw),
-                    activation=activation), force=force_compile)
-            except (RuntimeError, ValueError):
-                # 这是**探测**，不是编译：拿不到就跳过这个形状，绝不让它打断
-                # 整个 compile_llama2。三种拿不到的情形都走这里：
-                #   - `ToolchainUnavailable`（RuntimeError 子类）：没装 PIM pass
-                #   - `ValueError`：形状不满足 A 路契约（K 维、2 的幂等）
-                #   - `RuntimeError`：`triton-opt` 自己拒了。实测 tp4 的
-                #     `M=1 N=16 K=64` 没有合法的 2 的幂分块，而运行时对这种
-                #     形状本来就退回 numpy 内核 —— 它不占内核 tile。
-                continue
-            if not result.pimir:
-                continue
-            back = placement_of_module(result.pimir)
-            if back.placed_mram_bytes:
-                peak = max(peak, back.placed_mram_bytes)
-            # 宽度与图上 dtype 相同就是回声，不是新信息：探测按 spec.dtype 编译，
-            # 回传必然等于 dtype_bytes(spec.dtype)。只留真正不同的那个。
-            if (widths is not None and back.placed_elem_bytes
-                    and back.placed_elem_bytes != dtype_bytes(dtype)):
-                widths.setdefault("Gemm", back)
+            jobs.append((x_shape, w_shape, dtype, activation, raw))
+
+    def probe(job: tuple):
+        # 这是**探测**，不是编译：拿不到就返回 None，绝不让它打断整个
+        # compile_llama2。三种拿不到的情形都走这里：
+        #   - `ToolchainUnavailable`（RuntimeError 子类）：没装 PIM pass
+        #   - `ValueError`：形状不满足 A 路契约（K 维、2 的幂等）
+        #   - `RuntimeError`：`triton-opt` 自己拒了。实测 tp4 的
+        #     `M=1 N=16 K=64` 没有合法的 2 的幂分块，而运行时对这种
+        #     形状本来就退回 numpy 内核 —— 它不占内核 tile。
+        x_shape, w_shape, dtype, activation, raw = job
+        try:
+            result = compile_op(OpCompileRequest(
+                op="linear", arg_shapes=[x_shape, w_shape],
+                hardware=hardware, dtype=dtype,
+                num_tasklets=hardware.num_tasklets,
+                shard=None if raw is None else DpuShard.from_payload(raw),
+                activation=activation), force=force_compile)
+        except (RuntimeError, ValueError):
+            return None
+        if not result.pimir:
+            return None
+        return placement_of_module(result.pimir)
+
+    # 2. 并行探测：各任务走 compile_op 的独立缓存 key 与文件锁，互不影响；
+    #    结果按提交顺序聚合，与串行版逐项一致。
+    peak = 0
+    for job, back in zip(jobs, run_jobs(probe, jobs)):
+        if back is None:
+            continue
+        if back.placed_mram_bytes:
+            peak = max(peak, back.placed_mram_bytes)
+        # 宽度与图上 dtype 相同就是回声，不是新信息：探测按 spec.dtype 编译，
+        # 回传必然等于 dtype_bytes(spec.dtype)。只留真正不同的那个。
+        dtype = job[2]
+        if (widths is not None and back.placed_elem_bytes
+                and back.placed_elem_bytes != dtype_bytes(dtype)):
+            widths.setdefault("Gemm", back)
     return peak
 
 

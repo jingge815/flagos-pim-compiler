@@ -436,6 +436,30 @@ MNEMONIC_OF = {
 }
 
 
+def _source_names() -> Dict[str, tuple[str, str]]:
+    """每个算子类型的 `(source_name, mnemonic)`，用微小维度派生一次。
+
+    这两个字符串与形状无关，但配方工厂在构造时就为 A 路创建探针张量（GEMM
+    的权重是 [out_features, in_features]，llama2 的 gate 投影是 [11008, 4096]）。
+    sidecar 要给 IR 里每个桥接算子记一次名（llama2 有 3000+ 个），逐个建配方
+    光造张量就要数分钟。与 `MNEMONIC_OF` 同一手法：微小维度建一遍、模块级查表。
+    """
+    recipes = build_recipes({"hidden_size": 64, "head_dim": 64,
+                             "num_heads": 1, "ffn_dim": 64})
+    table: Dict[str, tuple[str, str]] = {}
+    for op_type, factory in recipes.items():
+        try:
+            recipe = factory(ShapePoint(tq=1, tp=0))
+        except TypeError:
+            # GEMM 的配方还要 in/out 两个宽度，名字与宽度无关，给个占位即可。
+            recipe = factory(ShapePoint(tq=1, tp=0), 64, 64)
+        table[op_type] = (recipe.source_name, recipe.mnemonic)
+    return table
+
+
+SOURCE_NAMES = _source_names()
+
+
 def gemm_features(op_dict: dict) -> tuple:
     """从算子形状读取 GEMM 的输入和输出特征数。"""
     in_shape = op_dict["input_shapes"][0]

@@ -12,6 +12,19 @@ import pytest
 _REPORT_STATE = None
 
 
+def _is_worker(config) -> bool:
+    """是否运行在 xdist worker 进程里（主进程汇总报告，worker 不写）。"""
+    return hasattr(config, "workerinput")
+
+
+def pytest_configure(config):
+    # 32 个 worker 各自默认开满核 BLAS/torch 线程会互相争抢，限到 4线程/worker。
+    # 须在 worker 导入 numpy/torch 之前设置（configure 先于收集导入测试模块）。
+    if _is_worker(config):
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(name, "4")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _forbid_test_writes_to_real_ceva_workspace():
     """测试不得写真实归档树：CEVA 工作区与本仓 runs/（round02 问题5、round03 问题1）。
@@ -70,6 +83,9 @@ class TestResult:
 
 def pytest_sessionstart(session):
     global _REPORT_STATE
+    # xdist worker 进程不写报告，避免多进程踩踏同一文件，由主进程汇总
+    if _is_worker(session.config):
+        return
     root = Path(session.config.rootpath)
     out_dir = root / "test-results"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -85,16 +101,22 @@ def pytest_sessionstart(session):
 
 def pytest_collection_modifyitems(session, config, items):
     state = _REPORT_STATE
+    if state is None:
+        return
     for item in sorted(items, key=lambda value: value.nodeid):
         state["ordered"].append(item.nodeid)
         state["results"][item.nodeid] = TestResult(item.nodeid)
 
 
 def pytest_runtest_logreport(report):
-    if _REPORT_STATE is None or report.nodeid not in _REPORT_STATE["results"]:
+    if _REPORT_STATE is None:
         return
     state = _REPORT_STATE
-    result = state["results"][report.nodeid]
+    # xdist 的主进程不做收集（modifyitems 不触发），报告到达时懒注册条目
+    result = state["results"].setdefault(
+        report.nodeid, TestResult(report.nodeid))
+    if report.nodeid not in state["ordered"]:
+        state["ordered"].append(report.nodeid)
     if report.when == "call":
         result.duration = report.duration
         result.status = (
@@ -110,10 +132,12 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if _REPORT_STATE is None:
+        return
     state = _REPORT_STATE
     ended = datetime.now()
     elapsed = time.perf_counter() - state["perf"]
-    results = [state["results"][nodeid] for nodeid in state["ordered"]]
+    results = [state["results"][nodeid] for nodeid in sorted(state["ordered"])]
     counts = {status: sum(item.status == status for item in results) for status in
               ("PASS", "FAIL", "ERROR", "SKIPPED", "NOT RUN")}
     lines = [

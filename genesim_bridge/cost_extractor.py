@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .flagtree_driver import lower_oplevel_to_pimir, run_and_capture
 from .ir_cost import analyze_ir
 from .op_classify import (
+    SOURCE_NAMES,
     UNCOVERED_OP_TYPES,
     OpRecipe,
     ShapePoint,
@@ -503,6 +504,75 @@ def validate_local_shapes_against_ir(
         )
 
 
+def _keeps_template_cost(op: dict, ir_level: str, recipe_types: set) -> bool:
+    """这个算子是否保留模板成本、不进测量。
+
+    两条判据：A 路不认识的算子类型留在模板里（B 路桥接的除外）；被折进主
+    算子且没有配方的算子也留在模板里（系数清零由调用方处理）。
+    """
+    op_type = op["op_type"]
+    # B 路桥接四类逐元素/归约算子，只要它有 `pimir`；A 路一律留在模板里。
+    bridged_here = ir_level == "oplevel" and op_type in recipe_types
+    return (op_type in UNCOVERED_OP_TYPES and not bridged_here) or (
+        bool(op.get("absorbed")) and op_type not in recipe_types
+    )
+
+
+def _measure_unique_keys(
+    ir: Dict[str, Any],
+    dims: Dict[str, int],
+    ir_level: str,
+    local_shapes: Dict[int, Tuple[int, int]],
+    prefill_point: ShapePoint,
+    decode_point: ShapePoint,
+    hardware,
+    force_compile: bool,
+    recipe_types: set,
+) -> Dict[tuple, Tuple[Measurement, Measurement]]:
+    """按唯一键预先测完两个形状点，返回主循环直接取用的缓存。
+
+    llama2 的 6850 个算子只有二十来个唯一键，逐个串行测量是纯子进程等待。
+    并行只给编译型子任务：oplevel 全部走 `triton-opt` 子进程，pimir 的 GEMM
+    走带文件锁的 `compile_op`，各键产物互不影响。pimir/ttir 的非 GEMM 要在
+    GPU 上真跑 FlagGems 并打全局补丁捕获 kernel（`capture_kernels`），并发
+    会互相踩，保持串行。
+    """
+    keys: list = []
+    rep_op: Dict[tuple, dict] = {}
+    for op in ir["operators"]:
+        if _keeps_template_cost(op, ir_level, recipe_types):
+            continue
+        key = (op["op_type"],
+               tuple(tuple(s) for s in op["input_shapes"]),
+               tuple(tuple(s) for s in op["output_shapes"]),
+               local_shapes.get(op["op_id"]),
+               op.get("fused_activation"))
+        if key not in rep_op:
+            rep_op[key] = op
+            keys.append(key)
+    points = (prefill_point, decode_point)
+
+    def measure(key: tuple) -> Tuple[Measurement, Measurement]:
+        # 同键的算子形状身份一致，代表算子测一次全体复用。
+        return tuple(
+            _measure(rep_op[key], point, dims, ir_level, key[3],
+                     hardware, force_compile)
+            for point in points
+        )
+
+    from opcompiler_bridge.parallel import run_jobs
+
+    parallel_keys = [k for k in keys
+                     if ir_level == "oplevel" or k[0] == "GEMM"]
+    serial_keys = [k for k in keys if k not in set(parallel_keys)]
+    cache: Dict[tuple, Tuple[Measurement, Measurement]] = {}
+    for key, value in zip(parallel_keys, run_jobs(measure, parallel_keys)):
+        cache[key] = value
+    for key in serial_keys:
+        cache[key] = measure(key)
+    return cache
+
+
 def export_costs_to_genesim(
     ir_path: Path,
     out_ir_path: Path,
@@ -541,8 +611,7 @@ def export_costs_to_genesim(
     prefill_point = ShapePoint(tq=seq_len, tp=0)
     decode_point = ShapePoint(tq=1, tp=seq_len)
 
-    # 缓存相同算子类型和形状的测量结果。
-    cache: Dict[tuple, Tuple[Measurement, Measurement]] = {}
+    # 测量缓存由 _measure_unique_keys 预先填好：相同算子类型和形状只测一次。
     sidecar: Dict[str, Any] = {
         "version": SIDECAR_VERSION,
         "ir_level": ir_level,
@@ -564,15 +633,16 @@ def export_costs_to_genesim(
     recipe_types = set(build_recipes(dims))
     # 融合清单来自放置 sidecar：图编译器折过的才折，没给清单就按未融合计。
     _mark_fused_activations(ir, _fused_pairs(placement_sidecar))
+    # 唯一键的测量全部预先做完（编译型子任务并行），主循环只取结果。
+    cache = _measure_unique_keys(
+        ir, dims, ir_level, local_shapes, prefill_point, decode_point,
+        hardware, force_compile, recipe_types,
+    )
     for op in ir["operators"]:
         op_type = op["op_type"]
         op_id = op["op_id"]
 
-        # B 路桥接四类逐元素/归约算子，只要它有 `pimir`；A 路一律留在模板里。
-        bridged_here = ir_level == "oplevel" and op_type in recipe_types
-        if (op_type in UNCOVERED_OP_TYPES and not bridged_here) or (
-            op.get("absorbed") and op_type not in recipe_types
-        ):
+        if _keeps_template_cost(op, ir_level, recipe_types):
             sidecar["coverage"]["template"].append(op_id)
             # 没桥接的算子不测量，但被吸收的仍要清掉模板系数，否则原样留在 IR 里
             # 被 GeneSim 照计。
@@ -596,13 +666,6 @@ def export_costs_to_genesim(
                tuple(tuple(s) for s in op["output_shapes"]),
                local_features,
                op.get("fused_activation"))
-        if key not in cache:
-            cache[key] = (
-                _measure(op, prefill_point, dims, ir_level, local_features,
-                         hardware, force_compile),
-                _measure(op, decode_point, dims, ir_level, local_features,
-                         hardware, force_compile),
-            )
         prefill, decode = cache[key]
 
         template_flops = dict(op.get("flops_coeffs", {}))
@@ -623,7 +686,7 @@ def export_costs_to_genesim(
         sidecar["coverage"]["bridged"].append(op_id)
         sidecar["operators"][str(op_id)] = {
             "op_type": op_type,
-            "source_name": _source_name(op, dims, prefill_point, ir_level),
+            "source_name": _source_name(op, ir_level),
             "dtype": prefill.dtype,
             "kernel_ids": sorted(set(prefill.kernel_ids + decode.kernel_ids)),
             "measurements": {
@@ -696,28 +759,21 @@ def _record_absorbed_ops(sidecar_path: Optional[Path], absorbed_ops: list) -> No
     Path(sidecar_path).write_text(json.dumps(data, indent=2))
 
 
-def _source_name(op: dict, dims: Dict[str, int], point: ShapePoint,
-                 ir_level: str) -> str:
+def _source_name(op: dict, ir_level: str) -> str:
     """sidecar 里记的实现名。
 
     B 路记 mnemonic（`pim.softmax`），不记 `flag_gems.ops.softmax`：4.9 的
     sidecar 要用这个字段区分同一笔成本是从哪条路量出来的（A 路 FlagGems linear
     与 B 路 `pim.matmul` 是两种口径），记成一样的就分不清了。
+
+    名字与形状无关，查 `SOURCE_NAMES` 表，不在这里建配方——配方工厂构造时就会
+    为 A 路创建探针张量（gate 投影的权重是 [11008, 4096]），llama2 的 3000+
+    个桥接算子逐个建一遍要数分钟，而这里只取一个字符串。
     """
-    op_type = op["op_type"]
-    recipes = build_recipes(dims)
-    if op_type == "GEMM":
-        in_f, out_f = gemm_features(op)
-        if op.get("fused_activation"):
-            recipe = recipes["GEMM_SILU"](
-                point, in_f, out_f, activation=op["fused_activation"])
-        else:
-            recipe = recipes["GEMM"](point, in_f, out_f)
-    else:
-        recipe = recipes[op_type](point)
-    if ir_level == "oplevel" and recipe.mnemonic:
-        return recipe.mnemonic
-    return recipe.source_name
+    source_name, mnemonic = SOURCE_NAMES[op["op_type"]]
+    if ir_level == "oplevel" and mnemonic:
+        return mnemonic
+    return source_name
 
 
 def _measurement_dict(m: Measurement) -> Dict[str, Any]:

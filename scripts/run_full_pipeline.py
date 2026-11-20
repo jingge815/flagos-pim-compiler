@@ -824,11 +824,24 @@ def parse_args() -> argparse.Namespace:
             "用于对照：验证走方案与直接给段数产出的 sidecar 语义相同。"
         ),
     )
+    parser.add_argument(
+        "--jobs", type=int, default=32,
+        help=(
+            "算子编译子任务的并行线程数（默认 32）。只并行子进程型编译，"
+            "各任务写各自的内容寻址缓存文件，互不影响；经 OPCOMPILER_JOBS "
+            "传给导出与精化子进程。"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.jobs < 1:
+        print("错误: --jobs 至少为 1", file=sys.stderr)
+        return 2
+    # 并行度经环境变量下发给导出/精化子进程（opcompiler_bridge.parallel 读它）。
+    os.environ["OPCOMPILER_JOBS"] = str(args.jobs)
     if args.backend == "ceva":
         if not args.run_name:
             print("错误: --backend ceva 需要 --run-name", file=sys.stderr)

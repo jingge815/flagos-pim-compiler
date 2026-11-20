@@ -36,6 +36,9 @@ pytestmark = pytest.mark.skipif(
     reason="需要在 paths.json 配置 llama2_7b_model_dir",
 )
 
+# 同文件用例固定在同一 worker：共享 module 级 7B 夹具，也避免多 worker 各持一份模型
+pytestmark = [pytestmark, pytest.mark.xdist_group("llama2-spec-prop")]
+
 
 @pytest.fixture(scope="module")
 def annotated_llama2():
