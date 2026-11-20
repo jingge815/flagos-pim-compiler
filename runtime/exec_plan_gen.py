@@ -206,6 +206,11 @@ def _emit_moe_dispatch(builder, layer: int, route_cmd_id: int) -> int:
 _SYNTH_EDGE = iter(range(-1, -10**6, -1))
 
 
+def moe_segment_bytes(t_rows: int, dtype: str, expert: int) -> int:
+    """专家 e 在路由表 idx/w 里的段起始字节偏移；路由表按专家等宽分段。"""
+    return expert * t_rows * dtype_bytes(dtype)
+
+
 def _emit_moe_exact_dispatch(
     builder: _PlanBuilder, topo: MoELayerTopology,
     mask_cmd_id: int, routing_cmd_id: int,
@@ -241,8 +246,6 @@ def _emit_moe_exact_dispatch(
         routing = hal.result_of(routing_cmd_id)
         lane = hal.current_lane_key()
         skips: set[int] = set()
-        idx_bytes = t_rows * dtype_bytes("int64")
-        w_bytes = t_rows * dtype_bytes("float16")
         for expert in experts:
             rows = mask[:, expert].nonzero(as_tuple=True)[0]
             k_e = int(rows.numel())
@@ -252,11 +255,13 @@ def _emit_moe_exact_dispatch(
                 for dpu_index, dpu_id in enumerate(dpus):
                     hal.write_local(
                         dpu_id,
-                        cmd.writes[2 * dpu_index].offset + expert * idx_bytes,
+                        cmd.writes[2 * dpu_index].offset
+                        + moe_segment_bytes(t_rows, "int64", expert),
                         rows.numpy())
                     hal.write_local(
                         dpu_id,
-                        cmd.writes[2 * dpu_index + 1].offset + expert * w_bytes,
+                        cmd.writes[2 * dpu_index + 1].offset
+                        + moe_segment_bytes(t_rows, "float16", expert),
                         w_col)
             hal.moe_rows[(lane, cmd.id, expert)] = k_e
             if k_e == 0:
@@ -296,7 +301,7 @@ def _emit_moe_gather(
     reads = [
         xs_access_of[dpu_id],
         Access(("dpu", dpu_id),
-               idx.offset + expert * t_rows * dtype_bytes("int64"),
+               idx.offset + moe_segment_bytes(t_rows, "int64", expert),
                t_rows * dtype_bytes("int64")),
     ]
     write = Access(("dpu", dpu_id), compact.offset, compact.nbytes)
@@ -336,9 +341,11 @@ def _emit_moe_scatter_add(
     reads = [
         Access(("dpu", dpu_id), acc.offset, acc.nbytes),
         out_access,
-        Access(("dpu", dpu_id), w.offset + expert * t_rows * dtype_bytes("float16"),
+        Access(("dpu", dpu_id),
+               w.offset + moe_segment_bytes(t_rows, "float16", expert),
                t_rows * dtype_bytes("float16")),
-        Access(("dpu", dpu_id), idx.offset + expert * t_rows * dtype_bytes("int64"),
+        Access(("dpu", dpu_id),
+               idx.offset + moe_segment_bytes(t_rows, "int64", expert),
                t_rows * dtype_bytes("int64")),
     ]
     write = Access(("dpu", dpu_id), acc.offset, acc.nbytes)
