@@ -26,6 +26,46 @@ NUM_HEADS = 4
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _tiny_llama_at_batch(batch: int) -> GraphModule:
+    """同款 tiny 模型按 [batch, S] 导出：batch 维进图后同链标注与传播。"""
+    sequence_length = 16
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32000,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            num_hidden_layers=1,
+            num_attention_heads=NUM_HEADS,
+            num_key_value_heads=NUM_HEADS,
+            max_position_embeddings=sequence_length,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+    ).eval()
+    input_ids = (
+        torch.arange(sequence_length, dtype=torch.long)
+        .unsqueeze(0).repeat(batch, 1)
+    )
+    blocked = torch.triu(torch.ones(sequence_length, sequence_length, dtype=torch.bool), diagonal=1)
+    causal_mask = torch.zeros((1, 1, sequence_length, sequence_length), dtype=torch.float32)
+    causal_mask.masked_fill_(blocked, torch.finfo(causal_mask.dtype).min)
+    gm = torch.export.export(
+        _FixedMaskLlama(model), (input_ids, causal_mask), strict=True
+    ).module()
+    partition_graph(gm)
+    shard_config = llama_shard_config(
+        NUM_DPUS,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_HEADS,
+        intermediate_size=INTERMEDIATE_SIZE,
+        vocab_size=32000,
+    )
+    propagate_specs(gm, shard_config)
+    return gm
+
+
 @pytest.fixture(scope="module")
 def annotated_tiny_llama() -> GraphModule:
     sequence_length = 16
@@ -487,6 +527,104 @@ def test_export_writes_legal_collective_fields_exactly(
     }]
 
 
+def _export_with_collectives(gm, tmp_path, edges):
+    """清空图上原重分布边后注入给定边列表，返回导出 sidecar。"""
+    from copy import deepcopy
+
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY
+
+    gm = deepcopy(gm)
+    for node in gm.graph.nodes:
+        if REDISTRIBUTE_META_KEY in node.meta:
+            node.meta[REDISTRIBUTE_META_KEY] = []
+    carrier = next(node for node in gm.graph.nodes if node.op == "call_function")
+    carrier.meta[REDISTRIBUTE_META_KEY] = list(edges)
+    ir_path = tmp_path / "base.ir"
+    _write_fixture_ir(ir_path)
+    return export_placement_to_genesim(
+        gm, ir_path, tmp_path / "placed.ir", tmp_path / "sidecar.json",
+    )
+
+
+def test_collectives_bytes_stay_per_row_across_export_batches(tmp_path) -> None:
+    """K6 不变性（导出侧）：集合通信字节不得携带编译档 batch 维。
+
+    多档扫参按档列表最大档编译图，[B_export, S] 图上量出的激活与 token id
+    字节乘过 batch 维；sidecar 必须写单行口径（消费侧按本次 forward 的
+    真实行数计价），否则同一 B 运行的通信量正比于档列表里的最大档
+    （round12–14 严重问题 2，b4g1 两代 sidecar 下 wall 差 16.5% 的根因）。
+    """
+    baseline = None
+    for batch in (1, 4, 8):
+        gm = _tiny_llama_at_batch(batch)
+        sidecar = _export_with_collectives(
+            gm, tmp_path, _real_collective_edges(gm))
+        got = [
+            (e["type"], tuple(e["dpu_ids"]), e["seq_len"], e["nbytes"])
+            for e in sidecar["collectives"]
+        ]
+        assert got, "fixture 图上应有集合通信边"
+        if baseline is None:
+            baseline = got
+        else:
+            assert got == baseline, f"B_export={batch} 的通信字节不是单行口径"
+
+
+def _real_collective_edges(gm: GraphModule):
+    """取出图上真实的 all_gather/scatter 重分布边（注入用原样保留）。"""
+    from contracts.graph_meta import REDISTRIBUTE_META_KEY
+
+    edges = [
+        edge
+        for node in gm.graph.nodes
+        for edge in node.meta.get(REDISTRIBUTE_META_KEY, [])
+        if edge.type in ("all_gather", "scatter")
+    ]
+    return edges
+
+
+def test_sidecar_version_declares_per_row_collectives_contract(tmp_path) -> None:
+    """sidecar 版本必须钉住单行通信口径的契约代（round15 问题 2）。
+
+    v6 起 collectives[].nbytes 语义为单行口径；口径变更不递增版本会让
+    旧口径产物与新计价公式静默混用（K6 的隐蔽形态）。导出侧版本必须与
+    消费侧契约常量一致（refine_profile.SIDECAR_SCHEMA_VERSION 与 genesim
+    的 PLACEMENT_SCHEMA_VERSION），口径变更 = 显式递增版本并同步两侧。
+    """
+    from genesim_bridge.refine_profile import SIDECAR_SCHEMA_VERSION
+
+    gm = _tiny_llama_at_batch(4)
+    sidecar = _export_with_collectives(
+        gm, tmp_path, _real_collective_edges(gm))
+    assert sidecar["version"] == SIDECAR_SCHEMA_VERSION == 6
+
+
+def test_collective_batch_dim_division_rule(tmp_path) -> None:
+    """按形状首维识别 batch 维：激活与 token id 除回单行，掩码不除。"""
+    from types import SimpleNamespace
+
+    def edge(edge_id, type_, nbytes, dtype, shape):
+        return SimpleNamespace(
+            edge_id=edge_id, type=type_, nbytes=nbytes,
+            src_loc={"device": "DPU", "dpus": [0, 1]},
+            dst_loc={"device": "DPU", "dpus": [0, 1]},
+            dtype=dtype, shape=shape,
+        )
+
+    activation = edge(9001, "all_gather", 8 * 16 * 64 * 2, "float16", (8, 16, 64))
+    token_ids = edge(9002, "scatter", 8 * 16 * 8, "int64", (8, 16))
+    mask = edge(9003, "all_gather", 16 * 16 * 2, "float16", (1, 1, 16, 16))
+    sidecar = _export_with_collectives(
+        _tiny_llama_at_batch(8), tmp_path, [activation, token_ids, mask])
+    by_id = {e["nbytes"]: e for e in sidecar["collectives"]}
+    # [8,16,64] 激活与 [8,16] token id 携带 batch 因子：除 8 后写单行字节。
+    assert 16 * 64 * 2 in by_id and by_id[16 * 64 * 2]["seq_len"] == 16
+    assert 16 * 8 in by_id and by_id[16 * 8]["seq_len"] is None
+    # [1,1,16,16] 掩码是广播形状、不含 batch 因子，原值保留。
+    assert 16 * 16 * 2 in by_id and by_id[16 * 16 * 2]["seq_len"] is None
+    assert 8 * 16 * 64 * 2 not in by_id and 8 * 16 * 8 not in by_id
+
+
 def _two_layer_graph() -> GraphModule:
     """两层的小模型图，用来验证层到流水段的钉死。"""
     sequence_length = 16
@@ -733,7 +871,7 @@ def test_local_shard_widths_follow_each_projection(
             assert shard["local_in_features"] == want_in, (op_id, entry)
             assert shard["local_out_features"] == want_out, (op_id, entry)
 
-    assert sidecar["version"] == 5
+    assert sidecar["version"] == 6
     assert sidecar["ir_num_operators"] == 11
 
 
@@ -766,7 +904,7 @@ def test_sidecar_exports_the_same_byte_budget(
         sys_reserve_bytes=reserve,
     )
 
-    assert sidecar["version"] == 5
+    assert sidecar["version"] == 6
     assert sidecar["hardware"] == {
         "mram_bytes_per_dpu": 8000000000,
         "sys_reserve_bytes": reserve,
@@ -1151,7 +1289,7 @@ def test_the_measured_tile_carries_the_returned_footprint() -> None:
 
     hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4, mram_bytes_per_dpu=1 << 32,
                            wram_bytes_per_dpu=65536, dma_align=64)
-    tile_n, _path, placed = _measure_kernel_tile_n(4096, 4096, "float16", hw, {})
+    tile_n, _path, placed, _tile_m = _measure_kernel_tile_n(4096, 4096, "float16", hw, {})
     assert tile_n > 0
     assert placed is not None and placed > 0, (
         "测出了分块却没有回传单台占用，sidecar 写不出 placed_mram_bytes")
@@ -1713,7 +1851,7 @@ def test_measured_gate_kernel_is_fused_by_the_operator_compiler(monkeypatch) -> 
     monkeypatch.setattr(driver, "compile_op", spy)
     hw = PIMHardwareConfig(num_dpus=1, num_tasklets=4, mram_bytes_per_dpu=1 << 32,
                            wram_bytes_per_dpu=65536, dma_align=64)
-    _tile, path, _placed = _measure_kernel_tile_n(
+    _tile, path, _placed, _tile_m = _measure_kernel_tile_n(
         256, 512, "float16", hw, {}, activation="silu")
     assert [r.activation for r in seen] == ["silu"], seen
     text = Path(path).read_text()
@@ -1828,7 +1966,8 @@ def test_export_rejects_single_tensor_pu_overflow_before_products(
         runtime_compile, "compile_llama2", lambda *args, **kwargs: compiled)
 
     strategy = SimpleNamespace(
-        num_dpus=8, num_stages=4, weight_rules=(), dpu_ids=tuple(range(8)))
+        num_dpus=8, num_stages=4, replicas=1, weight_rules=(),
+        dpu_ids=tuple(range(8)))
     with pytest.raises(ValueError, match="TensorPU"):
         export_placement_for_strategy(
             object(), tmp_path / "base.ir", tmp_path / "out",

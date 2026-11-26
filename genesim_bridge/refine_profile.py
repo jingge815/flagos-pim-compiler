@@ -14,8 +14,9 @@ from contracts.op_contract import PimOptimizations
 
 _PIM_ATTR_RE = re.compile(r'"?(pim\.[A-Za-z0-9_.-]+)"?\s*=\s*([^,}]+)')
 _HEX_DIGITS = frozenset("0123456789abcdef")
-# 放置 sidecar 的 schema 版本；5 起必须带完整编译契约与 A/B 编译路由。
-SIDECAR_SCHEMA_VERSION = 5
+# 放置 sidecar 的 schema 版本；5 起必须带完整编译契约与 A/B 编译路由，
+# 6 起 collectives[].nbytes 为单行口径（不携带编译档 batch 维）。
+SIDECAR_SCHEMA_VERSION = 6
 # 请求级预算与 PIM MLIR 模块属性的对应。
 _PIM_BUDGET_ATTRS = (
     ("pim.num-dpus", "num_dpus"),

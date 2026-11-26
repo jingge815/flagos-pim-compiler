@@ -28,7 +28,7 @@ torch 2.9.1 / transformers 4.57.6 / python 3.10.20，CUDA 可用。**每个新 s
 | `runtime/`        | `compile.py` 统一编译入口（模型+策略→蓝图）、`exec_plan_gen.py` 生成 ExecutionPlan、`executor.py` 解释 + 解码循环              | 6    |
 | `backend/`        | `dpu_sdk.py` 厂商 SDK（pre-g-driver-api）的 numpy 镜像 / `hal_numpy.py` 异步 HAL（存储架在 dpu_sdk 上）/ `hal_vendor.py` 真硬件 | 底座 |
 | `genesim_bridge/` | `ir_cost.py` 从 TTIR / pim mlir 抽 flops/data_bytes（评估旁支）                                                                 | 4    |
-| `tests/`          | `assert_node_matches_ref.py` 逐节点对拍器 + 各模块单测                                                                          | 验证 |
+| `tests/`          | 各模块单测 + PyTorch 对拍用例（执行计划后比 logits）                                                                            | 验证 |
 
 `contracts/` 是地基：改任何字段先 grep 调用方，改完同步全链路。各组只通过 `node.meta` 解耦，不私自约定字段。
 
@@ -65,7 +65,7 @@ AI 辅助开发最容易堆出大量重复、投机、永不执行的代码。�
 
 - 单测放 `tests/test_<module>.py`，用 pytest，跑：`python -m pytest tests/ -x -q`。
 - 编译期模块（问题 1/2/8）的判据是方案里的手推结果：附录 A 的 placement 推演、三区 offset 无重叠、容量 ≤ 8GB、torch.export 无 graph break。
-- 运行时模块（问题 3/6/7）的判据是**与单卡 PyTorch 逐元素对齐**，用 `tests/assert_node_matches_ref.py`：按 placement 把分片合并回完整张量再比，第一处不匹配即定位到具体 node。
+- 运行时模块（问题 3/6/7）的判据是**与单卡 PyTorch 逐元素对齐**：pytest 里执行计划后把输出 logits 与单卡 PyTorch 前向直接比（容差 max<0.2 / mean<0.02，范本 `tests/test_executor_llama2_7b.py`；多 batch 见 `tests/test_executor_batch.py`）。
 - `hal_numpy` 必须有「写 DPU_i 不影响 DPU_j」的独立地址空间测试。
 - 不确定就跑测试，别靠读代码断言正确性。
 

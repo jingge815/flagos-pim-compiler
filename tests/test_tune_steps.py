@@ -122,7 +122,7 @@ def _fake_compile(cfg, inputs, state, out_dir, force_compile):
         f'"pim.wram-bytes" = {hardware.wram_bytes_per_dpu} : i64'
         "} {\n}\n")
     sidecar = {
-        "version": 5,
+        "version": 6,
         "requires_pimir": True,
         "operators": {"0": {
             "op_type": "GEMM", "shards": [], "pimir_path": str(pimir),

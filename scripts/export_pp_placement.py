@@ -50,6 +50,9 @@ from graph.strategy import (
 )
 from memory.mem_planner import HwBudget
 
+# 档位解析与 run_full_pipeline 共用一份实现：两个 CLI 的 --batch 口径单点定义。
+from scripts.run_full_pipeline import parse_batch_list
+
 # 缺省画像：CEVA 64 核 4e，与 GeneSim 的 conf/ceva_64core_4e.yaml 成对。
 DEFAULT_PROFILE = Path(__file__).resolve().parent.parent / "contracts" / "profiles" / "ceva_64core_4e.json"
 NUM_TASKLETS = 4
@@ -99,6 +102,43 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--batch", type=parse_batch_list, default=(1,),
+        help=(
+            "batch 扫参档列表（逗号分隔，如 1,4）：算子按相位逐档出产物，"
+            "图按最大档编译。缺省单档 1。"
+        ),
+    )
+    parser.add_argument(
+        "--max-seq", type=int, default=None,
+        help=(
+            "KV 布局与容量表的最大序列长度。缺省沿用 64（经典单档路径）；"
+            "扫参由 run_full_pipeline 按仿真 trace 的 seq_len+output_length "
+            "传入，保证容量墙与真实序列同源。"
+        ),
+    )
+    parser.add_argument(
+        "--replicas", type=int, default=1,
+        help=(
+            "DP 副本数（R8 多 batch 并行）：每副本持有全部权重、KV/激活按"
+            "副本划分，物理 DPU 总数 = num_dpus × replicas；缺省 1 等价现状。"
+        ),
+    )
+    parser.add_argument(
+        "--kv-head-pin", action="store_true",
+        help=(
+            "执行侧 KV head 分片：KV 读取算子按 head 归属钉到持有该 head 的"
+            "DPU（缺省整段首 DPU 钉扎，B=1 执行放置不变）。"
+        ),
+    )
+    parser.add_argument(
+        "--per-slot-prefill", action="store_true",
+        help=(
+            "执行策略作为编译输入（R25-03）：额外导出 [1,S] 逐槽图并构建 "
+            "B 份槽位平移 prefill 计划，sidecar 记录策略声明；服务 "
+            "pipeline_overlap/weight_reuse 关的逐槽执行策略。缺省合批。"
+        ),
+    )
+    parser.add_argument(
         "--partition-plan", default=None,
         help=(
             "GeneSim 给定的切分方案（scripts/export_partition_plan.py 的产物）。"
@@ -140,6 +180,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if (args.num_stages is None) == (args.partition_plan is None):
         parser.error("必须给 --num-stages 或 --partition-plan，且只能给一个")
+    if args.replicas <= 0:
+        parser.error("--replicas 必须为正")
     return args
 
 
@@ -182,17 +224,26 @@ def main() -> None:
                 f"提示: 方案标注的 model_id={plan.model_id!r} 与本次加载的模型目录"
                 f"（{model_dir}）看起来不一致，请确认没有张冠李戴。"
             )
+        if args.replicas > 1 and args.replicas != plan.replicas:
+            raise SystemExit(
+                f"--replicas={args.replicas} 与方案声明的 replicas="
+                f"{plan.replicas} 不一致；请重新生成方案或改用方案的副本数"
+            )
         strategy = strategy_from_partition_plan(plan, **shard_kwargs)
         num_dpus = plan.num_dpus
         print(f"切分方案来自 {args.partition_plan}（source={plan.source or '未标注'}）")
     else:
         strategy = llama_strategy(
-            args.num_dpus, num_stages=args.num_stages, **shard_kwargs
+            args.num_dpus, num_stages=args.num_stages, replicas=args.replicas,
+            **shard_kwargs,
         )
         num_dpus = args.num_dpus
     print(format_strategy(strategy, cfg.num_hidden_layers))
 
     hw = build_hw_budget(args.mram_bytes, args.sys_reserve_bytes)
+    max_seq = MAX_SEQ if args.max_seq is None else int(args.max_seq)
+    if max_seq <= 0:
+        raise SystemExit("--max-seq 必须为正")
     # 字节预算允许命令行覆盖；WRAM/DMA 对齐/编译目标一律与画像同源。
     hardware = PIMHardwareConfig(
         num_dpus=num_dpus, num_tasklets=NUM_TASKLETS,
@@ -210,12 +261,26 @@ def main() -> None:
         model, ir_path, out_dir,
         strategy=strategy, plan=plan, hw=hw, hardware=hardware,
         profile=profile,
-        prefill_seq_len=PREFILL_SEQ_LEN, max_seq=MAX_SEQ,
+        prefill_seq_len=PREFILL_SEQ_LEN, max_seq=max_seq,
         force_compile=False,
         measure_kernel_tiles=args.measure_kernel_tiles,
+        batch_sizes=args.batch,
+        kv_head_pin=args.kv_head_pin,
+        per_slot_prefill=args.per_slot_prefill,
         # 旧单次链路沿用带策略名的文件名，不能和共享目录里的其他策略相撞。
         file_stem=f"llama2_7b_{strategy.name}",
     )
+    # 开关开启时逐槽主机计划必须真实生成（生产链证据，不是只写声明）。
+    if args.per_slot_prefill:
+        slots = max(args.batch)
+        plans = result.compiled.per_slot_prefill if result.compiled else None
+        if slots > 1 and (plans is None or len(plans) != slots):
+            raise SystemExit(
+                f"--per-slot-prefill 开启但没有生成 {slots} 份逐槽主机计划"
+                f"（got {0 if plans is None else len(plans)}）：逐槽编译没有"
+                "贯穿到 compile_llama2，产物不完整。")
+        print(f"逐槽 prefill 主机计划: {0 if plans is None else len(plans)} 份"
+              f"（slots={slots}）")
     out_ir = result.placed_ir
     sidecar_path = result.sidecar
     sidecar = json.loads(sidecar_path.read_text())
@@ -228,6 +293,13 @@ def main() -> None:
     print("每台 DPU 承担的 GEMM 分片数:")
     for dpu_id in sorted(by_dpu):
         print(f"  dpu{dpu_id}: {by_dpu[dpu_id]}")
+
+    # 编译期容量表落进导出日志：逐档「容量占用」与墙位判定都以它为源。
+    capacity = sidecar.get("capacity") or {}
+    if capacity.get("table"):
+        print(f"\n{capacity['table']}")
+        if capacity.get("wall_batch") is not None:
+            print(f"容量墙位（编译期折算）：B={capacity['wall_batch']} 起 KV+激活超预算")
 
     print(f"\n产物:\n  {out_ir}\n  {sidecar_path}")
     print(

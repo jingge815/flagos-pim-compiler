@@ -183,3 +183,55 @@ def test_format_strategy_is_readable() -> None:
     assert "4 stage × tp2" in text
     assert "stage0: dpus=[0, 1] layers=[0..7]（8 层）" in text
     assert "stage3: dpus=[6, 7] layers=[24..31]（8 层）" in text
+
+
+# --- DP 副本维度（R8 多 batch 并行：副本 × 现有 TP/PP 正交组合） --------------------
+
+
+def test_replicas_default_one_keeps_legacy_identity() -> None:
+    """缺省 replicas=1：total_dpus==num_dpus、副本 0 即原 DPU 集，等价现状。"""
+    strategy = ShardStrategy(name="tp2", num_dpus=2, num_stages=1)
+
+    assert strategy.replicas == 1
+    assert strategy.total_dpus == 2
+    assert strategy.dpus_of_replica(0) == (0, 1)
+
+
+def test_replicas_partition_physical_dpus_into_disjoint_blocks() -> None:
+    """G 副本各持一段连续物理 DPU 块：offset 不重叠、并集=total_dpus。"""
+    strategy = ShardStrategy(name="tp2_dp2", num_dpus=2, num_stages=1, replicas=2)
+
+    assert strategy.total_dpus == 4
+    assert strategy.dpus_of_replica(0) == (0, 1)
+    assert strategy.dpus_of_replica(1) == (2, 3)
+    blocks = [strategy.dpus_of_replica(g) for g in range(strategy.replicas)]
+    flat = [d for block in blocks for d in block]
+    assert len(flat) == len(set(flat)), "副本 DPU 块必须互不重叠"
+    assert sorted(flat) == list(range(strategy.total_dpus))
+
+
+def test_replicas_reject_non_positive_and_overlapping_dpu_ids() -> None:
+    """replicas<=0 拒绝；replicas>1 时 dpu_ids 越界（块会重叠）拒绝。"""
+    with pytest.raises(ValueError):
+        ShardStrategy(name="bad", num_dpus=2, num_stages=1, replicas=0)
+    # dpu_ids 跨出 [0,num_dpus) 时 +g*num_dpus 的块会重叠，必须拒绝。
+    with pytest.raises(ValueError):
+        ShardStrategy(name="bad", num_dpus=2, num_stages=1, replicas=2,
+                      dpu_ids=(2, 3))
+    with pytest.raises(ValueError):
+        ShardStrategy(name="tp2_dp2", num_dpus=2, num_stages=1, replicas=2
+                      ).dpus_of_replica(2)
+
+
+def test_llama_strategy_with_replicas_names_and_formats() -> None:
+    """llama_strategy 透传 replicas：策略名带 dp 后缀（缺省不带）、format 可读。"""
+    plain = llama_strategy(8, num_stages=4, **LLAMA2_7B)
+    dipped = llama_strategy(8, num_stages=4, replicas=2, **LLAMA2_7B)
+
+    assert plain.name == "tp2_pp4"
+    assert dipped.name == "tp2_pp4_dp2"
+    assert dipped.total_dpus == 16
+    # 段/层归属仍是每副本视角：dpus_of_stage 返回副本 0 的物理块。
+    assert dipped.dpus_of_stage(0) == (0, 1)
+    text = format_strategy(dipped, 32)
+    assert "DP 副本 ×2（物理 16 DPU" in text

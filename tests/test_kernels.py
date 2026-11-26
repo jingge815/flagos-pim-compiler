@@ -273,8 +273,10 @@ def test_sdpa_uses_the_mask_operand_not_a_recomputed_one() -> None:
                     [q, k, v, mask], q.shape, dtype="float32",
                     extra_payload={"sdpa": {
                         "np_dtype": "float32", "layer": 0, "max_seq": 4,
-                        "head_dim": 8, "heads": [{"head": 0, "dpu": 0,
-                        "k_off": 1 << 18, "v_off": 1 << 19, "row": 8 * 4}]}})
+                        "head_dim": 8, "num_slots": 1,
+                        "heads": [{"head": 0, "dpu": 0,
+                        "k_off": 1 << 18, "v_off": 1 << 19, "row": 8 * 4,
+                        "slot_stride": 0}]}})
 
     causal_out = run(causal)
     blocked_out = run(blocked)

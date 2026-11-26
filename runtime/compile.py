@@ -39,6 +39,28 @@ class CompiledModel:
     state: DecodeState
     hw: HwBudget
     hardware: PIMHardwareConfig
+    # 逐槽 prefill 计划（R21-02a）：B 份 [1,S] 计划，第 b 份把 KV 读写
+    # 平移到槽 b 的段——服务 pipeline_overlap / weight_reuse 关的逐槽
+    # 执行策略；None = 未编译（缺省，B=1 无逐槽对象）。
+    per_slot_prefill: tuple[CompiledPlan, ...] | None = None
+
+    @property
+    def replicas(self) -> int:
+        """DP 副本数（strategy 副本维度；1 即单副本，行为不变）。"""
+        return self.strategy.replicas
+
+    def mem_plans_of_replica(self, replica: int) -> dict[int, DPUPlan]:
+        """副本 g 的物理 DPU -> 内存计划（物理块 = base + g×num_dpus）。
+
+        布局与副本 0 同源（同策略同形状），权重装载由 `load_weights` 按
+        副本各写一份（权重复制 ×G）。
+        """
+        if not 0 <= replica < self.strategy.replicas:
+            raise ValueError(
+                f"replica={replica} 越界 [0,{self.strategy.replicas})")
+        offset = replica * self.strategy.num_dpus
+        return {dpu_id + offset: plan
+                for dpu_id, plan in self.mem_plans.items()}
 
 
 class PositionalLlama(torch.nn.Module):
@@ -73,9 +95,20 @@ def causal_mask_of(seq_len: int, dtype: torch.dtype = torch.float16) -> torch.Te
 def export_annotated_graph(
     model: torch.nn.Module, seq_len: int, position_ids: torch.Tensor, *,
     dtype: torch.dtype = torch.float16,
+    batch_size: int = 1,
 ) -> GraphModule:
-    """导出图并标记节点设备和分区编号。"""
-    input_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+    """按 batch 维导出静态图并标记节点设备和分区编号。
+
+    `input_ids` 内部按 `[batch_size, seq_len]` 构造；`position_ids` 由调用方
+    给出，行数必须等于 batch_size。掩码保持 `[1,1,S,S]` 广播：各槽是独立
+    等长因果序列，共享掩码语义正确。
+    """
+    if tuple(position_ids.shape) != (batch_size, seq_len):
+        raise ValueError(
+            f"position_ids 形状 {tuple(position_ids.shape)} 与 "
+            f"(batch_size={batch_size}, seq_len={seq_len}) 不符")
+    input_ids = (torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+                 .repeat(batch_size, 1))
     gm = torch.export.export(
         PositionalLlama(model),
         (input_ids, causal_mask_of(seq_len, dtype), position_ids),
@@ -223,20 +256,36 @@ def compile_llama2(
     dtype: torch.dtype = torch.float16,
     force_compile: bool = False,
     request_kv_tokens: tuple[int, ...] | None = None,
+    batch_size: int = 1,
+    per_slot_prefill: bool = False,
 ) -> CompiledModel:
     """编译 Llama 的两张图，返回共享内存蓝图的命令计划。
 
     `force_compile=True` 表示本轮要真实重编：图测量阶段的内核探测不走缓存，
-    与放置/成本侧的 strict 档共用同一个开关。
+    与放置/成本侧的 strict 档共用同一个开关。`batch_size` 是 closed batch
+    槽数：prefill 导出 `[B,S]`、decode 导出 `[B,1]`，KV 布局按 B 槽规划。
+    `per_slot_prefill=True` 且 B>1 时额外导出一张 `[1,S]` 逐槽图并构建
+    B 份槽位平移的 prefill 计划（每步 M=S、KV 落本槽段，R21-02a）。
     """
     cfg = model.config
     prefill_gm = export_annotated_graph(
         model, prefill_seq_len,
-        torch.arange(prefill_seq_len, dtype=torch.long).unsqueeze(0), dtype=dtype,
+        torch.arange(prefill_seq_len, dtype=torch.long)
+        .unsqueeze(0).repeat(batch_size, 1),
+        dtype=dtype, batch_size=batch_size,
     )
     decode_gm = export_annotated_graph(
-        model, 1, torch.tensor([[0]], dtype=torch.long), dtype=dtype
+        model, 1, torch.zeros(batch_size, 1, dtype=torch.long),
+        dtype=dtype, batch_size=batch_size,
     )
+    per_slot_gm = None
+    if per_slot_prefill and batch_size > 1:
+        # 逐槽 prefill 图：[1,S] 一次导出，B 份计划共用（只差 KV 槽平移）。
+        per_slot_gm = export_annotated_graph(
+            model, prefill_seq_len,
+            torch.arange(prefill_seq_len, dtype=torch.long).unsqueeze(0),
+            dtype=dtype, batch_size=1,
+        )
 
     # 切分传播看到的必须是优化后的图，否则分块拆出的子节点没有布局。
     # 没有流水并行时各层在同一组 DPU 上，各层重复的形状类算子可以合并。
@@ -245,15 +294,22 @@ def compile_llama2(
                    tp_width=strategy.tp_width, merge_shape_ops=single_stage)
     optimize_graph(decode_gm, wram_bytes=hardware.wram_bytes_per_dpu,
                    tp_width=strategy.tp_width, merge_shape_ops=single_stage)
+    if per_slot_gm is not None:
+        optimize_graph(per_slot_gm, wram_bytes=hardware.wram_bytes_per_dpu,
+                       tp_width=strategy.tp_width, merge_shape_ops=single_stage)
 
     prefill_edges = propagate_specs(prefill_gm, strategy)
     decode_edges = propagate_specs(decode_gm, strategy)
+    per_slot_edges = (propagate_specs(per_slot_gm, strategy)
+                      if per_slot_gm is not None else [])
 
     # 门控 silu 折进 linear，A 路编译内核按 activation 参数算。必须放在
     # 切分传播之后：部分和的 gate 投影（行切）经 silu 会直接报错，传播
     # 通过说明这里的 linear 输出都不是部分和。
     fuse_linear_activation(prefill_gm, prefill_edges)
     fuse_linear_activation(decode_gm, decode_edges)
+    if per_slot_gm is not None:
+        fuse_linear_activation(per_slot_gm, per_slot_edges)
 
     head_dim = cfg.hidden_size // cfg.num_attention_heads
     kv_specs = kv_specs_from_strategy(
@@ -265,10 +321,13 @@ def compile_llama2(
         head_dim=head_dim,
         max_seq=max_seq,
         dtype_bytes=kv_dtype_bytes,
+        num_slots=batch_size,
     )
 
     prefill_nodes = list(prefill_gm.graph.nodes)
     decode_nodes = list(decode_gm.graph.nodes)
+    per_slot_nodes = (list(per_slot_gm.graph.nodes)
+                      if per_slot_gm is not None else None)
     # 内核 tile 占的是与三区同一块 MRAM，所以容量判据要把两者相加。那份占用只有
     # 算子编译器知道（它定分块），这里问它回传；工具链不在位时退回 0，判据只看
     # 三区，与改动前逐字节等价。
@@ -278,23 +337,30 @@ def compile_llama2(
     mem_plans = {
         dpu_id: plan_dpu(dpu_id, prefill_nodes, decode_nodes, kv_specs, hw,
                          kernel_mram_bytes=kernel_mram,
-                         request_kv_tokens=request_kv_tokens)
+                         request_kv_tokens=request_kv_tokens,
+                         per_slot_nodes=per_slot_nodes)
         for dpu_id in strategy.dpu_ids
     }
     # `plan_dpu` 收的是节点列表、手里没有 gm，所以阶段标记落在这里 ——
-    # 两张图的 mram_offset 都已回填。
+    # 各图的 mram_offset 都已回填。
     mark_stage(prefill_gm, STAGE_PLANNED)
     mark_stage(decode_gm, STAGE_PLANNED)
+    if per_slot_gm is not None:
+        mark_stage(per_slot_gm, STAGE_PLANNED)
 
     prefill_entries = {e.edge_id: e for e in build_comm_plan(prefill_edges)}
     decode_entries = {e.edge_id: e for e in build_comm_plan(decode_edges)}
     pending_prefill: dict = {}
     pending_decode: dict = {}
+    pending_per_slot: dict = {}
     for plan in mem_plans.values():
         pending_prefill.update(plan.pending_readers_prefill)
         pending_decode.update(plan.pending_readers_decode)
+        pending_per_slot.update(plan.pending_readers_per_slot)
 
-    state = DecodeState(valid_len=0)
+    # 运行时状态是编译结果的公开契约字段：槽数必须与 batch 语义同步，
+    # 否则 B>1 时调用方被迫手工另建状态（round12–14 严重问题 1）。
+    state = DecodeState(valid_lens=(0,) * batch_size)
     np_dtype = np.dtype(np.float16 if dtype == torch.float16 else np.float32)
 
     # 注意力不再是主机回调：那段计算搬进了设备内核
@@ -313,6 +379,23 @@ def compile_llama2(
 
         return sdpa_info_of
 
+    def _slot_shifted(sdpa_info_of, slot: int):
+        # 槽位主序：槽 s 的 KV 基址 = 槽 0 基址 + s×槽步长；[1,S] 逐槽图
+        # 的内核行号恒为 0，槽选择由计划 payload 的基址平移表达。
+        def info_of(node):
+            info = sdpa_info_of(node)
+            if info is None or slot == 0:
+                return info
+            return {
+                **info,
+                "heads": [
+                    {**entry,
+                     "k_off": entry["k_off"] + slot * entry["slot_stride"],
+                     "v_off": entry["v_off"] + slot * entry["slot_stride"]}
+                    for entry in info["heads"]],
+            }
+        return info_of
+
     prefill = build_execution_plan(
         prefill_nodes, prefill_gm, prefill_entries, pending_prefill,
         hardware=hardware, sdpa_info_of=sdpa_info_for(prefill_gm),
@@ -323,6 +406,20 @@ def compile_llama2(
         hardware=hardware, sdpa_info_of=sdpa_info_for(decode_gm),
         num_tasklets=hardware.num_tasklets,
     )
+    per_slot_plans = None
+    if per_slot_gm is not None:
+        per_slot_entries = {
+            e.edge_id: e for e in build_comm_plan(per_slot_edges)}
+        base_info_of = sdpa_info_for(per_slot_gm)
+        per_slot_plans = tuple(
+            build_execution_plan(
+                per_slot_nodes, per_slot_gm, per_slot_entries,
+                pending_per_slot,
+                hardware=hardware,
+                sdpa_info_of=_slot_shifted(base_info_of, slot),
+                num_tasklets=hardware.num_tasklets,
+            )
+            for slot in range(batch_size))
 
     return CompiledModel(
         strategy=strategy,
@@ -337,11 +434,17 @@ def compile_llama2(
         state=state,
         hw=hw,
         hardware=hardware,
+        per_slot_prefill=per_slot_plans,
     )
 
 
-def write_weight_shards(gm: GraphModule, mem_plans: dict[int, DPUPlan], backend) -> None:
-    """按内存蓝图将权重的本地分片写入各 DPU 的 MRAM。"""
+def write_weight_shards(gm: GraphModule, mem_plans: dict[int, DPUPlan], backend,
+                        *, dpu_id_offset: int = 0) -> None:
+    """按内存蓝图将权重的本地分片写入各 DPU 的 MRAM。
+
+    `dpu_id_offset` 把写入目标平移到副本 g 的物理块（g×num_dpus）——
+    mem_plans 键仍是副本 0 的基数（spec 查询按基数），缺省 0 即原行为。
+    """
     by_target = {n.target: n for n in gm.graph.nodes if n.op == "get_attr"}
     for dpu_id, plan in mem_plans.items():
         for name, off in plan.weight.items():
@@ -357,9 +460,16 @@ def write_weight_shards(gm: GraphModule, mem_plans: dict[int, DPUPlan], backend)
                 local = obj[:, detail.start_idx : detail.end_idx].numpy()
             else:
                 local = obj.numpy()
-            backend.write_local(dpu_id, off, np.ascontiguousarray(local))
+            backend.write_local(dpu_id + dpu_id_offset, off,
+                                np.ascontiguousarray(local))
 
 
 def load_weights(compiled: CompiledModel, backend) -> None:
-    """`write_weight_shards` 的 `CompiledModel` 入口（权重区 offset 两图共用）。"""
-    write_weight_shards(compiled.prefill_gm, compiled.mem_plans, backend)
+    """`write_weight_shards` 的 `CompiledModel` 入口（权重区 offset 两图共用）。
+
+    DP 副本（R21-02b）：每个副本的物理块各写一份权重（权重复制 ×G）；
+    replicas=1 时单副本即原行为。"""
+    num_dpus = compiled.strategy.num_dpus
+    for replica in range(compiled.strategy.replicas):
+        write_weight_shards(compiled.prefill_gm, compiled.mem_plans, backend,
+                            dpu_id_offset=replica * num_dpus)

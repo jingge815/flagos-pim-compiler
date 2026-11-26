@@ -1254,9 +1254,11 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
             heads.append({
                 "head": int(head),
                 "dpu": int(dpu_id),
-                "k_off": int(spec.kv_off[(layer, head, "k")]),
-                "v_off": int(spec.kv_off[(layer, head, "v")]),
+                "k_off": int(spec.kv_off[(0, layer, head, "k")]),
+                "v_off": int(spec.kv_off[(0, layer, head, "v")]),
                 "row": int(row),
+                # 槽位主序下槽 s 的偏移 = 槽 0 基址 + s × 槽步长。
+                "slot_stride": int(spec.kv_allocated_bytes // spec.num_slots),
             })
     if not heads:
         return None
@@ -1265,6 +1267,7 @@ def sdpa_kv_info(node, kv_specs, layer_of_node, np_dtype) -> dict | None:
         "max_seq": int(next(iter(kv_specs.values())).max_seq),
         "head_dim": int(next(iter(kv_specs.values())).head_dim),
         "np_dtype": str(np_dtype),
+        "num_slots": int(next(iter(kv_specs.values())).num_slots),
         "heads": heads,
     }
 
@@ -1330,69 +1333,80 @@ def _compiled_kv_cache(value_shape: tuple[int, ...], cache_elems: int,
 
 
 def sdpa_kernel(hal, dpu_id: int, cmd) -> None:
-    """`aten.scaled_dot_product_attention` 的 DPU 内核。
+    """`aten.scaled_dot_product_attention` 的 DPU 内核（逐槽读写 KV）。
 
-    拆头之后这条不再是主路径：QKᵀ、掩码、softmax、PV 各自是设备命令。
-    留着是因为没拆头的图（直接 `build_execution_plan`、不经 `compile_llama2`）
-    仍会遇到整体 SDPA 节点，那时 KV 缓存的读写还在这里。
+    closed batch 下 q/k/v 形状为 `[B, heads, tq, head_dim]`，每槽读写
+    自己的 KV 段（槽位主序，偏移 = 槽 0 基址 + 槽号 × 槽步长）。
+    B=1（batch 维为 1、pos 为标量或单元素）时数值路径与单请求版一致。
     """
     info = cmd.payload.get("sdpa")
     if info is None:
         raise RuntimeError(
             "注意力命令里没有 KV 区域信息；build_execution_plan 要传 sdpa_info_of")
     np_dtype = np.dtype(info["np_dtype"])
-    layer = int(info["layer"])
     max_seq = int(info["max_seq"])
     head_dim = int(info["head_dim"])
 
     args = _read_tensor_args(hal, dpu_id, cmd)
     q, k, v = args[0], args[1], args[2]
     scale = 1.0 / np.sqrt(q.shape[-1])
-    num_heads, tq = q.shape[1], q.shape[2]
+    batch, num_heads, tq = q.shape[0], q.shape[1], q.shape[2]
 
+    if int(info["num_slots"]) < batch:
+        raise ValueError(
+            f"KV 槽数 {info['num_slots']} 装不下 batch={batch} 的注意力请求")
     pos = hal.bound_pos if hal.bound_pos is not None else 0
-    for entry in info["heads"]:
-        head, owner = entry["head"], entry["dpu"]
-        if head >= num_heads:
-            continue
-        for t in range(tq):
-            row = pos + t
-            _kv_row_write(hal, owner, entry["k_off"], row,
-                          np.ascontiguousarray(k[0, head, t], np_dtype), max_seq,
-                          ctx=_ctx_of(cmd))
-            _kv_row_write(hal, owner, entry["v_off"], row,
-                          np.ascontiguousarray(v[0, head, t], np_dtype), max_seq,
-                          ctx=_ctx_of(cmd))
+    pos_of = (pos,) * batch if isinstance(pos, int) else tuple(pos)
+    if len(pos_of) != batch:
+        raise ValueError(f"bound_pos 槽数 {len(pos_of)} 与 batch={batch} 不符")
+    # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
+    # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
+    graph_mask = args[3] if len(args) > 3 else None
 
-    valid_len = pos + tq
-    out = np.zeros((1, num_heads, tq, head_dim), dtype=np.float32)
-    for entry in info["heads"]:
-        head, owner = entry["head"], entry["dpu"]
-        if head >= num_heads:
-            continue
-        k_hist = hal.read_local(owner, entry["k_off"], (max_seq, head_dim), np_dtype)
-        v_hist = hal.read_local(owner, entry["v_off"], (max_seq, head_dim), np_dtype)
-        # 掩码优先用图上传入的第 4 个实参。按位置重算只是没有这个实参时的兜底：
-        # 图上换成滑动窗口或自定义 bias 时，重算会静默给出错误结果。
-        graph_mask = args[3] if len(args) > 3 else None
-        for t in range(tq):
-            # 三段各自走设备算子，不在这一处现算：`pim.matmul` 两次、`pim.mask`
-            # 一次、`pim.softmax` 一次。它们的数值口径与单测对拍的那条完全一样，
-            # 只是调用点在注意力里。
-            scores = matmul(k_hist, q[0, head, t][:, None]).reshape(-1)
-            scores = scores.astype(np.float32) * scale
-            # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史
-            # （长 max_seq），而图上的掩码只覆盖当前 query，短一截时补零
-            # 会把历史位置当成可见，结果就错了。长度对不上就退回按位置重算。
-            if graph_mask is not None and graph_mask.shape[-1] == scores.shape[0]:
-                row = graph_mask.reshape(-1, graph_mask.shape[-1])
-                mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
-            else:
-                mask = (prefill_mask(t + 1, max_seq) if tq > 1
-                        else decode_mask(valid_len - 1, max_seq))
-                mask_row = mask[t] if tq > 1 else mask
-            weights = softmax(add_mask(scores, mask_row).astype(np.float32))
-            out[0, head, t] = matmul(weights[None, :], v_hist).reshape(-1)
+    out = np.zeros((batch, num_heads, tq, head_dim), dtype=np.float32)
+    for b in range(batch):
+        # 1. 写当前行：本槽新 K/V 写进自己的槽位段。
+        for entry in info["heads"]:
+            head, owner = entry["head"], entry["dpu"]
+            if head >= num_heads:
+                continue
+            k_off = entry["k_off"] + b * entry["slot_stride"]
+            v_off = entry["v_off"] + b * entry["slot_stride"]
+            for t in range(tq):
+                row = pos_of[b] + t
+                _kv_row_write(hal, owner, k_off, row,
+                              np.ascontiguousarray(k[b, head, t], np_dtype), max_seq,
+                              ctx=_ctx_of(cmd))
+                _kv_row_write(hal, owner, v_off, row,
+                              np.ascontiguousarray(v[b, head, t], np_dtype), max_seq,
+                              ctx=_ctx_of(cmd))
+
+        # 2. 读整段历史并算注意力：三段各自走设备算子（`pim.matmul` 两次、
+        #    `pim.mask` 一次、`pim.softmax` 一次），数值口径与单测对拍一致。
+        valid_len = pos_of[b] + tq
+        for entry in info["heads"]:
+            head, owner = entry["head"], entry["dpu"]
+            if head >= num_heads:
+                continue
+            k_off = entry["k_off"] + b * entry["slot_stride"]
+            v_off = entry["v_off"] + b * entry["slot_stride"]
+            k_hist = hal.read_local(owner, k_off, (max_seq, head_dim), np_dtype)
+            v_hist = hal.read_local(owner, v_off, (max_seq, head_dim), np_dtype)
+            for t in range(tq):
+                scores = matmul(k_hist, q[b, head, t][:, None]).reshape(-1)
+                scores = scores.astype(np.float32) * scale
+                # 图上的掩码只有在长度与分数一致时才用得上：分数含 KV 历史
+                # （长 max_seq），而图上的掩码只覆盖当前 query，短一截时补零
+                # 会把历史位置当成可见，结果就错了。长度对不上就退回按位置重算。
+                if graph_mask is not None and graph_mask.shape[-1] == scores.shape[0]:
+                    row = graph_mask.reshape(-1, graph_mask.shape[-1])
+                    mask_row = row[min(t, row.shape[0] - 1)].astype(scores.dtype)
+                else:
+                    mask = (prefill_mask(t + 1, max_seq) if tq > 1
+                            else decode_mask(valid_len - 1, max_seq))
+                    mask_row = mask[t] if tq > 1 else mask
+                weights = softmax(add_mask(scores, mask_row).astype(np.float32))
+                out[b, head, t] = matmul(weights[None, :], v_hist).reshape(-1)
     _write_result(hal, dpu_id, cmd, out.astype(np_dtype))
 
 

@@ -65,6 +65,10 @@ class PartitionPlan:
     # 显式给出的好处：不靠取模碰巧落到哪几个 Cluster，且能让同段的 DPU 落在同一个
     # Cluster 内走快链路（PIM_Intra_Cluster 512 GB/s vs PIM_Inter_Cluster 128 GB/s）。
     dpu_to_cluster: tuple[tuple[int, int], ...] | None = None
+    # DP 副本数（R8 多 batch 并行）：num_dpus 是**每副本**的 DPU 数，物理总数
+    # = num_dpus × replicas；dpu_to_cluster 覆盖全部物理 DPU（replicas>1 时
+    # 副本 g 的物理编号 = g*num_dpus + 逻辑编号）。
+    replicas: int = 1
     # 方案来源，仅供人读与排错（如 "genesim_autotune" / "fixed_tp2_pp4"）。
     #
     # 当前只产出固定映射，但格式对将来的自动调优结果是同一份：调优侧只要能给出
@@ -78,6 +82,8 @@ class PartitionPlan:
             raise ValueError(f"num_dpus 必须为正，收到 {self.num_dpus}")
         if self.num_stages <= 0:
             raise ValueError(f"num_stages 必须为正，收到 {self.num_stages}")
+        if self.replicas <= 0:
+            raise ValueError(f"replicas 必须为正，收到 {self.replicas}")
         if self.num_dpus % self.num_stages:
             raise ValueError(
                 f"num_stages={self.num_stages} 不能整除 num_dpus={self.num_dpus}"
@@ -101,9 +107,11 @@ class PartitionPlan:
                 raise ValueError(f"dpu_ids 不能为负：{ids}")
         if self.dpu_to_cluster is not None:
             mapping = tuple(self.dpu_to_cluster)
-            if len(mapping) != self.num_dpus:
+            total = self.num_dpus * self.replicas
+            if len(mapping) != total:
                 raise ValueError(
-                    f"dpu_to_cluster 必须给全 {self.num_dpus} 台 DPU，收到 {len(mapping)} 项"
+                    f"dpu_to_cluster 必须给全 {total} 台物理 DPU"
+                    f"（{self.num_dpus} × {self.replicas} 副本），收到 {len(mapping)} 项"
                 )
             for entry in mapping:
                 if len(entry) != 2:
@@ -141,6 +149,8 @@ class PartitionPlan:
             "num_dpus": self.num_dpus,
             "num_stages": self.num_stages,
         }
+        if self.replicas > 1:
+            payload["replicas"] = self.replicas
         if self.weight_rules:
             payload["weight_rules"] = [list(rule) for rule in self.weight_rules]
         if self.dpu_ids is not None:
@@ -182,6 +192,7 @@ class PartitionPlan:
                 if mapping is not None
                 else None
             ),
+            replicas=int(payload.get("replicas", 1)),
             source=str(payload.get("source", "")),
             model_id=str(payload.get("model_id", "")),
         )

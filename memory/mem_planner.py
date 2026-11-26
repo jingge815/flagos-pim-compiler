@@ -38,9 +38,17 @@ class DPUPlan:
     total: int                           # 持久区 + max(两图激活峰值)
     pending_readers_prefill: dict[tuple, list[str]]
     pending_readers_decode: dict[tuple, list[str]]
+    # 逐槽 prefill 图（[1,S]）节点名 -> 激活 offset 与复用地址读者
+    # （R21-02a）；缺省空 = 未编译逐槽计划，旧调用方零改动。
+    act_per_slot: dict[str, int] = field(default_factory=dict)
+    pending_readers_per_slot: dict[tuple, list[str]] = field(default_factory=dict)
     # 单块最大常驻/瞬时分配的字节数。多 TensorPU 的簇可以整簇共享容量，
     # 但任何一块张量必须能放进单个 TensorPU。
     peak_allocation_bytes: int = 0
+    # 内核 tile 字节数（算子编译器回传的瞬时占用），容量表与超限报错用。
+    kernel_mram_bytes: int = 0
+    # KV 槽数（=closed batch 的 B 档），容量表的 batch 标注。
+    kv_slots: int = 1
     # 逐常驻分配台账：权重分片、KV 与内核 tile。同一 TensorPU 上按
     # tensor_key 去重模型常驻，请求峰值再相加，与 GeneSim 的容量语义一致。
     resident_allocations: tuple["ResidentAllocation", ...] = ()
@@ -99,22 +107,28 @@ def weights_of(dpu_nodes: list[Node], dpu_id: int) -> dict[str, Node]:
 
 
 def _pack_weights(
-    dpu_id: int, prefill_nodes: list[Node], decode_nodes: list[Node], align: int
+    dpu_id: int, prefill_nodes: list[Node], decode_nodes: list[Node], align: int,
+    *, per_slot_nodes: list[Node] | None = None,
 ) -> tuple[dict[str, int], int]:
-    """打包两张图共享的权重，并回填每个权重的 MRAM 偏移。"""
+    """打包多张图共享的权重，并回填每个权重的 MRAM 偏移。"""
     prefill_weights = weights_of(prefill_nodes, dpu_id)
     decode_weights = weights_of(decode_nodes, dpu_id)
-    names = sorted(set(prefill_weights) | set(decode_weights))
+    per_slot_weights = (
+        weights_of(per_slot_nodes, dpu_id) if per_slot_nodes else {})
+    names = sorted(set(prefill_weights) | set(decode_weights)
+                   | set(per_slot_weights))
     offsets: dict[str, int] = {}
     off = 0
     for name in names:
-        nodes = [n for n in (prefill_weights.get(name), decode_weights.get(name)) if n is not None]
+        nodes = [n for n in (prefill_weights.get(name),
+                             decode_weights.get(name),
+                             per_slot_weights.get(name)) if n is not None]
         details = [n.meta[SPEC_META_KEY].shard_map[dpu_id] for n in nodes]
         first = details[0]
         for detail in details[1:]:
             if detail.local_shape != first.local_shape or detail.shard_dim != first.shard_dim:
                 raise ValueError(
-                    f"权重 {name} 在 prefill/decode 两图的切分不一致: {detail} vs {first}"
+                    f"权重 {name} 在 prefill/decode/逐槽图的切分不一致: {detail} vs {first}"
                 )
         offsets[name] = off
         for node in nodes:
@@ -296,6 +310,7 @@ def plan_dpu(
     *,
     kernel_mram_bytes: int = 0,
     request_kv_tokens: tuple[int, ...] | None = None,
+    per_slot_nodes: list[Node] | None = None,
 ) -> DPUPlan:
     """规划三区偏移，回填规格，并返回单台 DPU 的内存蓝图。
 
@@ -303,9 +318,12 @@ def plan_dpu(
     （`pim.placed-mram-bytes`，含 `partial` 档的归约暂存）。它与三区占的是同一
     块 MRAM，所以算进容量判据。默认 0 = 没有回传可用，判据退回只看三区，
     与改动前逐字节等价。`request_kv_tokens` 是本轮轨迹逐请求的上下文上界，
-    缺省时 KV 台账按最大序列长度登记一个请求峰值。
+    缺省时 KV 台账按最大序列长度登记一个请求峰值。`per_slot_nodes` 是
+    逐槽 prefill 图（[1,S]，R21-02a）的节点列表：激活按第三张图独立
+    复用规划（容量上 [1,S] ⊆ [B,S]，峰值判据仍按两图口径不变）。
     """
-    weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align)
+    weight, off = _pack_weights(dpu_id, prefill_nodes, decode_nodes, hw.align,
+                                per_slot_nodes=per_slot_nodes)
 
     kv_spec = kv_specs[dpu_id]
     kv_spec.kv_base = off
@@ -318,10 +336,17 @@ def plan_dpu(
     decode_tensors = transient_tensors(decode_nodes, dpu_id)
     act_prefill, end_prefill = greedy_reuse(prefill_tensors, act_base, hw.align)
     act_decode, end_decode = greedy_reuse(decode_tensors, act_base, hw.align)
-    total = max(end_prefill, end_decode)
+    per_slot_tensors = (transient_tensors(per_slot_nodes, dpu_id)
+                        if per_slot_nodes else [])
+    act_per_slot, end_per_slot = greedy_reuse(
+        per_slot_tensors, act_base, hw.align)
+    total = max(end_prefill, end_decode, end_per_slot)
 
     # 写回激活节点的 MRAM 偏移。
-    for nodes, offsets in ((prefill_nodes, act_prefill), (decode_nodes, act_decode)):
+    write_back = [(prefill_nodes, act_prefill), (decode_nodes, act_decode)]
+    if per_slot_nodes:
+        write_back.append((per_slot_nodes, act_per_slot))
+    for nodes, offsets in write_back:
         by_name = {n.name: n for n in nodes}
         for name, node_off in offsets.items():
             if name.startswith("redist_dst:"):
@@ -333,8 +358,13 @@ def plan_dpu(
                                               align_bytes=hw.align)
 
     # 写回重分布落地缓冲的 MRAM 偏移。
-    for edges, offsets in ((_redistribute_edges_landing_on(prefill_nodes, dpu_id), act_prefill),
-                           (_redistribute_edges_landing_on(decode_nodes, dpu_id), act_decode)):
+    landing = [(_redistribute_edges_landing_on(prefill_nodes, dpu_id), act_prefill),
+               (_redistribute_edges_landing_on(decode_nodes, dpu_id), act_decode)]
+    if per_slot_nodes:
+        landing.append(
+            (_redistribute_edges_landing_on(per_slot_nodes, dpu_id),
+             act_per_slot))
+    for edges, offsets in landing:
         for edge_id, edge in edges.items():
             name = f"redist_dst:e{edge_id}"
             edge.dst_spec.shard_map[dpu_id] = replace(
@@ -352,10 +382,20 @@ def plan_dpu(
     kernel_bytes = kernel_mram_bytes or 0
     peak = total + kernel_bytes
     if peak > budget:
-        detail = (f"（三区 {total} + 内核 tile {kernel_bytes}）"
-                  if kernel_bytes else "")
+        weight_bytes = kv_base
+        region_bytes = {
+            "权重": weight_bytes,
+            "KV": kv_spec.kv_allocated_bytes,
+            "激活": total - act_base,
+            "内核 tile": kernel_bytes,
+        }
+        # 单独就超预算的那一区就是卡点；都不单独超则是合计超限。
+        culprits = [name for name, size in region_bytes.items() if size > budget]
+        stuck = "/".join(culprits) if culprits else "合计"
+        breakdown = " + ".join(f"{name} {size}" for name, size in region_bytes.items())
         raise ValueError(
-            f"dpu{dpu_id} 内存超限: peak={peak}{detail} > 可用预算={budget}")
+            f"dpu{dpu_id} 内存超限: peak={peak}（{breakdown}）> 可用预算={budget}，"
+            f"卡在: {stuck}")
 
     peak_allocation = _peak_single_allocation(
         dpu_id, prefill_nodes, decode_nodes, prefill_tensors, decode_tensors,
@@ -372,8 +412,13 @@ def plan_dpu(
         total=total,
         pending_readers_prefill=pending_readers_of_reused_addresses(prefill_tensors, act_prefill, dpu_id),
         pending_readers_decode=pending_readers_of_reused_addresses(decode_tensors, act_decode, dpu_id),
+        act_per_slot=act_per_slot,
+        pending_readers_per_slot=pending_readers_of_reused_addresses(
+            per_slot_tensors, act_per_slot, dpu_id),
         peak_allocation_bytes=peak_allocation,
         resident_allocations=allocations,
+        kernel_mram_bytes=kernel_bytes,
+        kv_slots=kv_spec.num_slots,
     )
 
 
@@ -620,3 +665,65 @@ def format_mem_plan(plans: dict[int, DPUPlan], hw: HwBudget) -> str:
             f"margin={margin / 2**20:.2f}MiB"
         )
     return "\n".join(lines)
+
+
+def format_capacity_table(plans: dict[int, DPUPlan], hw: HwBudget) -> str:
+    """按 DPU 打印 batch 档容量表：权重/KV/激活/内核 tile/合计/预算六列。
+
+    回答「这一档 B 装不装得下、卡在哪一区」：slots 列即 batch 档位，
+    余量为负说明超限（plan_dpu 会先抛，这里只做成功结果的呈现）。
+    """
+    budget = hw.mram_bytes - hw.sys_reserve_bytes
+    slots = {plan.kv_slots for plan in plans.values()}
+    batch_note = f"slots={slots.pop()}" if len(slots) == 1 else "slots=mixed"
+    lines = [
+        f"== 容量表（{batch_note}，{len(plans)} 台 DPU，"
+        f"预算 {budget / 2**20:.2f}MiB）==",
+        f"{'dpu':>5} {'slots':>5} {'权重[MiB]':>10} {'KV[MiB]':>9} "
+        f"{'激活[MiB]':>9} {'内核 tile[MiB]':>12} {'合计[MiB]':>9} {'余量[MiB]':>9}",
+    ]
+    for dpu_id, plan in sorted(plans.items()):
+        weight_bytes = plan.kv_base
+        kv_bytes_ = plan.act_base - plan.kv_base
+        act_bytes = plan.total - plan.act_base
+        peak = plan.total + plan.kernel_mram_bytes
+        lines.append(
+            f"{f'dpu{dpu_id}':>5} {plan.kv_slots:>5} "
+            f"{weight_bytes / 2**20:>10.3f} {kv_bytes_ / 2**20:>9.3f} "
+            f"{act_bytes / 2**20:>9.3f} {plan.kernel_mram_bytes / 2**20:>12.3f} "
+            f"{peak / 2**20:>9.3f} {(budget - peak) / 2**20:>9.3f}"
+        )
+    return "\n".join(lines)
+
+
+def capacity_batch_fit(plans: dict[int, DPUPlan], hw: HwBudget) -> dict:
+    """编译期容量折算：KV 与激活随 batch 线性缩放，权重与内核 tile 固定。
+
+    逐 DPU 给出固定字节、编译档槽数下的可变字节（KV+激活）与可装下的
+    最大 batch；墙位取各 DPU 最紧者 +1。可变字节为零的 DPU 不受 batch
+    约束（max_batch=None）。激活线性缩放在 batch 维 replicate 下成立，
+    对齐取整按向下兼容处理（估算口径，超限时 plan_dpu 仍会硬失败）。
+    """
+    budget = hw.mram_bytes - hw.sys_reserve_bytes
+    dpus: dict[str, dict[str, int | None]] = {}
+    wall_batch: int | None = None
+    for dpu_id, plan in sorted(plans.items()):
+        fixed = plan.kv_base + plan.kernel_mram_bytes
+        var_at_slots = plan.total - plan.kv_base
+        if var_at_slots <= 0 or plan.kv_slots < 1:
+            max_batch = None
+        else:
+            max_batch = (budget - fixed) * plan.kv_slots // var_at_slots
+        dpus[str(dpu_id)] = {
+            "fixed_bytes": int(fixed),
+            # fixed = 权重区（kv_base）+ 内核 tile：DP 副本的静态权重复制
+            # 只取权重部分，tile 单列（R17-04）。
+            "kernel_tile_bytes": int(plan.kernel_mram_bytes),
+            "var_bytes_at_slots": int(var_at_slots),
+            "slots": plan.kv_slots,
+            "max_batch": max_batch,
+        }
+        if max_batch is not None:
+            wall_batch = (max_batch + 1 if wall_batch is None
+                          else min(wall_batch, max_batch + 1))
+    return {"budget_bytes": int(budget), "dpus": dpus, "wall_batch": wall_batch}

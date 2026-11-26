@@ -91,6 +91,24 @@ class MRAMAllocator:
             )
 
 
+class _WindowedDpuSet:
+    """按 DP 副本窗口平移寻址的 DpuSet 视图（R21-02b）。
+
+    计划命令携带副本 0 的基数 DPU 编号；路由到副本 g 执行时，通信库
+    （DmaEngine）经此视图把 src/dst 平移到 g 的物理块。"""
+
+    def __init__(self, base: DpuSet, offset: int) -> None:
+        self._base = base
+        self._offset = offset
+
+    def dpu(self, dpu_id: int) -> DpuSet:
+        return self._base.dpu(dpu_id + self._offset)
+
+    def subset(self, dpu_ids: tuple[int, ...]) -> DpuSet:
+        return self._base.subset(
+            tuple(dpu_id + self._offset for dpu_id in dpu_ids))
+
+
 class NumpyBackend:
     """提供异步命令执行、每 DPU 有序流和共享 MRAM 的 HAL。"""
 
@@ -117,7 +135,8 @@ class NumpyBackend:
         # host op 在伪硬件上本就当 DMA 引擎语义处理，串行化不改行为。
         self._host_lock = Lock()
         self._bound_values: dict[str, object] = {}
-        self._bound_pos: int | None = None
+        self._bound_pos: int | tuple[int, ...] | None = None
+        self._dpu_window = 0
 
     def reset_events(self) -> None:
         """清空本次执行的命令事件表，保留各 DPU 的执行顺序。"""
@@ -125,7 +144,12 @@ class NumpyBackend:
 
     @property
     def dpu_set(self) -> DpuSet:
-        """底层 SDK 集合：通信库（comm/lowering.py）经此与 HAL 共享同一伪硬件。"""
+        """底层 SDK 集合：通信库（comm/lowering.py）经此与 HAL 共享同一伪硬件。
+
+        DP 副本窗口生效期间返回按窗口平移的视图（重分布段的 src/dst
+        基数编号随命令落在副本 g 的物理块上）。"""
+        if self._dpu_window:
+            return _WindowedDpuSet(self._dpu_set, self._dpu_window)
         return self._dpu_set
 
     def register_plan(self, plan: object) -> None:
@@ -137,7 +161,7 @@ class NumpyBackend:
     def copy_to_dpu(self, dpu_id: int, offset: int, data: np.ndarray) -> None:
         blob = np.ascontiguousarray(data).view(np.uint8).reshape(-1)
         self._alloc.check(offset, blob.nbytes)
-        dpu_copy_to(self._dpu_set.dpu(dpu_id), offset, blob, blob.nbytes)
+        dpu_copy_to(self._dpu_set.dpu(dpu_id + self._dpu_window), offset, blob, blob.nbytes)
 
     def copy_from_dpu(
         self, dpu_id: int, offset: int, shape: tuple[int, ...], dtype: np.dtype
@@ -145,7 +169,7 @@ class NumpyBackend:
         size = int(np.prod(shape)) * np.dtype(dtype).itemsize
         self._alloc.check(offset, size)
         data = np.empty(shape, dtype=dtype)
-        dpu_copy_from(self._dpu_set.dpu(dpu_id), offset, data, size)
+        dpu_copy_from(self._dpu_set.dpu(dpu_id + self._dpu_window), offset, data, size)
         return data
 
     def write_local(self, dpu_id: int, offset: int, data: np.ndarray) -> None:
@@ -153,12 +177,12 @@ class NumpyBackend:
 
     def raw_mram_ptr(self, dpu_id: int) -> int:
         """返回指定 DPU 的 MRAM 起始地址，供已编译内核直接访问。"""
-        _, dpu = self._dpu_set.dpu(dpu_id)._member()
+        _, dpu = self._dpu_set.dpu(dpu_id + self._dpu_window)._member()
         return dpu.mram.ctypes.data
 
     def wram_ptr(self, dpu_id: int) -> int:
         """返回指定 DPU 的 WRAM 起始地址，供已编译内核直接访问。"""
-        _, dpu = self._dpu_set.dpu(dpu_id)._member()
+        _, dpu = self._dpu_set.dpu(dpu_id + self._dpu_window)._member()
         return dpu.wram.ctypes.data
 
     def record_access(self, tasklet_id: int, loc: Literal["wram", "mram"],
@@ -184,6 +208,13 @@ class NumpyBackend:
         if cmd.id in self._events_by_id:
             raise ValueError(f"duplicate command id {cmd.id}")
         deps = self._dependency_futures(cmd.waits)
+        if cmd.dpu_id is None:
+            event = Event("host", self._pool.submit(self._run_host_or_dma, cmd, deps))
+            self._events_by_id[cmd.id] = event
+            return event
+        # 副本窗口只平移流排序与派发目标；内核收到的仍是基数编号，
+        # 内部 I/O 经 copy_*/raw_* 再加窗口，两条路径落同一物理 DPU。
+        dispatch_dpu = int(cmd.dpu_id) + self._dpu_window
         if cmd.op == "launch":
             kernel = self._kernels.lookup(str(cmd.payload["kernel"]))
             tracker = HazardTracker()
@@ -198,14 +229,14 @@ class NumpyBackend:
 
             event = Event(
                 "dpu",
-                self._submit_on_dpu(int(cmd.dpu_id), deps, run_with_tracker),
+                self._submit_on_dpu(dispatch_dpu, deps, run_with_tracker),
             )
         elif cmd.op == "dma_in":
             data = np.ascontiguousarray(np.asarray(cmd.payload["data"])).copy()
             event = Event(
                 "dma",
                 self._submit_on_dpu(
-                    int(cmd.dpu_id),
+                    dispatch_dpu,
                     deps,
                     self.copy_to_dpu,
                     int(cmd.dpu_id),
@@ -217,7 +248,7 @@ class NumpyBackend:
             event = Event(
                 "dma",
                 self._submit_on_dpu(
-                    int(cmd.dpu_id),
+                    dispatch_dpu,
                     deps,
                     self.copy_from_dpu,
                     int(cmd.dpu_id),
@@ -226,8 +257,6 @@ class NumpyBackend:
                     np.dtype(cmd.payload["dtype"]),
                 ),
             )
-        elif cmd.dpu_id is None:
-            event = Event("host", self._pool.submit(self._run_host_or_dma, cmd, deps))
         else:
             raise ValueError(f"unsupported command op {cmd.op!r}")
         self._events_by_id[cmd.id] = event
@@ -278,17 +307,24 @@ class NumpyBackend:
     def query(self, event: Event) -> bool:
         return event.future.done()
 
-    def bind_inputs(self, values: dict[str, object], *, pos: int | None = None) -> None:
-        """绑定本次计划执行的占位符值和可选 KV 写入位置。"""
+    def bind_inputs(self, values: dict[str, object], *,
+                    pos: int | tuple[int, ...] | None = None,
+                    dpu_window: int = 0) -> None:
+        """绑定本次计划执行的占位符值、可选 KV 写入位置与 DP 副本窗口。
+
+        `dpu_window` 把计划命令的基数 DPU 编号平移到副本 g 的物理块
+        （R21-02b）：窗口仅在 `execute_plan` 执行期间生效，执行完复位 0，
+        计划外的直接读写（权重装载）不受影响。"""
         self._bound_values = values
         self._bound_pos = pos
+        self._dpu_window = dpu_window
 
     def bound_value(self, name: str) -> object:
         """取本次绑定的某个 placeholder 值（`exec_plan_gen._resolve_value` 用）。"""
         return self._bound_values[name]
 
     @property
-    def bound_pos(self) -> int | None:
+    def bound_pos(self) -> int | tuple[int, ...] | None:
         """取本次 `bind_inputs` 绑定的 `pos`（KV/SDPA handler 读写位置用）。"""
         return self._bound_pos
 

@@ -115,10 +115,10 @@ def test_kv_bytes_lower_bound() -> None:
 def test_build_kv_layout_offsets_exact() -> None:
     spec = build_kv_layout(_spec(0, kv_base=1024), align=64)  # BLOCK=512 已对齐，无 padding
     assert spec.kv_off == {
-        (0, 0, "k"): 1024, (0, 0, "v"): 1536,
-        (0, 1, "k"): 2048, (0, 1, "v"): 2560,
-        (1, 0, "k"): 3072, (1, 0, "v"): 3584,
-        (1, 1, "k"): 4096, (1, 1, "v"): 4608,
+        (0, 0, 0, "k"): 1024, (0, 0, 0, "v"): 1536,
+        (0, 0, 1, "k"): 2048, (0, 0, 1, "v"): 2560,
+        (0, 1, 0, "k"): 3072, (0, 1, 0, "v"): 3584,
+        (0, 1, 1, "k"): 4096, (0, 1, 1, "v"): 4608,
     }
     assert spec.kv_allocated_bytes == 4096 == kv_bytes(spec)  # 无 padding 时二者相等
     # 对齐填充后的已分配字节数。
@@ -130,10 +130,10 @@ def test_build_kv_layout_offsets_exact() -> None:
 def test_kv_region_spec_crud_and_rebuild() -> None:
     """KVRegionSpec 可初始化/读/写/增/删/改：dataclass 字段可变，改完重建布局即可。"""
     spec = build_kv_layout(_spec(0, kv_base=0), align=64)
-    assert spec.kv_off[(0, 0, "k")] == 0  # 读
+    assert spec.kv_off[(0, 0, 0, "k")] == 0  # 读
     spec.kv_base = 2048                   # 改：基址平移
     build_kv_layout(spec, align=64)
-    assert spec.kv_off[(0, 0, "k")] == 2048 and spec.kv_allocated_bytes == 4096
+    assert spec.kv_off[(0, 0, 0, "k")] == 2048 and spec.kv_allocated_bytes == 4096
     spec.layers.append(2)                 # 增：多一层，占用多 2头×2(K/V)×512B
     build_kv_layout(spec, align=64)
     assert spec.kv_allocated_bytes == 4096 + 4 * BLOCK
@@ -141,7 +141,7 @@ def test_kv_region_spec_crud_and_rebuild() -> None:
     spec.kv_heads.remove(1)               # 删：少一个 head
     build_kv_layout(spec, align=64)
     assert spec.kv_allocated_bytes == len(spec.layers) * len(spec.kv_heads) * 2 * BLOCK
-    assert set(spec.kv_off) == {(L, 0, w) for L in spec.layers for w in ("k", "v")}
+    assert set(spec.kv_off) == {(0, L, 0, w) for L in spec.layers for w in ("k", "v")}
     broken = _spec(0)
     del broken.q_heads_by_kv[1]           # 破坏契约：kv head 1 无 q 映射
     with pytest.raises(ValueError):
@@ -198,7 +198,7 @@ def test_kv_access_matches_layout() -> None:
     spec = _specs()[0]
     acc = kv_access(spec, layer=1, head=0, which="v", pos_start=3, pos_end=7)
     assert acc.loc == ("dpu", 0)
-    assert acc.offset == spec.kv_off[(1, 0, "v")] + 3 * HEAD_DIM * DTYPE_BYTES
+    assert acc.offset == spec.kv_off[(0, 1, 0, "v")] + 3 * HEAD_DIM * DTYPE_BYTES
     assert acc.length == 4 * HEAD_DIM * DTYPE_BYTES
     with pytest.raises(ValueError):
         kv_access(spec, 0, 0, "k", 0, MAX_SEQ + 1)

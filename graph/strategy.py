@@ -23,11 +23,12 @@ LLAMA_WEIGHT_RULES: tuple[tuple[str, Literal["col", "row"]], ...] = (
 
 @dataclass(frozen=True)
 class ShardStrategy:
-    """定义流水段、张量并行宽度和权重切分规则。"""
+    """定义流水段、张量并行宽度、DP 副本数和权重切分规则。"""
 
     name: str
     num_dpus: int
     num_stages: int = 1
+    replicas: int = 1
     weight_rules: tuple[tuple[str, Literal["col", "row"]], ...] = ()
     dpu_ids: tuple[int, ...] | None = None
 
@@ -36,6 +37,8 @@ class ShardStrategy:
             raise ValueError("num_dpus must be positive")
         if self.num_stages <= 0:
             raise ValueError("num_stages must be positive")
+        if self.replicas <= 0:
+            raise ValueError("replicas must be positive")
         if self.num_dpus % self.num_stages:
             raise ValueError(
                 f"num_stages={self.num_stages} 不能整除 num_dpus={self.num_dpus}"
@@ -48,12 +51,30 @@ class ShardStrategy:
             or any(dpu_id < 0 for dpu_id in dpu_ids)
         ):
             raise ValueError("dpu_ids must contain unique non-negative IDs for every DPU")
+        # 副本 g 的物理块 = dpu_ids 各加 g*num_dpus：编号越出 [0,num_dpus)
+        # 时块之间会重叠，数据并行的空间划分就不成立了。
+        if self.replicas > 1 and any(dpu_id >= self.num_dpus for dpu_id in dpu_ids):
+            raise ValueError(
+                f"replicas={self.replicas} 要求 dpu_ids 全部落在 [0,{self.num_dpus})"
+                "（各副本物理块按 g*num_dpus 偏移，越界会重叠）"
+            )
         object.__setattr__(self, "dpu_ids", dpu_ids)
 
     @property
     def tp_width(self) -> int:
         """每个 stage 内的张量并行宽度（1 = 段内不切，纯流水）。"""
         return self.num_dpus // self.num_stages
+
+    @property
+    def total_dpus(self) -> int:
+        """物理 DPU 总数：每副本 num_dpus 台 × replicas 份（权重复制）。"""
+        return self.num_dpus * self.replicas
+
+    def dpus_of_replica(self, replica: int) -> tuple[int, ...]:
+        """返回某个 DP 副本持有的物理 DPU 编号（副本 g 偏移 g×num_dpus）。"""
+        if not 0 <= replica < self.replicas:
+            raise ValueError(f"replica={replica} 越界 [0,{self.replicas})")
+        return tuple(dpu_id + replica * self.num_dpus for dpu_id in self.dpu_ids)
 
     @property
     def kind(self) -> Literal["tensor", "pipeline", "hybrid"]:
@@ -122,12 +143,17 @@ def llama_strategy(
     vocab_size: int,
     num_layers: int,
     dpu_ids: tuple[int, ...] | None = None,
+    replicas: int = 1,
 ) -> ShardStrategy:
     """构造 Llama 切分策略，并校验各维可被张量并行宽度整除。"""
+    name = f"tp{num_dpus // num_stages}_pp{num_stages}"
+    if replicas > 1:
+        name += f"_dp{replicas}"
     strategy = ShardStrategy(
-        name=f"tp{num_dpus // num_stages}_pp{num_stages}",
+        name=name,
         num_dpus=num_dpus,
         num_stages=num_stages,
+        replicas=replicas,
         weight_rules=LLAMA_WEIGHT_RULES,
         dpu_ids=dpu_ids,
     )
@@ -210,6 +236,7 @@ def strategy_from_partition_plan(
         vocab_size=vocab_size,
         num_layers=num_layers,
         dpu_ids=plan.dpu_ids,
+        replicas=plan.replicas,
     )
     if not plan.weight_rules:
         return strategy
@@ -223,6 +250,11 @@ def format_strategy(strategy: ShardStrategy, num_layers: int) -> str:
         f"== 策略 {strategy.name}（{strategy.kind}）: {strategy.num_dpus} DPU = "
         f"{strategy.num_stages} stage × tp{strategy.tp_width}，{num_layers} 层 =="
     ]
+    if strategy.replicas > 1:
+        lines.append(
+            f"DP 副本 ×{strategy.replicas}（物理 {strategy.total_dpus} DPU，"
+            "权重每副本全量、KV/激活按副本划分）"
+        )
     for stage in range(strategy.num_stages):
         layers = strategy.layers_of_stage(stage, num_layers)
         lines.append(
